@@ -1,0 +1,295 @@
+{
+  "abi": [
+    {
+      "type": "impl",
+      "name": "PayrollEscrowImpl",
+      "interface_name": "starknet_contracts::IPayrollEscrow"
+    },
+    {
+      "type": "struct",
+      "name": "core::integer::u256",
+      "members": [
+        {
+          "name": "low",
+          "type": "core::integer::u128"
+        },
+        {
+          "name": "high",
+          "type": "core::integer::u128"
+        }
+      ]
+    },
+    {
+      "type": "interface",
+      "name": "starknet_contracts::IPayrollEscrow",
+      "items": [
+        {
+          "type": "function",
+          "name": "initialize",
+          "inputs": [
+            {
+              "name": "token",
+              "type": "core::starknet::contract_address::ContractAddress"
+            },
+            {
+              "name": "manager",
+              "type": "core::starknet::contract_address::ContractAddress"
+            }
+          ],
+          "outputs": [],
+          "state_mutability": "external"
+        },
+        {
+          "type": "function",
+          "name": "fund_agreement",
+          "inputs": [
+            {
+              "name": "agreement_id",
+              "type": "core::integer::u128"
+            },
+            {
+              "name": "employer",
+              "type": "core::starknet::contract_address::ContractAddress"
+            },
+            {
+              "name": "amount",
+              "type": "core::integer::u256"
+            }
+          ],
+          "outputs": [],
+          "state_mutability": "external"
+        },
+        {
+          "type": "function",
+          "name": "release",
+          "inputs": [
+            {
+              "name": "agreement_id",
+              "type": "core::integer::u128"
+            },
+            {
+              "name": "to",
+              "type": "core::starknet::contract_address::ContractAddress"
+            },
+            {
+              "name": "amount",
+              "type": "core::integer::u256"
+            }
+          ],
+          "outputs": [],
+          "state_mutability": "external"
+        },
+        {
+          "type": "function",
+          "name": "refund_remaining",
+          "inputs": [
+            {
+              "name": "agreement_id",
+              "type": "core::integer::u128"
+            }
+          ],
+          "outputs": [],
+          "state_mutability": "external"
+        },
+        {
+          "type": "function",
+          "name": "get_token",
+          "inputs": [],
+          "outputs": [
+            {
+              "type": "core::starknet::contract_address::ContractAddress"
+            }
+          ],
+          "state_mutability": "view"
+        },
+        {
+          "type": "function",
+          "name": "get_agreement_balance",
+          "inputs": [
+            {
+              "name": "agreement_id",
+              "type": "core::integer::u128"
+            }
+          ],
+          "outputs": [
+            {
+              "type": "core::integer::u256"
+            }
+          ],
+          "state_mutability": "view"
+        },
+        {
+          "type": "function",
+          "name": "get_agreement_employer",
+          "inputs": [
+            {
+              "name": "agreement_id",
+              "type": "core::integer::u128"
+            }
+          ],
+          "outputs": [
+            {
+              "type": "core::starknet::contract_address::ContractAddress"
+            }
+          ],
+          "state_mutability": "view"
+        },
+        {
+          "type": "function",
+          "name": "upgrade",
+          "inputs": [
+            {
+              "name": "new_class_hash",
+              "type": "core::starknet::class_hash::ClassHash"
+            }
+          ],
+          "outputs": [],
+          "state_mutability": "external"
+        },
+        {
+          "type": "function",
+          "name": "get_admin",
+          "inputs": [],
+          "outputs": [
+            {
+              "type": "core::starknet::contract_address::ContractAddress"
+            }
+          ],
+          "state_mutability": "view"
+        }
+      ]
+    },
+    {
+      "type": "event",
+      "name": "starknet_contracts::payroll_escrow::PayrollEscrow::Funded",
+      "kind": "struct",
+      "members": [
+        {
+          "name": "agreement_id",
+          "type": "core::integer::u128",
+          "kind": "data"
+        },
+        {
+          "name": "employer",
+          "type": "core::starknet::contract_address::ContractAddress",
+          "kind": "data"
+        },
+        {
+          "name": "amount",
+          "type": "core::integer::u256",
+          "kind": "data"
+        }
+      ]
+    },
+    {
+      "type": "event",
+      "name": "starknet_contracts::payroll_escrow::PayrollEscrow::Released",
+      "kind": "struct",
+      "members": [
+        {
+          "name": "agreement_id",
+          "type": "core::integer::u128",
+          "kind": "data"
+        },
+        {
+          "name": "to",
+          "type": "core::starknet::contract_address::ContractAddress",
+          "kind": "data"
+        },
+        {
+          "name": "amount",
+          "type": "core::integer::u256",
+          "kind": "data"
+        }
+      ]
+    },
+    {
+      "type": "event",
+      "name": "starknet_contracts::payroll_escrow::PayrollEscrow::Refunded",
+      "kind": "struct",
+      "members": [
+        {
+          "name": "agreement_id",
+          "type": "core::integer::u128",
+          "kind": "data"
+        },
+        {
+          "name": "to",
+          "type": "core::starknet::contract_address::ContractAddress",
+          "kind": "data"
+        },
+        {
+          "name": "amount",
+          "type": "core::integer::u256",
+          "kind": "data"
+        }
+      ]
+    },
+    {
+      "type": "event",
+      "name": "starknet_contracts::payroll_escrow::PayrollEscrow::Event",
+      "kind": "enum",
+      "variants": [
+        {
+          "name": "Funded",
+          "type": "starknet_contracts::payroll_escrow::PayrollEscrow::Funded",
+          "kind": "nested"
+        },
+        {
+          "name": "Released",
+          "type": "starknet_contracts::payroll_escrow::PayrollEscrow::Released",
+          "kind": "nested"
+        },
+        {
+          "name": "Refunded",
+          "type": "starknet_contracts::payroll_escrow::PayrollEscrow::Refunded",
+          "kind": "nested"
+        }
+      ]
+    }
+  ],
+  "contract_class_version": "0.1.0",
+  "entry_points_by_type": {
+    "EXTERNAL": [
+      {
+        "selector": "0x5a6dc6f7e8656767705fa1b809ec2c27086762f615cdddb3cd21888983b3e3",
+        "function_idx": 4
+      },
+      {
+        "selector": "0x79dc0da7c54b95f10aa182ad0a46400db63156920adb65eca2654c0945a463",
+        "function_idx": 0
+      },
+      {
+        "selector": "0x8315676307565aef00e2a38a443089bb56baa2a3ce514870961a621b4cfe75",
+        "function_idx": 8
+      },
+      {
+        "selector": "0xf2f7c15cbe06c8d94597cd91fd7f3369eae842359235712def5584f8d270cd",
+        "function_idx": 1
+      },
+      {
+        "selector": "0x14ec57661cd36bd079f1b6f9c04b8104bd67a39f9a1d9fc9677ecc2a8fdd58d",
+        "function_idx": 2
+      },
+      {
+        "selector": "0x1ab16f291a84ae5ed71a77264f4ecced58bc7b04fe74862f7579efbe64f17e3",
+        "function_idx": 3
+      },
+      {
+        "selector": "0x35ca76785c3351beab454986509dd2a401bd9fbd556b5c6dc4ed29e5d6e6cbd",
+        "function_idx": 6
+      },
+      {
+        "selector": "0x3672199c14186acad3ca3ff0fa3b500060ed7a9eb17df204edde4e4be50d600",
+        "function_idx": 7
+      },
+      {
+        "selector": "0x39428db164a0836c6e32405cd21fd32abd040bd258561dfe5b5b5dcf6998884",
+        "function_idx": 5
+      }
+    ],
+    "L1_HANDLER": [],
+    "CONSTRUCTOR": []
+  },
+  "sierra_program": []
+}
