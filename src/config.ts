@@ -29,6 +29,10 @@ const EnvSchema = z.object({
   TOKEN_STRK: z.string().optional(),
   TOKEN_USDC: z.string().optional(),
   TOKEN_USDT: z.string().optional(),
+  
+  // Email configuration for contact form
+  EMAIL_USER: z.string().optional(),
+  EMAIL_PASSWORD: z.string().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

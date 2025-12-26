@@ -135,3 +135,4 @@ await fetch(`/api/v1/events/process_tx/${fundTx.transaction_hash}`, {
 4. Ensure user has proper permissions
 
 
+

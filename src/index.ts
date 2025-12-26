@@ -16,6 +16,7 @@ import { indexerStatusRouter } from "./routes/indexer-status.js";
 import { reprocessEventsRouter } from "./routes/reprocess-events.js";
 import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { backfillEventsRouter } from "./routes/backfill-events.js";
+import { contactRouter } from "./routes/contact.js";
 
 const app = express();
 
@@ -60,6 +61,7 @@ app.use("/api/v1", indexerStatusRouter);
 app.use("/api/v1", reprocessEventsRouter);
 app.use("/api/v1", diagnosticsRouter);
 app.use("/api/v1", backfillEventsRouter);
+app.use("/api/v1", contactRouter);
 
 // Basic error handler
 app.use(
