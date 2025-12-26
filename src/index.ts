@@ -22,9 +22,22 @@ const app = express();
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
 
+// Parse CORS origins - supports comma-separated values or "*" for all origins
+const parseCorsOrigin = (origin: string): string | string[] | boolean => {
+  if (origin === "*") {
+    return true; // Allow all origins
+  }
+  
+  // Split by comma and trim whitespace
+  const origins = origin.split(",").map((o) => o.trim()).filter((o) => o.length > 0);
+  
+  // If only one origin, return as string; otherwise return array
+  return origins.length === 1 ? origins[0] : origins;
+};
+
 app.use(
   cors({
-    origin: env.CORS_ORIGIN === "*" ? true : env.CORS_ORIGIN,
+    origin: parseCorsOrigin(env.CORS_ORIGIN),
     credentials: true,
   }),
 );
