@@ -26,6 +26,18 @@ const app = express();
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
 
+// Set trust proxy for correct client IP detection in rate limiting
+// Parse TRUST_PROXY env var - can be a number, "true", or comma-separated list
+let trustProxyValue: string | number | string[] | boolean = env.TRUST_PROXY;
+if (env.TRUST_PROXY === "true") {
+  trustProxyValue = true;
+} else if (/^\d+$/.test(env.TRUST_PROXY)) {
+  trustProxyValue = parseInt(env.TRUST_PROXY, 10);
+} else if (env.TRUST_PROXY.includes(",")) {
+  trustProxyValue = env.TRUST_PROXY.split(",").map((s) => s.trim());
+}
+app.set("trust proxy", trustProxyValue);
+
 // Parse CORS origins - supports comma-separated values or "*" for all origins
 const parseCorsOrigin = (origin: string): string | string[] | boolean => {
   if (origin === "*") {
@@ -39,6 +51,10 @@ const parseCorsOrigin = (origin: string): string | string[] | boolean => {
   return origins.length === 1 ? origins[0] : origins;
 };
 
+// Security: Add Helmet headers
+app.use(helmet());
+
+// Apply CORS
 app.use(
   cors({
     origin: parseCorsOrigin(env.CORS_ORIGIN),
@@ -47,10 +63,52 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
+// Rate limiting: Global limiter (looser)
+const globalLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_WINDOW_MS,
+  max: env.RATE_LIMIT_MAX,
+  message: "Too many requests, please try again later.",
+  standardHeaders: false, // Return rate limit info in `RateLimit-*` headers
+  skip: (req) => {
+    // Don't count /health requests against rate limit
+    return req.path === "/health";
+  },
+  keyGenerator: (req) => {
+    // Key by client IP (respects X-Forwarded-For if trust proxy is set)
+    return req.ip || "unknown";
+  },
+  handler: (_req, res) => {
+    res.status(429).json({
+      error: "Too many requests, please try again later.",
+    });
+  },
+});
+
+// Rate limiting: Strict limiter for auth and contact endpoints
+const strictLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
+  max: env.RATE_LIMIT_STRICT_MAX,
+  message: "Too many requests from this IP, please try again later.",
+  standardHeaders: false,
+  keyGenerator: (req) => {
+    return req.ip || "unknown";
+  },
+  handler: (_req, res) => {
+    res.status(429).json({
+      error: "Too many requests from this IP, please try again later.",
+    });
+  },
+});
+
+// Apply global rate limiter to all API routes
+app.use("/api/", globalLimiter);
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.use("/api/v1", escrowRouter);
 app.use("/api/v1", agreementRouter);
+// Apply strict rate limiting to auth endpoint
+app.use("/api/v1/auth", strictLimiter);
 app.use("/api/v1", authRouter);
 app.use("/api/v1", systemRouter);
 app.use("/api/v1", readRouter);
@@ -64,6 +122,8 @@ app.use("/api/v1", indexerStatusRouter);
 app.use("/api/v1", reprocessEventsRouter);
 app.use("/api/v1", diagnosticsRouter);
 app.use("/api/v1", backfillEventsRouter);
+// Apply strict rate limiting to contact endpoint
+app.use("/api/v1/contact", strictLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
 
