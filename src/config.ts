@@ -33,6 +33,9 @@ const EnvSchema = z.object({
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
   EMAIL_PASSWORD: z.string().optional(),
+
+  // Session TTL in milliseconds (default: 24 hours)
+  SESSION_TTL_MS: z.coerce.number().int().positive().optional().default(86_400_000),
 });
 
 export const env = EnvSchema.parse(process.env);

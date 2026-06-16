@@ -71,7 +71,7 @@ tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
     const tokenAddress = AddressParam.parse(req.params.address);
     const body = ApproveBody.parse(req.body);
     
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!await requireSession(body.wallet_address, body.session_token)) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }

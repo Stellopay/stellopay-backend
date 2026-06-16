@@ -1,5 +1,24 @@
 import { bigint, pgTable, text, integer, boolean, timestamp, index } from "drizzle-orm/pg-core";
 
+// Sessions table - persisted auth sessions
+export const sessions = pgTable(
+  "sessions",
+  {
+    id: text("id").primaryKey(), // UUID
+    tokenHash: text("token_hash").notNull().unique(), // SHA-256(raw token)
+    address: text("address").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    revokedAt: timestamp("revoked_at"),
+    lastSeen: timestamp("last_seen").defaultNow().notNull(),
+  },
+  (table) => ({
+    tokenHashIdx: index("sessions_token_hash_idx").on(table.tokenHash),
+    addressIdx: index("sessions_address_idx").on(table.address),
+    expiresAtIdx: index("sessions_expires_at_idx").on(table.expiresAt),
+  })
+);
+
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
   "agreements",

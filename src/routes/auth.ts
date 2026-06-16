@@ -8,6 +8,7 @@ import {
   createSession,
   getChallenge,
   requireSession,
+  revokeSession,
 } from "../auth/session.js";
 
 const AddressBody = z.object({ address: z.string().min(3) });
@@ -116,7 +117,7 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       return;
     }
     clearChallenge(address);
-    const session = createSession(address);
+    const session = await createSession(address);
     res.json({ ok: true, address, session_token: session.token, expires_in_ms: session.expires_in_ms });
   } catch (e) {
     // eslint-disable-next-line no-console
@@ -129,12 +130,23 @@ authRouter.post("/auth/verify", async (req, res, next) => {
 authRouter.post("/auth/session/validate", async (req, res, next) => {
   try {
     const { address, session_token } = SessionBody.parse(req.body);
-    const ok = requireSession(address, session_token);
+    const ok = await requireSession(address, session_token);
     if (!ok) {
       res.status(401).json({ ok: false, error: "Invalid session" });
       return;
     }
     res.json({ ok: true, address });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Logout: revoke the caller's session
+authRouter.post("/auth/logout", async (req, res, next) => {
+  try {
+    const { session_token } = z.object({ session_token: z.string().min(10) }).parse(req.body);
+    await revokeSession(session_token);
+    res.json({ ok: true });
   } catch (e) {
     next(e);
   }
