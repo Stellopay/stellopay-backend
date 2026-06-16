@@ -150,4 +150,84 @@ async function deposit({
 }
 ```
 
+### Security
+
+The backend includes multiple security layers:
+
+#### Helmet
+[Helmet](https://helmetjs.github.io/) middleware is applied to all responses, setting secure HTTP headers including:
+- `Content-Security-Policy`
+- `Strict-Transport-Security` (HSTS)
+- `X-Frame-Options`
+- `X-Content-Type-Options`
+- `X-XSS-Protection`
+- And many others
+
+This provides baseline protection against common web vulnerabilities.
+
+#### Rate Limiting
+[express-rate-limit](https://github.com/nfriedly/express-rate-limit) is configured with a tiered approach:
+
+**Global Rate Limit** (applies to all `/api/v1` endpoints):
+- Window: 15 minutes (configurable via `RATE_LIMIT_WINDOW_MS`)
+- Max requests: 100 per window (configurable via `RATE_LIMIT_MAX`)
+- Returns HTTP 429 with JSON error response
+
+**Strict Rate Limit** (applies to sensitive endpoints):
+- Endpoints: `/api/v1/auth/*` and `/api/v1/contact/*`
+- Window: 5 minutes (configurable via `RATE_LIMIT_STRICT_WINDOW_MS`)
+- Max requests: 10 per window (configurable via `RATE_LIMIT_STRICT_MAX`)
+- Returns HTTP 429 with JSON error response
+- **Why**: These endpoints are unauthenticated and have side effects:
+  - `/auth/challenge` and `/auth/verify` trigger RPC calls to Starknet
+  - `/contact/send-message` sends emails via nodemailer
+
+This prevents:
+- Denial-of-service (DoS) attacks via resource exhaustion
+- Spam campaigns targeting the contact form
+- Brute force attacks on authentication endpoints
+
+#### Proxy Configuration
+For deployments behind a reverse proxy or CDN (nginx, Cloudflare, AWS ALB, etc.):
+- Set `TRUST_PROXY` to the number of trusted proxies (default: `1`)
+- This ensures rate limits key on the real client IP via `X-Forwarded-For` header
+- In containerized deployments, typical value is `1` (requests come through one proxy layer)
+- See [Express trust proxy documentation](https://expressjs.com/en/guide/behind-proxies.html)
+
+#### Configuration Examples
+
+**Development** (relaxed limits):
+```bash
+RATE_LIMIT_WINDOW_MS=900000        # 15 minutes
+RATE_LIMIT_MAX=100                 # 100 requests
+RATE_LIMIT_STRICT_WINDOW_MS=300000 # 5 minutes
+RATE_LIMIT_STRICT_MAX=10           # 10 requests
+TRUST_PROXY=1
+```
+
+**Production with high traffic** (stricter limits):
+```bash
+RATE_LIMIT_WINDOW_MS=600000        # 10 minutes
+RATE_LIMIT_MAX=50                  # 50 requests
+RATE_LIMIT_STRICT_WINDOW_MS=300000 # 5 minutes
+RATE_LIMIT_STRICT_MAX=5            # 5 requests
+TRUST_PROXY=1  # or higher if behind multiple proxies
+```
+
+**Production with CDN** (e.g., Cloudflare):
+```bash
+RATE_LIMIT_WINDOW_MS=900000
+RATE_LIMIT_MAX=100
+RATE_LIMIT_STRICT_WINDOW_MS=300000
+RATE_LIMIT_STRICT_MAX=10
+TRUST_PROXY=1  # Cloudflare is the only proxy
+```
+
+Rate-limit responses are JSON, consistent with the error-handler format:
+```json
+{
+  "error": "Too many requests, please try again later."
+}
+```
+
 
