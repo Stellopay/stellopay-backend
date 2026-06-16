@@ -7,7 +7,9 @@ dotenv.config();
 const EnvSchema = z.object({
   NODE_ENV: z.string().optional().default("development"),
   PORT: z.coerce.number().int().positive().optional().default(4000),
-  CORS_ORIGIN: z.string().optional().default("*"),
+  // Explicit allowlist required. Use comma-separated origins (e.g. "http://localhost:3000,https://app.stellopay.xyz").
+  // Use "*" ONLY for development — it disables credentials.
+  CORS_ORIGIN: z.string().optional().default("http://localhost:3000"),
 
   // Required: Starknet RPC URL (v0_8)
   // Provide via environment variable (e.g. in `.env` or inline `STARKNET_RPC_URL=... pnpm dev`)

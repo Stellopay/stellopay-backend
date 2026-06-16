@@ -24,23 +24,45 @@ const app = express();
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
 
-// Parse CORS origins - supports comma-separated values or "*" for all origins
-const parseCorsOrigin = (origin: string): string | string[] | boolean => {
-  if (origin === "*") {
-    return true; // Allow all origins
-  }
-  
-  // Split by comma and trim whitespace
-  const origins = origin.split(",").map((o) => o.trim()).filter((o) => o.length > 0);
-  
-  // If only one origin, return as string; otherwise return array
-  return origins.length === 1 ? origins[0] : origins;
-};
+// ── CORS ──────────────────────────────────────────────────────────────────
+// Wildcard ("*") and credentials:true are mutually exclusive per the CORS spec.
+// When a wildcard is configured we serve CORS without credentials (suitable for
+// fully-public read endpoints). Only an explicit allowlist enables credentials.
+const corsOriginValue = env.CORS_ORIGIN.trim();
+const isWildcard = corsOriginValue === "*";
+
+if (isWildcard && env.NODE_ENV === "production") {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[cors] WARNING: CORS_ORIGIN='*' is set in production. " +
+      "Credentials will be disabled. Set an explicit allowlist for authenticated endpoints.",
+  );
+}
+
+// Build the origin allowlist (array) or wildcard boolean.
+// Rejects (405-equivalent) origins not on the list — does NOT reflect arbitrary origins.
+const allowedOrigins: string[] = isWildcard
+  ? []
+  : corsOriginValue
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0);
+
+const corsOriginHandler: cors.CorsOptions["origin"] = isWildcard
+  ? true // wildcard — no credentials
+  : (origin, callback) => {
+      // Allow same-origin (server-to-server) and preflight requests (no Origin header).
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error(`CORS: origin '${origin}' is not in the allowlist`));
+    };
+
+app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: parseCorsOrigin(env.CORS_ORIGIN),
-    credentials: true,
+    origin: corsOriginHandler,
+    credentials: !isWildcard, // never combine wildcard + credentials
   }),
 );
 app.use(express.json({ limit: "1mb" }));
