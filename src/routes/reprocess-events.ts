@@ -2,10 +2,11 @@ import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
-import { eq, inArray } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
+import { processTxHash } from "../services/event-processor.js";
 
 export const reprocessEventsRouter = Router();
 
@@ -33,28 +34,13 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
   return payrollEscrowAbi;
 }
 
-// Reprocess events for a specific transaction to update event names
+// Reprocess events for a specific transaction to update event names.
+// Calls the shared processTxHash() function directly — no loopback HTTP.
 reprocessEventsRouter.post("/reprocess-events/tx/:tx_hash", async (req, res, next) => {
   try {
     const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
-    
-    // Format tx hash
-    let formattedTxHash = tx_hash;
-    if (!tx_hash.startsWith("0x")) {
-      formattedTxHash = `0x${tx_hash}`;
-    }
-    
-    // Call the events processing endpoint
-    const response = await fetch(`http://localhost:${process.env.PORT || 4002}/api/v1/events/process_tx/${formattedTxHash}`, {
-      method: "POST",
-    });
-    
-    const result = await response.json();
-    
-    res.json({
-      message: "Events reprocessed",
-      result,
-    });
+    const result = await processTxHash(tx_hash);
+    res.json({ message: "Events reprocessed", result });
   } catch (e) {
     next(e);
   }
