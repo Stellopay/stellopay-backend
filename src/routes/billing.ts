@@ -1,351 +1,327 @@
-import express from "express";
+import { Router } from "express";
+import { z } from "zod";
+import { eq, and } from "drizzle-orm";
+import { db, schema } from "../db/index.js";
+import { env } from "../config.js";
 
-const billingRouter = express.Router();
+export const billingRouter = Router();
 
-// Mock data for billing profiles
-const mockBillingProfile = {
-  id: "billing-profile-1",
-  profileType: "Individual",
-  annualRewardLimit: 10000.0,
-  usedAmount: 5000.0,
-  remainingAmount: 5000.0,
-  currency: "USD",
-  generalInformation: {
-    firstName: "John",
-    lastName: "Doe",
-    email: "john.doe@example.com",
-    phone: "+1 (555) 123-4567",
-    address: {
-      street: "123 Main Street",
-      city: "San Francisco",
-      state: "CA",
-      zipCode: "94102",
-      country: "United States",
-    },
-    // Flattened address fields for easier form binding
-    street: "123 Main Street",
-    city: "San Francisco",
-    state: "CA",
-    zipCode: "94102",
-    country: "United States",
-    taxId: "12-3456789",
-    taxResidency: "United States",
-    dateOfBirth: "1990-01-15",
-    companyName: null,
-    vatNumber: null,
-    businessType: "Individual",
-    occupation: "Software Developer",
-    website: "https://johndoe.dev",
-    notes: "Preferred contact method: Email",
-  },
-  paymentMethods: [
-    {
-      id: "pm-1",
-      type: "bank_account",
-      bankName: "Chase Bank",
-      accountNumber: "****1234",
-      routingNumber: "****5678",
-      isDefault: true,
-      addedDate: "2024-01-15",
-    },
-    {
-      id: "pm-2",
-      type: "paypal",
-      email: "john.doe@example.com",
-      isDefault: false,
-      addedDate: "2024-02-20",
-    },
-  ],
-  invoices: [
-    {
-      id: "inv-001",
-      invoiceNumber: "INV-2024-001",
-      date: "2024-03-01",
-      amount: 1500.0,
-      currency: "USD",
-      status: "paid",
-      description: "Monthly reward payment - March 2024",
-      downloadUrl: "/invoices/inv-001.pdf",
-    },
-    {
-      id: "inv-002",
-      invoiceNumber: "INV-2024-002",
-      date: "2024-02-01",
-      amount: 2000.0,
-      currency: "USD",
-      status: "paid",
-      description: "Monthly reward payment - February 2024",
-      downloadUrl: "/invoices/inv-002.pdf",
-    },
-    {
-      id: "inv-003",
-      invoiceNumber: "INV-2024-003",
-      date: "2024-01-01",
-      amount: 1500.0,
-      currency: "USD",
-      status: "paid",
-      description: "Monthly reward payment - January 2024",
-      downloadUrl: "/invoices/inv-003.pdf",
-    },
-  ],
-  createdAt: "2024-01-01T00:00:00Z",
-  updatedAt: "2024-03-15T10:30:00Z",
-};
+function billingDisabled(res: any) {
+  res.status(503).json({ error: "Billing is not enabled on this instance" });
+}
 
-// GET /api/v1/billing/profile/:profileId
-billingRouter.get("/billing/profile/:profileId", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    console.log(`[billing] Fetching full profile for: ${profileId}`);
-    
-    // Return mock data for any profile ID with generalInformation included
-    const profileData = {
-      ...mockBillingProfile,
-      id: profileId,
-      generalInformation: {
-        ...mockBillingProfile.generalInformation,
-        fullAddress: `${mockBillingProfile.generalInformation.street}, ${mockBillingProfile.generalInformation.city}, ${mockBillingProfile.generalInformation.state} ${mockBillingProfile.generalInformation.zipCode}`,
-      },
-    };
-    
-    console.log(`[billing] Returning full profile data`);
-    
-    res.json({
-      success: true,
-      data: profileData,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching billing profile:", error);
-    res.status(500).json({
-      error: "Failed to fetch billing profile",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
+const WalletParam = z.object({ walletAddress: z.string().min(3) });
+
+const GeneralInfoBody = z.object({
+  profileType: z.enum(["Individual", "Business"]).optional(),
+  currency: z.string().length(3).optional(),
+  annualRewardLimit: z.string().regex(/^\d+(\.\d{1,2})?$/).optional(),
+  firstName: z.string().max(100).optional(),
+  lastName: z.string().max(100).optional(),
+  email: z.string().email().max(254).optional(),
+  phone: z.string().max(30).optional(),
+  street: z.string().max(200).optional(),
+  city: z.string().max(100).optional(),
+  state: z.string().max(100).optional(),
+  zipCode: z.string().max(20).optional(),
+  country: z.string().max(100).optional(),
+  taxId: z.string().max(50).optional(),
+  taxResidency: z.string().max(100).optional(),
+  dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  companyName: z.string().max(200).optional(),
+  vatNumber: z.string().max(50).optional(),
+  businessType: z.string().max(100).optional(),
+  occupation: z.string().max(100).optional(),
+  website: z.string().url().max(300).optional().or(z.literal("")),
+  notes: z.string().max(2000).optional(),
 });
 
-// GET /api/v1/billing/profile/:profileId/general-information
-billingRouter.get("/billing/profile/:profileId/general-information", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    console.log(`[billing] Fetching general information for profile: ${profileId}`);
-    
-    // Return comprehensive general information with both nested and flattened structure
-    const info = mockBillingProfile.generalInformation;
-    const generalInfo = {
-      profileId,
-      ...info,
-      // Ensure address is available both as nested object and flat fields
-      fullAddress: `${info.street}, ${info.city}, ${info.state} ${info.zipCode}`,
-    };
-    
-    console.log(`[billing] Returning general information:`, JSON.stringify(generalInfo, null, 2));
-    
-    res.json({
-      success: true,
-      data: generalInfo,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching general information:", error);
-    res.status(500).json({
-      error: "Failed to fetch general information",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
+const PaymentMethodBody = z.object({
+  type: z.enum(["bank_account", "paypal", "crypto"]),
+  metadata: z.record(z.string()).refine(
+    (m) => typeof m === "object" && Object.keys(m).length <= 20,
+    "metadata must be a flat string record"
+  ),
+  isDefault: z.boolean().optional().default(false),
 });
 
-// GET /api/v1/billing-profiles/:profileId/general-information (matches frontend route pattern)
-billingRouter.get("/billing-profiles/:profileId/general-information", async (req, res) => {
+// GET /api/v1/billing/profile/:walletAddress
+billingRouter.get("/billing/profile/:walletAddress", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
   try {
-    const { profileId } = req.params;
-    console.log(`[billing] Fetching general information (billing-profiles route) for profile: ${profileId}`);
-    
-    const info = mockBillingProfile.generalInformation;
-    const generalInfo = {
-      profileId,
-      ...info,
-      fullAddress: `${info.street}, ${info.city}, ${info.state} ${info.zipCode}`,
-    };
-    
-    console.log(`[billing] Returning general information:`, JSON.stringify(generalInfo, null, 2));
-    
-    res.json({
-      success: true,
-      data: generalInfo,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching general information:", error);
-    res.status(500).json({
-      error: "Failed to fetch general information",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
-});
+    const { walletAddress } = WalletParam.parse(req.params);
+    const profile = await db
+      .select()
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .limit(1);
 
-// GET /api/v1/settings/billing-profiles/:profileId/general-information (matches exact frontend route)
-billingRouter.get("/settings/billing-profiles/:profileId/general-information", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    console.log(`[billing] Fetching general information (settings/billing-profiles route) for profile: ${profileId}`);
-    
-    const info = mockBillingProfile.generalInformation;
-    const generalInfo = {
-      profileId,
-      ...info,
-      fullAddress: `${info.street}, ${info.city}, ${info.state} ${info.zipCode}`,
-    };
-    
-    console.log(`[billing] Returning general information:`, JSON.stringify(generalInfo, null, 2));
-    
-    res.json({
-      success: true,
-      data: generalInfo,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching general information:", error);
-    res.status(500).json({
-      error: "Failed to fetch general information",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
-});
+    if (!profile[0]) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
 
-// Direct response endpoint (no wrapper) - in case frontend expects direct data
-billingRouter.get("/settings/billing-profiles/:profileId/general-information/direct", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    console.log(`[billing] Fetching general information (direct response) for profile: ${profileId}`);
-    
-    const info = mockBillingProfile.generalInformation;
-    
-    // Return data directly without success/data wrapper
-    res.json({
-      profileId,
-      ...info,
-      fullAddress: `${info.street}, ${info.city}, ${info.state} ${info.zipCode}`,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching general information:", error);
-    res.status(500).json({
-      error: "Failed to fetch general information",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
-});
+    const methods = await db
+      .select()
+      .from(schema.billingPaymentMethods)
+      .where(eq(schema.billingPaymentMethods.profileId, profile[0].id));
 
-// Alternative endpoint: GET /api/v1/billing/profiles/:profileId/general-information (plural)
-billingRouter.get("/billing/profiles/:profileId/general-information", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    console.log(`[billing] Fetching general information (plural route) for profile: ${profileId}`);
-    
-    const info = mockBillingProfile.generalInformation;
-    const generalInfo = {
-      profileId,
-      ...info,
-      fullAddress: `${info.street}, ${info.city}, ${info.state} ${info.zipCode}`,
-    };
-    
-    res.json({
-      success: true,
-      data: generalInfo,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching general information:", error);
-    res.status(500).json({
-      error: "Failed to fetch general information",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
-});
+    const invoices = await db
+      .select()
+      .from(schema.billingInvoices)
+      .where(eq(schema.billingInvoices.profileId, profile[0].id));
 
-// Direct endpoint without nested structure - just return the data directly
-billingRouter.get("/billing/profile/:profileId/general-information/direct", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    const info = mockBillingProfile.generalInformation;
-    
-    // Return data directly without wrapping in success/data structure
-    res.json({
-      profileId,
-      ...info,
-      fullAddress: `${info.street}, ${info.city}, ${info.state} ${info.zipCode}`,
-    });
-  } catch (error: any) {
-    console.error("[billing] Error fetching general information:", error);
-    res.status(500).json({
-      error: "Failed to fetch general information",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
-  }
-});
-
-// GET /api/v1/billing/profile/:profileId/payment-methods
-billingRouter.get("/billing/profile/:profileId/payment-methods", async (req, res) => {
-  try {
-    const { profileId } = req.params;
-    
     res.json({
       success: true,
       data: {
-        profileId,
-        paymentMethods: mockBillingProfile.paymentMethods,
+        ...profile[0],
+        paymentMethods: methods.map((m) => ({ ...m, metadata: JSON.parse(m.metadata) })),
+        invoices,
       },
     });
-  } catch (error: any) {
-    console.error("[billing] Error fetching payment methods:", error);
-    res.status(500).json({
-      error: "Failed to fetch payment methods",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+  } catch (e) {
+    next(e);
   }
 });
 
-// GET /api/v1/billing/profile/:profileId/invoices
-billingRouter.get("/billing/profile/:profileId/invoices", async (req, res) => {
+// POST /api/v1/billing/profile
+billingRouter.post("/billing/profile", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
   try {
-    const { profileId } = req.params;
-    
+    const body = z
+      .object({ walletAddress: z.string().min(3) })
+      .merge(GeneralInfoBody)
+      .parse(req.body);
+
+    const { walletAddress, ...fields } = body;
+    const addr = walletAddress.toLowerCase();
+
+    const existing = await db
+      .select({ id: schema.billingProfiles.id })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, addr))
+      .limit(1);
+
+    if (existing[0]) {
+      res.status(409).json({ error: "Billing profile already exists for this wallet" });
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    const [created] = await db
+      .insert(schema.billingProfiles)
+      .values({ id, walletAddress: addr, ...fields })
+      .returning();
+
+    res.status(201).json({ success: true, data: created });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// PATCH /api/v1/billing/profile/:walletAddress/general-information
+billingRouter.patch("/billing/profile/:walletAddress/general-information", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
+  try {
+    const { walletAddress } = WalletParam.parse(req.params);
+    const fields = GeneralInfoBody.parse(req.body);
+
+    if (Object.keys(fields).length === 0) {
+      res.status(400).json({ error: "No fields to update" });
+      return;
+    }
+
+    const [updated] = await db
+      .update(schema.billingProfiles)
+      .set({ ...fields, updatedAt: new Date() })
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .returning();
+
+    if (!updated) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
+
+    res.json({ success: true, data: updated });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// GET /api/v1/billing/profile/:walletAddress/summary
+billingRouter.get("/billing/profile/:walletAddress/summary", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
+  try {
+    const { walletAddress } = WalletParam.parse(req.params);
+    const [profile] = await db
+      .select()
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .limit(1);
+
+    if (!profile) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
+
+    const limit = parseFloat(profile.annualRewardLimit ?? "0");
+    const used = parseFloat(profile.usedAmount ?? "0");
+
     res.json({
       success: true,
       data: {
-        profileId,
-        invoices: mockBillingProfile.invoices,
+        profileId: profile.id,
+        profileType: profile.profileType,
+        annualRewardLimit: limit,
+        usedAmount: used,
+        remainingAmount: Math.max(0, limit - used),
+        currency: profile.currency,
+        progressPercentage: limit > 0 ? (used / limit) * 100 : 0,
       },
     });
-  } catch (error: any) {
-    console.error("[billing] Error fetching invoices:", error);
-    res.status(500).json({
-      error: "Failed to fetch invoices",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+  } catch (e) {
+    next(e);
   }
 });
 
-// GET /api/v1/billing/profile/:profileId/summary
-billingRouter.get("/billing/profile/:profileId/summary", async (req, res) => {
+// GET /api/v1/billing/profile/:walletAddress/payment-methods
+billingRouter.get("/billing/profile/:walletAddress/payment-methods", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
   try {
-    const { profileId } = req.params;
-    
+    const { walletAddress } = WalletParam.parse(req.params);
+    const [profile] = await db
+      .select({ id: schema.billingProfiles.id })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .limit(1);
+
+    if (!profile) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
+
+    const methods = await db
+      .select()
+      .from(schema.billingPaymentMethods)
+      .where(eq(schema.billingPaymentMethods.profileId, profile.id));
+
     res.json({
       success: true,
-      data: {
-        profileId,
-        profileType: mockBillingProfile.profileType,
-        annualRewardLimit: mockBillingProfile.annualRewardLimit,
-        usedAmount: mockBillingProfile.usedAmount,
-        remainingAmount: mockBillingProfile.remainingAmount,
-        currency: mockBillingProfile.currency,
-        progressPercentage: (mockBillingProfile.usedAmount / mockBillingProfile.annualRewardLimit) * 100,
-      },
+      data: methods.map((m) => ({ ...m, metadata: JSON.parse(m.metadata) })),
     });
-  } catch (error: any) {
-    console.error("[billing] Error fetching billing summary:", error);
-    res.status(500).json({
-      error: "Failed to fetch billing summary",
-      details: process.env.NODE_ENV === "development" ? error.message : undefined,
-    });
+  } catch (e) {
+    next(e);
   }
 });
 
-export { billingRouter };
+// POST /api/v1/billing/profile/:walletAddress/payment-methods
+billingRouter.post("/billing/profile/:walletAddress/payment-methods", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
+  try {
+    const { walletAddress } = WalletParam.parse(req.params);
+    const body = PaymentMethodBody.parse(req.body);
 
+    const [profile] = await db
+      .select({ id: schema.billingProfiles.id })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .limit(1);
+
+    if (!profile) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
+
+    if (body.isDefault) {
+      await db
+        .update(schema.billingPaymentMethods)
+        .set({ isDefault: false })
+        .where(eq(schema.billingPaymentMethods.profileId, profile.id));
+    }
+
+    const [created] = await db
+      .insert(schema.billingPaymentMethods)
+      .values({
+        id: crypto.randomUUID(),
+        profileId: profile.id,
+        type: body.type,
+        metadata: JSON.stringify(body.metadata),
+        isDefault: body.isDefault ?? false,
+      })
+      .returning();
+
+    res.status(201).json({
+      success: true,
+      data: { ...created, metadata: JSON.parse(created.metadata) },
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// DELETE /api/v1/billing/profile/:walletAddress/payment-methods/:methodId
+billingRouter.delete("/billing/profile/:walletAddress/payment-methods/:methodId", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
+  try {
+    const { walletAddress, methodId } = z
+      .object({ walletAddress: z.string().min(3), methodId: z.string().uuid() })
+      .parse(req.params);
+
+    const [profile] = await db
+      .select({ id: schema.billingProfiles.id })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .limit(1);
+
+    if (!profile) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
+
+    const deleted = await db
+      .delete(schema.billingPaymentMethods)
+      .where(
+        and(
+          eq(schema.billingPaymentMethods.id, methodId),
+          eq(schema.billingPaymentMethods.profileId, profile.id)
+        )
+      )
+      .returning({ id: schema.billingPaymentMethods.id });
+
+    if (!deleted[0]) {
+      res.status(404).json({ error: "Payment method not found" });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// GET /api/v1/billing/profile/:walletAddress/invoices
+billingRouter.get("/billing/profile/:walletAddress/invoices", async (req, res, next) => {
+  if (!env.BILLING_ENABLED) return billingDisabled(res);
+  try {
+    const { walletAddress } = WalletParam.parse(req.params);
+    const [profile] = await db
+      .select({ id: schema.billingProfiles.id })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.walletAddress, walletAddress.toLowerCase()))
+      .limit(1);
+
+    if (!profile) {
+      res.status(404).json({ error: "Billing profile not found" });
+      return;
+    }
+
+    const invoices = await db
+      .select()
+      .from(schema.billingInvoices)
+      .where(eq(schema.billingInvoices.profileId, profile.id));
+
+    res.json({ success: true, data: invoices });
+  } catch (e) {
+    next(e);
+  }
+});

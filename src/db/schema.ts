@@ -1,4 +1,4 @@
-import { bigint, pgTable, text, integer, boolean, timestamp, index } from "drizzle-orm/pg-core";
+import { bigint, pgTable, text, integer, boolean, numeric, timestamp, index } from "drizzle-orm/pg-core";
 
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
@@ -138,6 +138,78 @@ export const escrowEvents = pgTable(
     contractAddressIdx: index("escrow_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("escrow_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("escrow_events_block_number_idx").on(table.blockNumber),
+  })
+);
+
+// Billing profiles table
+export const billingProfiles = pgTable(
+  "billing_profiles",
+  {
+    id: text("id").primaryKey(), // UUID
+    walletAddress: text("wallet_address").notNull().unique(),
+    profileType: text("profile_type").notNull().default("Individual"),
+    annualRewardLimit: numeric("annual_reward_limit", { precision: 18, scale: 2 }).notNull().default("10000"),
+    usedAmount: numeric("used_amount", { precision: 18, scale: 2 }).notNull().default("0"),
+    currency: text("currency").notNull().default("USD"),
+    firstName: text("first_name"),
+    lastName: text("last_name"),
+    email: text("email"),
+    phone: text("phone"),
+    street: text("street"),
+    city: text("city"),
+    state: text("state"),
+    zipCode: text("zip_code"),
+    country: text("country"),
+    taxId: text("tax_id"),
+    taxResidency: text("tax_residency"),
+    dateOfBirth: text("date_of_birth"),
+    companyName: text("company_name"),
+    vatNumber: text("vat_number"),
+    businessType: text("business_type"),
+    occupation: text("occupation"),
+    website: text("website"),
+    notes: text("notes"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    walletAddressIdx: index("billing_profiles_wallet_address_idx").on(table.walletAddress),
+  })
+);
+
+// Billing payment methods table
+export const billingPaymentMethods = pgTable(
+  "billing_payment_methods",
+  {
+    id: text("id").primaryKey(), // UUID
+    profileId: text("profile_id").notNull(),
+    type: text("type").notNull(), // bank_account | paypal | crypto
+    metadata: text("metadata").notNull(), // JSON-encoded type-specific fields (no raw account numbers)
+    isDefault: boolean("is_default").notNull().default(false),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    profileIdIdx: index("billing_payment_methods_profile_id_idx").on(table.profileId),
+  })
+);
+
+// Billing invoices table
+export const billingInvoices = pgTable(
+  "billing_invoices",
+  {
+    id: text("id").primaryKey(), // UUID
+    profileId: text("profile_id").notNull(),
+    invoiceNumber: text("invoice_number").notNull().unique(),
+    date: text("date").notNull(),
+    amount: numeric("amount", { precision: 18, scale: 2 }).notNull(),
+    currency: text("currency").notNull().default("USD"),
+    status: text("status").notNull().default("pending"),
+    description: text("description"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    profileIdIdx: index("billing_invoices_profile_id_idx").on(table.profileId),
+    statusIdx: index("billing_invoices_status_idx").on(table.status),
   })
 );
 
