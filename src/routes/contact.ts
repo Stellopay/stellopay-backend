@@ -1,28 +1,39 @@
 import express from "express";
 import nodemailer from "nodemailer";
+import { z } from "zod";
 import { env } from "../config.js";
 
 const contactRouter = express.Router();
 
+const ContactBody = z.object({
+  firstName: z.string().trim().min(1).max(100),
+  lastName: z.string().trim().min(1).max(100),
+  email: z.string().trim().email().max(254),
+  message: z.string().trim().min(1).max(5000),
+});
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // POST /api/v1/contact/send-message
-contactRouter.post("/contact/send-message", async (req, res) => {
+contactRouter.post("/contact/send-message", async (req, res, next) => {
   try {
-    const { firstName, lastName, email, message } = req.body;
-
-    // Validate required fields
-    if (!firstName || !lastName || !email || !message) {
-      return res.status(400).json({
-        error: "Missing required fields: firstName, lastName, email, and message are required",
+    const parsed = ContactBody.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.issues,
       });
+      return;
     }
 
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({
-        error: "Invalid email format",
-      });
-    }
+    const { firstName, lastName, email, message } = parsed.data;
 
     // Check if email credentials are configured
     if (!env.EMAIL_USER || !env.EMAIL_PASSWORD) {
@@ -30,21 +41,28 @@ contactRouter.post("/contact/send-message", async (req, res) => {
         firstName,
         lastName,
         email,
-        message: message.substring(0, 100) + "...",
+        message: message.substring(0, 100) + (message.length > 100 ? "..." : ""),
       });
-      // In development, return success even without email configured
       if (env.NODE_ENV === "development") {
-        return res.json({
+        res.json({
           success: true,
           message: "Your message has been received (email not configured in development)",
         });
+        return;
       }
-      return res.status(503).json({
+      res.status(503).json({
         error: "Email service is not configured. Please contact support directly.",
       });
+      return;
     }
 
-    // Create transporter
+    const recipient = env.CONTACT_RECIPIENT_EMAIL ?? env.EMAIL_USER;
+
+    const safeFirst = escapeHtml(firstName);
+    const safeLast = escapeHtml(lastName);
+    const safeEmail = escapeHtml(email);
+    const safeMessage = escapeHtml(message).replace(/\n/g, "<br>");
+
     const transporter = nodemailer.createTransport({
       service: "gmail",
       auth: {
@@ -53,44 +71,25 @@ contactRouter.post("/contact/send-message", async (req, res) => {
       },
     });
 
-    // Email content
-    const mailOptions = {
+    await transporter.sendMail({
       from: env.EMAIL_USER,
-      to: "jagadeesh26062002@gmail.com",
-      subject: `Contact Form Submission from ${firstName} ${lastName}`,
+      to: recipient,
+      subject: `Contact Form Submission from ${safeFirst} ${safeLast}`,
       html: `
         <h2>New Contact Form Submission</h2>
-        <p><strong>Name:</strong> ${firstName} ${lastName}</p>
-        <p><strong>Email:</strong> ${email}</p>
+        <p><strong>Name:</strong> ${safeFirst} ${safeLast}</p>
+        <p><strong>Email:</strong> ${safeEmail}</p>
         <p><strong>Message:</strong></p>
-        <p>${message.replace(/\n/g, "<br>")}</p>
+        <p>${safeMessage}</p>
       `,
-      text: `
-New Contact Form Submission
-
-Name: ${firstName} ${lastName}
-Email: ${email}
-
-Message:
-${message}
-      `,
-    };
-
-    // Send email
-    await transporter.sendMail(mailOptions);
-
-    res.json({
-      success: true,
-      message: "Your message has been sent successfully!",
+      text: `New Contact Form Submission\n\nName: ${firstName} ${lastName}\nEmail: ${email}\n\nMessage:\n${message}`,
     });
+
+    res.json({ success: true, message: "Your message has been sent successfully!" });
   } catch (error: any) {
     console.error("[contact] Failed to send email:", error);
-    res.status(500).json({
-      error: "Failed to send message. Please try again later.",
-      details: env.NODE_ENV === "development" ? error.message : undefined,
-    });
+    next(error);
   }
 });
 
 export { contactRouter };
-

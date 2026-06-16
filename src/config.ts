@@ -33,6 +33,8 @@ const EnvSchema = z.object({
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
   EMAIL_PASSWORD: z.string().optional(),
+  // Recipient for contact form submissions. Defaults to EMAIL_USER when not set.
+  CONTACT_RECIPIENT_EMAIL: z.string().email().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);
