@@ -83,6 +83,46 @@ By default the backend loads ABI from:
 - `../Starknet-Contracts/target/release/starknet_contracts_PayrollEscrow.contract_class.json`
 - `../Starknet-Contracts/target/release/starknet_contracts_WorkAgreement.contract_class.json`
 
+### Database setup
+
+The backend uses PostgreSQL (via Drizzle ORM) to persist indexed contract events.
+
+#### Bootstrap
+
+1. Create a PostgreSQL database (defaults to `stellopay_indexer`):
+
+```bash
+createdb stellopay_indexer
+```
+
+2. Set `POSTGRES_CONNECTION_STRING` in your `.env`:
+
+```env
+POSTGRES_CONNECTION_STRING=postgresql://user:password@localhost:5432/stellopay_indexer
+```
+
+3. Apply the schema migration:
+
+```bash
+pnpm db:migrate
+```
+
+#### Generating a new migration after schema changes
+
+After editing `src/db/schema.ts`, run:
+
+```bash
+pnpm db:generate
+```
+
+This creates a new SQL file in `migrations/`. Commit the generated file alongside the schema change, then apply it in every environment with `pnpm db:migrate`.
+
+#### How it works
+
+- `drizzle.config.ts` points drizzle-kit at `src/db/schema.ts` and writes migrations to `migrations/`
+- `src/db/migrate.ts` is the migration runner — `pnpm db:migrate` executes it via `tsx`
+- Drizzle tracks applied migrations in the `__drizzle_migrations` table automatically
+
 ### Signing model
 
 - The backend **does not** hold private keys.
