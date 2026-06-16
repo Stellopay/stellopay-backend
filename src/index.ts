@@ -24,75 +24,58 @@ const app = express();
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
 
-// Parse CORS origins - supports comma-separated values or "*" for all origins
-const parseCorsOrigin = (origin: string): string | string[] | boolean => {
-  if (origin === "*") {
-    return true; // Allow all origins
-  }
-  
-  // Split by comma and trim whitespace
-  const origins = origin.split(",").map((o) => o.trim()).filter((o) => o.length > 0);
-  
-  // If only one origin, return as string; otherwise return array
-  return origins.length === 1 ? origins[0] : origins;
-};
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+// The CORS spec forbids combining credentials:true with a wildcard origin.
+// When CORS_ORIGIN="*" we serve public (credential-less) responses.
+// For an explicit allowlist we use a custom callback that rejects any origin
+// NOT on the list — no silent reflection of arbitrary origins.
+// ---------------------------------------------------------------------------
+const corsOriginValue = env.CORS_ORIGIN.trim();
+const isWildcard = corsOriginValue === "*";
+
+if (isWildcard && env.NODE_ENV === "production") {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[cors] SECURITY WARNING: CORS_ORIGIN='*' is set in production (NODE_ENV=${env.NODE_ENV}). ` +
+      `Credentials will be disabled. Set CORS_ORIGIN to an explicit comma-separated allowlist for authenticated endpoints.`,
+  );
+} else if (isWildcard) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[cors] Wildcard origin '*' detected — Access-Control-Allow-Credentials is disabled. ` +
+      `Never combine wildcard origins with credentials in production.`,
+  );
+}
+
+// Build the allowed-origins list (empty when wildcard).
+const allowedOrigins = isWildcard
+  ? []
+  : corsOriginValue
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0);
+
+// The origin handler:
+//  - Wildcard → pass `true` to cors (no credentials attached).
+//  - Allowlist → custom callback that only approves listed origins and
+//    explicitly rejects everything else (no reflection of unknown origins).
+const corsOriginHandler: cors.CorsOptions["origin"] = isWildcard
+  ? true
+  : (origin, callback) => {
+      // Allow server-to-server / same-origin requests (no Origin header).
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      // Reject unknown origins with a clear error — do NOT reflect them.
+      callback(new Error(`[cors] Origin '${origin}' is not in the allowlist`));
+    };
+
+app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: parseCorsOrigin(env.CORS_ORIGIN),
-    credentials: true,
+    origin: corsOriginHandler,
+    credentials: !isWildcard, // never combine wildcard + credentials
   }),
 );
-app.use(express.json({ limit: "1mb" }));
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.use("/api/v1", escrowRouter);
-app.use("/api/v1", agreementRouter);
-app.use("/api/v1", authRouter);
-app.use("/api/v1", systemRouter);
-app.use("/api/v1", readRouter);
-app.use("/api/v1", indexedRouter);
-app.use("/api/v1", tokenRouter);
-app.use("/api/v1", transactionsRouter);
-app.use("/api/v1", notificationsRouter);
-app.use("/api/v1", analyticsRouter);
-app.use("/api/v1", eventsRouter);
-app.use("/api/v1", indexerStatusRouter);
-app.use("/api/v1", reprocessEventsRouter);
-app.use("/api/v1", diagnosticsRouter);
-app.use("/api/v1", backfillEventsRouter);
-app.use("/api/v1", contactRouter);
-app.use("/api/v1", billingRouter);
-
-// Basic error handler
-app.use(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    // eslint-disable-next-line no-console
-    console.error("[api] error", {
-      message: err?.message,
-      cause: err?.cause,
-      stack: err?.stack,
-      issues: err?.issues,
-    });
-    const status = typeof err?.status === "number" ? err.status : 500;
-    res.status(status).json({
-      error: err?.message ?? "Internal error",
-      details: err?.issues ?? undefined,
-      ...(env.NODE_ENV === "development"
-        ? {
-            cause: err?.cause?.message ?? err?.cause ?? undefined,
-            stack: err?.stack,
-          }
-        : {}),
-    });
-  },
-);
-
-app.listen(env.PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`stellopay-backend listening on :${env.PORT}`);
-});
-
-
