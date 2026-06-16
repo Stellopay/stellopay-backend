@@ -27,16 +27,11 @@ type AgreementIndex = {
   contractAddress: string;
 };
 
-const indices = new Map<string, AgreementIndex>();
+import { normalizeStarknetAddress } from "../utils/codec.js";
 
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith('0x')) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, '');
-  return `0x${hex.padStart(64, '0')}`;
-}
+const normalizeAddress = normalizeStarknetAddress;
+
+const indices = new Map<string, AgreementIndex>();
 
 function getOrCreateIndex(contractAddress: string): AgreementIndex {
   if (!indices.has(contractAddress)) {

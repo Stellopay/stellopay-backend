@@ -3,7 +3,12 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
-import { toHexString, u256ToString } from "../utils/codec.js";
+import {
+  toHexString,
+  u256ToString,
+  normalizeStarknetAddress,
+  normalizeTransactionHash,
+} from "../utils/codec.js";
 import { shortString, Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
@@ -13,36 +18,7 @@ const AddressParam = z.string().min(3);
 
 export const eventsRouter = Router();
 
-// Helper to normalize addresses
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, "");
-  return `0x${hex.padStart(64, "0")}`;
-}
-
-// Helper to normalize transaction hashes (same as indexer)
-// Transaction hashes should be exactly 66 characters (0x + 64 hex), normalized to lowercase
-// Preserves leading zeros if the hash is already 66 chars, otherwise pads to 66 chars
-function normalizeTransactionHash(hash: string): string {
-  if (!hash) return "";
-  let normalized = hash.toLowerCase().trim();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  
-  // If already 66 chars (0x + 64 hex), return as-is (preserves leading zeros)
-  if (normalized.length === 66) {
-    return normalized;
-  }
-  
-  // Otherwise, pad to 64 hex characters
-  const hex = normalized.replace(/^0x/, "");
-  const paddedHex = hex.padStart(64, "0");
-  return `0x${paddedHex}`;
-}
+const normalizeAddress = normalizeStarknetAddress;
 
 // Load contract ABIs
 let workAgreementAbi: any[] | null = null;

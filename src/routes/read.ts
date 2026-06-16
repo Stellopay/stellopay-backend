@@ -2,21 +2,13 @@ import { Router } from "express";
 import { z } from "zod";
 import { shortString } from "starknet";
 import { agreementContract, escrowContract, provider } from "../starknet/client.js";
-import { u256ToString } from "../utils/codec.js";
+import { u256ToString, toHexString } from "../utils/codec.js";
 
 const AddressParam = z.string().min(3);
 
 function asU256FromResult(result: string[]) {
   if (!Array.isArray(result) || result.length < 2) return null;
   return { low: result[0], high: result[1] };
-}
-
-function toHexString(value: unknown) {
-  if (typeof value === "bigint") return `0x${value.toString(16)}`;
-  if (typeof value === "number") return `0x${BigInt(value).toString(16)}`;
-  // starknet.js often returns contract addresses as strings already
-  if (typeof value === "string") return value;
-  return String(value);
 }
 
 async function callContractResult(contractAddress: string, entrypoint: string, calldata: string[] = []) {
