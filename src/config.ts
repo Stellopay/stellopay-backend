@@ -33,6 +33,14 @@ const EnvSchema = z.object({
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
   EMAIL_PASSWORD: z.string().optional(),
+  // Recipient for contact form submissions. Defaults to EMAIL_USER when not set.
+  CONTACT_RECIPIENT_EMAIL: z.string().email().optional(),
+
+  // Rate limiting
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().optional().default(60_000),
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().optional().default(60),
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().optional().default(10),
+  CONTACT_RATE_LIMIT_MAX: z.coerce.number().int().positive().optional().default(5),
 });
 
 export const env = EnvSchema.parse(process.env);

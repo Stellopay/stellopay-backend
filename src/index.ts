@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
 import { env } from "./config.js";
 import { escrowRouter } from "./routes/escrow.js";
 import { agreementRouter } from "./routes/agreement.js";
@@ -24,28 +26,89 @@ const app = express();
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
 
-// Parse CORS origins - supports comma-separated values or "*" for all origins
-const parseCorsOrigin = (origin: string): string | string[] | boolean => {
-  if (origin === "*") {
-    return true; // Allow all origins
-  }
-  
-  // Split by comma and trim whitespace
-  const origins = origin.split(",").map((o) => o.trim()).filter((o) => o.length > 0);
-  
-  // If only one origin, return as string; otherwise return array
-  return origins.length === 1 ? origins[0] : origins;
-};
+// ── Proxy trust ────────────────────────────────────────────────────────────
+// Required so rate limiters key on the real client IP behind a reverse proxy.
+app.set("trust proxy", 1);
+
+// ── Security headers (Helmet) ──────────────────────────────────────────────
+app.use(helmet());
+
+// ── CORS ──────────────────────────────────────────────────────────────────
+// Wildcard ("*") and credentials:true are mutually exclusive per the CORS spec.
+// When a wildcard is configured we serve CORS without credentials.
+const corsOriginValue = env.CORS_ORIGIN.trim();
+const isWildcard = corsOriginValue === "*";
+
+if (isWildcard && env.NODE_ENV === "production") {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[cors] WARNING: CORS_ORIGIN='*' is set in production. " +
+      "Credentials will be disabled. Set an explicit allowlist for authenticated endpoints.",
+  );
+}
+
+const allowedOrigins: string[] = isWildcard
+  ? []
+  : corsOriginValue
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0);
+
+const corsOriginHandler: cors.CorsOptions["origin"] = isWildcard
+  ? true
+  : (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error(`CORS: origin '${origin}' is not in the allowlist`));
+    };
 
 app.use(
   cors({
-    origin: parseCorsOrigin(env.CORS_ORIGIN),
-    credentials: true,
+    origin: corsOriginHandler,
+    credentials: !isWildcard,
   }),
 );
+
+// ── Rate limiting ──────────────────────────────────────────────────────────
+const rateLimitResponse = (req: express.Request, res: express.Response) => {
+  res.status(429).json({ error: "Too many requests, please try again later." });
+};
+
+// Global limiter: 60 req / window (default 60s) per IP
+const globalLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_WINDOW_MS,
+  max: env.RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitResponse,
+});
+
+// Strict limiter for auth endpoints: 10 req / window per IP
+const authLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_WINDOW_MS,
+  max: env.AUTH_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitResponse,
+});
+
+// Contact form limiter: 5 req / window per IP
+const contactLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_WINDOW_MS,
+  max: env.CONTACT_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitResponse,
+});
+
+app.use(globalLimiter);
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Apply stricter limiters to sensitive route groups before mounting routers
+app.use("/api/v1/auth", authLimiter);
+app.use("/api/v1/contact", contactLimiter);
 
 app.use("/api/v1", escrowRouter);
 app.use("/api/v1", agreementRouter);
@@ -94,5 +157,3 @@ app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`stellopay-backend listening on :${env.PORT}`);
 });
-
-
