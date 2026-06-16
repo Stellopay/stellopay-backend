@@ -5,6 +5,22 @@ export function parseU256(value: string) {
   return cairo.uint256(bn);
 }
 
+export function normalizeStarknetAddress(addr: string): string {
+  if (!addr) return addr;
+  let normalized = addr.toLowerCase().trim();
+  if (!normalized.startsWith("0x")) normalized = `0x${normalized}`;
+  const hex = normalized.slice(2);
+  return `0x${hex.padStart(64, "0")}`;
+}
+
+export function normalizeTransactionHash(hash: string): string {
+  if (!hash) return hash;
+  let normalized = hash.toLowerCase().trim();
+  if (!normalized.startsWith("0x")) normalized = `0x${normalized}`;
+  if (normalized.length === 66) return normalized;
+  return `0x${normalized.slice(2).padStart(64, "0")}`;
+}
+
 export function u256ToString(v: unknown): string {
   // starknet.js returns uint256 as { low, high } sometimes (strings/bigints)
   if (typeof v === "bigint") return v.toString();

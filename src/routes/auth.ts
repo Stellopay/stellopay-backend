@@ -21,7 +21,7 @@ const SessionBody = z.object({
   session_token: z.string().min(10),
 });
 
-function buildTypedChallenge(address: string, chainId: string, nonce: string): TypedData {
+export function buildTypedChallenge(address: string, chainId: string, nonce: string): TypedData {
   // Wallets (ArgentX/Braavos) validate typed data using a JSON schema.
   // They expect plain string values like:
   // - domain.chainId: "SN_SEPOLIA" / "SN_MAIN"
