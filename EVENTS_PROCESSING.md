@@ -1,32 +1,36 @@
 # Event Processing Guide
 
 ## Overview
-This guide explains how to populate the database with contract events for transactions, analytics, and notifications.
 
-## Database Connection Fix
+This guide explains how to populate the database with contract events for
+transactions, analytics, and notifications.
 
-If you're getting the "SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string" error:
+Both `POST /events/process_tx/:tx_hash` and `POST /events/process_batch` use
+the **same** shared decoder (`processTxReceipt`) and are fully idempotent –
+re-processing the same transaction(s) will never produce duplicate rows.
 
-1. **Set the POSTGRES_CONNECTION_STRING environment variable:**
-   ```bash
-   export POSTGRES_CONNECTION_STRING="postgresql://username:password@localhost:5432/stellopay_indexer"
-   ```
+---
 
-2. **Or create a `.env` file in `stellopay-backend/`:**
-   ```
-   POSTGRES_CONNECTION_STRING=postgresql://username:password@localhost:5432/stellopay_indexer
-   ```
+## Database Connection
 
-3. **If you don't have a password, use an empty string:**
-   ```
-   POSTGRES_CONNECTION_STRING=postgresql://username:@localhost:5432/stellopay_indexer
-   ```
+If you encounter `"SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string"`:
+
+```bash
+# Option 1 – environment variable
+export POSTGRES_CONNECTION_STRING="postgresql://username:password@localhost:5432/stellopay_indexer"
+
+# Option 2 – .env file in stellopay-backend/
+POSTGRES_CONNECTION_STRING=postgresql://username:password@localhost:5432/stellopay_indexer
+
+# No password?
+POSTGRES_CONNECTION_STRING=postgresql://username:@localhost:5432/stellopay_indexer
+```
+
+---
 
 ## Processing Transaction Events
 
-### Method 1: Process a Single Transaction
-
-After executing a contract call (e.g., creating an agreement, funding, sending payment), call:
+### Method 1 – Single Transaction
 
 ```bash
 POST /api/v1/events/process_tx/:tx_hash
@@ -37,18 +41,33 @@ POST /api/v1/events/process_tx/:tx_hash
 curl -X POST http://localhost:4002/api/v1/events/process_tx/0x1234...abcd
 ```
 
-This will:
-- Fetch the transaction receipt
-- Parse all events (AgreementCreated, PaymentSent, PaymentReceived, Funded, Released, etc.)
-- Store them in the database
-- Return the number of events processed
+**Behaviour:**
+- Fetches the on-chain receipt via the StarkNet RPC provider.
+- Decodes every event using the `WorkAgreement` and `PayrollEscrow` ABIs.
+- Persists rows to `agreements`, `agreement_events`, `payments`, and
+  `escrow_events` with `ON CONFLICT DO NOTHING` (idempotent).
+- Returns the list of event labels that were processed.
 
-### Method 2: Process Multiple Transactions
+**Response:**
+```json
+{
+  "message": "Processed 2 events",
+  "eventsProcessed": ["AgreementCreated-1", "Funded-1"],
+  "transactionHash": "0x000...1234"
+}
+```
+
+---
+
+### Method 2 – Batch of Transactions
 
 ```bash
 POST /api/v1/events/process_batch
 Content-Type: application/json
+```
 
+**Request body:**
+```json
 {
   "tx_hashes": [
     "0x1234...abcd",
@@ -57,82 +76,135 @@ Content-Type: application/json
 }
 ```
 
-### Method 3: Auto-process After Contract Calls
+**Validation rules:**
+| Field | Rule |
+|---|---|
+| `tx_hashes` | Non-empty array; **maximum 50 hashes** per request |
+| Each hash | Must match `^0x[0-9a-fA-F]{1,64}$` |
 
-You can modify the frontend to automatically process events after each contract call:
+**Behaviour:**
+- Each tx hash is processed with `processTxReceipt`, the **same shared logic**
+  used by Method 1 – events are fully decoded and persisted.
+- A per-tx error (e.g. RPC timeout, bad hash) is captured and reported as
+  `status: "error"` without aborting the rest of the batch.
+- All writes use `ON CONFLICT DO NOTHING` – the whole batch is safe to replay.
+
+**Response:**
+```json
+{
+  "summary": {
+    "total": 2,
+    "processed": 2,
+    "noEvents": 0,
+    "notFound": 0,
+    "errors": 0,
+    "totalEventsProcessed": 3
+  },
+  "results": [
+    {
+      "txHash": "0x000...1234",
+      "status": "processed",
+      "eventsProcessed": 2,
+      "eventLabels": ["AgreementCreated-1", "Funded-1"]
+    },
+    {
+      "txHash": "0x000...5678",
+      "status": "processed",
+      "eventsProcessed": 1,
+      "eventLabels": ["PaymentSent-1"]
+    }
+  ]
+}
+```
+
+Per-tx `status` values:
+
+| Value | Meaning |
+|---|---|
+| `"processed"` | Receipt fetched, events decoded and stored |
+| `"no_events"` | Receipt exists but has no decodable events |
+| `"not_found"` | Provider returned no receipt for this hash |
+| `"error"` | Unexpected error (RPC failure, etc.); `error` field contains message |
+
+---
+
+### Method 3 – Auto-process After Contract Calls
 
 ```typescript
 // After a successful transaction
 const txHash = await executeCall(prepared.call);
 if (txHash?.transaction_hash) {
-  // Process events
   await apiPost(`/events/process_tx/${txHash.transaction_hash}`, {});
 }
 ```
 
+---
+
 ## Event Types Stored
 
-### Agreement Events
-- `AgreementCreated` - Stored in `agreement_events` and `agreements` tables
-- `AgreementActivated`, `AgreementPaused`, `AgreementCancelled`, etc. - Stored in `agreement_events`
+| Event | Table(s) written |
+|---|---|
+| `AgreementCreated` | `agreement_events`, `agreements` |
+| `AgreementActivated`, `AgreementPaused`, `AgreementResumed`, `AgreementCancelled`, `AgreementCompleted` | `agreement_events` |
+| `EmployeeAdded`, `MilestoneAdded`, `MilestoneApproved`, `MilestoneClaimed`, `PayrollClaimed` | `agreement_events` |
+| `DisputeRaised`, `DisputeResolved` | `agreement_events` |
+| `PaymentSent`, `PaymentReceived` | `payments` |
+| `Funded`, `Released`, `Refunded` | `escrow_events` |
 
-### Payment Events
-- `PaymentSent` - Stored in `payments` table
-- `PaymentReceived` - Stored in `payments` table
-
-### Escrow Events
-- `Funded` - Stored in `escrow_events` table
-- `Released` - Stored in `escrow_events` table
-- `Refunded` - Stored in `escrow_events` table
+---
 
 ## Data Flow
 
-1. **User executes contract call** (create agreement, fund, send payment, etc.)
-2. **Transaction is mined** on Starknet
-3. **Call `/events/process_tx/:tx_hash`** to parse and store events
-4. **Events are stored** in database tables
-5. **Frontend fetches data** from:
-   - `/transactions/:user_address` - For transaction history
-   - `/notifications/:user_address` - For notifications
-   - `/analytics/:user_address` - For analytics charts
-
-## Example Workflow
-
-```typescript
-// 1. Create an agreement
-const createTx = await executeCall(createAgreementCall);
-// tx_hash: 0xabc123...
-
-// 2. Process events
-await fetch(`/api/v1/events/process_tx/${createTx.transaction_hash}`, {
-  method: 'POST'
-});
-
-// 3. Fund the agreement
-const fundTx = await executeCall(fundAgreementCall);
-// tx_hash: 0xdef456...
-
-// 4. Process events
-await fetch(`/api/v1/events/process_tx/${fundTx.transaction_hash}`, {
-  method: 'POST'
-});
-
-// 5. Now transactions, notifications, and analytics will show the data!
 ```
+User executes contract call
+        │
+        ▼
+Transaction mined on StarkNet
+        │
+        ▼
+POST /events/process_tx/:hash   (or include in process_batch)
+        │
+        ▼
+processTxReceipt()  ◄─── shared decoder used by BOTH endpoints
+        │
+        ├── agreements
+        ├── agreement_events
+        ├── payments
+        └── escrow_events
+        │
+        ▼
+Frontend reads data from:
+  /transactions/:user_address
+  /notifications/:user_address
+  /analytics/:user_address
+```
+
+---
+
+## Idempotency
+
+All inserts use `ON CONFLICT DO NOTHING` keyed on `transaction_hash + event_index`.
+This means:
+
+- Re-running `process_tx` on the same hash is always safe.
+- Re-submitting the same `process_batch` body produces no duplicate rows.
+- Batch operations can be safely retried after partial failures.
+
+---
 
 ## Troubleshooting
 
 ### Events not appearing?
-1. Make sure the transaction has been mined (check on block explorer)
-2. Verify the transaction hash is correct
-3. Check backend logs for parsing errors
-4. Ensure database connection is working
+1. Confirm the transaction has been mined (check the block explorer).
+2. Verify the tx hash is correct and starts with `0x`.
+3. Review backend logs for parsing errors (`[events] ...`).
+4. Ensure the database connection is healthy.
+
+### Batch rejected with 400?
+- Check that the hash format matches `^0x[0-9a-fA-F]{1,64}$`.
+- Ensure the array contains ≤ 50 hashes and at least 1 hash.
 
 ### Database connection issues?
-1. Check `POSTGRES_CONNECTION_STRING` is set correctly
-2. Verify PostgreSQL is running
-3. Check database exists: `stellopay_indexer`
-4. Ensure user has proper permissions
-
-
-
+1. Verify `POSTGRES_CONNECTION_STRING` is set and well-formed.
+2. Confirm PostgreSQL is running and the `stellopay_indexer` database exists.
+3. Ensure the DB user has `INSERT`, `SELECT`, and `UPDATE` privileges.
