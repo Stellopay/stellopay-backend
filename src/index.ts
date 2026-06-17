@@ -26,8 +26,55 @@ const app = express();
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
 
-// Set trust proxy for correct client IP detection in rate limiting
-// Parse TRUST_PROXY env var - can be a number, "true", or comma-separated list
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+// The CORS spec forbids combining credentials:true with a wildcard origin.
+// When CORS_ORIGIN="*" we serve public (credential-less) responses.
+// For an explicit allowlist we use a custom callback that rejects any origin
+// NOT on the list — no silent reflection of arbitrary origins.
+// ---------------------------------------------------------------------------
+const corsOriginValue = env.CORS_ORIGIN.trim();
+const isWildcard = corsOriginValue === "*";
+
+if (isWildcard && env.NODE_ENV === "production") {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[cors] SECURITY WARNING: CORS_ORIGIN='*' is set in production (NODE_ENV=${env.NODE_ENV}). ` +
+      `Credentials will be disabled. Set CORS_ORIGIN to an explicit comma-separated allowlist for authenticated endpoints.`,
+  );
+} else if (isWildcard) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[cors] Wildcard origin '*' detected — Access-Control-Allow-Credentials is disabled. ` +
+      `Never combine wildcard origins with credentials in production.`,
+  );
+}
+
+// Build the allowed-origins list (empty when wildcard).
+const allowedOrigins = isWildcard
+  ? []
+  : corsOriginValue
+      .split(",")
+      .map((o) => o.trim())
+      .filter((o) => o.length > 0);
+
+// The origin handler:
+//  - Wildcard → pass `true` to cors (no credentials attached).
+//  - Allowlist → custom callback that only approves listed origins and
+//    explicitly rejects everything else (no reflection of unknown origins).
+const corsOriginHandler: cors.CorsOptions["origin"] = isWildcard
+  ? true
+  : (origin, callback) => {
+      // Allow server-to-server / same-origin requests (no Origin header).
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      // Reject unknown origins with a clear error — do NOT reflect them.
+      callback(new Error(`[cors] Origin '${origin}' is not in the allowlist`));
+    };
+
+// Set trust proxy for correct client IP detection in rate limiting.
+// Parse TRUST_PROXY env var - can be a number, "true", or comma-separated list.
 let trustProxyValue: string | number | string[] | boolean = env.TRUST_PROXY;
 if (env.TRUST_PROXY === "true") {
   trustProxyValue = true;
@@ -38,27 +85,14 @@ if (env.TRUST_PROXY === "true") {
 }
 app.set("trust proxy", trustProxyValue);
 
-// Parse CORS origins - supports comma-separated values or "*" for all origins
-const parseCorsOrigin = (origin: string): string | string[] | boolean => {
-  if (origin === "*") {
-    return true; // Allow all origins
-  }
-  
-  // Split by comma and trim whitespace
-  const origins = origin.split(",").map((o) => o.trim()).filter((o) => o.length > 0);
-  
-  // If only one origin, return as string; otherwise return array
-  return origins.length === 1 ? origins[0] : origins;
-};
-
 // Security: Add Helmet headers
 app.use(helmet());
 
 // Apply CORS
 app.use(
   cors({
-    origin: parseCorsOrigin(env.CORS_ORIGIN),
-    credentials: true,
+    origin: corsOriginHandler,
+    credentials: !isWildcard, // never combine wildcard + credentials
   }),
 );
 app.use(express.json({ limit: "1mb" }));
@@ -156,5 +190,3 @@ app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`stellopay-backend listening on :${env.PORT}`);
 });
-
-

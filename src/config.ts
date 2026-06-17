@@ -21,19 +21,22 @@ const EnvSchema = z.object({
   // In production, these should point to the actual location of the contract class JSON files
   ESCROW_CONTRACT_CLASS_JSON: z.string().optional(),
   AGREEMENT_CONTRACT_CLASS_JSON: z.string().optional(),
-  
+
   // Database connection for indexed data
-  POSTGRES_CONNECTION_STRING: z.string().optional().default("postgresql://localhost:5432/stellopay_indexer"),
-  
+  POSTGRES_CONNECTION_STRING: z
+    .string()
+    .optional()
+    .default("postgresql://localhost:5432/stellopay_indexer"),
+
   // Token addresses (optional, with defaults)
   TOKEN_STRK: z.string().optional(),
   TOKEN_USDC: z.string().optional(),
   TOKEN_USDT: z.string().optional(),
-  
+
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
   EMAIL_PASSWORD: z.string().optional(),
-  
+
   // Rate limiting configuration
   // Global rate limit window (milliseconds) - default 15 minutes
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().optional().default(15 * 60 * 1000),
@@ -45,6 +48,14 @@ const EnvSchema = z.object({
   RATE_LIMIT_STRICT_MAX: z.coerce.number().int().positive().optional().default(10),
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
+
+  // Feature flag: set to "true" to enable billing profile endpoints.
+  // When false (default) all /billing/* routes return 501 Not Implemented.
+  BILLING_ENABLED: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((v) => v === "true"),
 });
 
 export const env = EnvSchema.parse(process.env);
@@ -52,21 +63,29 @@ export const env = EnvSchema.parse(process.env);
 // Resolve ABI paths - use provided paths or fallback to local contracts directory
 // In production, these should be set as absolute paths or paths relative to the deployed location
 export const abiPaths = {
-  escrow: env.ESCROW_CONTRACT_CLASS_JSON || 
-    (process.env.NODE_ENV === "production" 
-      ? null 
-      : path.resolve(process.cwd(), "contracts/starknet_contracts_PayrollEscrow.contract_class.json")),
-  agreement: env.AGREEMENT_CONTRACT_CLASS_JSON || 
-    (process.env.NODE_ENV === "production" 
-      ? null 
-      : path.resolve(process.cwd(), "contracts/starknet_contracts_WorkAgreement.contract_class.json")),
+  escrow:
+    env.ESCROW_CONTRACT_CLASS_JSON ||
+    (process.env.NODE_ENV === "production"
+      ? null
+      : path.resolve(
+          process.cwd(),
+          "contracts/starknet_contracts_PayrollEscrow.contract_class.json",
+        )),
+  agreement:
+    env.AGREEMENT_CONTRACT_CLASS_JSON ||
+    (process.env.NODE_ENV === "production"
+      ? null
+      : path.resolve(
+          process.cwd(),
+          "contracts/starknet_contracts_WorkAgreement.contract_class.json",
+        )),
 };
 
 // Validate that ABI paths are set in production
 if (process.env.NODE_ENV === "production") {
   if (!abiPaths.escrow || !abiPaths.agreement) {
     throw new Error(
-      "ESCROW_CONTRACT_CLASS_JSON and AGREEMENT_CONTRACT_CLASS_JSON must be set in production environment"
+      "ESCROW_CONTRACT_CLASS_JSON and AGREEMENT_CONTRACT_CLASS_JSON must be set in production environment",
     );
   }
 }
@@ -79,5 +98,3 @@ export const defaults = {
     env.WORK_AGREEMENT_ADDRESS ??
     "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
 };
-
-
