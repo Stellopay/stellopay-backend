@@ -35,7 +35,34 @@ For production:
 pnpm start
 ```
 
-### Endpoints
+### CORS Configuration
+
+The server enforces strict CORS rules to prevent credential leakage:
+
+| `CORS_ORIGIN` value | `credentials` | Behaviour |
+|---|---|---|
+| `http://localhost:3000` | ✅ `true` | Only that origin is allowed; unlisted origins are **rejected** |
+| `http://a.com,https://b.com` | ✅ `true` | Both origins allowed; all others **rejected** |
+| `*` | ❌ `false` | All origins allowed, but cookies/auth headers are **not forwarded** |
+
+> **Security rule** (enforced by the CORS spec): you **cannot** combine `credentials: true`
+> with a wildcard `*` origin. The server will never silently reflect an unknown origin —
+> any origin not on the allowlist receives an explicit rejection error.
+
+**Development** (default — single origin):
+```env
+CORS_ORIGIN=http://localhost:3000
+```
+
+**Production** (explicit allowlist — recommended):
+```env
+CORS_ORIGIN=https://app.stellopay.com,https://staging.stellopay.com
+```
+
+**Public / unauthenticated API** (no cookies/auth forwarded):
+```env
+CORS_ORIGIN=*
+```
 
 - `GET /health`
 - `GET /api/v1/network/chain_id`
