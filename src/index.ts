@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { env } from "./config.js";
 import { escrowRouter } from "./routes/escrow.js";
 import { agreementRouter } from "./routes/agreement.js";
@@ -71,11 +73,120 @@ const corsOriginHandler: cors.CorsOptions["origin"] = isWildcard
       callback(new Error(`[cors] Origin '${origin}' is not in the allowlist`));
     };
 
-app.set("trust proxy", 1);
+// Set trust proxy for correct client IP detection in rate limiting.
+// Parse TRUST_PROXY env var - can be a number, "true", or comma-separated list.
+let trustProxyValue: string | number | string[] | boolean = env.TRUST_PROXY;
+if (env.TRUST_PROXY === "true") {
+  trustProxyValue = true;
+} else if (/^\d+$/.test(env.TRUST_PROXY)) {
+  trustProxyValue = parseInt(env.TRUST_PROXY, 10);
+} else if (env.TRUST_PROXY.includes(",")) {
+  trustProxyValue = env.TRUST_PROXY.split(",").map((s) => s.trim());
+}
+app.set("trust proxy", trustProxyValue);
 
+// Security: Add Helmet headers
+app.use(helmet());
+
+// Apply CORS
 app.use(
   cors({
     origin: corsOriginHandler,
     credentials: !isWildcard, // never combine wildcard + credentials
   }),
 );
+app.use(express.json({ limit: "1mb" }));
+
+// Rate limiting: Global limiter (looser)
+const globalLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_WINDOW_MS,
+  max: env.RATE_LIMIT_MAX,
+  message: "Too many requests, please try again later.",
+  standardHeaders: false, // Return rate limit info in `RateLimit-*` headers
+  skip: (req) => {
+    // Don't count /health requests against rate limit
+    return req.path === "/health";
+  },
+  keyGenerator: (req) => {
+    // Key by client IP (respects X-Forwarded-For if trust proxy is set)
+    return req.ip || "unknown";
+  },
+  handler: (_req, res) => {
+    res.status(429).json({
+      error: "Too many requests, please try again later.",
+    });
+  },
+});
+
+// Rate limiting: Strict limiter for auth and contact endpoints
+const strictLimiter = rateLimit({
+  windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
+  max: env.RATE_LIMIT_STRICT_MAX,
+  message: "Too many requests from this IP, please try again later.",
+  standardHeaders: false,
+  keyGenerator: (req) => {
+    return req.ip || "unknown";
+  },
+  handler: (_req, res) => {
+    res.status(429).json({
+      error: "Too many requests from this IP, please try again later.",
+    });
+  },
+});
+
+// Apply global rate limiter to all API routes
+app.use("/api/", globalLimiter);
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.use("/api/v1", escrowRouter);
+app.use("/api/v1", agreementRouter);
+// Apply strict rate limiting to auth endpoint
+app.use("/api/v1/auth", strictLimiter);
+app.use("/api/v1", authRouter);
+app.use("/api/v1", systemRouter);
+app.use("/api/v1", readRouter);
+app.use("/api/v1", indexedRouter);
+app.use("/api/v1", tokenRouter);
+app.use("/api/v1", transactionsRouter);
+app.use("/api/v1", notificationsRouter);
+app.use("/api/v1", analyticsRouter);
+app.use("/api/v1", eventsRouter);
+app.use("/api/v1", indexerStatusRouter);
+app.use("/api/v1", reprocessEventsRouter);
+app.use("/api/v1", diagnosticsRouter);
+app.use("/api/v1", backfillEventsRouter);
+// Apply strict rate limiting to contact endpoint
+app.use("/api/v1/contact", strictLimiter);
+app.use("/api/v1", contactRouter);
+app.use("/api/v1", billingRouter);
+
+// Basic error handler
+app.use(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    // eslint-disable-next-line no-console
+    console.error("[api] error", {
+      message: err?.message,
+      cause: err?.cause,
+      stack: err?.stack,
+      issues: err?.issues,
+    });
+    const status = typeof err?.status === "number" ? err.status : 500;
+    res.status(status).json({
+      error: err?.message ?? "Internal error",
+      details: err?.issues ?? undefined,
+      ...(env.NODE_ENV === "development"
+        ? {
+            cause: err?.cause?.message ?? err?.cause ?? undefined,
+            stack: err?.stack,
+          }
+        : {}),
+    });
+  },
+);
+
+app.listen(env.PORT, () => {
+  // eslint-disable-next-line no-console
+  console.log(`stellopay-backend listening on :${env.PORT}`);
+});
