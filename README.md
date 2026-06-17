@@ -11,6 +11,7 @@ cp env.example .env
 ```
 
 2. Fill in:
+
 - `STARKNET_RPC_URL`
 - (optional) `PAYROLL_ESCROW_ADDRESS`, `WORK_AGREEMENT_ADDRESS`
 
@@ -34,22 +35,52 @@ For production:
 pnpm start
 ```
 
-### Endpoints
+### CORS Configuration
+
+The server enforces strict CORS rules to prevent credential leakage:
+
+| `CORS_ORIGIN` value | `credentials` | Behaviour |
+|---|---|---|
+| `http://localhost:3000` | ✅ `true` | Only that origin is allowed; unlisted origins are **rejected** |
+| `http://a.com,https://b.com` | ✅ `true` | Both origins allowed; all others **rejected** |
+| `*` | ❌ `false` | All origins allowed, but cookies/auth headers are **not forwarded** |
+
+> **Security rule** (enforced by the CORS spec): you **cannot** combine `credentials: true`
+> with a wildcard `*` origin. The server will never silently reflect an unknown origin —
+> any origin not on the allowlist receives an explicit rejection error.
+
+**Development** (default — single origin):
+```env
+CORS_ORIGIN=http://localhost:3000
+```
+
+**Production** (explicit allowlist — recommended):
+```env
+CORS_ORIGIN=https://app.stellopay.com,https://staging.stellopay.com
+```
+
+**Public / unauthenticated API** (no cookies/auth forwarded):
+```env
+CORS_ORIGIN=*
+```
 
 - `GET /health`
 - `GET /api/v1/network/chain_id`
 - `GET /api/v1/account/:address/nonce`
 
 #### Auth (wallet ownership)
+
 - `POST /api/v1/auth/challenge`
 - `POST /api/v1/auth/verify`
 
 #### PayrollEscrow (view)
+
 - `GET /api/v1/escrow/:address/get_employer`
 - `GET /api/v1/escrow/:address/get_agreement`
 - `GET /api/v1/escrow/:address/get_token`
 
 #### PayrollEscrow (prepare to sign client-side)
+
 - `POST /api/v1/prepare/escrow/:address/initialize`
 - `POST /api/v1/prepare/escrow/:address/set_agreement`
 - `POST /api/v1/prepare/escrow/:address/deposit`
@@ -57,6 +88,7 @@ pnpm start
 - `POST /api/v1/prepare/escrow/:address/refund_remaining`
 
 #### WorkAgreement (view)
+
 - `GET /api/v1/agreement/:address/get_employer`
 - `GET /api/v1/agreement/:address/get_contributor`
 - `GET /api/v1/agreement/:address/get_token`
@@ -65,7 +97,9 @@ pnpm start
 - `GET /api/v1/agreement/:address/get_paid_amount`
 
 #### WorkAgreement (invoke)
+
 #### WorkAgreement (prepare to sign client-side)
+
 - `POST /api/v1/prepare/agreement/:address/initialize_time_based`
 - `POST /api/v1/prepare/agreement/:address/initialize_milestone_based`
 - `POST /api/v1/prepare/agreement/:address/add_milestone`
@@ -77,9 +111,44 @@ pnpm start
 - `POST /api/v1/prepare/agreement/:address/cancel`
 - `POST /api/v1/prepare/agreement/:address/claim_time_based`
 
+#### Billing Profiles _(requires `BILLING_ENABLED=true`)_
+
+All billing routes live under a single canonical prefix.  
+Previously there were multiple duplicate paths (`/billing/profile/...`, `/billing-profiles/...`, `/settings/billing-profiles/...`, etc.) — these have been consolidated.
+
+| Method | Path                                                      | Description                                           |
+| ------ | --------------------------------------------------------- | ----------------------------------------------------- |
+| `GET`  | `/api/v1/billing/profiles/:profileId`                     | Full profile (info + payment methods + invoices)      |
+| `GET`  | `/api/v1/billing/profiles/:profileId/general-information` | Identity / contact fields (sensitive fields excluded) |
+| `GET`  | `/api/v1/billing/profiles/:profileId/payment-methods`     | Payment methods (masked numbers only)                 |
+| `GET`  | `/api/v1/billing/profiles/:profileId/invoices`            | Invoice history                                       |
+| `GET`  | `/api/v1/billing/profiles/:profileId/summary`             | Reward-limit / spend summary                          |
+
+**Feature flag:** Set `BILLING_ENABLED=true` in your environment once the `billing_profiles` database migration has been applied.  
+Until then every route returns `HTTP 501 Not Implemented` — no mock PII is served at any time.
+
+**Response envelope** (all routes):
+
+```json
+{ "success": true, "data": { ... } }
+// or on error:
+{ "success": false, "error": "message" }
+```
+
+**Database tables added** (see `src/db/schema.ts`):
+
+- `billing_profiles` — identity, address, limits
+- `billing_payment_methods` — masked payment method references
+- `billing_invoices` — invoice records
+
+**Security note:** `taxId` and `dateOfBirth` are stored in the database but are **never returned** by any API endpoint. They must only be accessed through separately-authorised, audited internal processes.
+
+---
+
 ### ABI source
 
 By default the backend loads ABI from:
+
 - `../Starknet-Contracts/target/release/starknet_contracts_PayrollEscrow.contract_class.json`
 - `../Starknet-Contracts/target/release/starknet_contracts_WorkAgreement.contract_class.json`
 
@@ -91,7 +160,7 @@ By default the backend loads ABI from:
 
 ### Frontend usage (starknet.js wallet)
 
-1) Get challenge and sign it:
+1. Get challenge and sign it:
 
 ```ts
 import { connect, type TypedData } from "starknet";
@@ -121,7 +190,7 @@ async function login(address: string) {
 }
 ```
 
-2) Prepare a call (example: escrow deposit), then execute from wallet:
+2. Prepare a call (example: escrow deposit), then execute from wallet:
 
 ```ts
 async function deposit({
@@ -135,11 +204,18 @@ async function deposit({
   escrowAddress: string;
   amount: string; // decimal string
 }) {
-  const prepRes = await fetch(`${BACKEND}/prepare/escrow/${escrowAddress}/deposit`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ wallet_address: walletAddress, session_token: sessionToken, amount }),
-  });
+  const prepRes = await fetch(
+    `${BACKEND}/prepare/escrow/${escrowAddress}/deposit`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        wallet_address: walletAddress,
+        session_token: sessionToken,
+        amount,
+      }),
+    },
+  );
   const prep = await prepRes.json(); // { call, nonce, chain_id, wallet_address }
 
   const conn = await connect();
@@ -149,5 +225,3 @@ async function deposit({
   return await conn.account.execute(prep.call, { nonce: prep.nonce });
 }
 ```
-
-

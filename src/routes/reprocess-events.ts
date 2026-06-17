@@ -6,7 +6,7 @@ import { eq, inArray } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxEvents } from "./events.js";
+import { processTxReceipt } from "./events.js";
 
 export const reprocessEventsRouter = Router();
 
@@ -53,8 +53,13 @@ reprocessEventsRouter.post("/reprocess-events/tx/:tx_hash", async (req, res, nex
     }
     
     // Call the shared events processing logic directly, avoiding loopback HTTP requests
-    const result = await processTxEvents(formattedTxHash);
-    
+    const result = await processTxReceipt(formattedTxHash);
+
+    if (result.status === "not_found") {
+      res.status(404).json({ error: "Transaction not found" });
+      return;
+    }
+
     res.json({
       message: "Events reprocessed",
       result,

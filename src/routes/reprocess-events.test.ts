@@ -128,13 +128,14 @@ describe("Reprocess Events Routes", () => {
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(200);
 
-      // Verify response structure
+      // Verify response structure (result is the shared processTxReceipt output)
       expect(res.body).toEqual({
         message: "Events reprocessed",
         result: {
-          message: "Processed 1 events",
-          eventsProcessed: ["AgreementCreated-123"],
-          transactionHash: "0x0000000000000000000000000000000000000000000000001234567890abcdef",
+          txHash: "0x0000000000000000000000000000000000000000000000001234567890abcdef",
+          status: "processed",
+          eventsProcessed: 1,
+          eventLabels: ["AgreementCreated-123"],
         },
       });
 
@@ -198,8 +199,10 @@ describe("Reprocess Events Routes", () => {
         .post(`/api/v1/events/process_tx/${txHash}`)
         .expect(200);
 
-      // Verify they returned identical results
-      expect(reprocessRes.body.result).toEqual(processRes.body);
+      // Both paths run the same shared processor, so they decode the same
+      // events and tx hash even though the two routes shape their JSON differently.
+      expect(reprocessRes.body.result.eventLabels).toEqual(processRes.body.eventsProcessed);
+      expect(reprocessRes.body.result.txHash).toEqual(processRes.body.transactionHash);
     });
 
     it("should handle outer catch-all error in reprocess-events/tx", async () => {
