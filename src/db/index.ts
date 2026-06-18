@@ -42,3 +42,13 @@ export const db = drizzle(pool, { schema });
 // Export schema for use in routes
 export { schema };
 
+/**
+ * Closes the Postgres connection pool gracefully.
+ */
+export async function closePool(): Promise<void> {
+  if (pool) {
+    console.log("[db] Closing Postgres connection pool...");
+    await pool.end();
+    console.log("[db] Postgres connection pool closed.");
+  }
+}

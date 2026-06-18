@@ -56,6 +56,9 @@ const EnvSchema = z.object({
     .optional()
     .default("false")
     .transform((v) => v === "true"),
+
+  // Drain timeout for graceful shutdown (milliseconds) - default 10000 (10 seconds)
+  SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(10000),
 });
 
 export const env = EnvSchema.parse(process.env);
