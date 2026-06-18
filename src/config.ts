@@ -36,6 +36,8 @@ const EnvSchema = z.object({
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
   EMAIL_PASSWORD: z.string().optional(),
+  // Recipient for contact-form submissions (no personal address is hardcoded in source)
+  CONTACT_RECIPIENT_EMAIL: z.string().email().optional(),
 
   // Rate limiting configuration
   // Global rate limit window (milliseconds) - default 15 minutes
