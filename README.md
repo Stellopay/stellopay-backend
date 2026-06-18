@@ -45,6 +45,22 @@ The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
 
 When deploying under a process manager (like PM2 or systemd) or container orchestrator (like Kubernetes/Docker Swarm), ensure that the orchestrator sends `SIGTERM` and waits at least `SHUTDOWN_DRAIN_TIMEOUT_MS` before sending `SIGKILL`. This ensures no in-flight requests are dropped and database connections are returned cleanly.
 
+### Testing
+
+Unit tests run with [Vitest](https://vitest.dev). They need no database or live
+Starknet RPC — a dummy `STARKNET_RPC_URL` is injected via `vitest.config.ts`, and
+route tests mock the DB/RPC layer.
+
+```bash
+pnpm test            # run the suite once
+pnpm test:watch      # watch mode
+pnpm test:coverage   # run with a coverage report
+```
+
+Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
+the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
+on every push and pull request.
+
 ### CORS Configuration
 
 The server enforces strict CORS rules to prevent credential leakage:
