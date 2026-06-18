@@ -14,6 +14,7 @@ cp env.example .env
 
 - `STARKNET_RPC_URL`
 - (optional) `PAYROLL_ESCROW_ADDRESS`, `WORK_AGREEMENT_ADDRESS`
+- (optional) `CONTACT_RECIPIENT_EMAIL` — recipient for contact-form submissions (required to deliver them)
 
 3. Install + run:
 
