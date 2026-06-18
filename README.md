@@ -35,6 +35,16 @@ For production:
 pnpm start
 ```
 
+### Deployment & graceful shutdown
+
+The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
+1. Stops accepting new connections (drains HTTP server).
+2. Waits for existing in-flight requests to finish, bounded by a timeout (`SHUTDOWN_DRAIN_TIMEOUT_MS`, default 10 seconds).
+3. Closes the Postgres connection pool gracefully.
+4. Exits with code `0`. If the drain timeout is exceeded, it force-exits with `1`.
+
+When deploying under a process manager (like PM2 or systemd) or container orchestrator (like Kubernetes/Docker Swarm), ensure that the orchestrator sends `SIGTERM` and waits at least `SHUTDOWN_DRAIN_TIMEOUT_MS` before sending `SIGKILL`. This ensures no in-flight requests are dropped and database connections are returned cleanly.
+
 ### Testing
 
 Unit tests run with [Vitest](https://vitest.dev). They need no database or live
