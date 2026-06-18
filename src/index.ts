@@ -20,6 +20,8 @@ import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { backfillEventsRouter } from "./routes/backfill-events.js";
 import { contactRouter } from "./routes/contact.js";
 import { billingRouter } from "./routes/billing.js";
+import { closePool } from "./db/index.js";
+import { setupGracefulShutdown } from "./shutdown.js";
 
 const app = express();
 
@@ -186,7 +188,10 @@ app.use(
   },
 );
 
-app.listen(env.PORT, () => {
+const server = app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`stellopay-backend listening on :${env.PORT}`);
 });
+
+// Setup graceful shutdown handling
+setupGracefulShutdown(server, closePool, env.SHUTDOWN_DRAIN_TIMEOUT_MS);
