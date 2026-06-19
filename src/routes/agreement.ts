@@ -3,6 +3,7 @@ import { z } from "zod";
 import { defaults } from "../config.js";
 import { agreementContract, provider } from "../starknet/client.js";
 import { parseU256, u256ToString, toHexString } from "../utils/codec.js";
+import { normalizeStarknetAddress } from "../utils/address.js";
 import { requireSession } from "../auth/session.js";
 // Removed in-memory index - using database only
 import { db, schema } from "../db/index.js";
@@ -957,11 +958,8 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
         const employerStr = typeof employer === 'bigint' ? toHexString(employer) : employer;
         const contributorStr = typeof contributor === 'bigint' ? toHexString(contributor) : (contributor || "0x0");
         
-        // Normalize addresses
-        const employerHex = employerStr.replace(/^0x/, '');
-        const employerPadded = `0x${employerHex.padStart(64, '0')}`;
-        const contributorHex = contributorStr.replace(/^0x/, '');
-        const contributorPadded = `0x${contributorHex.padStart(64, '0')}`;
+        const employerPadded = normalizeStarknetAddress(employerStr);
+        const contributorPadded = normalizeStarknetAddress(contributorStr);
         
         // Removed in-memory index - data is stored in database by indexer
         console.log(`[list-agreements] ✓ Added agreement ${agreementIdStr} to index (employer: ${employerPadded})`);
@@ -987,21 +985,11 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
   }
 });
 
-// Helper to normalize addresses
-function normalizeAddressForQuery(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, "");
-  return `0x${hex.padStart(64, "0")}`;
-}
-
 // List all agreements for a user (as employer or contributor/employee)
 agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
-    const userAddress = normalizeAddressForQuery(req.params.user_address);
+    const userAddress = normalizeStarknetAddress(req.params.user_address);
     
     console.log(`[list-agreements] Querying database for agreements for user: ${userAddress} in contract: ${address}`);
     
@@ -1134,10 +1122,8 @@ agreementRouter.post("/agreement/:address/sync_index", async (req, res, next) =>
               const employerStr = typeof employer === 'bigint' ? toHexString(employer) : employer;
               const contributorStr = typeof contributor === 'bigint' ? toHexString(contributor) : (contributor || "0x0");
               
-              const employerHex = employerStr.replace(/^0x/, '');
-              const employerPadded = `0x${employerHex.padStart(64, '0')}`;
-              const contributorHex = contributorStr.replace(/^0x/, '');
-              const contributorPadded = `0x${contributorHex.padStart(64, '0')}`;
+              const employerPadded = normalizeStarknetAddress(employerStr);
+              const contributorPadded = normalizeStarknetAddress(contributorStr);
               
               // Removed in-memory index - data is stored in database by indexer
               synced++;
