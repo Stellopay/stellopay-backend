@@ -81,6 +81,20 @@ Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced 
 the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
 on every push and pull request.
 
+### Linting and formatting
+
+ESLint uses a flat config for the ESM TypeScript codebase. Prettier handles
+formatting.
+
+```bash
+pnpm lint       # check TypeScript and JavaScript files
+pnpm lint:fix   # auto-fix lint issues where possible
+pnpm format     # format supported source and docs files
+```
+
+The same scripts can be run with `npm run lint`, `npm run lint:fix`, and
+`npm run format`.
+
 ### CORS Configuration
 
 The server enforces strict CORS rules to prevent credential leakage:
