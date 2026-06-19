@@ -36,6 +36,25 @@ For production:
 pnpm start
 ```
 
+### Environment variables
+
+All configuration is parsed and validated in `src/config.ts`. `env.example` has the full annotated list; the main settings and their defaults are:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `STARKNET_RPC_URL` | (required) | Startup fails if unset |
+| `NODE_ENV` | `development` | `production` enforces the ABI path guard below |
+| `PORT` | `4000` | |
+| `CORS_ORIGIN` | `*` | See the CORS Configuration section |
+| `POSTGRES_CONNECTION_STRING` | `postgresql://localhost:5432/stellopay_indexer` | |
+| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | `900000` / `100` | Global rate limiter |
+| `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX` | `300000` / `10` | Auth and contact limiter |
+| `TRUST_PROXY` | `1` | Number of proxies, or `true` |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `10000` | Graceful shutdown drain timeout |
+| `BILLING_ENABLED` | `false` | Only the literal `true` enables billing routes |
+| `CONTACT_RECIPIENT_EMAIL` | (none) | Must be a valid email; required to deliver contact emails |
+| `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev | Required in production; startup fails if unset |
+
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:

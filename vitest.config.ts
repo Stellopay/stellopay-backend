@@ -20,6 +20,7 @@ export default defineConfig({
         "src/utils/codec.ts",
         "src/auth/session.ts",
         "src/auth/challenge.ts",
+        "src/config.ts",
       ],
       thresholds: {
         lines: 95,
