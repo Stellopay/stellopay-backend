@@ -78,8 +78,9 @@ pnpm test:coverage   # run with a coverage report
 ```
 
 Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
-the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
-on every push and pull request.
+the core auth/codec modules. CI (`.github/workflows/ci.yml`) installs with pnpm on
+Node.js 22, runs the build, optional lint, tests, and uploads the generated coverage
+report on every pull request and push to `main`.
 
 ### CORS Configuration
 
