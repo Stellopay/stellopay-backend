@@ -51,6 +51,9 @@ const EnvSchema = z.object({
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
 
+  // Session token lifetime in milliseconds (sliding expiry) - default 24 hours
+  SESSION_TTL_MS: z.coerce.number().int().positive().optional().default(24 * 60 * 60 * 1000),
+
   // Feature flag: set to "true" to enable billing profile endpoints.
   // When false (default) all /billing/* routes return 501 Not Implemented.
   BILLING_ENABLED: z
