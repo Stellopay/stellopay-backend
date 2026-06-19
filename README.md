@@ -110,84 +110,96 @@ CORS_ORIGIN=https://app.stellopay.com,https://staging.stellopay.com
 CORS_ORIGIN=*
 ```
 
-- `GET /health`
-- `GET /api/v1/network/chain_id`
-- `GET /api/v1/account/:address/nonce`
+### Route inventory
 
-#### Auth (wallet ownership)
+Routes are mounted in `src/index.ts`. `/api/*` routes share the global rate limiter; `/api/v1/auth/*` and `/api/v1/contact/*` also use the stricter limiter. "Session" means the route calls `requireSession` with `wallet_address` and `session_token` from the JSON body.
 
-- `POST /api/v1/auth/challenge`
-- `POST /api/v1/auth/verify`
+| Method | Path | Purpose | Auth/session | DB/RPC/flag notes |
+| --- | --- | --- | --- | --- |
+| `GET` | `/health` | Liveness check | No | No DB/RPC |
+| `GET` | `/api/v1/network/chain_id` | Starknet chain/spec version | No | RPC |
+| `GET` | `/api/v1/account/:address/nonce` | Pending nonce for an account | No | RPC |
+| `POST` | `/api/v1/auth/challenge` | Create wallet ownership challenge | No | RPC chain ID; strict limiter |
+| `POST` | `/api/v1/auth/verify` | Verify signed challenge and create session | No existing session | RPC signature verification; strict limiter |
+| `POST` | `/api/v1/auth/session/validate` | Validate and refresh a session | Body session | In-memory session store |
+| `GET` | `/api/v1/escrow/defaults` | Default escrow contract address | No | Config only |
+| `GET` | `/api/v1/escrow/:address/get_token` | Escrow token address | No | RPC |
+| `GET` | `/api/v1/escrow/:address/is_initialized` | Escrow initialization probe | No | RPC |
+| `GET` | `/api/v1/escrow/:address/get_agreement_balance/:agreement_id` | Escrow balance for agreement | No | DB indexed events, then RPC fallback |
+| `GET` | `/api/v1/escrow/:address/get_agreement_employer/:agreement_id` | Employer for escrow agreement | No | RPC |
+| `POST` | `/api/v1/prepare/escrow/:address/initialize` | Prepare escrow `initialize` call | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/escrow/:address/fund_agreement` | Prepare escrow funding call | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/escrow/:address/release` | Prepare escrow release call | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/escrow/:address/refund_remaining` | Prepare escrow refund call | Body session | RPC nonce/chain ID |
+| `GET` | `/api/v1/agreement/defaults` | Default agreement contract address | No | Config only |
+| `GET` | `/api/v1/agreement/:address/get_employer/:agreement_id` | Agreement employer | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_contributor/:agreement_id` | Agreement contributor | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_token/:agreement_id` | Agreement token | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_escrow` | Agreement escrow contract | No | RPC |
+| `GET` | `/api/v1/agreement/:address/is_initialized` | Agreement initialization probe | No | RPC |
+| `GET` | `/api/v1/agreement/:address/get_total_amount/:agreement_id` | Agreement total amount | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_paid_amount/:agreement_id` | Agreement paid amount | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_status/:agreement_id` | Agreement status | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_agreement_mode/:agreement_id` | Escrow/payroll mode | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_employee_count/:agreement_id` | Payroll employee count | No | DB employees, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_employee/:agreement_id/:index` | Payroll employee address | No | DB employees, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_employee_salary/:agreement_id/:index` | Payroll employee salary | No | DB employees, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/get_dispute_status/:agreement_id` | Agreement dispute status | No | DB agreement row, then RPC fallback |
+| `GET` | `/api/v1/agreement/:address/is_grace_period_active/:agreement_id` | Grace period status | No | RPC |
+| `POST` | `/api/v1/prepare/agreement/:address/initialize` | Prepare agreement `initialize` call | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/create_time_based_agreement` | Prepare time-based agreement creation | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/create_milestone_agreement` | Prepare milestone agreement creation | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/create_payroll_agreement` | Prepare payroll agreement creation | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/add_employee` | Prepare payroll employee addition | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/fund_agreement` | Prepare agreement funding | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/add_milestone` | Prepare milestone addition | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/approve_milestone` | Prepare milestone approval | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/claim_milestone` | Prepare milestone claim | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/activate` | Prepare agreement activation | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/pause` | Prepare agreement pause | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/resume` | Prepare agreement resume | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/cancel` | Prepare agreement cancellation | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/finalize_grace_period` | Prepare grace-period finalization | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/raise_dispute` | Prepare dispute raise | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/agreement/:address/get_agreement_id_from_tx` | Extract agreement ID from a transaction receipt | No | RPC receipt and contract reads |
+| `GET` | `/api/v1/agreement/:address/list/:user_address` | List indexed agreements for a user | No | DB only |
+| `POST` | `/api/v1/agreement/:address/sync_index` | Operator sync scan for agreement IDs | No app auth | RPC; no persisted writes in current code |
+| `POST` | `/api/v1/prepare/agreement/:address/resolve_dispute` | Prepare dispute resolution | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/claim_time_based` | Prepare time-based claim | Body session | RPC nonce/chain ID |
+| `POST` | `/api/v1/prepare/agreement/:address/claim_payroll` | Prepare payroll claim | Body session | RPC nonce/chain ID |
+| `GET` | `/api/v1/token/:token/balance/:owner` | ERC20 balance | No | RPC |
+| `GET` | `/api/v1/token/:token/decimals` | ERC20 decimals | No | RPC |
+| `GET` | `/api/v1/token/:token/symbol` | ERC20 symbol | No | RPC |
+| `GET` | `/api/v1/escrow/:address/balance/:agreement_id` | Escrow balance read | No | RPC |
+| `GET` | `/api/v1/escrow/:address/summary/:agreement_id` | Escrow UI summary | No | RPC |
+| `GET` | `/api/v1/agreement/:address/summary/:agreement_id` | Agreement UI summary | No | RPC |
+| `GET` | `/api/v1/indexed/agreements/:contract_address/user/:user_address` | Indexed agreements for a user | No | DB |
+| `GET` | `/api/v1/indexed/agreement/:contract_address/:agreement_id` | Indexed agreement detail with related rows | No | DB |
+| `GET` | `/api/v1/indexed/payments/user/:user_address` | Indexed payments for a user | No | DB |
+| `GET` | `/api/v1/indexed/escrow/:contract_address/balance/:agreement_id` | Indexed escrow balance from events | No | DB |
+| `GET` | `/api/v1/token/:address/allowance/:owner/:spender` | ERC20 allowance | No | RPC |
+| `POST` | `/api/v1/prepare/token/:address/approve` | Prepare ERC20 approve call | Body session | RPC nonce/chain ID |
+| `GET` | `/api/v1/transactions/:user_address` | Combined transaction feed | No | DB; may read agreement token over RPC with cache |
+| `GET` | `/api/v1/transactions/:user_address/filtered` | Transaction feed with date filters | No | DB |
+| `GET` | `/api/v1/notifications/:user_address` | User notification feed | No | DB |
+| `GET` | `/api/v1/analytics/:user_address` | Monthly analytics for a user | No | DB |
+| `POST` | `/api/v1/events/process_tx/:tx_hash` | Operator event decode/persist for one tx | No app auth | RPC receipts/ABIs; DB writes; idempotent inserts |
+| `POST` | `/api/v1/events/process_batch` | Operator batch event decode/persist | No app auth | RPC receipts/ABIs; DB writes; max 50 tx hashes |
+| `GET` | `/api/v1/indexer/status` | Indexer counts and latest rows | No app auth | DB diagnostics |
+| `GET` | `/api/v1/indexer/user/:user_address/events` | Indexed event summary for a user | No | DB |
+| `POST` | `/api/v1/reprocess-events/tx/:tx_hash` | Operator reprocess one tx via shared event processor | No app auth | RPC receipts/ABIs; DB writes |
+| `POST` | `/api/v1/reprocess-events/status-changes` | Operator rename stored status-change events | No app auth | RPC receipts/ABIs; DB updates |
+| `GET` | `/api/v1/diagnostics/events` | Operator event/table diagnostics | No app auth | DB raw aggregate queries |
+| `POST` | `/api/v1/backfill/employee-events` | Operator backfill `EmployeeAdded` events | No app auth | DB reads/writes |
+| `POST` | `/api/v1/backfill/milestone-events` | Operator backfill `MilestoneAdded` events | No app auth | DB reads/writes |
+| `POST` | `/api/v1/contact/send-message` | Contact form submission | No | Strict limiter; sends email when configured |
+| `GET` | `/api/v1/billing/profiles/:profileId` | Full billing profile | Feature flag only | `BILLING_ENABLED=true`; DB; 501 when disabled |
+| `GET` | `/api/v1/billing/profiles/:profileId/general-information` | Billing identity/contact fields | Feature flag only | `BILLING_ENABLED=true`; DB; excludes sensitive fields; 501 when disabled |
+| `GET` | `/api/v1/billing/profiles/:profileId/payment-methods` | Billing payment methods | Feature flag only | `BILLING_ENABLED=true`; DB; masked methods only; 501 when disabled |
+| `GET` | `/api/v1/billing/profiles/:profileId/invoices` | Billing invoice history | Feature flag only | `BILLING_ENABLED=true`; DB; 501 when disabled |
+| `GET` | `/api/v1/billing/profiles/:profileId/summary` | Billing reward-limit/spend summary | Feature flag only | `BILLING_ENABLED=true`; DB; 501 when disabled |
 
-#### PayrollEscrow (view)
-
-- `GET /api/v1/escrow/:address/get_employer`
-- `GET /api/v1/escrow/:address/get_agreement`
-- `GET /api/v1/escrow/:address/get_token`
-
-#### PayrollEscrow (prepare to sign client-side)
-
-- `POST /api/v1/prepare/escrow/:address/initialize`
-- `POST /api/v1/prepare/escrow/:address/set_agreement`
-- `POST /api/v1/prepare/escrow/:address/deposit`
-- `POST /api/v1/prepare/escrow/:address/release`
-- `POST /api/v1/prepare/escrow/:address/refund_remaining`
-
-#### WorkAgreement (view)
-
-- `GET /api/v1/agreement/:address/get_employer`
-- `GET /api/v1/agreement/:address/get_contributor`
-- `GET /api/v1/agreement/:address/get_token`
-- `GET /api/v1/agreement/:address/get_escrow`
-- `GET /api/v1/agreement/:address/get_total_amount`
-- `GET /api/v1/agreement/:address/get_paid_amount`
-
-#### WorkAgreement (invoke)
-
-#### WorkAgreement (prepare to sign client-side)
-
-- `POST /api/v1/prepare/agreement/:address/initialize_time_based`
-- `POST /api/v1/prepare/agreement/:address/initialize_milestone_based`
-- `POST /api/v1/prepare/agreement/:address/add_milestone`
-- `POST /api/v1/prepare/agreement/:address/approve_milestone`
-- `POST /api/v1/prepare/agreement/:address/claim_milestone`
-- `POST /api/v1/prepare/agreement/:address/activate`
-- `POST /api/v1/prepare/agreement/:address/pause`
-- `POST /api/v1/prepare/agreement/:address/resume`
-- `POST /api/v1/prepare/agreement/:address/cancel`
-- `POST /api/v1/prepare/agreement/:address/claim_time_based`
-
-#### Billing Profiles _(requires `BILLING_ENABLED=true`)_
-
-All billing routes live under a single canonical prefix.  
-Previously there were multiple duplicate paths (`/billing/profile/...`, `/billing-profiles/...`, `/settings/billing-profiles/...`, etc.) — these have been consolidated.
-
-| Method | Path                                                      | Description                                           |
-| ------ | --------------------------------------------------------- | ----------------------------------------------------- |
-| `GET`  | `/api/v1/billing/profiles/:profileId`                     | Full profile (info + payment methods + invoices)      |
-| `GET`  | `/api/v1/billing/profiles/:profileId/general-information` | Identity / contact fields (sensitive fields excluded) |
-| `GET`  | `/api/v1/billing/profiles/:profileId/payment-methods`     | Payment methods (masked numbers only)                 |
-| `GET`  | `/api/v1/billing/profiles/:profileId/invoices`            | Invoice history                                       |
-| `GET`  | `/api/v1/billing/profiles/:profileId/summary`             | Reward-limit / spend summary                          |
-
-**Feature flag:** Set `BILLING_ENABLED=true` in your environment once the `billing_profiles` database migration has been applied.  
-Until then every route returns `HTTP 501 Not Implemented` — no mock PII is served at any time.
-
-**Response envelope** (all routes):
-
-```json
-{ "success": true, "data": { ... } }
-// or on error:
-{ "success": false, "error": "message" }
-```
-
-**Database tables added** (see `src/db/schema.ts`):
-
-- `billing_profiles` — identity, address, limits
-- `billing_payment_methods` — masked payment method references
-- `billing_invoices` — invoice records
-
-**Security note:** `taxId` and `dateOfBirth` are stored in the database but are **never returned** by any API endpoint. They must only be accessed through separately-authorised, audited internal processes.
+Billing responses use `{ "success": true, "data": ... }` or `{ "success": false, "error": "message" }`. Billing stores `taxId` and `dateOfBirth`, but route responses strip those fields.
 
 ---
 
@@ -240,28 +252,34 @@ async function login(address: string) {
 }
 ```
 
-2. Prepare a call (example: escrow deposit), then execute from wallet:
+2. Prepare a call (example: escrow funding), then execute from wallet:
 
 ```ts
-async function deposit({
+async function fundAgreement({
   walletAddress,
   sessionToken,
   escrowAddress,
+  agreementId,
+  employer,
   amount,
 }: {
   walletAddress: string;
   sessionToken: string;
   escrowAddress: string;
+  agreementId: string;
+  employer: string;
   amount: string; // decimal string
 }) {
   const prepRes = await fetch(
-    `${BACKEND}/prepare/escrow/${escrowAddress}/deposit`,
+    `${BACKEND}/prepare/escrow/${escrowAddress}/fund_agreement`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         wallet_address: walletAddress,
         session_token: sessionToken,
+        agreement_id: agreementId,
+        employer,
         amount,
       }),
     },
