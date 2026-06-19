@@ -280,6 +280,23 @@ async function deposit({
 
 The backend includes multiple security layers:
 
+#### Protected endpoints
+
+Mutating endpoints and backend administration routes require session authentication. A bearer token (session token) and an `x-user-address` header are required. Some routes are strictly limited to administrators defined in the `ADMIN_ADDRESSES` environment variable.
+
+**Authenticated Endpoints (`requireAuth`)**
+- `POST /api/v1/events/process_tx/:tx_hash`
+- `POST /api/v1/events/process_batch`
+
+**Admin Endpoints (`requireAuth` + `requireAdmin`)**
+- `POST /api/v1/backfill/employee-events`
+- `POST /api/v1/backfill/milestone-events`
+- `POST /api/v1/reprocess-events/tx/:tx_hash`
+- `POST /api/v1/reprocess-events/status-changes`
+- `GET /api/v1/diagnostics/events`
+
+*Note: Indexed reading routes remain public because they only expose aggregated on-chain data and do not trigger remote RPC calls.*
+
 #### Helmet
 [Helmet](https://helmetjs.github.io/) middleware is applied to all responses, setting secure HTTP headers including:
 - `Content-Security-Policy`

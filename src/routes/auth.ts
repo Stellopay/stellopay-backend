@@ -25,8 +25,12 @@ export const authRouter = Router();
 
 // Debug logger for auth routes (helps track nonce/signature/RPC issues)
 authRouter.use((req, _res, next) => {
+  const bodyLog = req.body ? { ...req.body } : {};
+  if (bodyLog.session_token) {
+    bodyLog.session_token = "***";
+  }
   // eslint-disable-next-line no-console
-  console.log(`[auth] ${req.method} ${req.originalUrl}`, { body: req.body });
+  console.log(`[auth] ${req.method} ${req.originalUrl}`, { body: bodyLog });
   next();
 });
 
