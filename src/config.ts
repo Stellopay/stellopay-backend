@@ -36,6 +36,8 @@ const EnvSchema = z.object({
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
   EMAIL_PASSWORD: z.string().optional(),
+  // Recipient for contact-form submissions (no personal address is hardcoded in source)
+  CONTACT_RECIPIENT_EMAIL: z.string().email().optional(),
 
   // Rate limiting configuration
   // Global rate limit window (milliseconds) - default 15 minutes
@@ -48,6 +50,9 @@ const EnvSchema = z.object({
   RATE_LIMIT_STRICT_MAX: z.coerce.number().int().positive().optional().default(10),
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
+
+  // Session token lifetime in milliseconds (sliding expiry) - default 24 hours
+  SESSION_TTL_MS: z.coerce.number().int().positive().optional().default(24 * 60 * 60 * 1000),
 
   // Feature flag: set to "true" to enable billing profile endpoints.
   // When false (default) all /billing/* routes return 501 Not Implemented.

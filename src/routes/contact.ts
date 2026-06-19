@@ -1,38 +1,56 @@
 import express from "express";
 import nodemailer from "nodemailer";
+import { z } from "zod";
 import { env } from "../config.js";
 
 const contactRouter = express.Router();
 
+/**
+ * Validation schema for the contact form. Trims input and caps each field's
+ * length to prevent unbounded, unchecked input and large-payload abuse.
+ */
+const ContactBody = z.object({
+  firstName: z.string().trim().min(1).max(100),
+  lastName: z.string().trim().min(1).max(100),
+  email: z.string().trim().email().max(254),
+  message: z.string().trim().min(1).max(5000),
+});
+
+/**
+ * Escapes HTML-significant characters so user-provided values cannot inject
+ * markup or extra content into the HTML email body.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // POST /api/v1/contact/send-message
 contactRouter.post("/contact/send-message", async (req, res) => {
   try {
-    const { firstName, lastName, email, message } = req.body;
-
-    // Validate required fields
-    if (!firstName || !lastName || !email || !message) {
+    const parsed = ContactBody.safeParse(req.body);
+    if (!parsed.success) {
       return res.status(400).json({
-        error: "Missing required fields: firstName, lastName, email, and message are required",
+        error: "Validation failed",
+        details: parsed.error.issues,
       });
     }
+    const { firstName, lastName, email, message } = parsed.data;
 
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({
-        error: "Invalid email format",
-      });
-    }
+    const recipient = env.CONTACT_RECIPIENT_EMAIL;
 
-    // Check if email credentials are configured
-    if (!env.EMAIL_USER || !env.EMAIL_PASSWORD) {
-      console.warn("[contact] Email credentials not configured. Message would be sent to:", {
-        firstName,
-        lastName,
-        email,
-        message: message.substring(0, 100) + "...",
-      });
-      // In development, return success even without email configured
+    // Email is sent only when SMTP credentials AND a recipient are configured.
+    // Otherwise keep the dev-mode "received" behaviour and fail closed in
+    // production — never fall back to a hardcoded personal address.
+    if (!env.EMAIL_USER || !env.EMAIL_PASSWORD || !recipient) {
+      // Log minimally: never echo credentials or the full message body.
+      console.warn(
+        "[contact] Email not configured (missing credentials or CONTACT_RECIPIENT_EMAIL); message not sent.",
+      );
       if (env.NODE_ENV === "development") {
         return res.json({
           success: true,
@@ -44,7 +62,6 @@ contactRouter.post("/contact/send-message", async (req, res) => {
       });
     }
 
-    // Create transporter
     const transporter = nodemailer.createTransport({
       service: "gmail",
       auth: {
@@ -53,30 +70,32 @@ contactRouter.post("/contact/send-message", async (req, res) => {
       },
     });
 
-    // Email content
+    const safeFirstName = escapeHtml(firstName);
+    const safeLastName = escapeHtml(lastName);
+    const safeEmail = escapeHtml(email);
+    const safeMessage = escapeHtml(message).replace(/\n/g, "<br>");
+
     const mailOptions = {
       from: env.EMAIL_USER,
-      to: "jagadeesh26062002@gmail.com",
+      to: recipient,
       subject: `Contact Form Submission from ${firstName} ${lastName}`,
       html: `
         <h2>New Contact Form Submission</h2>
-        <p><strong>Name:</strong> ${firstName} ${lastName}</p>
-        <p><strong>Email:</strong> ${email}</p>
+        <p><strong>Name:</strong> ${safeFirstName} ${safeLastName}</p>
+        <p><strong>Email:</strong> ${safeEmail}</p>
         <p><strong>Message:</strong></p>
-        <p>${message.replace(/\n/g, "<br>")}</p>
+        <p>${safeMessage}</p>
       `,
-      text: `
-New Contact Form Submission
+      text: `New Contact Form Submission
 
 Name: ${firstName} ${lastName}
 Email: ${email}
 
 Message:
 ${message}
-      `,
+`,
     };
 
-    // Send email
     await transporter.sendMail(mailOptions);
 
     res.json({
@@ -84,13 +103,12 @@ ${message}
       message: "Your message has been sent successfully!",
     });
   } catch (error: any) {
-    console.error("[contact] Failed to send email:", error);
+    console.error("[contact] Failed to send email:", error?.message ?? error);
     res.status(500).json({
       error: "Failed to send message. Please try again later.",
-      details: env.NODE_ENV === "development" ? error.message : undefined,
+      details: env.NODE_ENV === "development" ? error?.message : undefined,
     });
   }
 });
 
 export { contactRouter };
-

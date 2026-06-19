@@ -14,6 +14,7 @@ cp env.example .env
 
 - `STARKNET_RPC_URL`
 - (optional) `PAYROLL_ESCROW_ADDRESS`, `WORK_AGREEMENT_ADDRESS`
+- (optional) `CONTACT_RECIPIENT_EMAIL` — recipient for contact-form submissions (required to deliver them)
 
 3. Install + run:
 
@@ -35,6 +36,25 @@ For production:
 pnpm start
 ```
 
+### Environment variables
+
+All configuration is parsed and validated in `src/config.ts`. `env.example` has the full annotated list; the main settings and their defaults are:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `STARKNET_RPC_URL` | (required) | Startup fails if unset |
+| `NODE_ENV` | `development` | `production` enforces the ABI path guard below |
+| `PORT` | `4000` | |
+| `CORS_ORIGIN` | `*` | See the CORS Configuration section |
+| `POSTGRES_CONNECTION_STRING` | `postgresql://localhost:5432/stellopay_indexer` | |
+| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | `900000` / `100` | Global rate limiter |
+| `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX` | `300000` / `10` | Auth and contact limiter |
+| `TRUST_PROXY` | `1` | Number of proxies, or `true` |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `10000` | Graceful shutdown drain timeout |
+| `BILLING_ENABLED` | `false` | Only the literal `true` enables billing routes |
+| `CONTACT_RECIPIENT_EMAIL` | (none) | Must be a valid email; required to deliver contact emails |
+| `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev | Required in production; startup fails if unset |
+
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
@@ -44,6 +64,22 @@ The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
 4. Exits with code `0`. If the drain timeout is exceeded, it force-exits with `1`.
 
 When deploying under a process manager (like PM2 or systemd) or container orchestrator (like Kubernetes/Docker Swarm), ensure that the orchestrator sends `SIGTERM` and waits at least `SHUTDOWN_DRAIN_TIMEOUT_MS` before sending `SIGKILL`. This ensures no in-flight requests are dropped and database connections are returned cleanly.
+
+### Testing
+
+Unit tests run with [Vitest](https://vitest.dev). They need no database or live
+Starknet RPC — a dummy `STARKNET_RPC_URL` is injected via `vitest.config.ts`, and
+route tests mock the DB/RPC layer.
+
+```bash
+pnpm test            # run the suite once
+pnpm test:watch      # watch mode
+pnpm test:coverage   # run with a coverage report
+```
+
+Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
+the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
+on every push and pull request.
 
 ### CORS Configuration
 
@@ -167,6 +203,10 @@ By default the backend loads ABI from:
 - The backend **does not** hold private keys.
 - Users first prove wallet ownership by signing a backend-issued challenge (`/auth/challenge` → sign typed data → `/auth/verify`).
 - For contract mutations, the backend returns a prepared `call` + `nonce`; the frontend wallet/account should sign + execute.
+
+### Sessions
+
+After `/auth/verify` succeeds, the backend issues a session token with a **sliding expiry**. The lifetime is controlled by `SESSION_TTL_MS` (default 24 hours), and `/auth/verify` returns the remaining lifetime as `expires_in_ms`. A token is refreshed for another full TTL each time it is used on a successful `/auth/session/validate`, and expired tokens are rejected and purged (lazily on use, plus a periodic background sweep) so they cannot be replayed or leak memory.
 
 ### Frontend usage (starknet.js wallet)
 
