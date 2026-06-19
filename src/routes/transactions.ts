@@ -46,11 +46,17 @@ const NORMALIZED_STRK = normalizeAddr(STRK_TOKEN_ADDRESS);
 const NORMALIZED_USDC = normalizeAddr(USDC_TOKEN_ADDRESS);
 const NORMALIZED_USDT = normalizeAddr(USDT_TOKEN_ADDRESS);
 
+const logTransactionsDebug = (...args: Parameters<typeof console.log>) => {
+  if (process.env.TRANSACTIONS_DEBUG === "true") {
+    console.log(...args);
+  }
+};
+
 // Log known token addresses on module load
-console.log(`[transactions] Known token addresses configured:`);
-console.log(`  - STRK: ${STRK_TOKEN_ADDRESS} (normalized: ${NORMALIZED_STRK})`);
-console.log(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
-console.log(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
+logTransactionsDebug(`[transactions] Known token addresses configured:`);
+logTransactionsDebug(`  - STRK: ${STRK_TOKEN_ADDRESS} (normalized: ${NORMALIZED_STRK})`);
+logTransactionsDebug(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
+logTransactionsDebug(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
 
 // Helper to get token info from token address
 function getTokenInfo(tokenAddress: string | null | undefined): {
@@ -60,19 +66,19 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
   isSTRK: boolean;
 } {
   if (!tokenAddress) {
-    console.log(`[transactions] getTokenInfo: No token address provided, returning "-"`);
+    logTransactionsDebug(`[transactions] getTokenInfo: No token address provided, returning "-"`);
     return { name: "-", icon: "", decimals: 0, isSTRK: false };
   }
   
   const normalized = normalizeAddr(tokenAddress);
   
-  console.log(`[transactions] getTokenInfo: Comparing token ${normalized}`);
-  console.log(`[transactions]   vs STRK: ${NORMALIZED_STRK} (match: ${normalized === NORMALIZED_STRK})`);
-  console.log(`[transactions]   vs USDC: ${NORMALIZED_USDC} (match: ${normalized === NORMALIZED_USDC})`);
-  console.log(`[transactions]   vs USDT: ${NORMALIZED_USDT} (match: ${normalized === NORMALIZED_USDT})`);
+  logTransactionsDebug(`[transactions] getTokenInfo: Comparing token ${normalized}`);
+  logTransactionsDebug(`[transactions]   vs STRK: ${NORMALIZED_STRK} (match: ${normalized === NORMALIZED_STRK})`);
+  logTransactionsDebug(`[transactions]   vs USDC: ${NORMALIZED_USDC} (match: ${normalized === NORMALIZED_USDC})`);
+  logTransactionsDebug(`[transactions]   vs USDT: ${NORMALIZED_USDT} (match: ${normalized === NORMALIZED_USDT})`);
   
   if (normalized === NORMALIZED_STRK) {
-    console.log(`[transactions] getTokenInfo: Identified as STRK`);
+    logTransactionsDebug(`[transactions] getTokenInfo: Identified as STRK`);
     return {
       name: "STRK",
       icon: "/strk-logo.png", // Update with actual icon path
@@ -80,7 +86,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: true,
     };
   } else if (normalized === NORMALIZED_USDC) {
-    console.log(`[transactions] getTokenInfo: Identified as USDC`);
+    logTransactionsDebug(`[transactions] getTokenInfo: Identified as USDC`);
     return {
       name: "USDC",
       icon: "/usdc-logo.png",
@@ -88,7 +94,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: false,
     };
   } else if (normalized === NORMALIZED_USDT) {
-    console.log(`[transactions] getTokenInfo: Identified as USDT`);
+    logTransactionsDebug(`[transactions] getTokenInfo: Identified as USDT`);
     return {
       name: "USDT",
       icon: "/usdt-logo.png",
@@ -98,7 +104,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
   }
   
   // Default to USDC format for unknown tokens
-  console.log(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
+  logTransactionsDebug(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
   return {
     name: "USDC",
     icon: "/usdc-logo.png",
@@ -110,7 +116,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
 // Helper to format amount based on token type
 function formatAmount(amount: string | bigint, tokenInfo: { name: string; decimals: number; isSTRK: boolean }): string {
   if (!amount || amount === "0" || amount === BigInt(0)) {
-    console.log(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
+    logTransactionsDebug(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
     return "-";
   }
   
@@ -119,13 +125,13 @@ function formatAmount(amount: string | bigint, tokenInfo: { name: string; decima
   const wholePart = amountBigInt / divisor;
   const fractionalPart = amountBigInt % divisor;
   
-  console.log(`[transactions] formatAmount: Processing amount`);
-  console.log(`  - Raw amount: ${amount} (type: ${typeof amount})`);
-  console.log(`  - Amount as BigInt: ${amountBigInt.toString()}`);
-  console.log(`  - Token decimals: ${tokenInfo.decimals}`);
-  console.log(`  - Divisor: ${divisor.toString()}`);
-  console.log(`  - Whole part: ${wholePart.toString()}`);
-  console.log(`  - Fractional part: ${fractionalPart.toString()}`);
+  logTransactionsDebug(`[transactions] formatAmount: Processing amount`);
+  logTransactionsDebug(`  - Raw amount: ${amount} (type: ${typeof amount})`);
+  logTransactionsDebug(`  - Amount as BigInt: ${amountBigInt.toString()}`);
+  logTransactionsDebug(`  - Token decimals: ${tokenInfo.decimals}`);
+  logTransactionsDebug(`  - Divisor: ${divisor.toString()}`);
+  logTransactionsDebug(`  - Whole part: ${wholePart.toString()}`);
+  logTransactionsDebug(`  - Fractional part: ${fractionalPart.toString()}`);
   
   if (tokenInfo.isSTRK) {
     // Format STRK: show decimals like "0.434 strk"
@@ -134,21 +140,21 @@ function formatAmount(amount: string | bigint, tokenInfo: { name: string; decima
     const fractionalTrimmed = fractionalStr.replace(/0+$/, "");
     if (fractionalTrimmed === "") {
       const result = `${wholePart.toString()} ${tokenInfo.name}`;
-      console.log(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
+      logTransactionsDebug(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
       return result;
     }
     // Show up to 6 significant digits in fractional part
     const fractionalDisplay = fractionalTrimmed.slice(0, 6);
     const result = `${wholePart.toString()}.${fractionalDisplay} ${tokenInfo.name}`;
-    console.log(`[transactions] formatAmount: STRK result: ${result}`);
+    logTransactionsDebug(`[transactions] formatAmount: STRK result: ${result}`);
     return result;
   } else {
     // Format USDC: show as dollar amount
     const amountNum = Number(amountBigInt) / Number(divisor);
     const result = `$${amountNum.toFixed(2)}`;
-    console.log(`[transactions] formatAmount: USDC/USDT calculation:`);
-    console.log(`  - Amount as number: ${amountNum}`);
-    console.log(`  - Result: ${result}`);
+    logTransactionsDebug(`[transactions] formatAmount: USDC/USDT calculation:`);
+    logTransactionsDebug(`  - Amount as number: ${amountNum}`);
+    logTransactionsDebug(`  - Result: ${result}`);
     return result;
   }
 }
@@ -172,21 +178,21 @@ async function getTokenFromAgreementContract(
   
   // Return cached value if still valid
   if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL_MS) {
-    console.log(`[transactions] Using cached token for agreement ${agreementId}: ${cached.token}`);
+    logTransactionsDebug(`[transactions] Using cached token for agreement ${agreementId}: ${cached.token}`);
     return cached.token;
   }
   
   try {
-    console.log(`[transactions] Fetching token from agreement contract ${agreementContractAddress} for agreement ${agreementId}`);
+    logTransactionsDebug(`[transactions] Fetching token from agreement contract ${agreementContractAddress} for agreement ${agreementId}`);
     const c = agreementContract(agreementContractAddress);
     const out = await c.get_token(agreementId);
     const tokenAddress = toHexString(out);
     const normalizedToken = normalizeAddr(tokenAddress);
     
-    console.log(`[transactions] Successfully fetched token for agreement ${agreementId}:`);
-    console.log(`  - Raw token: ${tokenAddress}`);
-    console.log(`  - Normalized token: ${normalizedToken}`);
-    console.log(`  - Token info: ${JSON.stringify(getTokenInfo(normalizedToken))}`);
+    logTransactionsDebug(`[transactions] Successfully fetched token for agreement ${agreementId}:`);
+    logTransactionsDebug(`  - Raw token: ${tokenAddress}`);
+    logTransactionsDebug(`  - Normalized token: ${normalizedToken}`);
+    logTransactionsDebug(`  - Token info: ${JSON.stringify(getTokenInfo(normalizedToken))}`);
     
     // Cache the result
     tokenCache.set(cacheKey, { token: normalizedToken, timestamp: Date.now() });
@@ -208,7 +214,7 @@ async function getTokenFromAgreementContract(
 async function batchGetTokensFromAgreementContracts(
   agreements: Array<{ agreementContractAddress: string; agreementId: string }>
 ): Promise<Map<string, string>> {
-  console.log(`[transactions] Batch fetching tokens for ${agreements.length} agreements`);
+  logTransactionsDebug(`[transactions] Batch fetching tokens for ${agreements.length} agreements`);
   const tokenMap = new Map<string, string>();
   const uncachedAgreements: Array<{ agreementContractAddress: string; agreementId: string; key: string }> = [];
   
@@ -218,20 +224,20 @@ async function batchGetTokensFromAgreementContracts(
     const cached = tokenCache.get(cacheKey);
     
     if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL_MS) {
-      console.log(`[transactions] Using cached token for agreement ${agreement.agreementId}: ${cached.token}`);
+      logTransactionsDebug(`[transactions] Using cached token for agreement ${agreement.agreementId}: ${cached.token}`);
       tokenMap.set(agreement.agreementId, cached.token);
     } else {
       uncachedAgreements.push({ ...agreement, key: cacheKey });
     }
   }
   
-  console.log(`[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`);
+  logTransactionsDebug(`[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`);
   
   // Fetch uncached tokens in parallel (limit concurrency to avoid overwhelming RPC)
   const BATCH_SIZE = 10;
   for (let i = 0; i < uncachedAgreements.length; i += BATCH_SIZE) {
     const batch = uncachedAgreements.slice(i, i + BATCH_SIZE);
-    console.log(`[transactions] Fetching batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} agreements)`);
+    logTransactionsDebug(`[transactions] Fetching batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} agreements)`);
     const fetchPromises = batch.map(async (agreement) => {
       try {
         const token = await getTokenFromAgreementContract(
@@ -251,7 +257,7 @@ async function batchGetTokensFromAgreementContracts(
     await Promise.all(fetchPromises);
   }
   
-  console.log(`[transactions] Batch fetch complete. Got ${tokenMap.size} tokens out of ${agreements.length} agreements`);
+  logTransactionsDebug(`[transactions] Batch fetch complete. Got ${tokenMap.size} tokens out of ${agreements.length} agreements`);
   return tokenMap;
 }
 
@@ -409,7 +415,7 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
     // Get token addresses for escrow events from agreements
     // First get agreement contract addresses from database
     const agreementIds = [...new Set(escrowEvents.map(e => e.agreementId))];
-    console.log(`[transactions] Processing ${escrowEvents.length} escrow events for ${agreementIds.length} unique agreements`);
+    logTransactionsDebug(`[transactions] Processing ${escrowEvents.length} escrow events for ${agreementIds.length} unique agreements`);
     
     const agreements = agreementIds.length > 0 ? await db
       .select({ 
@@ -420,9 +426,9 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       .from(schema.agreements)
       .where(inArray(schema.agreements.id, agreementIds)) : [];
     
-    console.log(`[transactions] Found ${agreements.length} agreements in database`);
+    logTransactionsDebug(`[transactions] Found ${agreements.length} agreements in database`);
     agreements.forEach(a => {
-      console.log(`[transactions] Agreement ${a.id}: contract=${a.contractAddress}, db_token=${a.token}`);
+      logTransactionsDebug(`[transactions] Agreement ${a.id}: contract=${a.contractAddress}, db_token=${a.token}`);
     });
     
     // Create map for fallback (database tokens)
@@ -436,7 +442,7 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
         agreementId: a.id,
       }));
     
-    console.log(`[transactions] Will fetch tokens from ${agreementsForTokenFetch.length} agreement contracts`);
+    logTransactionsDebug(`[transactions] Will fetch tokens from ${agreementsForTokenFetch.length} agreement contracts`);
     
     const contractTokenMap = await batchGetTokensFromAgreementContracts(agreementsForTokenFetch);
     
@@ -447,11 +453,11 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       const dbToken = agreement.token;
       const finalToken = contractToken || dbToken;
       
-      console.log(`[transactions] Agreement ${agreement.id} token resolution:`);
-      console.log(`  - Database token: ${dbToken}`);
-      console.log(`  - Contract token: ${contractToken || 'N/A'}`);
-      console.log(`  - Final token: ${finalToken}`);
-      console.log(`  - Token info: ${JSON.stringify(getTokenInfo(finalToken))}`);
+      logTransactionsDebug(`[transactions] Agreement ${agreement.id} token resolution:`);
+      logTransactionsDebug(`  - Database token: ${dbToken}`);
+      logTransactionsDebug(`  - Contract token: ${contractToken || 'N/A'}`);
+      logTransactionsDebug(`  - Final token: ${finalToken}`);
+      logTransactionsDebug(`  - Token info: ${JSON.stringify(getTokenInfo(finalToken))}`);
       
       // Use contract token if available, otherwise use database token
       tokenMap.set(agreement.id, finalToken);
@@ -636,12 +642,12 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
         const sign = isIncoming ? "+" : "-";
         const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
         
-        console.log(`[transactions] Escrow event ${e.eventType} for agreement ${e.agreementId}:`);
-        console.log(`  - Raw amount from DB: ${e.amount}`);
-        console.log(`  - Token address: ${tokenAddress}`);
-        console.log(`  - Token info: ${JSON.stringify(tokenInfo)}`);
-        console.log(`  - Formatted amount: ${amountStr}`);
-        console.log(`  - Final amount: ${finalAmount}`);
+        logTransactionsDebug(`[transactions] Escrow event ${e.eventType} for agreement ${e.agreementId}:`);
+        logTransactionsDebug(`  - Raw amount from DB: ${e.amount}`);
+        logTransactionsDebug(`  - Token address: ${tokenAddress}`);
+        logTransactionsDebug(`  - Token info: ${JSON.stringify(tokenInfo)}`);
+        logTransactionsDebug(`  - Formatted amount: ${amountStr}`);
+        logTransactionsDebug(`  - Final amount: ${finalAmount}`);
         
         return {
           id: e.transactionHash.slice(0, 10),
@@ -831,7 +837,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
     // Get token addresses for escrow events from agreements
     // First get agreement contract addresses from database
     const escrowAgreementIds = [...new Set(escrowEvents.map(e => e.agreementId))];
-    console.log(`[transactions/filtered] Processing ${escrowEvents.length} escrow events for ${escrowAgreementIds.length} unique agreements`);
+    logTransactionsDebug(`[transactions/filtered] Processing ${escrowEvents.length} escrow events for ${escrowAgreementIds.length} unique agreements`);
     
     const escrowAgreements = escrowAgreementIds.length > 0 ? await db
       .select({ 
@@ -842,9 +848,9 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       .from(schema.agreements)
       .where(inArray(schema.agreements.id, escrowAgreementIds)) : [];
     
-    console.log(`[transactions/filtered] Found ${escrowAgreements.length} agreements in database`);
+    logTransactionsDebug(`[transactions/filtered] Found ${escrowAgreements.length} agreements in database`);
     escrowAgreements.forEach(a => {
-      console.log(`[transactions/filtered] Agreement ${a.id}: contract=${a.contractAddress}, db_token=${a.token}`);
+      logTransactionsDebug(`[transactions/filtered] Agreement ${a.id}: contract=${a.contractAddress}, db_token=${a.token}`);
     });
     
     // Fetch tokens from agreement contracts
@@ -855,7 +861,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
         agreementId: a.id,
       }));
     
-    console.log(`[transactions/filtered] Will fetch tokens from ${agreementsForTokenFetch.length} agreement contracts`);
+    logTransactionsDebug(`[transactions/filtered] Will fetch tokens from ${agreementsForTokenFetch.length} agreement contracts`);
     
     const contractTokenMap = await batchGetTokensFromAgreementContracts(agreementsForTokenFetch);
     
@@ -866,11 +872,11 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       const dbToken = agreement.token;
       const finalToken = contractToken || dbToken;
       
-      console.log(`[transactions/filtered] Agreement ${agreement.id} token resolution:`);
-      console.log(`  - Database token: ${dbToken}`);
-      console.log(`  - Contract token: ${contractToken || 'N/A'}`);
-      console.log(`  - Final token: ${finalToken}`);
-      console.log(`  - Token info: ${JSON.stringify(getTokenInfo(finalToken))}`);
+      logTransactionsDebug(`[transactions/filtered] Agreement ${agreement.id} token resolution:`);
+      logTransactionsDebug(`  - Database token: ${dbToken}`);
+      logTransactionsDebug(`  - Contract token: ${contractToken || 'N/A'}`);
+      logTransactionsDebug(`  - Final token: ${finalToken}`);
+      logTransactionsDebug(`  - Token info: ${JSON.stringify(getTokenInfo(finalToken))}`);
       
       // Use contract token if available, otherwise use database token
       escrowTokenMap.set(agreement.id, finalToken);
@@ -953,12 +959,12 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
         const sign = isIncoming ? "+" : "-";
         const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
         
-        console.log(`[transactions/filtered] Escrow event ${e.eventType} for agreement ${e.agreementId}:`);
-        console.log(`  - Raw amount from DB: ${e.amount}`);
-        console.log(`  - Token address: ${tokenAddress}`);
-        console.log(`  - Token info: ${JSON.stringify(tokenInfo)}`);
-        console.log(`  - Formatted amount: ${amountStr}`);
-        console.log(`  - Final amount: ${finalAmount}`);
+        logTransactionsDebug(`[transactions/filtered] Escrow event ${e.eventType} for agreement ${e.agreementId}:`);
+        logTransactionsDebug(`  - Raw amount from DB: ${e.amount}`);
+        logTransactionsDebug(`  - Token address: ${tokenAddress}`);
+        logTransactionsDebug(`  - Token info: ${JSON.stringify(tokenInfo)}`);
+        logTransactionsDebug(`  - Formatted amount: ${amountStr}`);
+        logTransactionsDebug(`  - Final amount: ${finalAmount}`);
         
         return {
           id: e.transactionHash.slice(0, 10),
@@ -1026,4 +1032,3 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
     next(e);
   }
 });
-
