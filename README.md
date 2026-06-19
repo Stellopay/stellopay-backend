@@ -185,6 +185,10 @@ By default the backend loads ABI from:
 - Users first prove wallet ownership by signing a backend-issued challenge (`/auth/challenge` → sign typed data → `/auth/verify`).
 - For contract mutations, the backend returns a prepared `call` + `nonce`; the frontend wallet/account should sign + execute.
 
+### Sessions
+
+After `/auth/verify` succeeds, the backend issues a session token with a **sliding expiry**. The lifetime is controlled by `SESSION_TTL_MS` (default 24 hours), and `/auth/verify` returns the remaining lifetime as `expires_in_ms`. A token is refreshed for another full TTL each time it is used on a successful `/auth/session/validate`, and expired tokens are rejected and purged (lazily on use, plus a periodic background sweep) so they cannot be replayed or leak memory.
+
 ### Frontend usage (starknet.js wallet)
 
 1. Get challenge and sign it:
