@@ -118,6 +118,7 @@ CORS_ORIGIN=*
 
 - `POST /api/v1/auth/challenge`
 - `POST /api/v1/auth/verify`
+- `POST /api/v1/auth/session/validate`
 
 #### PayrollEscrow (view)
 
@@ -204,9 +205,185 @@ By default the backend loads ABI from:
 - Users first prove wallet ownership by signing a backend-issued challenge (`/auth/challenge` → sign typed data → `/auth/verify`).
 - For contract mutations, the backend returns a prepared `call` + `nonce`; the frontend wallet/account should sign + execute.
 
-### Sessions
+### Wallet-signature auth flow
 
-After `/auth/verify` succeeds, the backend issues a session token with a **sliding expiry**. The lifetime is controlled by `SESSION_TTL_MS` (default 24 hours), and `/auth/verify` returns the remaining lifetime as `expires_in_ms`. A token is refreshed for another full TTL each time it is used on a successful `/auth/session/validate`, and expired tokens are rejected and purged (lazily on use, plus a periodic background sweep) so they cannot be replayed or leak memory.
+Authentication is a wallet-ownership proof. The backend creates a short-lived
+challenge, the frontend asks the wallet to sign the returned SNIP-12 typed data,
+and the backend verifies the signature against the Starknet account contract
+before issuing a session token.
+
+#### 1. Request a challenge
+
+`POST /api/v1/auth/challenge`
+
+Request:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS"
+}
+```
+
+Response:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS",
+  "nonce": "0xRANDOM_16_BYTE_NONCE",
+  "expires_in_ms": 300000,
+  "chain_id": "0xCHAIN_ID_FELT",
+  "typed_data": {
+    "types": {
+      "StarknetDomain": [
+        { "name": "name", "type": "felt" },
+        { "name": "version", "type": "felt" },
+        { "name": "chainId", "type": "felt" },
+        { "name": "revision", "type": "felt" }
+      ],
+      "Challenge": [
+        { "name": "action", "type": "felt" },
+        { "name": "wallet", "type": "felt" },
+        { "name": "nonce", "type": "felt" }
+      ]
+    },
+    "primaryType": "Challenge",
+    "domain": {
+      "name": "StelloPay",
+      "version": "1",
+      "chainId": "SN_SEPOLIA",
+      "revision": "1"
+    },
+    "message": {
+      "action": "LOGIN",
+      "wallet": "0xWALLET_ADDRESS",
+      "nonce": "0xRANDOM_16_BYTE_NONCE"
+    }
+  }
+}
+```
+
+`expires_in_ms` is the remaining challenge lifetime in milliseconds. Challenges
+currently live for five minutes (`300000` ms) and are stored in process memory.
+
+`chain_id` is the raw chain ID returned by the configured Starknet RPC provider.
+`typed_data.domain.chainId` is the decoded short-string label that wallets sign,
+for example `SN_SEPOLIA` on Starknet Sepolia. Sign exactly the returned
+`typed_data`; do not reconstruct it with a different chain ID, nonce, domain, or
+message.
+
+Safe challenge request:
+
+```bash
+curl -sS http://localhost:4000/api/v1/auth/challenge \
+  -H 'content-type: application/json' \
+  --data '{"address":"0xWALLET_ADDRESS"}'
+```
+
+#### 2. Sign typed data and verify
+
+The frontend passes `typed_data` to the connected Starknet wallet. The backend
+does not receive or need a private key.
+
+`POST /api/v1/auth/verify`
+
+Request:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS",
+  "signature": [
+    "0xSIGNATURE_PART_0",
+    "0xSIGNATURE_PART_1",
+    "0xOPTIONAL_SIGNATURE_PART_2"
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "address": "0xWALLET_ADDRESS",
+  "session_token": "SESSION_TOKEN",
+  "expires_in_ms": 86400000
+}
+```
+
+`signature` is an array of felts encoded as strings. It must contain at least two
+items, but it is intentionally variable length because Starknet wallets and
+account contracts do not all emit exactly two signature elements. Send the array
+returned by the wallet without truncating or padding it.
+
+`expires_in_ms` in the verify response is the session lifetime in milliseconds.
+It is controlled by `SESSION_TTL_MS` and defaults to 24 hours (`86400000` ms).
+The used challenge is cleared after successful verification.
+
+Safe verify request shape with placeholder values:
+
+```bash
+curl -sS http://localhost:4000/api/v1/auth/verify \
+  -H 'content-type: application/json' \
+  --data '{
+    "address": "0xWALLET_ADDRESS",
+    "signature": [
+      "0xSIGNATURE_PART_0",
+      "0xSIGNATURE_PART_1"
+    ]
+  }'
+```
+
+#### 3. Validate a session
+
+`POST /api/v1/auth/session/validate`
+
+Request:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS",
+  "session_token": "SESSION_TOKEN"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "address": "0xWALLET_ADDRESS"
+}
+```
+
+Invalid, expired, unknown, or wrong-address tokens return `401`:
+
+```json
+{
+  "ok": false,
+  "error": "Invalid session"
+}
+```
+
+Safe validation request shape with placeholder values:
+
+```bash
+curl -sS http://localhost:4000/api/v1/auth/session/validate \
+  -H 'content-type: application/json' \
+  --data '{
+    "address": "0xWALLET_ADDRESS",
+    "session_token": "SESSION_TOKEN"
+  }'
+```
+
+Sessions have a sliding expiry. A successful `/auth/session/validate` refreshes
+the token for another full `SESSION_TTL_MS`, although the validation response
+does not include the refreshed expiry. Expired tokens are rejected and purged
+lazily on use, with a periodic background sweep for tokens that are never used
+again.
+
+Challenges and sessions are both in-memory only. Restarting the server clears
+all outstanding challenges and session tokens, so clients should handle
+`401 Invalid session` by starting the challenge → verify flow again.
 
 ### Frontend usage (starknet.js wallet)
 
