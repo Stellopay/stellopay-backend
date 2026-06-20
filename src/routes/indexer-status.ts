@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { db, schema } from "../db/index.js";
 import { desc, count, eq, or } from "drizzle-orm";
-import { normalizeStarknetAddress } from "../utils/address.js";
+import { StarknetAddress, parsePagination } from "../utils/validation.js";
 
 export const indexerStatusRouter = Router();
 
@@ -50,7 +50,8 @@ indexerStatusRouter.get("/indexer/status", async (req, res, next) => {
 // Get events for a specific user
 indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, next) => {
   try {
-    const normalizedAddress = normalizeStarknetAddress(req.params.user_address);
+    const normalizedAddress = StarknetAddress.parse(req.params.user_address);
+    const { limit, offset } = parsePagination(req.query);
 
     // Get agreements where user is employer or contributor
     const agreements = await db
@@ -62,7 +63,9 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
           eq(schema.agreements.contributor, normalizedAddress)
         )
       )
-      .orderBy(desc(schema.agreements.createdAt));
+      .orderBy(desc(schema.agreements.createdAt))
+      .limit(limit)
+      .offset(offset);
 
     // Get payments
     const payments = await db
@@ -74,7 +77,9 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
           eq(schema.payments.to, normalizedAddress)
         )
       )
-      .orderBy(desc(schema.payments.blockNumber));
+      .orderBy(desc(schema.payments.blockNumber))
+      .limit(limit)
+      .offset(offset);
 
     // Get escrow events
     const escrowEvents = await db
@@ -86,7 +91,9 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
           eq(schema.escrowEvents.to, normalizedAddress)
         )
       )
-      .orderBy(desc(schema.escrowEvents.blockNumber));
+      .orderBy(desc(schema.escrowEvents.blockNumber))
+      .limit(limit)
+      .offset(offset);
 
     res.json({
       userAddress: normalizedAddress,
@@ -103,4 +110,3 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
     next(e);
   }
 });
-
