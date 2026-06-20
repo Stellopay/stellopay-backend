@@ -360,3 +360,51 @@ Rate-limit responses are JSON, consistent with the error-handler format:
   "error": "Too many requests, please try again later."
 }
 ```
+
+#### Limiter Factory
+
+All limiters are built by a single factory, `makeLimiter`, in
+[`src/middleware/rate-limit.ts`](src/middleware/rate-limit.ts). This removes the
+duplicated `keyGenerator`/`handler`/`message` wiring that previously lived inline
+and gives the app one place to tune limits and swap the backing store:
+
+```ts
+import { makeLimiter } from "./middleware/rate-limit.js";
+
+const adminLimiter = makeLimiter({
+  name: "admin",            // label for docs/debugging and future shared stores
+  windowMs: 60_000,         // sliding window length
+  max: 20,                  // max requests per window, per client IP
+  message: "Too many admin requests, please try again later.", // optional
+  skip: (req) => req.path === "/health", // optional bypass predicate
+});
+
+app.use("/api/v1/admin", adminLimiter);
+```
+
+Every limiter shares the same client-IP key generator and emits the same JSON
+`429` envelope (`{ "error": string }`), so adding a new named limiter for
+write/admin endpoints is a one-liner that cannot drift from the others.
+
+**Security:** the shared key generator keys on `req.ip`, which honours the
+Express `trust proxy` setting (`TRUST_PROXY`). When `trust proxy` is unset, a
+forged `X-Forwarded-For` header is ignored and the direct socket IP is used —
+clients cannot spoof the rate-limit key.
+
+#### Store Limitation and Shared (Redis) Store Seam
+
+The factory uses `express-rate-limit`'s **default in-memory store**. Counters
+live in the process heap, which means:
+
+- **Not shared across instances** — each replica enforces its own counts, so
+  behind a load balancer the effective limit scales with the number of
+  instances.
+- **Resets on restart/redeploy** — counters are lost, briefly relaxing
+  enforcement.
+
+For multi-instance deployments, replace the store with a shared backend (e.g.
+Redis via [`rate-limit-redis`](https://www.npmjs.com/package/rate-limit-redis)).
+`makeLimiter` is the single seam for this: construct a shared `store` and pass it
+to the `rateLimit` call inside the factory (see the marked `store` comment in
+[`src/middleware/rate-limit.ts`](src/middleware/rate-limit.ts)). No call sites
+change.

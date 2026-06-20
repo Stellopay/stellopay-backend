@@ -1,8 +1,8 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 import { env } from "./config.js";
+import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
 import { agreementRouter } from "./routes/agreement.js";
 import { authRouter } from "./routes/auth.js";
@@ -100,41 +100,27 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-// Rate limiting: Global limiter (looser)
-const globalLimiter = rateLimit({
+// Rate limiting: limiters are built via the shared factory so the
+// keyGenerator (IP, honouring trust proxy) and JSON 429 envelope stay
+// consistent. See src/middleware/rate-limit.ts for the in-memory store
+// limitation and the shared-store (Redis) seam.
+
+// Global limiter (looser) — applied to all /api routes; /health is exempt.
+const globalLimiter = makeLimiter({
+  name: "global",
   windowMs: env.RATE_LIMIT_WINDOW_MS,
   max: env.RATE_LIMIT_MAX,
   message: "Too many requests, please try again later.",
-  standardHeaders: false, // Return rate limit info in `RateLimit-*` headers
-  skip: (req) => {
-    // Don't count /health requests against rate limit
-    return req.path === "/health";
-  },
-  keyGenerator: (req) => {
-    // Key by client IP (respects X-Forwarded-For if trust proxy is set)
-    return req.ip || "unknown";
-  },
-  handler: (_req, res) => {
-    res.status(429).json({
-      error: "Too many requests, please try again later.",
-    });
-  },
+  // Don't count /health requests against the rate limit.
+  skip: (req) => req.path === "/health",
 });
 
-// Rate limiting: Strict limiter for auth and contact endpoints
-const strictLimiter = rateLimit({
+// Strict limiter for unauthenticated, side-effecting auth and contact endpoints.
+const strictLimiter = makeLimiter({
+  name: "strict",
   windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
   max: env.RATE_LIMIT_STRICT_MAX,
   message: "Too many requests from this IP, please try again later.",
-  standardHeaders: false,
-  keyGenerator: (req) => {
-    return req.ip || "unknown";
-  },
-  handler: (_req, res) => {
-    res.status(429).json({
-      error: "Too many requests from this IP, please try again later.",
-    });
-  },
 });
 
 // Apply global rate limiter to all API routes
