@@ -2,15 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, inArray } from "drizzle-orm";
-// Helper to normalize addresses
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, "");
-  return `0x${hex.padStart(64, "0")}`;
-}
+import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
 
 const AddressParam = z.string().min(3);
 

@@ -1,9 +1,11 @@
 import { Router } from "express";
+import { requireAuth } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
+import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
 import { shortString, Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
@@ -26,16 +28,6 @@ const TxHashSchema = z
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
 
 export const eventsRouter = Router();
-
-// Helper to normalize addresses
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, "");
-  return `0x${hex.padStart(64, "0")}`;
-}
 
 /**
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.
@@ -506,7 +498,7 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
  * Process a single Starknet transaction: fetch its receipt, decode all events
  * using the on-chain ABIs, and persist them to the database.
  */
-eventsRouter.post("/events/process_tx/:tx_hash", async (req, res, next) => {
+eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
   try {
     const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
 
@@ -550,7 +542,7 @@ eventsRouter.post("/events/process_tx/:tx_hash", async (req, res, next) => {
  * contains `{ txHash, status, eventsProcessed, eventLabels?, error? }`.
  * A per-tx error never aborts the rest of the batch.
  */
-eventsRouter.post("/events/process_batch", async (req, res, next) => {
+eventsRouter.post("/events/process_batch", requireAuth, async (req, res, next) => {
   try {
     const { tx_hashes } = z
       .object({

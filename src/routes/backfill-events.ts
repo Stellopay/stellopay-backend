@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
 import { sql } from "drizzle-orm";
@@ -6,7 +7,7 @@ import { sql } from "drizzle-orm";
 export const backfillEventsRouter = Router();
 
 // Backfill EmployeeAdded events from employees table
-backfillEventsRouter.post("/backfill/employee-events", async (req, res, next) => {
+backfillEventsRouter.post("/backfill/employee-events", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     // Get all employees that don't have corresponding EmployeeAdded events
     const employeesWithoutEvents = await db.execute(sql`
@@ -77,7 +78,7 @@ backfillEventsRouter.post("/backfill/employee-events", async (req, res, next) =>
 });
 
 // Backfill MilestoneAdded events from milestones table
-backfillEventsRouter.post("/backfill/milestone-events", async (req, res, next) => {
+backfillEventsRouter.post("/backfill/milestone-events", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const milestonesWithoutEvents = await db.execute(sql`
       SELECT m.id, m.agreement_id, m.contract_address, m.block_number, 
