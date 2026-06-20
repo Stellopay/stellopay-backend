@@ -54,6 +54,15 @@ All configuration is parsed and validated in `src/config.ts`. `env.example` has 
 | `BILLING_ENABLED` | `false` | Only the literal `true` enables billing routes |
 | `CONTACT_RECIPIENT_EMAIL` | (none) | Must be a valid email; required to deliver contact emails |
 | `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev | Required in production; startup fails if unset |
+| `LOG_LEVEL` | `info` | Specifies the minimum logging level |
+| `LOG_FORMAT` | `json` | Use `json` for structured logging or `text` for readable console output |
+
+### Observability
+
+The application includes structured JSON access logging to monitor traffic, latency, and error rates.
+By default, the logger records `method`, `path`, `status`, `duration_ms`, and `request_id`.
+
+Sensitive fields such as request bodies and authorization tokens are strictly omitted from all access logs. The noisy `/health` endpoint is completely excluded from logging.
 
 ### Deployment & graceful shutdown
 

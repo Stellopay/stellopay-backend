@@ -23,11 +23,15 @@ import { billingRouter } from "./routes/billing.js";
 import { apiV1NotFoundHandler } from "./routes/not-found.js";
 import { closePool } from "./db/index.js";
 import { setupGracefulShutdown } from "./shutdown.js";
+import { accessLogMiddleware } from "./middleware/access-log.js";
 
 const app = express();
 
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
+
+// Apply access log middleware early
+app.use(accessLogMiddleware);
 
 // ---------------------------------------------------------------------------
 // CORS
