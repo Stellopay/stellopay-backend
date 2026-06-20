@@ -5,6 +5,7 @@ import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
+import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
 import { shortString, Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
@@ -27,16 +28,6 @@ const TxHashSchema = z
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
 
 export const eventsRouter = Router();
-
-// Helper to normalize addresses
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, "");
-  return `0x${hex.padStart(64, "0")}`;
-}
 
 /**
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.

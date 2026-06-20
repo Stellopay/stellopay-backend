@@ -4,28 +4,12 @@ import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, gte, lte, inArray, sql, count } from "drizzle-orm";
 import { agreementContract } from "../starknet/client.js";
 import { toHexString } from "../utils/codec.js";
+import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 import { env } from "../config.js";
 
 const AddressParam = z.string().min(3);
 
 export const transactionsRouter = Router();
-
-// Helper to normalize addresses (for comparison)
-// Starknet addresses are 66 chars (0x + 64 hex), we normalize by lowercasing and ensuring proper format
-function normalizeAddr(addr: string): string {
-  if (!addr) return addr;
-  let normalized = addr.toLowerCase().trim();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  // Remove 0x prefix
-  const hex = normalized.replace(/^0x/, "");
-  // Remove leading zeros, but keep at least one zero if the address is all zeros
-  const trimmedHex = hex.replace(/^0+/, "") || "0";
-  // Pad to 64 hex characters (Starknet address format: 0x + 64 hex chars = 66 total)
-  const paddedHex = trimmedHex.padStart(64, "0");
-  return `0x${paddedHex}`;
-}
 
 // Helper to format address for display (truncate like 0x1234...5678)
 function formatAddress(addr: string): string {

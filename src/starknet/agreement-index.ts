@@ -8,6 +8,8 @@
  * 3. Real-time updates when agreements are created
  */
 
+import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
+
 type AgreementIndex = {
   // Map: user address (normalized) -> array of agreement IDs
   byUser: Map<string, Set<string>>;
@@ -28,15 +30,6 @@ type AgreementIndex = {
 };
 
 const indices = new Map<string, AgreementIndex>();
-
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith('0x')) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, '');
-  return `0x${hex.padStart(64, '0')}`;
-}
 
 function getOrCreateIndex(contractAddress: string): AgreementIndex {
   if (!indices.has(contractAddress)) {

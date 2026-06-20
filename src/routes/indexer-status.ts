@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { db, schema } from "../db/index.js";
 import { desc, count, eq, or } from "drizzle-orm";
+import { normalizeStarknetAddress } from "../utils/address.js";
 
 export const indexerStatusRouter = Router();
 
@@ -49,15 +50,7 @@ indexerStatusRouter.get("/indexer/status", async (req, res, next) => {
 // Get events for a specific user
 indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, next) => {
   try {
-    const userAddress = req.params.user_address.toLowerCase();
-    
-    // Normalize address
-    let normalized = userAddress;
-    if (!normalized.startsWith("0x")) {
-      normalized = `0x${normalized}`;
-    }
-    const hex = normalized.replace(/^0x/, "");
-    const normalizedAddress = `0x${hex.padStart(64, "0")}`;
+    const normalizedAddress = normalizeStarknetAddress(req.params.user_address);
 
     // Get agreements where user is employer or contributor
     const agreements = await db
