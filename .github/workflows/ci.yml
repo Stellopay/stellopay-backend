@@ -17,6 +17,22 @@ jobs:
     env:
       CI: true
       STARKNET_RPC_URL: https://starknet-sepolia.public.invalid/rpc
+      POSTGRES_CONNECTION_STRING: postgresql://postgres:postgres@localhost:5432/stellopay_indexer
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: stellopay_indexer
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d stellopay_indexer"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Check out repository
