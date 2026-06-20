@@ -20,6 +20,7 @@ import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { backfillEventsRouter } from "./routes/backfill-events.js";
 import { contactRouter } from "./routes/contact.js";
 import { billingRouter } from "./routes/billing.js";
+import { apiV1NotFoundHandler } from "./routes/not-found.js";
 import { closePool } from "./db/index.js";
 import { setupGracefulShutdown } from "./shutdown.js";
 
@@ -148,6 +149,7 @@ app.use("/api/v1", backfillEventsRouter);
 app.use("/api/v1/contact", strictLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
+app.use("/api/v1", apiV1NotFoundHandler);
 
 // Basic error handler
 app.use(

@@ -181,6 +181,11 @@ Until then every route returns `HTTP 501 Not Implemented` — no mock PII is ser
 { "success": false, "error": "message" }
 ```
 
+Unmatched `/api/v1` routes also return this JSON envelope with HTTP 404. The
+response includes the requested HTTP method and normalized path in `data`, while
+`/health` remains outside the API router and is not intercepted by the not-found
+handler.
+
 **Database tables added** (see `src/db/schema.ts`):
 
 - `billing_profiles` — identity, address, limits
