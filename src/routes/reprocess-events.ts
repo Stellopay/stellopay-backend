@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
@@ -35,7 +36,7 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
 }
 
 // Reprocess events for a specific transaction to update event names
-reprocessEventsRouter.post("/reprocess-events/tx/:tx_hash", async (req, res, next) => {
+reprocessEventsRouter.post("/reprocess-events/tx/:tx_hash", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
     
@@ -74,7 +75,7 @@ reprocessEventsRouter.post("/reprocess-events/tx/:tx_hash", async (req, res, nex
 });
 
 // Reprocess all AgreementStatusChange events to decode their actual names
-reprocessEventsRouter.post("/reprocess-events/status-changes", async (req, res, next) => {
+reprocessEventsRouter.post("/reprocess-events/status-changes", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const limit = z.coerce.number().int().positive().max(1000).optional().parse(req.query.limit) || 100;
     

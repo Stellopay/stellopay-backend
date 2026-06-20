@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { requireAuth } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
@@ -497,7 +498,7 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
  * Process a single Starknet transaction: fetch its receipt, decode all events
  * using the on-chain ABIs, and persist them to the database.
  */
-eventsRouter.post("/events/process_tx/:tx_hash", async (req, res, next) => {
+eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
   try {
     const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
 
@@ -541,7 +542,7 @@ eventsRouter.post("/events/process_tx/:tx_hash", async (req, res, next) => {
  * contains `{ txHash, status, eventsProcessed, eventLabels?, error? }`.
  * A per-tx error never aborts the rest of the batch.
  */
-eventsRouter.post("/events/process_batch", async (req, res, next) => {
+eventsRouter.post("/events/process_batch", requireAuth, async (req, res, next) => {
   try {
     const { tx_hashes } = z
       .object({

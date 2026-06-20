@@ -181,6 +181,11 @@ Until then every route returns `HTTP 501 Not Implemented` — no mock PII is ser
 { "success": false, "error": "message" }
 ```
 
+Unmatched `/api/v1` routes also return this JSON envelope with HTTP 404. The
+response includes the requested HTTP method and normalized path in `data`, while
+`/health` remains outside the API router and is not intercepted by the not-found
+handler.
+
 **Database tables added** (see `src/db/schema.ts`):
 
 - `billing_profiles` — identity, address, limits
@@ -280,6 +285,23 @@ async function deposit({
 
 The backend includes multiple security layers:
 
+#### Protected endpoints
+
+Mutating endpoints and backend administration routes require session authentication. A bearer token (session token) and an `x-user-address` header are required. Some routes are strictly limited to administrators defined in the `ADMIN_ADDRESSES` environment variable.
+
+**Authenticated Endpoints (`requireAuth`)**
+- `POST /api/v1/events/process_tx/:tx_hash`
+- `POST /api/v1/events/process_batch`
+
+**Admin Endpoints (`requireAuth` + `requireAdmin`)**
+- `POST /api/v1/backfill/employee-events`
+- `POST /api/v1/backfill/milestone-events`
+- `POST /api/v1/reprocess-events/tx/:tx_hash`
+- `POST /api/v1/reprocess-events/status-changes`
+- `GET /api/v1/diagnostics/events`
+
+*Note: Indexed reading routes remain public because they only expose aggregated on-chain data and do not trigger remote RPC calls.*
+
 #### Helmet
 [Helmet](https://helmetjs.github.io/) middleware is applied to all responses, setting secure HTTP headers including:
 - `Content-Security-Policy`
@@ -355,3 +377,51 @@ Rate-limit responses are JSON, consistent with the error-handler format:
   "error": "Too many requests, please try again later."
 }
 ```
+
+#### Limiter Factory
+
+All limiters are built by a single factory, `makeLimiter`, in
+[`src/middleware/rate-limit.ts`](src/middleware/rate-limit.ts). This removes the
+duplicated `keyGenerator`/`handler`/`message` wiring that previously lived inline
+and gives the app one place to tune limits and swap the backing store:
+
+```ts
+import { makeLimiter } from "./middleware/rate-limit.js";
+
+const adminLimiter = makeLimiter({
+  name: "admin",            // label for docs/debugging and future shared stores
+  windowMs: 60_000,         // sliding window length
+  max: 20,                  // max requests per window, per client IP
+  message: "Too many admin requests, please try again later.", // optional
+  skip: (req) => req.path === "/health", // optional bypass predicate
+});
+
+app.use("/api/v1/admin", adminLimiter);
+```
+
+Every limiter shares the same client-IP key generator and emits the same JSON
+`429` envelope (`{ "error": string }`), so adding a new named limiter for
+write/admin endpoints is a one-liner that cannot drift from the others.
+
+**Security:** the shared key generator keys on `req.ip`, which honours the
+Express `trust proxy` setting (`TRUST_PROXY`). When `trust proxy` is unset, a
+forged `X-Forwarded-For` header is ignored and the direct socket IP is used —
+clients cannot spoof the rate-limit key.
+
+#### Store Limitation and Shared (Redis) Store Seam
+
+The factory uses `express-rate-limit`'s **default in-memory store**. Counters
+live in the process heap, which means:
+
+- **Not shared across instances** — each replica enforces its own counts, so
+  behind a load balancer the effective limit scales with the number of
+  instances.
+- **Resets on restart/redeploy** — counters are lost, briefly relaxing
+  enforcement.
+
+For multi-instance deployments, replace the store with a shared backend (e.g.
+Redis via [`rate-limit-redis`](https://www.npmjs.com/package/rate-limit-redis)).
+`makeLimiter` is the single seam for this: construct a shared `store` and pass it
+to the `rateLimit` call inside the factory (see the marked `store` comment in
+[`src/middleware/rate-limit.ts`](src/middleware/rate-limit.ts)). No call sites
+change.
