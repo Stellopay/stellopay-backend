@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { provider } from "../starknet/client.js";
+import { provider, getCachedNetworkInfo } from "../starknet/client.js";
 import { buildTypedChallenge } from "../auth/challenge.js";
 import {
   clearChallenge,
@@ -39,16 +39,10 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
   try {
     const { address } = AddressBody.parse(req.body);
     const { nonce, expires_in_ms } = createChallenge(address);
-    const chainId: unknown = await provider.getChainId();
+    const { chainId } = await getCachedNetworkInfo();
 
-    if (!chainId) {
-      throw new Error("Failed to get chain ID from RPC provider");
-    }
-
-    // Ensure chainId is a string (it might be a BigInt or number)
-    const chainIdStr = typeof chainId === 'bigint' ? chainId.toString() : typeof chainId === 'number' ? String(chainId) : String(chainId);
-    const typedData = buildTypedChallenge(address, chainIdStr, nonce);
-    res.json({ address, nonce, expires_in_ms, chain_id: chainIdStr, typed_data: typedData });
+    const typedData = buildTypedChallenge(address, chainId, nonce);
+    res.json({ address, nonce, expires_in_ms, chain_id: chainId, typed_data: typedData });
   } catch (e) {
     // eslint-disable-next-line no-console
     console.error("[auth] /auth/challenge error", e);
@@ -65,16 +59,9 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       res.status(400).json({ error: "No active challenge (or expired). Call /auth/challenge again." });
       return;
     }
-    const chainId: unknown = await provider.getChainId();
+    const { chainId } = await getCachedNetworkInfo();
 
-    if (!chainId) {
-      res.status(500).json({ error: "Failed to get chain ID from RPC provider" });
-      return;
-    }
-
-    // Ensure chainId is a string (it might be a BigInt or number)
-    const chainIdStr = typeof chainId === 'bigint' ? chainId.toString() : typeof chainId === 'number' ? String(chainId) : String(chainId);
-    const typedData = buildTypedChallenge(address, chainIdStr, ch.nonce);
+    const typedData = buildTypedChallenge(address, chainId, ch.nonce);
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
     if (!ok) {
