@@ -45,18 +45,33 @@ const EnvSchema = z.object({
 
   // Rate limiting configuration
   // Global rate limit window (milliseconds) - default 15 minutes
-  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().optional().default(15 * 60 * 1000),
+  RATE_LIMIT_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(15 * 60 * 1000),
   // Global rate limit max requests per window - default 100
   RATE_LIMIT_MAX: z.coerce.number().int().positive().optional().default(100),
   // Strict rate limit for auth/contact endpoints (milliseconds) - default 5 minutes
-  RATE_LIMIT_STRICT_WINDOW_MS: z.coerce.number().int().positive().optional().default(5 * 60 * 1000),
+  RATE_LIMIT_STRICT_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(5 * 60 * 1000),
   // Strict rate limit max requests per window - default 10
   RATE_LIMIT_STRICT_MAX: z.coerce.number().int().positive().optional().default(10),
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
 
   // Session token lifetime in milliseconds (sliding expiry) - default 24 hours
-  SESSION_TTL_MS: z.coerce.number().int().positive().optional().default(24 * 60 * 60 * 1000),
+  SESSION_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(24 * 60 * 60 * 1000),
 
   // Feature flag: set to "true" to enable billing profile endpoints.
   // When false (default) all /billing/* routes return 501 Not Implemented.
@@ -78,7 +93,7 @@ const EnvSchema = z.object({
       s
         .split(",")
         .map((a) => a.trim().toLowerCase())
-        .filter((a) => a.length > 0)
+        .filter((a) => a.length > 0),
     ),
 });
 

@@ -59,8 +59,8 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
       .where(
         or(
           eq(schema.agreements.employer, normalizedAddress),
-          eq(schema.agreements.contributor, normalizedAddress)
-        )
+          eq(schema.agreements.contributor, normalizedAddress),
+        ),
       )
       .orderBy(desc(schema.agreements.createdAt));
 
@@ -69,10 +69,7 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
       .select()
       .from(schema.payments)
       .where(
-        or(
-          eq(schema.payments.from, normalizedAddress),
-          eq(schema.payments.to, normalizedAddress)
-        )
+        or(eq(schema.payments.from, normalizedAddress), eq(schema.payments.to, normalizedAddress)),
       )
       .orderBy(desc(schema.payments.blockNumber));
 
@@ -83,8 +80,8 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
       .where(
         or(
           eq(schema.escrowEvents.employer, normalizedAddress),
-          eq(schema.escrowEvents.to, normalizedAddress)
-        )
+          eq(schema.escrowEvents.to, normalizedAddress),
+        ),
       )
       .orderBy(desc(schema.escrowEvents.blockNumber));
 
@@ -103,4 +100,3 @@ indexerStatusRouter.get("/indexer/user/:user_address/events", async (req, res, n
     next(e);
   }
 });
-

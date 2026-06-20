@@ -6,11 +6,7 @@ import { shortString, type TypedData } from "starknet";
  * Extracted from the auth route so it can be unit-tested in isolation, without
  * pulling in the Express router or the Starknet RPC provider.
  */
-export function buildTypedChallenge(
-  address: string,
-  chainId: string,
-  nonce: string,
-): TypedData {
+export function buildTypedChallenge(address: string, chainId: string, nonce: string): TypedData {
   // Wallets (ArgentX/Braavos) validate typed data using a JSON schema.
   // They expect plain string values like:
   // - domain.chainId: "SN_SEPOLIA" / "SN_MAIN"

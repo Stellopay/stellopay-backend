@@ -156,29 +156,26 @@ app.use("/api/v1", billingRouter);
 app.use("/api/v1", apiV1NotFoundHandler);
 
 // Basic error handler
-app.use(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    // eslint-disable-next-line no-console
-    console.error("[api] error", {
-      message: err?.message,
-      cause: err?.cause,
-      stack: err?.stack,
-      issues: err?.issues,
-    });
-    const status = typeof err?.status === "number" ? err.status : 500;
-    res.status(status).json({
-      error: err?.message ?? "Internal error",
-      details: err?.issues ?? undefined,
-      ...(env.NODE_ENV === "development"
-        ? {
-            cause: err?.cause?.message ?? err?.cause ?? undefined,
-            stack: err?.stack,
-          }
-        : {}),
-    });
-  },
-);
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  // eslint-disable-next-line no-console
+  console.error("[api] error", {
+    message: err?.message,
+    cause: err?.cause,
+    stack: err?.stack,
+    issues: err?.issues,
+  });
+  const status = typeof err?.status === "number" ? err.status : 500;
+  res.status(status).json({
+    error: err?.message ?? "Internal error",
+    details: err?.issues ?? undefined,
+    ...(env.NODE_ENV === "development"
+      ? {
+          cause: err?.cause?.message ?? err?.cause ?? undefined,
+          stack: err?.stack,
+        }
+      : {}),
+  });
+});
 
 const server = app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console

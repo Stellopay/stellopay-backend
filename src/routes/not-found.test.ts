@@ -7,9 +7,7 @@ function makeApp() {
   const app = express();
   app.use(express.json());
   app.get("/health", (_req, res) => res.json({ ok: true }));
-  app.get("/api/v1/known", (_req, res) =>
-    res.json({ success: true, data: { ok: true } }),
-  );
+  app.get("/api/v1/known", (_req, res) => res.json({ success: true, data: { ok: true } }));
   app.use("/api/v1", apiV1NotFoundHandler);
   return app;
 }
@@ -55,9 +53,7 @@ describe("apiV1NotFoundHandler", () => {
   });
 
   it("serializes suspicious paths as JSON instead of HTML", async () => {
-    const res = await request(makeApp()).get(
-      "/api/v1/%3Cscript%3Ealert(1)%3C%2Fscript%3E",
-    );
+    const res = await request(makeApp()).get("/api/v1/%3Cscript%3Ealert(1)%3C%2Fscript%3E");
 
     expect(res.status).toBe(404);
     expect(res.type).toMatch(/json/);

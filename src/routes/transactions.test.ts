@@ -15,8 +15,8 @@ vi.mock("../config.js", () => ({
   env: {
     TOKEN_STRK: "0xSTRK",
     TOKEN_USDC: "0xUSDC",
-    TOKEN_USDT: "0xUSDT"
-  }
+    TOKEN_USDT: "0xUSDT",
+  },
 }));
 
 // Let's create a robust query chain mock
@@ -61,18 +61,49 @@ vi.mock("../db/index.js", () => {
             from: "0xuser",
             to: "0xother",
             amount: "1000000",
-            token: "0xUSDC"
-          }
+            token: "0xUSDC",
+          },
         ]);
       }),
     },
     schema: {
-      payments: { from: 'from', to: 'to', eventType: 'eventType', blockNumber: 'blockNumber', createdAt: 'createdAt', id: 'id' },
-      escrowEvents: { employer: 'employer', to: 'to', eventType: 'eventType', blockNumber: 'blockNumber', createdAt: 'createdAt', id: 'id' },
-      agreements: { employer: 'employer', contributor: 'contributor', token: 'token', id: 'id' },
-      agreementEvents: { eventType: 'eventType', blockNumber: 'blockNumber', createdAt: 'createdAt', agreementId: 'agreementId', id: 'id' },
-      employees: { employeeAddress: 'employeeAddress', blockNumber: 'blockNumber', createdAt: 'createdAt', agreementId: 'agreementId', id: 'id' },
-      milestones: { blockNumber: 'blockNumber', createdAt: 'createdAt', agreementId: 'agreementId', id: 'id' },
+      payments: {
+        from: "from",
+        to: "to",
+        eventType: "eventType",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        id: "id",
+      },
+      escrowEvents: {
+        employer: "employer",
+        to: "to",
+        eventType: "eventType",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        id: "id",
+      },
+      agreements: { employer: "employer", contributor: "contributor", token: "token", id: "id" },
+      agreementEvents: {
+        eventType: "eventType",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        agreementId: "agreementId",
+        id: "id",
+      },
+      employees: {
+        employeeAddress: "employeeAddress",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        agreementId: "agreementId",
+        id: "id",
+      },
+      milestones: {
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        agreementId: "agreementId",
+        id: "id",
+      },
     },
   };
 });
@@ -93,32 +124,35 @@ describe("Transactions Router Pagination", () => {
   it("should return correct total and clamp limit", async () => {
     // 5 tables * 2 count each = 10 total items expected based on our mock
     const res = await request(app).get("/transactions/0xuser?limit=200"); // Request limit > 100
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     // Limit should be clamped to 100
     expect(res.body.limit).toBe(100);
     expect(res.body.total).toBe(10); // 5 count queries * 2 = 10
-    
+
     // We mocked 1 item per table, so 5 items total
     expect(res.body.transactions.length).toBe(5);
-    
+
     // total (10) > offset (0) + limit (100) -> false
     expect(res.body.hasMore).toBe(false);
   });
 
   it("should calculate hasMore correctly when paginating", async () => {
     const res = await request(app).get("/transactions/0xuser?limit=5");
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     expect(res.body.limit).toBe(5);
     // offset 0 + limit 5 < total 10 -> true
     expect(res.body.hasMore).toBe(true);
   });
-  
+
   it("should work for filtered endpoint with similar logic", async () => {
     const res = await request(app).get("/transactions/0xuser/filtered?limit=5");
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     expect(res.body.total).toBe(10);
     expect(res.body.hasMore).toBe(true);
   });
@@ -132,8 +166,9 @@ describe("Transactions Router Pagination", () => {
     });
 
     const res = await request(app).get("/transactions/0xuser");
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     expect(res.body.total).toBe(0);
     expect(res.body.transactions.length).toBe(0);
     expect(res.body.hasMore).toBe(false);

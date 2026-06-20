@@ -257,9 +257,7 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
               toHexString(BigInt(decodedEvent.data.employer || eventData[1])),
             );
             const contributor = decodedEvent.data.contributor
-              ? normalizeAddress(
-                  toHexString(BigInt(decodedEvent.data.contributor || eventData[2])),
-                )
+              ? normalizeAddress(toHexString(BigInt(decodedEvent.data.contributor || eventData[2])))
               : null;
             const tokenFromEvent = normalizeAddress(
               toHexString(BigInt(decodedEvent.data.token || eventData[3])),
@@ -328,17 +326,12 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
       }
 
       // Payment events
-      else if (
-        ["PaymentSent", "PaymentReceived"].includes(eventType) &&
-        decodedEvent.data
-      ) {
+      else if (["PaymentSent", "PaymentReceived"].includes(eventType) && decodedEvent.data) {
         try {
           const from = normalizeAddress(
             toHexString(BigInt(decodedEvent.data.from || eventData[1])),
           );
-          const to = normalizeAddress(
-            toHexString(BigInt(decodedEvent.data.to || eventData[2])),
-          );
+          const to = normalizeAddress(toHexString(BigInt(decodedEvent.data.to || eventData[2])));
           const amount = decodedEvent.data.amount
             ? typeof decodedEvent.data.amount === "object" &&
               decodedEvent.data.amount.low &&
@@ -378,10 +371,7 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
       }
 
       // Escrow events
-      else if (
-        ["Funded", "Released", "Refunded"].includes(eventType) &&
-        decodedEvent.data
-      ) {
+      else if (["Funded", "Released", "Refunded"].includes(eventType) && decodedEvent.data) {
         try {
           const employer = decodedEvent.data.employer
             ? normalizeAddress(toHexString(BigInt(decodedEvent.data.employer)))

@@ -29,5 +29,3 @@ export function toHexString(value: bigint | string | number): string {
   }
   return `0x${BigInt(value).toString(16)}`;
 }
-
-

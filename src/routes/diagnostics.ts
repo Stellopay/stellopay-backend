@@ -71,10 +71,3 @@ diagnosticsRouter.get("/diagnostics/events", requireAuth, requireAdmin, async (r
     next(e);
   }
 });
-
-
-
-
-
-
-

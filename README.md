@@ -40,22 +40,22 @@ pnpm start
 
 All configuration is parsed and validated in `src/config.ts`. `env.example` has the full annotated list; the main settings and their defaults are:
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `STARKNET_RPC_URL` | (required) | Startup fails if unset |
-| `NODE_ENV` | `development` | `production` enforces the ABI path guard below |
-| `PORT` | `4000` | |
-| `CORS_ORIGIN` | `*` | See the CORS Configuration section |
-| `POSTGRES_CONNECTION_STRING` | `postgresql://localhost:5432/stellopay_indexer` | |
-| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | `900000` / `100` | Global rate limiter |
-| `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX` | `300000` / `10` | Auth and contact limiter |
-| `TRUST_PROXY` | `1` | Number of proxies, or `true` |
-| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `10000` | Graceful shutdown drain timeout |
-| `BILLING_ENABLED` | `false` | Only the literal `true` enables billing routes |
-| `CONTACT_RECIPIENT_EMAIL` | (none) | Must be a valid email; required to deliver contact emails |
-| `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev | Required in production; startup fails if unset |
-| `LOG_LEVEL` | `info` | Specifies the minimum logging level |
-| `LOG_FORMAT` | `json` | Use `json` for structured logging or `text` for readable console output |
+| Variable                                                       | Default                                         | Notes                                                                   |
+| -------------------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------- |
+| `STARKNET_RPC_URL`                                             | (required)                                      | Startup fails if unset                                                  |
+| `NODE_ENV`                                                     | `development`                                   | `production` enforces the ABI path guard below                          |
+| `PORT`                                                         | `4000`                                          |                                                                         |
+| `CORS_ORIGIN`                                                  | `*`                                             | See the CORS Configuration section                                      |
+| `POSTGRES_CONNECTION_STRING`                                   | `postgresql://localhost:5432/stellopay_indexer` |                                                                         |
+| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX`                      | `900000` / `100`                                | Global rate limiter                                                     |
+| `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX`        | `300000` / `10`                                 | Auth and contact limiter                                                |
+| `TRUST_PROXY`                                                  | `1`                                             | Number of proxies, or `true`                                            |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS`                                    | `10000`                                         | Graceful shutdown drain timeout                                         |
+| `BILLING_ENABLED`                                              | `false`                                         | Only the literal `true` enables billing routes                          |
+| `CONTACT_RECIPIENT_EMAIL`                                      | (none)                                          | Must be a valid email; required to deliver contact emails               |
+| `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev                 | Required in production; startup fails if unset                          |
+| `LOG_LEVEL`                                                    | `info`                                          | Specifies the minimum logging level                                     |
+| `LOG_FORMAT`                                                   | `json`                                          | Use `json` for structured logging or `text` for readable console output |
 
 ### Observability
 
@@ -67,6 +67,7 @@ Sensitive fields such as request bodies and authorization tokens are strictly om
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
+
 1. Stops accepting new connections (drains HTTP server).
 2. Waits for existing in-flight requests to finish, bounded by a timeout (`SHUTDOWN_DRAIN_TIMEOUT_MS`, default 10 seconds).
 3. Closes the Postgres connection pool gracefully.
@@ -90,31 +91,50 @@ Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced 
 the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
 on every push and pull request.
 
+### Linting and formatting
+
+The repository uses ESLint flat config and Prettier for local quality checks.
+
+```bash
+pnpm lint          # run the blocking ESLint gate
+pnpm lint:all      # run ESLint and show non-blocking warnings
+pnpm lint:fix      # run ESLint with safe fixes
+pnpm format        # format files with Prettier
+pnpm format:check  # check formatting without writing changes
+```
+
+The lint config enables `@typescript-eslint/no-unused-vars` and keeps the existing
+`no-console` disable comments meaningful in the entrypoint and middleware files that
+already annotate intentional startup, warning, and error logs.
+
 ### CORS Configuration
 
 The server enforces strict CORS rules to prevent credential leakage:
 
-| `CORS_ORIGIN` value | `credentials` | Behaviour |
-|---|---|---|
-| `http://localhost:3000` | ✅ `true` | Only that origin is allowed; unlisted origins are **rejected** |
-| `http://a.com,https://b.com` | ✅ `true` | Both origins allowed; all others **rejected** |
-| `*` | ❌ `false` | All origins allowed, but cookies/auth headers are **not forwarded** |
+| `CORS_ORIGIN` value          | `credentials` | Behaviour                                                           |
+| ---------------------------- | ------------- | ------------------------------------------------------------------- |
+| `http://localhost:3000`      | ✅ `true`     | Only that origin is allowed; unlisted origins are **rejected**      |
+| `http://a.com,https://b.com` | ✅ `true`     | Both origins allowed; all others **rejected**                       |
+| `*`                          | ❌ `false`    | All origins allowed, but cookies/auth headers are **not forwarded** |
 
 > **Security rule** (enforced by the CORS spec): you **cannot** combine `credentials: true`
 > with a wildcard `*` origin. The server will never silently reflect an unknown origin —
 > any origin not on the allowlist receives an explicit rejection error.
 
 **Development** (default — single origin):
+
 ```env
 CORS_ORIGIN=http://localhost:3000
 ```
 
 **Production** (explicit allowlist — recommended):
+
 ```env
 CORS_ORIGIN=https://app.stellopay.com,https://staging.stellopay.com
 ```
 
 **Public / unauthenticated API** (no cookies/auth forwarded):
+
 ```env
 CORS_ORIGIN=*
 ```
@@ -268,18 +288,15 @@ async function deposit({
   escrowAddress: string;
   amount: string; // decimal string
 }) {
-  const prepRes = await fetch(
-    `${BACKEND}/prepare/escrow/${escrowAddress}/deposit`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        wallet_address: walletAddress,
-        session_token: sessionToken,
-        amount,
-      }),
-    },
-  );
+  const prepRes = await fetch(`${BACKEND}/prepare/escrow/${escrowAddress}/deposit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      wallet_address: walletAddress,
+      session_token: sessionToken,
+      amount,
+    }),
+  });
   const prep = await prepRes.json(); // { call, nonce, chain_id, wallet_address }
 
   const conn = await connect();
@@ -299,20 +316,24 @@ The backend includes multiple security layers:
 Mutating endpoints and backend administration routes require session authentication. A bearer token (session token) and an `x-user-address` header are required. Some routes are strictly limited to administrators defined in the `ADMIN_ADDRESSES` environment variable.
 
 **Authenticated Endpoints (`requireAuth`)**
+
 - `POST /api/v1/events/process_tx/:tx_hash`
 - `POST /api/v1/events/process_batch`
 
 **Admin Endpoints (`requireAuth` + `requireAdmin`)**
+
 - `POST /api/v1/backfill/employee-events`
 - `POST /api/v1/backfill/milestone-events`
 - `POST /api/v1/reprocess-events/tx/:tx_hash`
 - `POST /api/v1/reprocess-events/status-changes`
 - `GET /api/v1/diagnostics/events`
 
-*Note: Indexed reading routes remain public because they only expose aggregated on-chain data and do not trigger remote RPC calls.*
+_Note: Indexed reading routes remain public because they only expose aggregated on-chain data and do not trigger remote RPC calls._
 
 #### Helmet
+
 [Helmet](https://helmetjs.github.io/) middleware is applied to all responses, setting secure HTTP headers including:
+
 - `Content-Security-Policy`
 - `Strict-Transport-Security` (HSTS)
 - `X-Frame-Options`
@@ -323,14 +344,17 @@ Mutating endpoints and backend administration routes require session authenticat
 This provides baseline protection against common web vulnerabilities.
 
 #### Rate Limiting
+
 [express-rate-limit](https://github.com/nfriedly/express-rate-limit) is configured with a tiered approach:
 
 **Global Rate Limit** (applies to all `/api/v1` endpoints):
+
 - Window: 15 minutes (configurable via `RATE_LIMIT_WINDOW_MS`)
 - Max requests: 100 per window (configurable via `RATE_LIMIT_MAX`)
 - Returns HTTP 429 with JSON error response
 
 **Strict Rate Limit** (applies to sensitive endpoints):
+
 - Endpoints: `/api/v1/auth/*` and `/api/v1/contact/*`
 - Window: 5 minutes (configurable via `RATE_LIMIT_STRICT_WINDOW_MS`)
 - Max requests: 10 per window (configurable via `RATE_LIMIT_STRICT_MAX`)
@@ -340,12 +364,15 @@ This provides baseline protection against common web vulnerabilities.
   - `/contact/send-message` sends emails via nodemailer
 
 This prevents:
+
 - Denial-of-service (DoS) attacks via resource exhaustion
 - Spam campaigns targeting the contact form
 - Brute force attacks on authentication endpoints
 
 #### Proxy Configuration
+
 For deployments behind a reverse proxy or CDN (nginx, Cloudflare, AWS ALB, etc.):
+
 - Set `TRUST_PROXY` to the number of trusted proxies (default: `1`)
 - This ensures rate limits key on the real client IP via `X-Forwarded-For` header
 - In containerized deployments, typical value is `1` (requests come through one proxy layer)
@@ -354,6 +381,7 @@ For deployments behind a reverse proxy or CDN (nginx, Cloudflare, AWS ALB, etc.)
 #### Configuration Examples
 
 **Development** (relaxed limits):
+
 ```bash
 RATE_LIMIT_WINDOW_MS=900000        # 15 minutes
 RATE_LIMIT_MAX=100                 # 100 requests
@@ -363,6 +391,7 @@ TRUST_PROXY=1
 ```
 
 **Production with high traffic** (stricter limits):
+
 ```bash
 RATE_LIMIT_WINDOW_MS=600000        # 10 minutes
 RATE_LIMIT_MAX=50                  # 50 requests
@@ -372,6 +401,7 @@ TRUST_PROXY=1  # or higher if behind multiple proxies
 ```
 
 **Production with CDN** (e.g., Cloudflare):
+
 ```bash
 RATE_LIMIT_WINDOW_MS=900000
 RATE_LIMIT_MAX=100
@@ -381,6 +411,7 @@ TRUST_PROXY=1  # Cloudflare is the only proxy
 ```
 
 Rate-limit responses are JSON, consistent with the error-handler format:
+
 ```json
 {
   "error": "Too many requests, please try again later."
@@ -398,9 +429,9 @@ and gives the app one place to tune limits and swap the backing store:
 import { makeLimiter } from "./middleware/rate-limit.js";
 
 const adminLimiter = makeLimiter({
-  name: "admin",            // label for docs/debugging and future shared stores
-  windowMs: 60_000,         // sliding window length
-  max: 20,                  // max requests per window, per client IP
+  name: "admin", // label for docs/debugging and future shared stores
+  windowMs: 60_000, // sliding window length
+  max: 20, // max requests per window, per client IP
   message: "Too many admin requests, please try again later.", // optional
   skip: (req) => req.path === "/health", // optional bypass predicate
 });
