@@ -8,6 +8,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  */
 const BASE_ENV: Record<string, string> = {
   STARKNET_RPC_URL: "https://rpc.test.invalid",
+  POSTGRES_CONNECTION_STRING:
+    "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
 };
 
 const ORIGINAL_ENV = process.env;

@@ -10,13 +10,16 @@ vi.mock("../starknet/client.js", () => ({
   })),
 }));
 
-// Mock config
+// Mock config with valid hex token addresses so the router can normalize them.
 vi.mock("../config.js", () => ({
   env: {
-    TOKEN_STRK: "0xSTRK",
-    TOKEN_USDC: "0xUSDC",
-    TOKEN_USDT: "0xUSDT"
-  }
+    TOKEN_STRK:
+      "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+    TOKEN_USDC:
+      "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
+    TOKEN_USDT:
+      "0x02ab8758891e84b968ff11361789070c6b1af2df618d6d2f4a78b0757573c6eb",
+  },
 }));
 
 // Let's create a robust query chain mock
@@ -53,15 +56,17 @@ vi.mock("../db/index.js", () => {
           {
             id: "1",
             agreementId: "1",
-            contractAddress: "0x123",
+            contractAddress:
+              "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
             eventType: "PaymentSent",
             blockNumber: 100,
-            transactionHash: "0xabc123" + Math.random(),
+            transactionHash:
+              "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             createdAt: new Date(),
-            from: "0xuser",
-            to: "0xother",
+            from: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            to: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
             amount: "1000000",
-            token: "0xUSDC"
+            token: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
           }
         ]);
       }),
@@ -92,7 +97,9 @@ describe("Transactions Router Pagination", () => {
 
   it("should return correct total and clamp limit", async () => {
     // 5 tables * 2 count each = 10 total items expected based on our mock
-    const res = await request(app).get("/transactions/0xuser?limit=200"); // Request limit > 100
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=200",
+    ); // Request limit > 100
     
     if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
     // Limit should be clamped to 100
@@ -107,7 +114,9 @@ describe("Transactions Router Pagination", () => {
   });
 
   it("should calculate hasMore correctly when paginating", async () => {
-    const res = await request(app).get("/transactions/0xuser?limit=5");
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=5",
+    );
     
     if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
     expect(res.body.limit).toBe(5);
@@ -116,7 +125,9 @@ describe("Transactions Router Pagination", () => {
   });
   
   it("should work for filtered endpoint with similar logic", async () => {
-    const res = await request(app).get("/transactions/0xuser/filtered?limit=5");
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4/filtered?limit=5",
+    );
     
     if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
     expect(res.body.total).toBe(10);
@@ -131,7 +142,9 @@ describe("Transactions Router Pagination", () => {
       return createQueryChain([]);
     });
 
-    const res = await request(app).get("/transactions/0xuser");
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
+    );
     
     if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
     expect(res.body.total).toBe(0);
