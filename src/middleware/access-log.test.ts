@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
 import { accessLogMiddleware } from "./access-log.js";
+import { requestIdMiddleware } from "./request-id.js";
 
 describe("accessLogMiddleware", () => {
   let app: express.Express;
@@ -10,6 +11,8 @@ describe("accessLogMiddleware", () => {
   beforeEach(() => {
     app = express();
     app.use(express.json());
+    // Mount requestIdMiddleware before accessLogMiddleware so request_id is set
+    app.use(requestIdMiddleware);
     app.use(accessLogMiddleware);
 
     app.get("/test", (req, res) => {
