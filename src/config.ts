@@ -9,6 +9,10 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().positive().optional().default(4000),
   CORS_ORIGIN: z.string().optional().default("*"),
 
+  // Observability configuration
+  LOG_LEVEL: z.string().optional().default("info"),
+  LOG_FORMAT: z.string().optional().default("json"),
+
   // Required: Starknet RPC URL (v0_8)
   // Provide via environment variable (e.g. in `.env` or inline `STARKNET_RPC_URL=... pnpm dev`)
   STARKNET_RPC_URL: z.string().min(1),
