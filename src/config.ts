@@ -64,6 +64,18 @@ const EnvSchema = z.object({
 
   // Drain timeout for graceful shutdown (milliseconds) - default 10000 (10 seconds)
   SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(10000),
+
+  // Comma-separated list of admin addresses
+  ADMIN_ADDRESSES: z
+    .string()
+    .optional()
+    .default("")
+    .transform((s) =>
+      s
+        .split(",")
+        .map((a) => a.trim().toLowerCase())
+        .filter((a) => a.length > 0)
+    ),
 });
 
 export const env = EnvSchema.parse(process.env);

@@ -81,6 +81,11 @@ vi.mock("starknet", async (importOriginal) => {
   };
 });
 
+
+vi.mock("../auth/middleware.js", () => ({
+  requireAuth: vi.fn((req, res, next) => next()),
+  requireAdmin: vi.fn((req, res, next) => next()),
+}));
 describe("Reprocess Events Routes", () => {
   let app: express.Express;
 

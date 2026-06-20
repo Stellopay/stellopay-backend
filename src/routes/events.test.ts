@@ -193,6 +193,11 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
+
+vi.mock("../auth/middleware.js", () => ({
+  requireAuth: vi.fn((req, res, next) => next()),
+  requireAdmin: vi.fn((req, res, next) => next()),
+}));
 describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
