@@ -1,13 +1,13 @@
 import { Router } from "express";
 import { z } from "zod";
-import { provider } from "../starknet/client.js";
+import { provider, getCachedNetworkInfo } from "../starknet/client.js";
 
 export const systemRouter = Router();
 
 systemRouter.get("/network/chain_id", async (_req, res, next) => {
   try {
-    const chainId = await provider.getChainId();
-    const specVersion = await provider.getSpecVersion();
+    const { chainId, specVersion } = await getCachedNetworkInfo();
+    res.setHeader("Cache-Control", "public, max-age=300");
     res.json({ chain_id: chainId, spec_version: specVersion });
   } catch (e) {
     next(e);
