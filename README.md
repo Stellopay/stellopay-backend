@@ -226,6 +226,17 @@ pnpm db:generate
 > [!IMPORTANT]
 > The database schema is shared with the external Apibara indexer (see [INDEXER_INTEGRATION.md](INDEXER_INTEGRATION.md)). Ensure any schema modifications remain compatible with the indexer's write paths.
 
+### Database & health checks
+
+The service uses a configured Postgres pool with explicit limits and timeouts. The connection string is validated at startup, and the pool listens for runtime errors without crashing the process.
+
+- `GET /health` returns `{ "ok": true }` for process liveness.
+- `GET /ready` runs `SELECT 1` against the database and returns:
+  - `200` when the database responds successfully.
+  - `503` when the database is unreachable or returns an error.
+
+The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
+
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
