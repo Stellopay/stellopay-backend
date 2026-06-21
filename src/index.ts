@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import { ZodError } from "zod";
 import { env } from "./config.js";
 import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
@@ -166,9 +167,16 @@ app.use(
       stack: err?.stack,
       issues: err?.issues,
     });
-    const status = typeof err?.status === "number" ? err.status : 500;
+    // Zod validation errors are client errors: surface them as 400 with the
+    // structured issue list rather than the default 500.
+    const isZodError = err instanceof ZodError;
+    const status = isZodError
+      ? 400
+      : typeof err?.status === "number"
+        ? err.status
+        : 500;
     res.status(status).json({
-      error: err?.message ?? "Internal error",
+      error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
       details: err?.issues ?? undefined,
       ...(env.NODE_ENV === "development"
         ? {

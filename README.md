@@ -205,6 +205,18 @@ handler.
 
 ---
 
+### Indexed query parameters
+
+Path and query parameters on the indexed and indexer-status routes are validated with Zod before any database call:
+
+- Address parameters (`contract_address`, `user_address`) must be hex with an optional `0x` prefix, up to 64 hex characters; malformed values are rejected with `400`.
+- `agreement_id` must be a numeric string.
+- List endpoints (`/indexed/agreements/...`, `/indexed/payments/user/...`, and `/indexer/user/:user_address/events`) accept `limit` and `offset` query parameters. `limit` is clamped server-side to the range 1 to 100 (default 50) and `offset` to 0 or more, so a client cannot request an unbounded result set.
+
+Validation failures return `400` with a structured `details` array of the Zod issues.
+
+---
+
 ### ABI source
 
 By default the backend loads ABI from:
