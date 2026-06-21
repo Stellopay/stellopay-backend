@@ -201,9 +201,22 @@ To integrate with external monitoring systems (Datadog, New Relic, Grafana Loki,
 The service uses a configured Postgres pool with explicit limits and timeouts. The connection string is validated at startup, and the pool listens for runtime errors without crashing the process.
 
 - `GET /health` returns `{ "ok": true }` for process liveness.
-- `GET /ready` runs `SELECT 1` against the database and returns:
-  - `200` when the database responds successfully.
-  - `503` when the database is unreachable or returns an error.
+- `GET /ready` runs `SELECT 1` against the database and checks the Starknet RPC
+  with `getChainId()` under a short timeout. It returns:
+  - `200` when both dependencies respond successfully.
+  - `503` when either dependency is unreachable, slow, or returns an error.
+
+Readiness responses include only coarse dependency status, for example:
+
+```json
+{
+  "ok": false,
+  "dependencies": {
+    "database": "up",
+    "starknetRpc": "down"
+  }
+}
+```
 
 The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
 

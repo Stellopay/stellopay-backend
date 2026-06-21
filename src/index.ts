@@ -26,6 +26,7 @@ import { checkDbHealth, closePool } from "./db/index.js";
 import { setupGracefulShutdown } from "./shutdown.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
+import { provider } from "./starknet/client.js";
 
 export const app = express();
 
@@ -115,14 +116,15 @@ app.use(express.json({ limit: "1mb" }));
 // consistent. See src/middleware/rate-limit.ts for the in-memory store
 // limitation and the shared-store (Redis) seam.
 
-// Global limiter (looser) — applied to all /api routes; /health is exempt.
+// Global limiter (looser) — applied to all /api routes; health probes are
+// mounted outside /api and do not pass through this limiter.
 const globalLimiter = makeLimiter({
   name: "global",
   windowMs: env.RATE_LIMIT_WINDOW_MS,
   max: env.RATE_LIMIT_MAX,
   message: "Too many requests, please try again later.",
-  // Don't count /health requests against the rate limit.
-  skip: (req) => req.path === "/health",
+  // Keep this predicate for future global mounts that include probe routes.
+  skip: (req) => req.path === "/health" || req.path === "/ready",
 });
 
 // Strict limiter for unauthenticated, side-effecting auth and contact endpoints.
@@ -137,9 +139,36 @@ const strictLimiter = makeLimiter({
 app.use("/api/", globalLimiter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("readiness check timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 app.get("/ready", async (_req, res) => {
-  const isReady = await checkDbHealth();
-  res.status(isReady ? 200 : 503).json(isReady ? { ok: true } : { ok: false });
+  const [database, starknetRpc] = await Promise.allSettled([
+    checkDbHealth(),
+    withTimeout(provider.getChainId(), 1_500),
+  ]);
+
+  const dependencies = {
+    database: database.status === "fulfilled" && database.value ? "up" : "down",
+    starknetRpc: starknetRpc.status === "fulfilled" ? "up" : "down",
+  };
+  const ok = dependencies.database === "up" && dependencies.starknetRpc === "up";
+
+  res.status(ok ? 200 : 503).json({ ok, dependencies });
 });
 
 app.use("/api/v1", escrowRouter);
@@ -181,11 +210,7 @@ app.use(
     // Zod validation errors are client errors: surface them as 400 with the
     // structured issue list rather than the default 500.
     const isZodError = err instanceof ZodError;
-    const status = isZodError
-      ? 400
-      : typeof err?.status === "number"
-        ? err.status
-        : 500;
+    const status = isZodError ? 400 : typeof err?.status === "number" ? err.status : 500;
     res.status(status).json({
       error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
       request_id: requestId,
