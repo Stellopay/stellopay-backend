@@ -506,11 +506,7 @@ Request:
 ```json
 {
   "address": "0xWALLET_ADDRESS",
-  "signature": [
-    "0xSIGNATURE_PART_0",
-    "0xSIGNATURE_PART_1",
-    "0xOPTIONAL_SIGNATURE_PART_2"
-  ]
+  "signature": ["0xSIGNATURE_PART_0", "0xSIGNATURE_PART_1", "0xOPTIONAL_SIGNATURE_PART_2"]
 }
 ```
 
