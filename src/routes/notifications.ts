@@ -3,6 +3,8 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, inArray } from "drizzle-orm";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
+import { formatTokenAmount } from "../utils/codec.js";
+import { tokenDecimals } from "../utils/token.js";
 
 const AddressParam = z.string().min(3);
 
@@ -78,7 +80,7 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       ...payments.map((p) => ({
         id: p.id,
         title: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
-        message: `#${p.transactionHash.slice(0, 10)} · ${p.eventType === "PaymentSent" ? "You sent" : "You received"} ${Number(BigInt(p.amount)) / 1_000_000} tokens`,
+        message: `#${p.transactionHash.slice(0, 10)} · ${p.eventType === "PaymentSent" ? "You sent" : "You received"} ${formatTokenAmount(p.amount, tokenDecimals(p.token))} tokens`,
         read: false,
         date: p.createdAt.toISOString(),
         type: p.eventType,
@@ -104,7 +106,7 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
         title: e.eventType === "Funded" ? "Agreement Funded"
           : e.eventType === "Released" ? "Funds Released"
           : "Funds Refunded",
-        message: `Agreement ${e.agreementId}: ${e.eventType} of ${Number(BigInt(e.amount)) / 1_000_000} tokens`,
+        message: `Agreement ${e.agreementId}: ${e.eventType} of ${formatTokenAmount(e.amount)} tokens`,
         read: false,
         date: e.createdAt.toISOString(),
         type: e.eventType,
