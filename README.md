@@ -479,7 +479,9 @@ The server enforces this expiry; clients should treat the value as display or
 retry guidance, not as an authority to extend the challenge lifetime.
 
 `chain_id` is the raw chain ID returned by the configured Starknet RPC provider.
-`typed_data.domain.chainId` is the decoded short-string label that wallets sign,
+The `typed_data` object is Starknet SNIP-12 typed data, similar in shape to
+EIP-712: it declares domain fields, a primary type, and the message fields that
+the wallet signs. `typed_data.domain.chainId` is the decoded short-string label,
 for example `SN_SEPOLIA` on Starknet Sepolia. Sign exactly the returned
 `typed_data`; do not reconstruct it with a different chain ID, nonce, domain, or
 message.
