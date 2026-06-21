@@ -485,6 +485,14 @@ Mutating endpoints and backend administration routes require session authenticat
 
 _Note: Indexed reading routes remain public because they only expose aggregated on-chain data and do not trigger remote RPC calls._
 
+#### Operator diagnostics
+
+`GET /api/v1/diagnostics/events` is operator-only. The whole diagnostics router is gated by `requireAuth` + `requireAdmin`, so only an authenticated address listed in `ADMIN_ADDRESSES` can reach it.
+
+- It returns **aggregate counts** (event-type counts and per-table totals) for operators.
+- The recent-activity list is **redacted** to `event_type` and `created_at` only. Transaction hashes and agreement IDs are never returned, since the aggregate counts already convey volume and the raw identifiers aid reconnaissance.
+- Every query is static SQL with no request input, so there is no injection surface.
+
 #### Helmet
 
 [Helmet](https://helmetjs.github.io/) middleware is applied to all responses, setting secure HTTP headers including:
