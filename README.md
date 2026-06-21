@@ -421,7 +421,7 @@ By default the backend loads ABI from:
 Authentication is a wallet-ownership proof. The backend creates a short-lived
 challenge, the frontend asks the wallet to sign the returned SNIP-12 typed data,
 and the backend verifies the signature against the Starknet account contract
-before issuing a session token.
+through the configured RPC provider before issuing a session token.
 
 #### 1. Request a challenge
 
@@ -475,6 +475,8 @@ Response:
 
 `expires_in_ms` is the remaining challenge lifetime in milliseconds. Challenges
 currently live for five minutes (`300000` ms) and are stored in process memory.
+The server enforces this expiry; clients should treat the value as display or
+retry guidance, not as an authority to extend the challenge lifetime.
 
 `chain_id` is the raw chain ID returned by the configured Starknet RPC provider.
 `typed_data.domain.chainId` is the decoded short-string label that wallets sign,
@@ -528,7 +530,27 @@ returned by the wallet without truncating or padding it.
 
 `expires_in_ms` in the verify response is the session lifetime in milliseconds.
 It is controlled by `SESSION_TTL_MS` and defaults to 24 hours (`86400000` ms).
-The used challenge is cleared after successful verification.
+Session TTL enforcement is server-side, following the fix tracked in
+[#41](https://github.com/Stellopay/stellopay-backend/issues/41); do not trust a
+client-reported timestamp or cached expiry as proof that a session is still
+valid. The used challenge is cleared after successful verification.
+
+If the challenge is missing or expired, `/auth/verify` returns `400`:
+
+```json
+{
+  "error": "No active challenge (or expired). Call /auth/challenge again."
+}
+```
+
+If the wallet signature does not validate through the Starknet account contract,
+`/auth/verify` returns `401`:
+
+```json
+{
+  "error": "Invalid signature"
+}
+```
 
 Safe verify request shape with placeholder values:
 
