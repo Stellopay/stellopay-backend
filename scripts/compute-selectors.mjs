@@ -22,10 +22,9 @@ const events = [
 ];
 
 const map = {};
-events.forEach(e => {
+events.forEach((e) => {
   const selectorValue = selector.getSelectorFromName(e);
   map[selectorValue] = e;
 });
 
 console.log(JSON.stringify(map, null, 2));
-

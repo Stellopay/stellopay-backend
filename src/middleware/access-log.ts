@@ -22,10 +22,11 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
   }
 
   // Get existing request ID or generate a new one
-  const requestId = (req.headers["x-request-id"] as string) || 
-                    (req.headers["x-correlation-id"] as string) || 
-                    crypto.randomUUID();
-                    
+  const requestId =
+    (req.headers["x-request-id"] as string) ||
+    (req.headers["x-correlation-id"] as string) ||
+    crypto.randomUUID();
+
   // Attach for downstream use if needed
   req.id = requestId;
 
@@ -51,7 +52,7 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
     } else {
       // eslint-disable-next-line no-console
       console.info(
-        `[${logEntry.timestamp}] INFO ${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms [${logEntry.request_id}]`
+        `[${logEntry.timestamp}] INFO ${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms [${logEntry.request_id}]`,
       );
     }
   });

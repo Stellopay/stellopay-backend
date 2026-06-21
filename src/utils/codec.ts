@@ -106,4 +106,3 @@ export function formatTokenAmount(
   const fractionStr = fraction.toString().padStart(decimals, "0").replace(/0+$/, "");
   return `${sign}${whole.toString()}.${fractionStr}`;
 }
-

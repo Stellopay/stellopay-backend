@@ -60,7 +60,11 @@ vi.mock("starknet", async (importOriginal) => {
   return {
     ...original,
     Contract: class MockContract {
-      constructor(public abi: any, public address: string, public provider: any) {}
+      constructor(
+        public abi: any,
+        public address: string,
+        public provider: any,
+      ) {}
       parseEvent = vi.fn().mockImplementation((event: any) => {
         if (event?.shouldFail) {
           throw new Error("Failed to parse event");
@@ -81,7 +85,6 @@ vi.mock("starknet", async (importOriginal) => {
   };
 });
 
-
 vi.mock("../auth/middleware.js", () => ({
   requireAuth: vi.fn((req, res, next) => next()),
   requireAdmin: vi.fn((req, res, next) => next()),
@@ -92,11 +95,11 @@ describe("Reprocess Events Routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     global.fetch = fetchMock as any;
-    
+
     // Set up test express app
     app = express();
     app.use(express.json());
-    
+
     // Add a basic error handler for express testing of catch blocks
     app.use("/api/v1", reprocessEventsRouter);
     app.use("/api/v1", eventsRouter);
@@ -129,9 +132,7 @@ describe("Reprocess Events Routes", () => {
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
 
       const txHash = "0x1234567890abcdef";
-      const res = await request(app)
-        .post(`/api/v1/reprocess-events/tx/${txHash}`)
-        .expect(200);
+      const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(200);
 
       // Verify response structure (result is the shared processTxReceipt output)
       expect(res.body).toEqual({
@@ -169,9 +170,7 @@ describe("Reprocess Events Routes", () => {
       mockGetTransactionReceipt.mockResolvedValue(null);
 
       const txHash = "0x99999";
-      const res = await request(app)
-        .post(`/api/v1/reprocess-events/tx/${txHash}`)
-        .expect(404);
+      const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(404);
 
       expect(res.body).toEqual({
         error: "Transaction not found",
@@ -200,9 +199,7 @@ describe("Reprocess Events Routes", () => {
         .expect(200);
 
       // 2. Call direct process_tx endpoint
-      const processRes = await request(app)
-        .post(`/api/v1/events/process_tx/${txHash}`)
-        .expect(200);
+      const processRes = await request(app).post(`/api/v1/events/process_tx/${txHash}`).expect(200);
 
       // Both paths run the same shared processor, so they decode the same
       // events and tx hash even though the two routes shape their JSON differently.
@@ -213,9 +210,7 @@ describe("Reprocess Events Routes", () => {
     it("should handle outer catch-all error in reprocess-events/tx", async () => {
       mockGetTransactionReceipt.mockRejectedValue(new Error("RPC Connection Fail"));
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/tx/0x1234")
-        .expect(500);
+      const res = await request(app).post("/api/v1/reprocess-events/tx/0x1234").expect(500);
 
       expect(res.body.error).toBe("RPC Connection Fail");
     });
@@ -231,9 +226,7 @@ describe("Reprocess Events Routes", () => {
         }),
       } as any);
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.message).toContain("Reprocessed 0 events");
       expect(res.body.updated).toBe(0);
@@ -262,9 +255,7 @@ describe("Reprocess Events Routes", () => {
 
       mockGetTransactionReceipt.mockResolvedValue(null);
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.results[0]).toEqual({
         eventId: "event_1",
@@ -297,9 +288,7 @@ describe("Reprocess Events Routes", () => {
         events: [{ from_address: "0xwork" }],
       });
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.results[0]).toEqual({
         eventId: "event_1",
@@ -338,9 +327,7 @@ describe("Reprocess Events Routes", () => {
         ],
       });
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.updated).toBe(1);
       expect(res.body.results[0]).toEqual({
@@ -382,9 +369,7 @@ describe("Reprocess Events Routes", () => {
         ],
       });
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.updated).toBe(0);
       expect(res.body.results[0]).toEqual({
@@ -427,9 +412,7 @@ describe("Reprocess Events Routes", () => {
         ],
       });
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.updated).toBe(0);
       expect(res.body.results[0]).toEqual({
@@ -462,9 +445,7 @@ describe("Reprocess Events Routes", () => {
 
       mockGetTransactionReceipt.mockRejectedValue(new Error("RPC Error"));
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(200);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
 
       expect(res.body.results[0]).toEqual({
         eventId: "event_1",
@@ -480,9 +461,7 @@ describe("Reprocess Events Routes", () => {
         throw new Error("DB Connection Failed");
       });
 
-      const res = await request(app)
-        .post("/api/v1/reprocess-events/status-changes")
-        .expect(500);
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(500);
 
       expect(res.body.error).toBe("DB Connection Failed");
 

@@ -13,7 +13,9 @@ export const analyticsRouter = Router();
 analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   try {
     const userAddress = normalizeAddress(req.params.user_address);
-    const year = z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) || new Date().getFullYear();
+    const year =
+      z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) ||
+      new Date().getFullYear();
 
     // Get all payments for the user in the specified year
     const startDate = new Date(year, 0, 1);
@@ -27,13 +29,10 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       .from(schema.payments)
       .where(
         and(
-          or(
-            eq(schema.payments.from, userAddress),
-            eq(schema.payments.to, userAddress)
-          ),
+          or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
           gte(schema.payments.createdAt, startDate),
-          lte(schema.payments.createdAt, endDate)
-        )
+          lte(schema.payments.createdAt, endDate),
+        ),
       );
 
     // Get escrow events (funding, releases, refunds)
@@ -48,11 +47,11 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         and(
           or(
             eq(schema.escrowEvents.employer, userAddress),
-            eq(schema.escrowEvents.to, userAddress)
+            eq(schema.escrowEvents.to, userAddress),
           ),
           gte(schema.escrowEvents.createdAt, startDate),
-          lte(schema.escrowEvents.createdAt, endDate)
-        )
+          lte(schema.escrowEvents.createdAt, endDate),
+        ),
       );
 
     // Get agreement creation events (for analytics - count agreements created per month)
@@ -68,16 +67,29 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
           eq(schema.agreementEvents.eventType, "AgreementCreated"),
           or(
             eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress)
+            eq(schema.agreements.contributor, userAddress),
           ),
           gte(schema.agreementEvents.createdAt, startDate),
-          lte(schema.agreementEvents.createdAt, endDate)
-        )
+          lte(schema.agreementEvents.createdAt, endDate),
+        ),
       );
 
     // Aggregate by month
     const monthlyData: Record<number, bigint> = {};
-    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+    const monthNames = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sept",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
 
     // Initialize all months to 0
     for (let i = 1; i <= 12; i++) {
@@ -148,4 +160,3 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     next(e);
   }
 });
-

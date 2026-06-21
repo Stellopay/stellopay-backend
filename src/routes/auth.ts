@@ -56,7 +56,9 @@ authRouter.post("/auth/verify", async (req, res, next) => {
     const { address, signature } = VerifyBody.parse(req.body);
     const ch = getChallenge(address);
     if (!ch) {
-      res.status(400).json({ error: "No active challenge (or expired). Call /auth/challenge again." });
+      res
+        .status(400)
+        .json({ error: "No active challenge (or expired). Call /auth/challenge again." });
       return;
     }
     const { chainId } = await getCachedNetworkInfo();
@@ -70,7 +72,12 @@ authRouter.post("/auth/verify", async (req, res, next) => {
     }
     clearChallenge(address);
     const session = createSession(address);
-    res.json({ ok: true, address, session_token: session.token, expires_in_ms: session.expires_in_ms });
+    res.json({
+      ok: true,
+      address,
+      session_token: session.token,
+      expires_in_ms: session.expires_in_ms,
+    });
   } catch (e) {
     // eslint-disable-next-line no-console
     console.error("[auth] /auth/verify error", e);

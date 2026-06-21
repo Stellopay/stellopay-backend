@@ -3,11 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ZodError } from "zod";
 
-const {
-  dbMock,
-  queryState,
-  schemaMock,
-} = vi.hoisted(() => {
+const { dbMock, queryState, schemaMock } = vi.hoisted(() => {
   type TableName = "agreements" | "agreementEvents" | "payments" | "escrowEvents";
   type Condition = { type: "eq"; value: string } | { type: "or"; conditions: Condition[] };
 
@@ -30,10 +26,8 @@ const {
     escrowEvents: makeTable("escrowEvents"),
   };
 
-  const validUser =
-    "0x0000000000000000000000000000000000000000000000000000000000000abc";
-  const otherUser =
-    "0x0000000000000000000000000000000000000000000000000000000000000def";
+  const validUser = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+  const otherUser = "0x0000000000000000000000000000000000000000000000000000000000000def";
 
   const state = {
     validUser,
@@ -202,9 +196,7 @@ describe("indexer status routes", () => {
   });
 
   it("normalizes a user address and returns matching agreements, payments, and escrow events", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/indexer/user/ABC/events")
-      .expect(200);
+    const res = await request(makeApp()).get("/api/v1/indexer/user/ABC/events").expect(200);
 
     expect(res.body.userAddress).toBe(queryState.validUser);
     expect(res.body).toMatchObject({
@@ -232,9 +224,7 @@ describe("indexer status routes", () => {
   });
 
   it("returns empty collections for an unknown user address", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/indexer/user/def/events")
-      .expect(200);
+    const res = await request(makeApp()).get("/api/v1/indexer/user/def/events").expect(200);
 
     expect(res.body.userAddress).toBe(
       "0x0000000000000000000000000000000000000000000000000000000000000def",

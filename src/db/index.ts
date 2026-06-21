@@ -8,9 +8,9 @@ import * as schema from "./schema.js";
 let pool: Pool;
 try {
   const connectionString = env.POSTGRES_CONNECTION_STRING;
-  
+
   // Validate connection string format
-  if (!connectionString || typeof connectionString !== 'string') {
+  if (!connectionString || typeof connectionString !== "string") {
     console.warn("[db] POSTGRES_CONNECTION_STRING not set, database features will be unavailable");
     // Create a dummy pool that will fail gracefully
     pool = new Pool({
@@ -23,7 +23,7 @@ try {
     if (url.password === null || url.password === undefined) {
       url.password = "";
     }
-    
+
     pool = new Pool({
       connectionString: url.toString(),
     });

@@ -1,6 +1,6 @@
 /**
  * Agreement Index - In-memory cache for fast agreement lookups
- * 
+ *
  * This module maintains an index of agreements by user address for instant lookups.
  * It can be populated by:
  * 1. Listening to AgreementCreated events
@@ -14,15 +14,18 @@ type AgreementIndex = {
   // Map: user address (normalized) -> array of agreement IDs
   byUser: Map<string, Set<string>>;
   // Map: agreement ID -> agreement metadata
-  agreements: Map<string, {
-    agreement_id: string;
-    employer: string;
-    contributor: string;
-    status: number;
-    mode: number;
-    total_amount: string;
-    paid_amount: string;
-  }>;
+  agreements: Map<
+    string,
+    {
+      agreement_id: string;
+      employer: string;
+      contributor: string;
+      status: number;
+      mode: number;
+      total_amount: string;
+      paid_amount: string;
+    }
+  >;
   // Last sync block number
   lastSyncedBlock: number;
   // Contract address
@@ -53,11 +56,12 @@ export function addAgreementToIndex(
     mode: number;
     total_amount: string;
     paid_amount: string;
-  }
+  },
 ) {
   const index = getOrCreateIndex(contractAddress);
   const normalizedEmployer = normalizeAddress(employer);
-  const normalizedContributor = contributor && contributor !== "0x0" ? normalizeAddress(contributor) : null;
+  const normalizedContributor =
+    contributor && contributor !== "0x0" ? normalizeAddress(contributor) : null;
 
   // Add to user index
   if (!index.byUser.has(normalizedEmployer)) {
@@ -83,20 +87,14 @@ export function addAgreementToIndex(
   }
 }
 
-export function getUserAgreements(
-  contractAddress: string,
-  userAddress: string
-): string[] {
+export function getUserAgreements(contractAddress: string, userAddress: string): string[] {
   const index = getOrCreateIndex(contractAddress);
   const normalizedUser = normalizeAddress(userAddress);
   const agreementIds = index.byUser.get(normalizedUser);
   return agreementIds ? Array.from(agreementIds) : [];
 }
 
-export function getAgreementMetadata(
-  contractAddress: string,
-  agreementId: string
-) {
+export function getAgreementMetadata(contractAddress: string, agreementId: string) {
   const index = getOrCreateIndex(contractAddress);
   return index.agreements.get(agreementId);
 }
@@ -108,11 +106,3 @@ export function clearIndex(contractAddress: string) {
 export function getAllIndices(): Map<string, AgreementIndex> {
   return indices;
 }
-
-
-
-
-
-
-
-
