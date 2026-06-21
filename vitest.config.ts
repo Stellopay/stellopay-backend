@@ -9,7 +9,10 @@ export default defineConfig({
     // any test file that imports config (directly or transitively) loads cleanly;
     // no test performs real network calls.
     env: {
+      NODE_ENV: "test",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
+      POSTGRES_CONNECTION_STRING:
+        "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
     },
     coverage: {
       provider: "v8",

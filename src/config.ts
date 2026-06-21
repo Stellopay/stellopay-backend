@@ -26,11 +26,12 @@ const EnvSchema = z.object({
   ESCROW_CONTRACT_CLASS_JSON: z.string().optional(),
   AGREEMENT_CONTRACT_CLASS_JSON: z.string().optional(),
 
-  // Database connection for indexed data
-  POSTGRES_CONNECTION_STRING: z
-    .string()
-    .optional()
-    .default("postgresql://localhost:5432/stellopay_indexer"),
+  // Database connection for indexed data (required for startup and health checks)
+  POSTGRES_CONNECTION_STRING: z.string().url(),
+  // Pool tuning knobs for the Postgres connection pool
+  DB_POOL_MAX: z.coerce.number().int().positive().optional().default(10),
+  DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(30_000),
+  DB_POOL_CONNECTION_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(5_000),
 
   // Token addresses (optional, with defaults)
   TOKEN_STRK: z.string().optional(),

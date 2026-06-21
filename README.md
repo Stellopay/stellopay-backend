@@ -64,6 +64,17 @@ By default, the logger records `method`, `path`, `status`, `duration_ms`, and `r
 
 Sensitive fields such as request bodies and authorization tokens are strictly omitted from all access logs. The noisy `/health` endpoint is completely excluded from logging.
 
+### Database & health checks
+
+The service uses a configured Postgres pool with explicit limits and timeouts. The connection string is validated at startup, and the pool listens for runtime errors without crashing the process.
+
+- `GET /health` returns `{ "ok": true }` for process liveness.
+- `GET /ready` runs `SELECT 1` against the database and returns:
+  - `200` when the database responds successfully.
+  - `503` when the database is unreachable or returns an error.
+
+The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
+
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
