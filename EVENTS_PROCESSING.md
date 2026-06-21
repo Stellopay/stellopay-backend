@@ -351,14 +351,110 @@ POST /api/v1/reprocess-events/status-changes
 
 ---
 
+## Backfill Events (Operator)
+
+Backfill is a **privileged** operation (admin-only) that synthesises
+`EmployeeAdded` and `MilestoneAdded` events for rows in the `employees` and
+`milestones` tables that do not yet have a corresponding entry in
+`agreement_events`.
+
+Synthetic event rows are fully distinguishable from real on-chain events:
+- The event ID follows the pattern `{transactionHash}_backfill_{eventType}_{rowId}`
+  — the `_backfill_` segment ensures no collision with real IDs
+  (`{txHash}_{eventIndex}`).
+- The `eventIndex` column is set to **`-1`**, a value real events can never
+  have.
+
+### Method 7 – Backfill Employee-Added Events
+
+```bash
+POST /api/v1/backfill/employee-events
+```
+
+**Query parameters** (all optional):
+
+| Parameter     | Type   | Default | Max    | Description                                      |
+| ------------- | ------ | ------- | ------ | ------------------------------------------------ |
+| `limit`       | number | 1000    | 5000   | Maximum number of employee rows to scan          |
+| `agreementId` | string | —       | —      | Restrict backfill to a single agreement           |
+
+**Validation rules:**
+
+| Input     | Rule                                          |
+| --------- | --------------------------------------------- |
+| `limit`   | Positive integer, 1–5000                      |
+| `agreementId` | Optional string                           |
+
+**Behaviour:**
+
+- Scans the `employees` table for rows without a matching `EmployeeAdded`
+  event in `agreement_events` (matched by `agreement_id` + `transaction_hash`).
+- Inserts all missing events inside a **single database transaction** using
+  `ON CONFLICT DO NOTHING` — re-runs are safe no-ops.
+- Each inserted row carries `eventIndex: -1` and an id of the form
+  `{txHash}_backfill_EmployeeAdded_{employeeId}`.
+
+**Response:**
+
+```json
+{
+  "message": "Backfilled 3 EmployeeAdded events",
+  "totalScanned": 10,
+  "created": 3,
+  "results": [
+    { "employeeId": "emp_1", "agreementId": "agr_123", "status": "created" }
+  ]
+}
+```
+
+---
+
+### Method 8 – Backfill Milestone-Added Events
+
+```bash
+POST /api/v1/backfill/milestone-events
+```
+
+**Query parameters** (all optional — identical schema to Method 7):
+
+| Parameter     | Type   | Default | Max    | Description                                      |
+| ------------- | ------ | ------- | ------ | ------------------------------------------------ |
+| `limit`       | number | 1000    | 5000   | Maximum number of milestone rows to scan         |
+| `agreementId` | string | —       | —      | Restrict backfill to a single agreement           |
+
+**Behaviour:**
+
+- Same logic as the employee backfill, operating against the `milestones`
+  table and producing `MilestoneAdded` events.
+- Inserts run inside a transaction with `ON CONFLICT DO NOTHING`.
+- Synthetic ID format: `{txHash}_backfill_MilestoneAdded_{milestoneId}`,
+  `eventIndex: -1`.
+
+**Response:**
+
+```json
+{
+  "message": "Backfilled 2 MilestoneAdded events",
+  "totalScanned": 5,
+  "created": 2,
+  "results": [
+    { "milestoneId": "ms_1", "agreementId": "agr_456", "status": "created" }
+  ]
+}
+```
+
+---
+
 ### Security notes
 
-- All reprocess routes are gated behind **both** `requireAuth` and
-  `requireAdmin` — regular users cannot trigger reprocessing.
+- All reprocess **and backfill** routes are gated behind **both** `requireAuth`
+  and `requireAdmin` — regular users cannot trigger these operations.
 - Array/list sizes are bounded to prevent excessive RPC or DB load:
   - `tx_hashes`: maximum **50** per batch request.
-  - `limit`: maximum **1000** events per status-changes request.
-- Inputs are validated with Zod schemas and rejected with **400** on failure.
+  - `limit`: maximum **1000** events per status-changes request, **5000**
+    rows per backfill request.
+- All inputs are validated with Zod schemas and rejected with **400** on
+  failure.
 
 ---
 
