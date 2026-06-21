@@ -37,11 +37,13 @@ POST /api/v1/events/process_tx/:tx_hash
 ```
 
 **Example:**
+
 ```bash
 curl -X POST http://localhost:4002/api/v1/events/process_tx/0x1234...abcd
 ```
 
 **Behaviour:**
+
 - Fetches the on-chain receipt via the StarkNet RPC provider.
 - Decodes every event using the `WorkAgreement` and `PayrollEscrow` ABIs.
 - Persists rows to `agreements`, `agreement_events`, `payments`, and
@@ -49,6 +51,7 @@ curl -X POST http://localhost:4002/api/v1/events/process_tx/0x1234...abcd
 - Returns the list of event labels that were processed.
 
 **Response:**
+
 ```json
 {
   "message": "Processed 2 events",
@@ -67,12 +70,10 @@ Content-Type: application/json
 ```
 
 **Request body:**
+
 ```json
 {
-  "tx_hashes": [
-    "0x1234...abcd",
-    "0x5678...efgh"
-  ]
+  "tx_hashes": ["0x1234...abcd", "0x5678...efgh"]
 }
 ```
 
@@ -83,6 +84,7 @@ Content-Type: application/json
 | Each hash | Must match `^0x[0-9a-fA-F]{1,64}$` |
 
 **Behaviour:**
+
 - Each tx hash is processed with `processTxReceipt`, the **same shared logic**
   used by Method 1 – events are fully decoded and persisted.
 - A per-tx error (e.g. RPC timeout, bad hash) is captured and reported as
@@ -90,6 +92,7 @@ Content-Type: application/json
 - All writes use `ON CONFLICT DO NOTHING` – the whole batch is safe to replay.
 
 **Response:**
+
 ```json
 {
   "summary": {
@@ -119,12 +122,12 @@ Content-Type: application/json
 
 Per-tx `status` values:
 
-| Value | Meaning |
-|---|---|
-| `"processed"` | Receipt fetched, events decoded and stored |
-| `"no_events"` | Receipt exists but has no decodable events |
-| `"not_found"` | Provider returned no receipt for this hash |
-| `"error"` | Unexpected error (RPC failure, etc.); `error` field contains message |
+| Value         | Meaning                                                              |
+| ------------- | -------------------------------------------------------------------- |
+| `"processed"` | Receipt fetched, events decoded and stored                           |
+| `"no_events"` | Receipt exists but has no decodable events                           |
+| `"not_found"` | Provider returned no receipt for this hash                           |
+| `"error"`     | Unexpected error (RPC failure, etc.); `error` field contains message |
 
 ---
 
@@ -142,14 +145,14 @@ if (txHash?.transaction_hash) {
 
 ## Event Types Stored
 
-| Event | Table(s) written |
-|---|---|
-| `AgreementCreated` | `agreement_events`, `agreements` |
-| `AgreementActivated`, `AgreementPaused`, `AgreementResumed`, `AgreementCancelled`, `AgreementCompleted` | `agreement_events` |
-| `EmployeeAdded`, `MilestoneAdded`, `MilestoneApproved`, `MilestoneClaimed`, `PayrollClaimed` | `agreement_events` |
-| `DisputeRaised`, `DisputeResolved` | `agreement_events` |
-| `PaymentSent`, `PaymentReceived` | `payments` |
-| `Funded`, `Released`, `Refunded` | `escrow_events` |
+| Event                                                                                                   | Table(s) written                 |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `AgreementCreated`                                                                                      | `agreement_events`, `agreements` |
+| `AgreementActivated`, `AgreementPaused`, `AgreementResumed`, `AgreementCancelled`, `AgreementCompleted` | `agreement_events`               |
+| `EmployeeAdded`, `MilestoneAdded`, `MilestoneApproved`, `MilestoneClaimed`, `PayrollClaimed`            | `agreement_events`               |
+| `DisputeRaised`, `DisputeResolved`                                                                      | `agreement_events`               |
+| `PaymentSent`, `PaymentReceived`                                                                        | `payments`                       |
+| `Funded`, `Released`, `Refunded`                                                                        | `escrow_events`                  |
 
 ---
 
@@ -195,16 +198,19 @@ This means:
 ## Troubleshooting
 
 ### Events not appearing?
+
 1. Confirm the transaction has been mined (check the block explorer).
 2. Verify the tx hash is correct and starts with `0x`.
 3. Review backend logs for parsing errors (`[events] ...`).
 4. Ensure the database connection is healthy.
 
 ### Batch rejected with 400?
+
 - Check that the hash format matches `^0x[0-9a-fA-F]{1,64}$`.
 - Ensure the array contains ≤ 50 hashes and at least 1 hash.
 
 ### Database connection issues?
+
 1. Verify `POSTGRES_CONNECTION_STRING` is set and well-formed.
 2. Confirm PostgreSQL is running and the `stellopay_indexer` database exists.
 3. Ensure the DB user has `INSERT`, `SELECT`, and `UPDATE` privileges.

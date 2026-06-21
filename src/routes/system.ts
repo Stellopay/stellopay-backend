@@ -23,5 +23,3 @@ systemRouter.get("/account/:address/nonce", async (req, res, next) => {
     next(e);
   }
 });
-
-

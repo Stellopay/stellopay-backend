@@ -43,7 +43,7 @@ describe("accessLogMiddleware", () => {
     expect(res.status).toBe(200);
 
     expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
-    
+
     const logLine = consoleInfoSpy.mock.calls[0][0];
     const logObj = JSON.parse(logLine);
 
@@ -77,16 +77,16 @@ describe("accessLogMiddleware", () => {
       .post("/test-body")
       .set("Authorization", "Bearer my-secret-token")
       .send({ password: "my-secret-password" });
-      
+
     expect(res.status).toBe(201);
 
     expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
     const logLine = consoleInfoSpy.mock.calls[0][0];
-    
+
     // Ensure the sensitive data is not anywhere in the log string
     expect(logLine).not.toContain("my-secret-token");
     expect(logLine).not.toContain("my-secret-password");
-    
+
     const logObj = JSON.parse(logLine);
     // Explicitly check that there's no body or token property
     expect(logObj.body).toBeUndefined();

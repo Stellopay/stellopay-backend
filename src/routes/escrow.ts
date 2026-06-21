@@ -14,10 +14,10 @@ const WalletSession = z.object({
   wallet_address: z.string().min(3),
   session_token: z.string().min(10),
 });
-const FundAgreementBody = WalletSession.extend({ 
+const FundAgreementBody = WalletSession.extend({
   agreement_id: z.coerce.bigint().positive(),
   employer: z.string().min(3),
-  amount: z.string().min(1) 
+  amount: z.string().min(1),
 });
 const ReleaseBody = WalletSession.extend({
   agreement_id: z.coerce.bigint().positive(),
@@ -28,8 +28,8 @@ const InitBody = WalletSession.extend({
   token: z.string().min(3),
   manager: z.string().min(3),
 });
-const RefundBody = WalletSession.extend({ 
-  agreement_id: z.coerce.bigint().positive() 
+const RefundBody = WalletSession.extend({
+  agreement_id: z.coerce.bigint().positive(),
 });
 
 export const escrowRouter = Router();
@@ -58,7 +58,8 @@ escrowRouter.get("/escrow/:address/is_initialized", async (req, res, next) => {
     try {
       const token = await c.get_token();
       // Normalize the token address for comparison
-      const tokenStr = typeof token === "string" ? token.toLowerCase() : String(token).toLowerCase();
+      const tokenStr =
+        typeof token === "string" ? token.toLowerCase() : String(token).toLowerCase();
       // Check for various zero address representations
       const zeroAddresses = [
         "0x0",
@@ -85,7 +86,7 @@ escrowRouter.get("/escrow/:address/get_agreement_balance/:agreement_id", async (
   try {
     const address = AddressParam.parse(req.params.address);
     const agreement_id = AgreementIdParam.parse(req.params.agreement_id);
-    
+
     // Try indexed data first - calculate balance from escrow events
     try {
       const escrowEvents = await db
@@ -94,11 +95,11 @@ escrowRouter.get("/escrow/:address/get_agreement_balance/:agreement_id", async (
         .where(
           and(
             eq(schema.escrowEvents.contractAddress, address),
-            eq(schema.escrowEvents.agreementId, agreement_id.toString())
-          )
+            eq(schema.escrowEvents.agreementId, agreement_id.toString()),
+          ),
         )
         .orderBy(schema.escrowEvents.blockNumber);
-      
+
       if (escrowEvents.length > 0) {
         let balance = BigInt(0);
         for (const event of escrowEvents) {
@@ -108,36 +109,43 @@ escrowRouter.get("/escrow/:address/get_agreement_balance/:agreement_id", async (
             balance -= BigInt(event.amount);
           }
         }
-        return res.json({ 
-          agreement_id: agreement_id.toString(), 
+        return res.json({
+          agreement_id: agreement_id.toString(),
           balance: balance.toString(),
-          source: "indexed"
+          source: "indexed",
         });
       }
     } catch (dbError) {
       // Fall through to contract call
     }
-    
+
     // Fallback to contract call
     const c = escrowContract(address);
     const out = await c.get_agreement_balance(agreement_id);
-    res.json({ agreement_id: agreement_id.toString(), balance: u256ToString(out), source: "contract" });
+    res.json({
+      agreement_id: agreement_id.toString(),
+      balance: u256ToString(out),
+      source: "contract",
+    });
   } catch (e) {
     next(e);
   }
 });
 
-escrowRouter.get("/escrow/:address/get_agreement_employer/:agreement_id", async (req, res, next) => {
-  try {
-    const address = AddressParam.parse(req.params.address);
-    const agreement_id = AgreementIdParam.parse(req.params.agreement_id);
-    const c = escrowContract(address);
-    const out = await c.get_agreement_employer(agreement_id);
-    res.json({ agreement_id: agreement_id.toString(), employer: out });
-  } catch (e) {
-    next(e);
-  }
-});
+escrowRouter.get(
+  "/escrow/:address/get_agreement_employer/:agreement_id",
+  async (req, res, next) => {
+    try {
+      const address = AddressParam.parse(req.params.address);
+      const agreement_id = AgreementIdParam.parse(req.params.agreement_id);
+      const c = escrowContract(address);
+      const out = await c.get_agreement_employer(agreement_id);
+      res.json({ agreement_id: agreement_id.toString(), employer: out });
+    } catch (e) {
+      next(e);
+    }
+  },
+);
 
 // -------- setters (prepare to sign client-side) --------
 escrowRouter.post("/prepare/escrow/:address/initialize", async (req, res, next) => {
@@ -172,7 +180,7 @@ escrowRouter.post("/prepare/escrow/:address/fund_agreement", async (req, res, ne
     const call = c.populate("fund_agreement", [
       body.agreement_id.toString(),
       body.employer,
-      parseU256(body.amount)
+      parseU256(body.amount),
     ]);
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
@@ -195,7 +203,7 @@ escrowRouter.post("/prepare/escrow/:address/release", async (req, res, next) => 
     const call = c.populate("release", [
       body.agreement_id.toString(),
       body.to,
-      parseU256(body.amount)
+      parseU256(body.amount),
     ]);
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
@@ -223,5 +231,3 @@ escrowRouter.post("/prepare/escrow/:address/refund_remaining", async (req, res, 
     next(e);
   }
 });
-
-

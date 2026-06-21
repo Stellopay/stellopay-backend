@@ -1,12 +1,9 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ZodError } from "zod";
 
-const {
-  dbMock,
-  queryState,
-  schemaMock,
-} = vi.hoisted(() => {
+const { dbMock, queryState, schemaMock } = vi.hoisted(() => {
   type TableName = "agreements" | "agreementEvents" | "payments" | "escrowEvents";
   type Condition = { type: "eq"; value: string } | { type: "or"; conditions: Condition[] };
 
@@ -29,10 +26,8 @@ const {
     escrowEvents: makeTable("escrowEvents"),
   };
 
-  const validUser =
-    "0x0000000000000000000000000000000000000000000000000000000000000abc";
-  const otherUser =
-    "0x0000000000000000000000000000000000000000000000000000000000000def";
+  const validUser = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+  const otherUser = "0x0000000000000000000000000000000000000000000000000000000000000def";
 
   const state = {
     validUser,
@@ -69,7 +64,9 @@ const {
       ],
       agreementEvents: [],
     } as Record<TableName, unknown[]>,
+    emptyCounts: false,
     limitCalls: [] as Array<{ table: TableName; limit: number }>,
+    userLimitCalls: [] as Array<{ table: TableName; limit: number; offset: number }>,
     whereValues: [] as string[],
   };
 
@@ -90,7 +87,9 @@ const {
         const tableName = table.__name;
 
         if (selection?.count !== undefined) {
-          return Promise.resolve([{ count: state.counts[tableName] ?? 0 }]);
+          return Promise.resolve(
+            state.emptyCounts ? [] : [{ count: state.counts[tableName] ?? 0 }]
+          );
         }
 
         return {
@@ -101,7 +100,14 @@ const {
             }),
           })),
           where: vi.fn((condition: Condition) => ({
-            orderBy: vi.fn(() => Promise.resolve(rowsForUser(tableName, condition))),
+            orderBy: vi.fn(() => ({
+              limit: vi.fn((limit: number) => ({
+                offset: vi.fn((offset: number) => {
+                  state.userLimitCalls.push({ table: tableName, limit, offset });
+                  return Promise.resolve(rowsForUser(tableName, condition));
+                }),
+              })),
+            })),
           })),
         };
       }),
@@ -131,12 +137,16 @@ function makeApp() {
   app.use("/api/v1", indexerStatusRouter);
   app.use(
     (
-      err: { status?: number; message?: string },
+      err: { status?: number; message?: string; issues?: unknown },
       _req: express.Request,
       res: express.Response,
       _next: express.NextFunction,
     ) => {
-      res.status(err.status ?? 500).json({ error: err.message ?? "Internal error" });
+      const isZod = err instanceof ZodError;
+      res.status(isZod ? 400 : (err.status ?? 500)).json({
+        error: isZod ? "Validation failed" : (err.message ?? "Internal error"),
+        details: isZod ? err.issues : undefined,
+      });
     },
   );
   return app;
@@ -144,7 +154,9 @@ function makeApp() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  queryState.emptyCounts = false;
   queryState.limitCalls = [];
+  queryState.userLimitCalls = [];
   queryState.whereValues = [];
 });
 
@@ -184,9 +196,7 @@ describe("indexer status routes", () => {
   });
 
   it("normalizes a user address and returns matching agreements, payments, and escrow events", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/indexer/user/ABC/events")
-      .expect(200);
+    const res = await request(makeApp()).get("/api/v1/indexer/user/ABC/events").expect(200);
 
     expect(res.body.userAddress).toBe(queryState.validUser);
     expect(res.body).toMatchObject({
@@ -214,9 +224,7 @@ describe("indexer status routes", () => {
   });
 
   it("returns empty collections for an unknown user address", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/indexer/user/def/events")
-      .expect(200);
+    const res = await request(makeApp()).get("/api/v1/indexer/user/def/events").expect(200);
 
     expect(res.body.userAddress).toBe(
       "0x0000000000000000000000000000000000000000000000000000000000000def",
@@ -230,6 +238,35 @@ describe("indexer status routes", () => {
         payments: [],
         escrowEvents: [],
       },
+    });
+  });
+
+  it("rejects a malformed user address with 400", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/indexer/user/not-an-address/events")
+      .expect(400);
+    expect(res.body.error).toBe("Validation failed");
+  });
+
+  it("clamps an oversized limit to 100 on the user events endpoint", async () => {
+    await request(makeApp())
+      .get("/api/v1/indexer/user/abc/events?limit=9999")
+      .expect(200);
+    expect(queryState.userLimitCalls.length).toBeGreaterThan(0);
+    for (const call of queryState.userLimitCalls) {
+      expect(call.limit).toBe(100);
+      expect(call.offset).toBe(0);
+    }
+  });
+
+  it("falls back to zero counts when a count query returns no rows", async () => {
+    queryState.emptyCounts = true;
+    const res = await request(makeApp()).get("/api/v1/indexer/status").expect(200);
+    expect(res.body.counts).toEqual({
+      agreements: 0,
+      events: 0,
+      payments: 0,
+      escrowEvents: 0,
     });
   });
 });

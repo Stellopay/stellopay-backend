@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import { ZodError } from "zod";
 import { env } from "./config.js";
 import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
@@ -21,12 +22,12 @@ import { backfillEventsRouter } from "./routes/backfill-events.js";
 import { contactRouter } from "./routes/contact.js";
 import { billingRouter } from "./routes/billing.js";
 import { apiV1NotFoundHandler } from "./routes/not-found.js";
-import { closePool } from "./db/index.js";
+import { checkDbHealth, closePool } from "./db/index.js";
 import { setupGracefulShutdown } from "./shutdown.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
 
-const app = express();
+export const app = express();
 
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
@@ -136,6 +137,10 @@ const strictLimiter = makeLimiter({
 app.use("/api/", globalLimiter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/ready", async (_req, res) => {
+  const isReady = await checkDbHealth();
+  res.status(isReady ? 200 : 503).json(isReady ? { ok: true } : { ok: false });
+});
 
 app.use("/api/v1", escrowRouter);
 app.use("/api/v1", agreementRouter);
@@ -173,9 +178,16 @@ app.use(
       stack: err?.stack,
       issues: err?.issues,
     });
-    const status = typeof err?.status === "number" ? err.status : 500;
+    // Zod validation errors are client errors: surface them as 400 with the
+    // structured issue list rather than the default 500.
+    const isZodError = err instanceof ZodError;
+    const status = isZodError
+      ? 400
+      : typeof err?.status === "number"
+        ? err.status
+        : 500;
     res.status(status).json({
-      error: err?.message ?? "Internal error",
+      error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
       request_id: requestId,
       details: err?.issues ?? undefined,
       ...(env.NODE_ENV === "development"
@@ -188,10 +200,12 @@ app.use(
   },
 );
 
-const server = app.listen(env.PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`stellopay-backend listening on :${env.PORT}`);
-});
+if (process.env.NODE_ENV !== "test") {
+  const server = app.listen(env.PORT, () => {
+    // eslint-disable-next-line no-console
+    console.log(`stellopay-backend listening on :${env.PORT}`);
+  });
 
-// Setup graceful shutdown handling
-setupGracefulShutdown(server, closePool, env.SHUTDOWN_DRAIN_TIMEOUT_MS);
+  // Setup graceful shutdown handling
+  setupGracefulShutdown(server, closePool, env.SHUTDOWN_DRAIN_TIMEOUT_MS);
+}

@@ -196,6 +196,17 @@ To integrate with external monitoring systems (Datadog, New Relic, Grafana Loki,
    - Pass `X-Request-Id` header to downstream services
    - Include it in log aggregation queries for full request traces
 
+### Database & health checks
+
+The service uses a configured Postgres pool with explicit limits and timeouts. The connection string is validated at startup, and the pool listens for runtime errors without crashing the process.
+
+- `GET /health` returns `{ "ok": true }` for process liveness.
+- `GET /ready` runs `SELECT 1` against the database and returns:
+  - `200` when the database responds successfully.
+  - `503` when the database is unreachable or returns an error.
+
+The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
+
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
@@ -222,6 +233,22 @@ pnpm test:coverage   # run with a coverage report
 Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
 the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
 on every push and pull request.
+
+### Linting and formatting
+
+The repository uses ESLint flat config and Prettier for local quality checks.
+
+```bash
+pnpm lint          # run the blocking ESLint gate
+pnpm lint:all      # run ESLint and show non-blocking warnings
+pnpm lint:fix      # run ESLint with safe fixes
+pnpm format        # format files with Prettier
+pnpm format:check  # check formatting without writing changes
+```
+
+The lint config enables `@typescript-eslint/no-unused-vars` and keeps the existing
+`no-console` disable comments meaningful in the entrypoint and middleware files that
+already annotate intentional startup, warning, and error logs.
 
 ### CORS Configuration
 
@@ -338,6 +365,18 @@ handler.
 - `billing_invoices` — invoice records
 
 **Security note:** `taxId` and `dateOfBirth` are stored in the database but are **never returned** by any API endpoint. They must only be accessed through separately-authorised, audited internal processes.
+
+---
+
+### Indexed query parameters
+
+Path and query parameters on the indexed and indexer-status routes are validated with Zod before any database call:
+
+- Address parameters (`contract_address`, `user_address`) must be hex with an optional `0x` prefix, up to 64 hex characters; malformed values are rejected with `400`.
+- `agreement_id` must be a numeric string.
+- List endpoints (`/indexed/agreements/...`, `/indexed/payments/user/...`, and `/indexer/user/:user_address/events`) accept `limit` and `offset` query parameters. `limit` is clamped server-side to the range 1 to 100 (default 50) and `offset` to 0 or more, so a client cannot request an unbounded result set.
+
+Validation failures return `400` with a structured `details` array of the Zod issues.
 
 ---
 

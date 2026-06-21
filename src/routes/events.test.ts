@@ -49,9 +49,9 @@ vi.mock("../db/index.js", () => {
 vi.mock("../starknet/client.js", () => ({
   provider: { getTransactionReceipt: vi.fn() },
   agreementContract: vi.fn(() => ({
-    get_token: vi.fn().mockResolvedValue(
-      "0xdeadbeef00000000000000000000000000000000000000000000000000000002",
-    ),
+    get_token: vi
+      .fn()
+      .mockResolvedValue("0xdeadbeef00000000000000000000000000000000000000000000000000000002"),
   })),
 }));
 
@@ -73,10 +73,8 @@ vi.mock("starknet", async (importOriginal) => {
 
 vi.mock("../config.js", () => ({
   defaults: {
-    workAgreementAddress:
-      "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
-    payrollEscrowAddress:
-      "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
+    workAgreementAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+    payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
   },
   abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
   env: { NODE_ENV: "test" },
@@ -99,13 +97,10 @@ import { provider } from "../starknet/client.js";
 // Constants
 // ---------------------------------------------------------------------------
 
-const AGREEMENT_ADDRESS =
-  "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd";
+const AGREEMENT_ADDRESS = "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd";
 
-const TX_A =
-  "0x000000000000000000000000000000000000000000000000000000000000aaaa";
-const TX_B =
-  "0x000000000000000000000000000000000000000000000000000000000000bbbb";
+const TX_A = "0x000000000000000000000000000000000000000000000000000000000000aaaa";
+const TX_B = "0x000000000000000000000000000000000000000000000000000000000000bbbb";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -193,7 +188,6 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
-
 vi.mock("../auth/middleware.js", () => ({
   requireAuth: vi.fn((req, res, next) => next()),
   requireAdmin: vi.fn((req, res, next) => next()),
@@ -214,9 +208,7 @@ describe("processTxReceipt – shared processor", () => {
   });
 
   it("returns no_events when receipt has empty events array", async () => {
-    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(
-      EMPTY_RECEIPT as any,
-    );
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(EMPTY_RECEIPT as any);
 
     const result = await processTxReceipt(TX_B);
 
@@ -255,9 +247,7 @@ describe("processTxReceipt – shared processor", () => {
 
   it("is idempotent – all inserts use onConflictDoNothing", async () => {
     parseEventMock.mockReturnValue(decodedAgreementCreated());
-    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(
-      makeAgreementReceipt(TX_A) as any,
-    );
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
 
     const r1 = await processTxReceipt(TX_A);
     const r2 = await processTxReceipt(TX_A);
@@ -271,8 +261,7 @@ describe("processTxReceipt – shared processor", () => {
 
   it("normalises a short tx hash to exactly 0x + 64 hex chars", async () => {
     parseEventMock.mockReturnValue(decodedAgreementCreated());
-    const paddedHash =
-      "0x000000000000000000000000000000000000000000000000000000000000aaaa";
+    const paddedHash = "0x000000000000000000000000000000000000000000000000000000000000aaaa";
     vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(
       makeAgreementReceipt(paddedHash) as any,
     );
@@ -322,18 +311,14 @@ describe("processTxReceipt – batch semantics (per-tx isolation)", () => {
 
   it("a failing tx throws so the batch handler can capture it per-tx", async () => {
     // Both the padded and un-padded lookups must fail to surface the RPC error
-    vi.mocked(provider.getTransactionReceipt).mockRejectedValue(
-      new Error("RPC timeout"),
-    );
+    vi.mocked(provider.getTransactionReceipt).mockRejectedValue(new Error("RPC timeout"));
 
     await expect(processTxReceipt(TX_A)).rejects.toThrow("RPC timeout");
   });
 
   it("re-processing the same tx is idempotent (no duplicate rows)", async () => {
     parseEventMock.mockReturnValue(decodedAgreementCreated());
-    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(
-      makeAgreementReceipt(TX_A) as any,
-    );
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
 
     const r1 = await processTxReceipt(TX_A);
     const r2 = await processTxReceipt(TX_A);
@@ -343,9 +328,7 @@ describe("processTxReceipt – batch semantics (per-tx isolation)", () => {
   });
 
   it("returns no_events for a tx with an empty events list", async () => {
-    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(
-      EMPTY_RECEIPT as any,
-    );
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(EMPTY_RECEIPT as any);
 
     const result = await processTxReceipt(TX_B);
 
@@ -367,9 +350,9 @@ describe("processTxReceipt – batch semantics (per-tx isolation)", () => {
     expect(agreementEventInsert).toBeDefined();
 
     // values() was called on the insert mock – the ID includes the tx hash
-    const valuesMock = vi.mocked(db.insert).mock.results.find(
-      (_, i) => insertCalls[i]?.[0] === "agreementEvents",
-    );
+    const valuesMock = vi
+      .mocked(db.insert)
+      .mock.results.find((_, i) => insertCalls[i]?.[0] === "agreementEvents");
     expect(valuesMock).toBeDefined();
   });
 });
@@ -403,9 +386,7 @@ describe("Zod input validation schemas", () => {
   });
 
   it("BatchSchema rejects arrays with more than 50 hashes (MAX_BATCH_SIZE)", () => {
-    const tooMany = Array.from({ length: 51 }, (_, i) =>
-      `0x${i.toString(16).padStart(4, "0")}`,
-    );
+    const tooMany = Array.from({ length: 51 }, (_, i) => `0x${i.toString(16).padStart(4, "0")}`);
     expect(() => BatchSchema.parse({ tx_hashes: tooMany })).toThrow();
   });
 
@@ -414,16 +395,12 @@ describe("Zod input validation schemas", () => {
   });
 
   it("BatchSchema accepts arrays of 1 to 50 valid hashes", () => {
-    const maxValid = Array.from({ length: 50 }, (_, i) =>
-      `0x${i.toString(16).padStart(4, "0")}`,
-    );
+    const maxValid = Array.from({ length: 50 }, (_, i) => `0x${i.toString(16).padStart(4, "0")}`);
     expect(() => BatchSchema.parse({ tx_hashes: maxValid })).not.toThrow();
     expect(() => BatchSchema.parse({ tx_hashes: [TX_A] })).not.toThrow();
   });
 
   it("BatchSchema rejects a batch containing even one invalid hash", () => {
-    expect(() =>
-      BatchSchema.parse({ tx_hashes: [TX_A, "not-a-hash"] }),
-    ).toThrow();
+    expect(() => BatchSchema.parse({ tx_hashes: [TX_A, "not-a-hash"] })).toThrow();
   });
 });

@@ -13,6 +13,7 @@ Starknet Contracts → Apibara Indexer → PostgreSQL Database → Backend API �
 ## Current Setup
 
 ### Indexer Configuration
+
 - **Location**: `my-indexer/apibara.config.ts`
 - **Starting Block**: `4420000` (Sepolia)
 - **Stream URL**: `https://sepolia.starknet.a5a.ch`
@@ -21,7 +22,9 @@ Starknet Contracts → Apibara Indexer → PostgreSQL Database → Backend API �
   - `0x0414394dff460d037efc45bdd64214c6478f8bb8e858002359595d88010f8cdc`
 
 ### Database Schema
+
 Both indexer and backend use the same schema:
+
 - `agreements` - Agreement records
 - `agreement_events` - All agreement-related events
 - `payments` - PaymentSent/PaymentReceived events
@@ -39,6 +42,7 @@ pnpm dev
 ```
 
 You should see logs like:
+
 ```
 📋 Indexer Configuration:
    Starting Block: 4420000
@@ -55,6 +59,7 @@ curl http://localhost:4002/api/v1/indexer/status
 ```
 
 Response:
+
 ```json
 {
   "status": "connected",
@@ -110,6 +115,7 @@ curl -X POST http://localhost:4002/api/v1/events/process_tx/0xYOUR_TX_HASH
 ```
 
 This will:
+
 - Fetch the transaction receipt
 - Parse all events
 - Store them in the database
@@ -118,12 +124,14 @@ This will:
 ## Verifying Data Flow
 
 ### Step 1: Create Agreement
+
 ```bash
 # Use frontend or API to create agreement
 # Note the transaction hash
 ```
 
 ### Step 2: Check Indexer Logs
+
 ```bash
 # In my-indexer terminal, you should see:
 ✅ Block XXXX | Found 1 event(s)
@@ -131,6 +139,7 @@ This will:
 ```
 
 ### Step 3: Check Database
+
 ```bash
 # Query database directly
 psql postgresql://user:pass@localhost:5432/stellopay_indexer
@@ -140,6 +149,7 @@ SELECT * FROM agreement_events ORDER BY block_number DESC LIMIT 5;
 ```
 
 ### Step 4: Check Backend API
+
 ```bash
 curl http://localhost:4002/api/v1/transactions/YOUR_ADDRESS
 curl http://localhost:4002/api/v1/notifications/YOUR_ADDRESS
@@ -151,14 +161,13 @@ curl http://localhost:4002/api/v1/analytics/YOUR_ADDRESS
 If you deploy new contracts:
 
 1. **Update indexer config** (`my-indexer/apibara.config.ts`):
+
    ```typescript
-   contractAddresses: [
-     "0xNEW_CONTRACT_ADDRESS_1",
-     "0xNEW_CONTRACT_ADDRESS_2",
-   ]
+   contractAddresses: ["0xNEW_CONTRACT_ADDRESS_1", "0xNEW_CONTRACT_ADDRESS_2"];
    ```
 
 2. **Restart indexer**:
+
    ```bash
    cd my-indexer
    pnpm dev
@@ -166,29 +175,33 @@ If you deploy new contracts:
 
 3. **Update backend defaults** (optional, `stellopay-backend/src/config.ts`):
    ```typescript
-   workAgreementAddress: "0xNEW_CONTRACT_ADDRESS"
+   workAgreementAddress: "0xNEW_CONTRACT_ADDRESS";
    ```
 
 ## Monitoring
 
 ### Real-time Monitoring
+
 ```bash
 cd my-indexer
 pnpm monitor-events
 ```
 
 This will show:
+
 - New events as they're indexed
 - Current block number
 - Event counts
 
 ### Check Events Script
+
 ```bash
 cd my-indexer
 pnpm check-events
 ```
 
 Shows:
+
 - Recent agreements
 - Recent events
 - Contract addresses being indexed
@@ -212,6 +225,3 @@ If data is still not showing:
 4. ✅ Verify address normalization: Check if user address format matches stored addresses
 5. ✅ Check backend logs for query errors
 6. ✅ Use `/indexer/status` endpoint to see what's in the database
-
-
-

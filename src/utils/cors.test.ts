@@ -134,4 +134,3 @@ describe("buildCorsOriginHandler", () => {
     expect(console.warn).not.toHaveBeenCalled();
   });
 });
-

@@ -40,7 +40,7 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
     } else {
       // eslint-disable-next-line no-console
       console.info(
-        `[${logEntry.timestamp}] INFO ${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms [${logEntry.request_id}]`
+        `[${logEntry.timestamp}] INFO ${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms [${logEntry.request_id}]`,
       );
     }
   });

@@ -68,9 +68,7 @@ describe("POST /contact/send-message", () => {
   });
 
   it("dev-mode without credentials returns success without sending", async () => {
-    const res = await request(makeApp())
-      .post("/api/v1/contact/send-message")
-      .send(valid);
+    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(sendMail).not.toHaveBeenCalled();
@@ -81,9 +79,7 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_USER = "sender@gmail.com";
     envMock.EMAIL_PASSWORD = "app-password";
     // CONTACT_RECIPIENT_EMAIL intentionally left unset
-    const res = await request(makeApp())
-      .post("/api/v1/contact/send-message")
-      .send(valid);
+    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
     expect(res.status).toBe(503);
     expect(sendMail).not.toHaveBeenCalled();
   });
@@ -109,9 +105,7 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_PASSWORD = "app-password";
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     sendMail.mockRejectedValueOnce(new Error("smtp down"));
-    const res = await request(makeApp())
-      .post("/api/v1/contact/send-message")
-      .send(valid);
+    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/Failed to send/);
   });
@@ -122,9 +116,7 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_PASSWORD = "app-password";
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     sendMail.mockRejectedValueOnce(new Error("smtp down"));
-    const res = await request(makeApp())
-      .post("/api/v1/contact/send-message")
-      .send(valid);
+    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
     expect(res.status).toBe(500);
     expect(res.body.details).toBeUndefined();
   });
@@ -134,9 +126,7 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_PASSWORD = "app-password";
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     sendMail.mockRejectedValueOnce("smtp exploded"); // a thrown string, not an Error
-    const res = await request(makeApp())
-      .post("/api/v1/contact/send-message")
-      .send(valid);
+    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
     expect(res.status).toBe(500);
   });
 });

@@ -19,7 +19,11 @@ function toHexString(value: unknown) {
   return String(value);
 }
 
-async function callContractResult(contractAddress: string, entrypoint: string, calldata: string[] = []) {
+async function callContractResult(
+  contractAddress: string,
+  entrypoint: string,
+  calldata: string[] = [],
+) {
   const out = await provider.callContract({
     contractAddress,
     entrypoint,
@@ -98,10 +102,10 @@ readRouter.get("/escrow/:address/balance/:agreement_id", async (req, res, next) 
     const agreement_id = z.coerce.bigint().positive().parse(req.params.agreement_id);
     const escrow = escrowContract(escrowAddress);
     const balance = await escrow.get_agreement_balance(agreement_id);
-    res.json({ 
-      escrow: escrowAddress, 
+    res.json({
+      escrow: escrowAddress,
       agreement_id: agreement_id.toString(),
-      balance: u256ToString(balance) 
+      balance: u256ToString(balance),
     });
   } catch (e) {
     next(e);
@@ -136,17 +140,18 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
     const agreementAddress = AddressParam.parse(req.params.address);
     const agreement_id = z.coerce.bigint().positive().parse(req.params.agreement_id);
     const agreement = agreementContract(agreementAddress);
-    const [employer, contributor, token, escrow, total, paid, status, mode, dispute_status] = await Promise.all([
-      agreement.get_employer(agreement_id),
-      agreement.get_contributor(agreement_id),
-      agreement.get_token(agreement_id),
-      agreement.get_escrow(),
-      agreement.get_total_amount(agreement_id),
-      agreement.get_paid_amount(agreement_id),
-      agreement.get_status(agreement_id),
-      agreement.get_agreement_mode(agreement_id),
-      agreement.get_dispute_status(agreement_id),
-    ]);
+    const [employer, contributor, token, escrow, total, paid, status, mode, dispute_status] =
+      await Promise.all([
+        agreement.get_employer(agreement_id),
+        agreement.get_contributor(agreement_id),
+        agreement.get_token(agreement_id),
+        agreement.get_escrow(),
+        agreement.get_total_amount(agreement_id),
+        agreement.get_paid_amount(agreement_id),
+        agreement.get_status(agreement_id),
+        agreement.get_agreement_mode(agreement_id),
+        agreement.get_dispute_status(agreement_id),
+      ]);
     res.json({
       agreement: agreementAddress,
       agreement_id: agreement_id.toString(),
@@ -164,5 +169,3 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
     next(e);
   }
 });
-
-

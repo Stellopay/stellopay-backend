@@ -22,7 +22,7 @@ describe("Graceful Shutdown", () => {
     // Mock process.exit and process.on
     processExitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
     processOnSpy = vi.spyOn(process, "on").mockImplementation(() => process);
-    
+
     vi.useFakeTimers();
   });
 
@@ -39,7 +39,7 @@ describe("Graceful Shutdown", () => {
     expect(sigtermHandlerCall).toBeDefined();
 
     const handler = sigtermHandlerCall[1];
-    
+
     // Trigger the signal
     handler("SIGTERM");
 
@@ -61,7 +61,7 @@ describe("Graceful Shutdown", () => {
 
     const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
     const handler = sigtermHandlerCall[1];
-    
+
     handler("SIGTERM");
 
     // Server close is initiated but we DO NOT call the callback
@@ -79,7 +79,7 @@ describe("Graceful Shutdown", () => {
 
     const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
     const handler = sigtermHandlerCall[1];
-    
+
     // First signal
     handler("SIGTERM");
 
@@ -92,12 +92,12 @@ describe("Graceful Shutdown", () => {
 
   it("should handle error during pool close", async () => {
     mockClosePool.mockRejectedValue(new Error("Pool close error"));
-    
+
     setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
 
     const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
     const handler = sigtermHandlerCall[1];
-    
+
     handler("SIGTERM");
 
     // Call the callback to simulate server closed

@@ -51,19 +51,10 @@ const profileIdSchema = z.object({
 });
 
 /** Middleware: parse + validate :profileId, attach to res.locals */
-function validateProfileId(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
+function validateProfileId(req: Request, res: Response, next: NextFunction): void {
   const parsed = profileIdSchema.safeParse(req.params);
   if (!parsed.success) {
-    fail(
-      res,
-      400,
-      "Invalid profileId: " +
-        parsed.error.issues.map((i) => i.message).join(", "),
-    );
+    fail(res, 400, "Invalid profileId: " + parsed.error.issues.map((i) => i.message).join(", "));
     return;
   }
   res.locals.profileId = parsed.data.profileId;
@@ -71,11 +62,7 @@ function validateProfileId(
 }
 
 /** Middleware: gate all billing routes behind the BILLING_ENABLED flag */
-function requireBillingEnabled(
-  _req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
+function requireBillingEnabled(_req: Request, res: Response, next: NextFunction): void {
   if (!env.BILLING_ENABLED) {
     fail(
       res,
@@ -99,7 +86,6 @@ type SafeProfile = Omit<ProfileRow, "taxId" | "dateOfBirth">;
 
 function stripSensitive(profile: ProfileRow): SafeProfile {
   // Destructure to drop the sensitive fields; the rest is safe to return.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { taxId: _taxId, dateOfBirth: _dob, ...safe } = profile;
   return safe;
 }
@@ -182,13 +168,9 @@ billingRouter.get(
       const safe = stripSensitive(profile);
 
       // Compute a convenience fullAddress for UI display
-      const addrParts = [
-        safe.street,
-        safe.city,
-        safe.state,
-        safe.zipCode,
-        safe.country,
-      ].filter(Boolean);
+      const addrParts = [safe.street, safe.city, safe.state, safe.zipCode, safe.country].filter(
+        Boolean,
+      );
       const fullAddress = addrParts.length ? addrParts.join(", ") : null;
 
       ok(res, { ...safe, fullAddress });
