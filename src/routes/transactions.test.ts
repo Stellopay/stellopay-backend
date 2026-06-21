@@ -67,17 +67,48 @@ vi.mock("../db/index.js", () => {
             to: "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
             amount: "1000000",
             token: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
-          }
+          },
         ]);
       }),
     },
     schema: {
-      payments: { from: 'from', to: 'to', eventType: 'eventType', blockNumber: 'blockNumber', createdAt: 'createdAt', id: 'id' },
-      escrowEvents: { employer: 'employer', to: 'to', eventType: 'eventType', blockNumber: 'blockNumber', createdAt: 'createdAt', id: 'id' },
-      agreements: { employer: 'employer', contributor: 'contributor', token: 'token', id: 'id' },
-      agreementEvents: { eventType: 'eventType', blockNumber: 'blockNumber', createdAt: 'createdAt', agreementId: 'agreementId', id: 'id' },
-      employees: { employeeAddress: 'employeeAddress', blockNumber: 'blockNumber', createdAt: 'createdAt', agreementId: 'agreementId', id: 'id' },
-      milestones: { blockNumber: 'blockNumber', createdAt: 'createdAt', agreementId: 'agreementId', id: 'id' },
+      payments: {
+        from: "from",
+        to: "to",
+        eventType: "eventType",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        id: "id",
+      },
+      escrowEvents: {
+        employer: "employer",
+        to: "to",
+        eventType: "eventType",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        id: "id",
+      },
+      agreements: { employer: "employer", contributor: "contributor", token: "token", id: "id" },
+      agreementEvents: {
+        eventType: "eventType",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        agreementId: "agreementId",
+        id: "id",
+      },
+      employees: {
+        employeeAddress: "employeeAddress",
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        agreementId: "agreementId",
+        id: "id",
+      },
+      milestones: {
+        blockNumber: "blockNumber",
+        createdAt: "createdAt",
+        agreementId: "agreementId",
+        id: "id",
+      },
     },
   };
 });
@@ -98,38 +129,41 @@ describe("Transactions Router Pagination", () => {
   it("should return correct total and clamp limit", async () => {
     // 5 tables * 2 count each = 10 total items expected based on our mock
     const res = await request(app).get(
-      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=200",
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=200"
     ); // Request limit > 100
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     // Limit should be clamped to 100
     expect(res.body.limit).toBe(100);
     expect(res.body.total).toBe(10); // 5 count queries * 2 = 10
-    
+
     // We mocked 1 item per table, so 5 items total
     expect(res.body.transactions.length).toBe(5);
-    
+
     // total (10) > offset (0) + limit (100) -> false
     expect(res.body.hasMore).toBe(false);
   });
 
   it("should calculate hasMore correctly when paginating", async () => {
     const res = await request(app).get(
-      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=5",
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?limit=5"
     );
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     expect(res.body.limit).toBe(5);
     // offset 0 + limit 5 < total 10 -> true
     expect(res.body.hasMore).toBe(true);
   });
-  
+
   it("should work for filtered endpoint with similar logic", async () => {
     const res = await request(app).get(
-      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4/filtered?limit=5",
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4/filtered?limit=5"
     );
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     expect(res.body.total).toBe(10);
     expect(res.body.hasMore).toBe(true);
   });
@@ -143,10 +177,11 @@ describe("Transactions Router Pagination", () => {
     });
 
     const res = await request(app).get(
-      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4"
     );
-    
-    if(res.status!==200) console.log(res.body); expect(res.status).toBe(200);
+
+    if (res.status !== 200) console.log(res.body);
+    expect(res.status).toBe(200);
     expect(res.body.total).toBe(0);
     expect(res.body.transactions.length).toBe(0);
     expect(res.body.hasMore).toBe(false);

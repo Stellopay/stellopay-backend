@@ -67,7 +67,7 @@ export const requireAdmin = (req: Request, res: Response, next: NextFunction): v
   }
 
   const userAddress = req.auth.address.toLowerCase();
-  
+
   if (!env.ADMIN_ADDRESSES.includes(userAddress)) {
     res.status(401).json({ error: "Unauthorized" });
     return;

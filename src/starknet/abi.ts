@@ -14,5 +14,3 @@ export function loadAbiFromContractClassJsonPath(p: string): unknown[] {
   }
   return parsed.abi as unknown[];
 }
-
-

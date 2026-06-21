@@ -77,4 +77,3 @@ export const buildCorsOriginHandler = (
 
   return { originHandler, credentials: true };
 };
-

@@ -3,8 +3,10 @@ import { Pool } from "pg";
 import { env } from "../config.js";
 import * as schema from "./schema.js";
 
-const poolConfig = {
-  connectionString: env.POSTGRES_CONNECTION_STRING,
+// Pool tuning shared across whichever connection string we end up using:
+// bounded size plus idle/connection timeouts so a stuck DB can't exhaust the
+// pool. Sourced from validated env config.
+const poolTuning = {
   max: env.DB_POOL_MAX,
   idleTimeoutMillis: env.DB_POOL_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: env.DB_POOL_CONNECTION_TIMEOUT_MS,
@@ -21,9 +23,44 @@ function maskConnectionString(connectionString: string): string {
   }
 }
 
-const pool = new Pool(poolConfig);
+// Create connection pool with proper error handling.
+let pool: Pool;
+try {
+  const connectionString = env.POSTGRES_CONNECTION_STRING;
 
-pool.on("error", (error) => {
+  // Validate connection string format
+  if (!connectionString || typeof connectionString !== "string") {
+    console.warn("[db] POSTGRES_CONNECTION_STRING not set, database features will be unavailable");
+    // Create a dummy pool that will fail gracefully
+    pool = new Pool({
+      connectionString: "postgresql://localhost:5432/stellopay_indexer",
+      ...poolTuning,
+    });
+  } else {
+    // Parse and validate the connection string
+    const url = new URL(connectionString);
+    // Ensure password is a string (even if empty)
+    if (url.password === null || url.password === undefined) {
+      url.password = "";
+    }
+
+    pool = new Pool({
+      connectionString: url.toString(),
+      ...poolTuning,
+    });
+  }
+} catch (error) {
+  console.error("[db] Failed to initialize connection pool", {
+    message: error instanceof Error ? error.message : String(error),
+  });
+  // Fall back to a pool that will fail gracefully on use rather than at import.
+  pool = new Pool({
+    connectionString: "postgresql://localhost:5432/stellopay_indexer",
+    ...poolTuning,
+  });
+}
+
+pool.on("error", (error: Error & { code?: string }) => {
   console.error("[db] Unexpected pool error", {
     message: error.message,
     code: error.code,

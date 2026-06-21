@@ -1,79 +1,81 @@
 import { Router } from "express";
-import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
-import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
-
-const AddressParam = z.string().min(3);
+import {
+  StarknetAddress,
+  AgreementId,
+  parsePagination,
+} from "../utils/validation.js";
 
 export const indexedRouter = Router();
 
 // Get all agreements for a user (employer or contributor/employee)
-indexedRouter.get("/indexed/agreements/:contract_address/user/:user_address", async (req, res, next) => {
-  try {
-    const contractAddress = AddressParam.parse(req.params.contract_address);
-    const userAddress = normalizeAddress(req.params.user_address);
+indexedRouter.get(
+  "/indexed/agreements/:contract_address/user/:user_address",
+  async (req, res, next) => {
+    try {
+      const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      const userAddress = StarknetAddress.parse(req.params.user_address);
+      const { limit, offset } = parsePagination(req.query);
 
-    // Find agreements where user is employer or contributor
-    const agreements = await db
-      .select()
-      .from(schema.agreements)
-      .where(
-        and(
-          eq(schema.agreements.contractAddress, contractAddress),
-          or(
-            eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress)
-          )
+      // Find agreements where user is employer or contributor
+      const agreements = await db
+        .select()
+        .from(schema.agreements)
+        .where(
+          and(
+            eq(schema.agreements.contractAddress, contractAddress),
+            or(
+              eq(schema.agreements.employer, userAddress),
+              eq(schema.agreements.contributor, userAddress),
+            ),
+          ),
         )
-      )
-      .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt))
+        .limit(limit)
+        .offset(offset);
 
-    // Also check if user is an employee in any payroll agreements
-    const employeeAgreements = await db
-      .select({
-        agreement: schema.agreements,
-      })
-      .from(schema.agreements)
-      .innerJoin(
-        schema.employees,
-        eq(schema.agreements.id, schema.employees.agreementId)
-      )
-      .where(
-        and(
-          eq(schema.agreements.contractAddress, contractAddress),
-          eq(schema.employees.employeeAddress, userAddress),
-          eq(schema.agreements.mode, 1) // Payroll mode
+      // Also check if user is an employee in any payroll agreements
+      const employeeAgreements = await db
+        .select({
+          agreement: schema.agreements,
+        })
+        .from(schema.agreements)
+        .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
+        .where(
+          and(
+            eq(schema.agreements.contractAddress, contractAddress),
+            eq(schema.employees.employeeAddress, userAddress),
+            eq(schema.agreements.mode, 1), // Payroll mode
+          ),
         )
-      )
-      .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt))
+        .limit(limit);
 
-    // Combine and deduplicate
-    const allAgreements = [
-      ...agreements,
-      ...employeeAgreements.map((e) => e.agreement),
-    ];
+      // Combine and deduplicate
+      const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
 
-    // Remove duplicates by agreement ID
-    const uniqueAgreements = Array.from(
-      new Map(allAgreements.map((a) => [a.id, a])).values()
-    );
+      // Remove duplicates by agreement ID, then bound the combined result.
+      const uniqueAgreements = Array.from(
+        new Map(allAgreements.map((a) => [a.id, a])).values()
+      ).slice(0, limit);
 
-    res.json({
-      agreements: uniqueAgreements,
-      count: uniqueAgreements.length,
-      source: "indexed",
-    });
-  } catch (e) {
-    next(e);
-  }
-});
+      res.json({
+        agreements: uniqueAgreements,
+        count: uniqueAgreements.length,
+        source: "indexed",
+      });
+    } catch (e) {
+      next(e);
+    }
+  },
+);
 
 // Get agreement details by ID
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
-    const contractAddress = AddressParam.parse(req.params.contract_address);
-    const agreementId = req.params.agreement_id;
+    const contractAddress = StarknetAddress.parse(req.params.contract_address);
+    const agreementId = AgreementId.parse(req.params.agreement_id);
 
     const agreement = await db
       .select()
@@ -81,8 +83,8 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       .where(
         and(
           eq(schema.agreements.contractAddress, contractAddress),
-          eq(schema.agreements.id, agreementId)
-        )
+          eq(schema.agreements.id, agreementId),
+        ),
       )
       .limit(1);
 
@@ -145,19 +147,16 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
 // Get payments for a user
 indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddress(req.params.user_address);
+    const userAddress = StarknetAddress.parse(req.params.user_address);
+    const { limit, offset } = parsePagination(req.query);
 
     const payments = await db
       .select()
       .from(schema.payments)
-      .where(
-        or(
-          eq(schema.payments.from, userAddress),
-          eq(schema.payments.to, userAddress)
-        )
-      )
+      .where(or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)))
       .orderBy(desc(schema.payments.blockNumber))
-      .limit(100);
+      .limit(limit)
+      .offset(offset);
 
     res.json({ payments, count: payments.length });
   } catch (e) {
@@ -166,39 +165,41 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
 });
 
 // Get escrow balance for an agreement
-indexedRouter.get("/indexed/escrow/:contract_address/balance/:agreement_id", async (req, res, next) => {
-  try {
-    const contractAddress = AddressParam.parse(req.params.contract_address);
-    const agreementId = req.params.agreement_id;
+indexedRouter.get(
+  "/indexed/escrow/:contract_address/balance/:agreement_id",
+  async (req, res, next) => {
+    try {
+      const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      const agreementId = AgreementId.parse(req.params.agreement_id);
 
-    // Calculate balance from escrow events
-    const escrowEvents = await db
-      .select()
-      .from(schema.escrowEvents)
-      .where(
-        and(
-          eq(schema.escrowEvents.contractAddress, contractAddress),
-          eq(schema.escrowEvents.agreementId, agreementId)
+      // Calculate balance from escrow events
+      const escrowEvents = await db
+        .select()
+        .from(schema.escrowEvents)
+        .where(
+          and(
+            eq(schema.escrowEvents.contractAddress, contractAddress),
+            eq(schema.escrowEvents.agreementId, agreementId),
+          ),
         )
-      )
-      .orderBy(schema.escrowEvents.blockNumber);
+        .orderBy(schema.escrowEvents.blockNumber);
 
-    let balance = BigInt(0);
-    for (const event of escrowEvents) {
-      if (event.eventType === "Funded") {
-        balance += BigInt(event.amount);
-      } else if (event.eventType === "Released" || event.eventType === "Refunded") {
-        balance -= BigInt(event.amount);
+      let balance = BigInt(0);
+      for (const event of escrowEvents) {
+        if (event.eventType === "Funded") {
+          balance += BigInt(event.amount);
+        } else if (event.eventType === "Released" || event.eventType === "Refunded") {
+          balance -= BigInt(event.amount);
+        }
       }
+
+      res.json({
+        agreement_id: agreementId,
+        balance: balance.toString(),
+        events: escrowEvents,
+      });
+    } catch (e) {
+      next(e);
     }
-
-    res.json({
-      agreement_id: agreementId,
-      balance: balance.toString(),
-      events: escrowEvents,
-    });
-  } catch (e) {
-    next(e);
-  }
-});
-
+  },
+);
