@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import { ZodError } from "zod";
 import { env } from "./config.js";
 import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
@@ -156,26 +157,36 @@ app.use("/api/v1", billingRouter);
 app.use("/api/v1", apiV1NotFoundHandler);
 
 // Basic error handler
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  // eslint-disable-next-line no-console
-  console.error("[api] error", {
-    message: err?.message,
-    cause: err?.cause,
-    stack: err?.stack,
-    issues: err?.issues,
-  });
-  const status = typeof err?.status === "number" ? err.status : 500;
-  res.status(status).json({
-    error: err?.message ?? "Internal error",
-    details: err?.issues ?? undefined,
-    ...(env.NODE_ENV === "development"
-      ? {
-          cause: err?.cause?.message ?? err?.cause ?? undefined,
-          stack: err?.stack,
-        }
-      : {}),
-  });
-});
+app.use(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    // eslint-disable-next-line no-console
+    console.error("[api] error", {
+      message: err?.message,
+      cause: err?.cause,
+      stack: err?.stack,
+      issues: err?.issues,
+    });
+    // Zod validation errors are client errors: surface them as 400 with the
+    // structured issue list rather than the default 500.
+    const isZodError = err instanceof ZodError;
+    const status = isZodError
+      ? 400
+      : typeof err?.status === "number"
+        ? err.status
+        : 500;
+    res.status(status).json({
+      error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
+      details: err?.issues ?? undefined,
+      ...(env.NODE_ENV === "development"
+        ? {
+            cause: err?.cause?.message ?? err?.cause ?? undefined,
+            stack: err?.stack,
+          }
+        : {}),
+    });
+  },
+);
 
 const server = app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console

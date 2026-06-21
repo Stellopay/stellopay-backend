@@ -1,10 +1,11 @@
 import { Router } from "express";
-import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
-import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
-
-const AddressParam = z.string().min(3);
+import {
+  StarknetAddress,
+  AgreementId,
+  parsePagination,
+} from "../utils/validation.js";
 
 export const indexedRouter = Router();
 
@@ -13,8 +14,9 @@ indexedRouter.get(
   "/indexed/agreements/:contract_address/user/:user_address",
   async (req, res, next) => {
     try {
-      const contractAddress = AddressParam.parse(req.params.contract_address);
-      const userAddress = normalizeAddress(req.params.user_address);
+      const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      const userAddress = StarknetAddress.parse(req.params.user_address);
+      const { limit, offset } = parsePagination(req.query);
 
       // Find agreements where user is employer or contributor
       const agreements = await db
@@ -29,7 +31,9 @@ indexedRouter.get(
             ),
           ),
         )
-        .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt))
+        .limit(limit)
+        .offset(offset);
 
       // Also check if user is an employee in any payroll agreements
       const employeeAgreements = await db
@@ -45,13 +49,16 @@ indexedRouter.get(
             eq(schema.agreements.mode, 1), // Payroll mode
           ),
         )
-        .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt))
+        .limit(limit);
 
       // Combine and deduplicate
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
 
-      // Remove duplicates by agreement ID
-      const uniqueAgreements = Array.from(new Map(allAgreements.map((a) => [a.id, a])).values());
+      // Remove duplicates by agreement ID, then bound the combined result.
+      const uniqueAgreements = Array.from(
+        new Map(allAgreements.map((a) => [a.id, a])).values()
+      ).slice(0, limit);
 
       res.json({
         agreements: uniqueAgreements,
@@ -67,8 +74,8 @@ indexedRouter.get(
 // Get agreement details by ID
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
-    const contractAddress = AddressParam.parse(req.params.contract_address);
-    const agreementId = req.params.agreement_id;
+    const contractAddress = StarknetAddress.parse(req.params.contract_address);
+    const agreementId = AgreementId.parse(req.params.agreement_id);
 
     const agreement = await db
       .select()
@@ -140,14 +147,16 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
 // Get payments for a user
 indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddress(req.params.user_address);
+    const userAddress = StarknetAddress.parse(req.params.user_address);
+    const { limit, offset } = parsePagination(req.query);
 
     const payments = await db
       .select()
       .from(schema.payments)
       .where(or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)))
       .orderBy(desc(schema.payments.blockNumber))
-      .limit(100);
+      .limit(limit)
+      .offset(offset);
 
     res.json({ payments, count: payments.length });
   } catch (e) {
@@ -160,8 +169,8 @@ indexedRouter.get(
   "/indexed/escrow/:contract_address/balance/:agreement_id",
   async (req, res, next) => {
     try {
-      const contractAddress = AddressParam.parse(req.params.contract_address);
-      const agreementId = req.params.agreement_id;
+      const contractAddress = StarknetAddress.parse(req.params.contract_address);
+      const agreementId = AgreementId.parse(req.params.agreement_id);
 
       // Calculate balance from escrow events
       const escrowEvents = await db
