@@ -294,33 +294,51 @@ CORS_ORIGIN=*
 
 #### PayrollEscrow (view)
 
-- `GET /api/v1/escrow/:address/get_employer`
-- `GET /api/v1/escrow/:address/get_agreement`
+- `GET /api/v1/escrow/defaults`
 - `GET /api/v1/escrow/:address/get_token`
+- `GET /api/v1/escrow/:address/is_initialized`
+- `GET /api/v1/escrow/:address/get_agreement_balance/:agreement_id`
+- `GET /api/v1/escrow/:address/get_agreement_employer/:agreement_id`
 
 #### PayrollEscrow (prepare to sign client-side)
 
 - `POST /api/v1/prepare/escrow/:address/initialize`
-- `POST /api/v1/prepare/escrow/:address/set_agreement`
-- `POST /api/v1/prepare/escrow/:address/deposit`
+- `POST /api/v1/prepare/escrow/:address/fund_agreement`
 - `POST /api/v1/prepare/escrow/:address/release`
 - `POST /api/v1/prepare/escrow/:address/refund_remaining`
 
 #### WorkAgreement (view)
 
-- `GET /api/v1/agreement/:address/get_employer`
-- `GET /api/v1/agreement/:address/get_contributor`
-- `GET /api/v1/agreement/:address/get_token`
+- `GET /api/v1/agreement/defaults`
+- `GET /api/v1/agreement/:address/get_employer/:agreement_id`
+- `GET /api/v1/agreement/:address/get_contributor/:agreement_id`
+- `GET /api/v1/agreement/:address/get_token/:agreement_id`
 - `GET /api/v1/agreement/:address/get_escrow`
-- `GET /api/v1/agreement/:address/get_total_amount`
-- `GET /api/v1/agreement/:address/get_paid_amount`
+- `GET /api/v1/agreement/:address/is_initialized`
+- `GET /api/v1/agreement/:address/get_total_amount/:agreement_id`
+- `GET /api/v1/agreement/:address/get_paid_amount/:agreement_id`
+- `GET /api/v1/agreement/:address/get_status/:agreement_id`
+- `GET /api/v1/agreement/:address/get_agreement_mode/:agreement_id`
+- `GET /api/v1/agreement/:address/get_employee_count/:agreement_id`
+- `GET /api/v1/agreement/:address/get_employee/:agreement_id/:index`
+- `GET /api/v1/agreement/:address/get_employee_salary/:agreement_id/:index`
+- `GET /api/v1/agreement/:address/get_dispute_status/:agreement_id`
+- `GET /api/v1/agreement/:address/is_grace_period_active/:agreement_id`
+- `GET /api/v1/agreement/:address/list/:user_address`
 
-#### WorkAgreement (invoke)
+#### WorkAgreement (index helpers)
+
+- `POST /api/v1/agreement/:address/get_agreement_id_from_tx`
+- `POST /api/v1/agreement/:address/sync_index`
 
 #### WorkAgreement (prepare to sign client-side)
 
-- `POST /api/v1/prepare/agreement/:address/initialize_time_based`
-- `POST /api/v1/prepare/agreement/:address/initialize_milestone_based`
+- `POST /api/v1/prepare/agreement/:address/initialize`
+- `POST /api/v1/prepare/agreement/:address/create_time_based_agreement`
+- `POST /api/v1/prepare/agreement/:address/create_milestone_agreement`
+- `POST /api/v1/prepare/agreement/:address/create_payroll_agreement`
+- `POST /api/v1/prepare/agreement/:address/add_employee`
+- `POST /api/v1/prepare/agreement/:address/fund_agreement`
 - `POST /api/v1/prepare/agreement/:address/add_milestone`
 - `POST /api/v1/prepare/agreement/:address/approve_milestone`
 - `POST /api/v1/prepare/agreement/:address/claim_milestone`
@@ -328,7 +346,11 @@ CORS_ORIGIN=*
 - `POST /api/v1/prepare/agreement/:address/pause`
 - `POST /api/v1/prepare/agreement/:address/resume`
 - `POST /api/v1/prepare/agreement/:address/cancel`
+- `POST /api/v1/prepare/agreement/:address/finalize_grace_period`
+- `POST /api/v1/prepare/agreement/:address/raise_dispute`
+- `POST /api/v1/prepare/agreement/:address/resolve_dispute`
 - `POST /api/v1/prepare/agreement/:address/claim_time_based`
+- `POST /api/v1/prepare/agreement/:address/claim_payroll`
 
 #### Billing Profiles _(requires `BILLING_ENABLED=true`)_
 
@@ -570,6 +592,11 @@ does not include the refreshed expiry. Expired tokens are rejected and purged
 lazily on use, with a periodic background sweep for tokens that are never used
 again.
 
+Contract prepare routes currently validate sessions from the JSON request body
+with `wallet_address` and `session_token`. Middleware-protected routes use the
+same session store but expect `Authorization: Bearer <session_token>` plus an
+`x-user-address` header.
+
 Challenges and sessions are both in-memory only. Restarting the server clears
 all outstanding challenges and session tokens, so clients should handle
 `401 Invalid session` by starting the challenge → verify flow again.
@@ -606,26 +633,32 @@ async function login(address: string) {
 }
 ```
 
-2. Prepare a call (example: escrow deposit), then execute from wallet:
+2. Prepare a call (example: funding an escrow agreement), then execute from wallet:
 
 ```ts
-async function deposit({
+async function fundAgreement({
   walletAddress,
   sessionToken,
   escrowAddress,
+  agreementId,
+  employer,
   amount,
 }: {
   walletAddress: string;
   sessionToken: string;
   escrowAddress: string;
+  agreementId: string;
+  employer: string;
   amount: string; // decimal string
 }) {
-  const prepRes = await fetch(`${BACKEND}/prepare/escrow/${escrowAddress}/deposit`, {
+  const prepRes = await fetch(`${BACKEND}/prepare/escrow/${escrowAddress}/fund_agreement`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       wallet_address: walletAddress,
       session_token: sessionToken,
+      agreement_id: agreementId,
+      employer,
       amount,
     }),
   });
