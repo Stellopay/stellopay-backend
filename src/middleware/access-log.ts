@@ -1,19 +1,13 @@
 import { Request, Response, NextFunction } from "express";
-import crypto from "node:crypto";
 import { env } from "../config.js";
-
-declare global {
-  namespace Express {
-    interface Request {
-      id: string;
-    }
-  }
-}
 
 /**
  * Structured access log middleware.
  * Records method, path, status code, and duration of requests.
  * Explicitly skips bodies and auth tokens for security.
+ *
+ * Reads `res.locals.requestId` set by {@link requestIdMiddleware}, which must
+ * be mounted before this middleware.
  */
 export function accessLogMiddleware(req: Request, res: Response, next: NextFunction) {
   // Skip noisy /health requests
@@ -21,14 +15,8 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
     return next();
   }
 
-  // Get existing request ID or generate a new one
-  const requestId =
-    (req.headers["x-request-id"] as string) ||
-    (req.headers["x-correlation-id"] as string) ||
-    crypto.randomUUID();
-
-  // Attach for downstream use if needed
-  req.id = requestId;
+  // ID is set by requestIdMiddleware; fall back gracefully when used standalone
+  const requestId: string = res.locals.requestId ?? "unknown";
 
   const startHrTime = process.hrtime.bigint();
 
@@ -43,7 +31,7 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
       path: req.originalUrl || req.path,
       status: res.statusCode,
       duration_ms: Math.round(durationMs * 100) / 100,
-      request_id: requestId,
+      request_id: res.locals.requestId ?? requestId,
     };
 
     if (env.LOG_FORMAT === "json") {

@@ -59,10 +59,142 @@ All configuration is parsed and validated in `src/config.ts`. `env.example` has 
 
 ### Observability
 
-The application includes structured JSON access logging to monitor traffic, latency, and error rates.
-By default, the logger records `method`, `path`, `status`, `duration_ms`, and `request_id`.
+The application includes structured JSON access logging and request correlation to monitor traffic, latency, error rates, and trace requests across the frontend/backend boundary.
 
-Sensitive fields such as request bodies and authorization tokens are strictly omitted from all access logs. The noisy `/health` endpoint is completely excluded from logging.
+#### Request ID Correlation
+
+Every request is assigned a unique `request_id` that flows through the entire request lifecycle:
+
+- **Client-supplied IDs** (via `X-Request-Id` header) are validated, sanitised, and echoed back on the response header
+  - Length-capped at 128 characters
+  - Restricted to printable ASCII (no control chars, newlines, or carriage returns)
+  - Invalid IDs are silently rejected; a server-generated UUID is used instead
+- **Server-generated IDs** (when no header is provided) use `crypto.randomUUID()` to ensure uniqueness
+- The ID is available on `res.locals.requestId` for all downstream handlers and middleware
+- Every response includes the `X-Request-Id` header so clients can correlate their logs with server-side logs
+
+**Example: correlating a 500 error**
+
+Frontend logs report a failed request:
+
+```
+[app] POST /api/v1/escrow/0x123/deposit failed with status 500
+Request-Id: req-client-001
+```
+
+Backend logs include the same correlation ID:
+
+```json
+{"level":"error","request_id":"req-client-001","message":"database connection failed",...}
+```
+
+**Client library integration** (e.g., in React/Vue):
+
+```javascript
+// Send a client-managed request ID to link frontend logs with backend
+const requestId = `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+const response = await fetch("/api/v1/escrow/0x123/deposit", {
+  method: "POST",
+  headers: {
+    "X-Request-Id": requestId,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    /* ... */
+  }),
+});
+console.log("[app]", requestId, "server echo:", response.headers.get("X-Request-Id"));
+```
+
+#### Access Logging
+
+By default, the logger records:
+
+- `method` — HTTP method (GET, POST, etc.)
+- `path` — request path and query string
+- `status` — HTTP response status
+- `duration_ms` — request duration in milliseconds
+- `request_id` — correlation ID (see above)
+- `timestamp` — ISO 8601 timestamp
+
+**JSON format** (structured, recommended for production):
+
+```json
+{
+  "timestamp": "2024-06-20T15:51:29.123Z",
+  "level": "info",
+  "method": "POST",
+  "path": "/api/v1/escrow/0x123/initialize",
+  "status": 200,
+  "duration_ms": 45.23,
+  "request_id": "req-client-001"
+}
+```
+
+**Text format** (human-readable, development):
+
+```
+[2024-06-20T15:51:29.123Z] INFO POST /api/v1/escrow/0x123/initialize 200 45.23ms [req-client-001]
+```
+
+**Configuration**:
+
+```env
+LOG_FORMAT=json  # Use 'json' for structured logging (production) or 'text' for console (development)
+LOG_LEVEL=info   # Minimum logging level (debug, info, warn, error)
+```
+
+Sensitive fields such as request bodies and authorization tokens are **strictly omitted** from all access logs.
+The noisy `/health` endpoint is **completely excluded** from logging to reduce noise.
+
+#### Error Logging with Correlation
+
+When an error occurs, the central error handler logs the full error context **with the request ID**:
+
+```json
+{
+  "level": "error",
+  "request_id": "req-client-001",
+  "message": "Insufficient balance in escrow",
+  "cause": "SmartContract validation failed",
+  "stack": "Error: ...",
+  "status": 400
+}
+```
+
+The client also receives the correlation ID in the error response body:
+
+```json
+{
+  "error": "Insufficient balance in escrow",
+  "request_id": "req-client-001",
+  "details": null
+}
+```
+
+In development mode, the response includes `cause` and `stack` for debugging:
+
+```json
+{
+  "error": "Insufficient balance in escrow",
+  "request_id": "req-client-001",
+  "cause": "SmartContract validation failed",
+  "stack": "Error: ...\n    at ..."
+}
+```
+
+#### Monitoring & Alerting Integration
+
+To integrate with external monitoring systems (Datadog, New Relic, Grafana Loki, etc.):
+
+1. **Set `LOG_FORMAT=json`** to emit structured JSON that most systems can ingest
+2. **Parse the JSON stream** in your collector to extract metrics:
+   - `status >= 500` → alert on server errors
+   - `duration_ms > threshold` → alert on slow requests
+   - Group errors by `request_id` to trace failure chains
+3. **Use `request_id` as a unique trace identifier** across services:
+   - Pass `X-Request-Id` header to downstream services
+   - Include it in log aggregation queries for full request traces
 
 ### Database & health checks
 

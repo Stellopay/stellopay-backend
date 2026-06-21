@@ -25,11 +25,16 @@ import { apiV1NotFoundHandler } from "./routes/not-found.js";
 import { checkDbHealth, closePool } from "./db/index.js";
 import { setupGracefulShutdown } from "./shutdown.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
+import { requestIdMiddleware } from "./middleware/request-id.js";
 
 export const app = express();
 
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
+
+// Mount request-ID middleware first so every downstream handler and logger
+// can read res.locals.requestId and every response carries X-Request-Id.
+app.use(requestIdMiddleware);
 
 // Apply access log middleware early
 app.use(accessLogMiddleware);
@@ -164,8 +169,10 @@ app.use("/api/v1", apiV1NotFoundHandler);
 app.use(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const requestId: string | undefined = res.locals.requestId;
     // eslint-disable-next-line no-console
     console.error("[api] error", {
+      request_id: requestId,
       message: err?.message,
       cause: err?.cause,
       stack: err?.stack,
@@ -181,6 +188,7 @@ app.use(
         : 500;
     res.status(status).json({
       error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
+      request_id: requestId,
       details: err?.issues ?? undefined,
       ...(env.NODE_ENV === "development"
         ? {
