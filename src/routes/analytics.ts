@@ -1,18 +1,19 @@
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, or, gte, lte, sql, inArray } from "drizzle-orm";
-import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
+import { eq, and, or, gte, lte, sql } from "drizzle-orm";
+import { StarknetAddress } from "../utils/validation.js";
 import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
-
-const AddressParam = z.string().min(3);
 
 export const analyticsRouter = Router();
 
 // Get analytics data (monthly payment amounts) for a user
 analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddress(req.params.user_address);
+    // Validate the path param before it is normalized so a crafted string
+    // cannot produce a surprising lookup key; an invalid address throws a
+    // ZodError that the global handler maps to a 400 before any DB query.
+    const userAddress = StarknetAddress.parse(req.params.user_address);
     const year =
       z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) ||
       new Date().getFullYear();
