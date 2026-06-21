@@ -142,6 +142,7 @@ describe("Reprocess Events Routes", () => {
           status: "processed",
           eventsProcessed: 1,
           eventLabels: ["AgreementCreated-123"],
+          tokenVerified: true,
         },
       });
 
