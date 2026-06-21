@@ -2,6 +2,7 @@
   "name": "stellopay-backend",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@10.29.3",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -20,16 +21,17 @@
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "drizzle-orm": "^0.40.1",
-    "express": "^4.19.2",
+    "drizzle-orm": "^0.45.2",
+    "express": "^5.2.1",
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
-    "nodemailer": "^6.9.16",
+    "nodemailer": "^9.0.1",
     "pg": "^8.13.1",
     "starknet": "^6.17.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.2",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/express-rate-limit": "^6.0.0",
@@ -38,7 +40,6 @@
     "@types/pg": "^8.11.10",
     "@types/supertest": "^7.2.0",
     "@vitest/coverage-v8": "^3.2.4",
-    "@eslint/js": "^9.39.2",
     "eslint": "^9.39.2",
     "prettier": "^3.7.4",
     "supertest": "^7.2.2",
