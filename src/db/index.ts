@@ -4,12 +4,14 @@ import { env } from "../config.js";
 import * as schema from "./schema.js";
 
 // Pool tuning shared across whichever connection string we end up using:
-// bounded size plus idle/connection timeouts so a stuck DB can't exhaust the
-// pool. Sourced from validated env config.
+// bounded size plus idle/connection/query timeouts so a stuck DB can't exhaust
+// the pool. Sourced from validated env config.
 const poolTuning = {
   max: env.DB_POOL_MAX,
   idleTimeoutMillis: env.DB_POOL_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: env.DB_POOL_CONNECTION_TIMEOUT_MS,
+  statement_timeout: env.DB_POOL_STATEMENT_TIMEOUT_MS,
+  query_timeout: env.DB_POOL_QUERY_TIMEOUT_MS,
 };
 
 function maskConnectionString(connectionString: string): string {
@@ -98,4 +100,3 @@ export async function closePool(): Promise<void> {
 }
 
 export { maskConnectionString };
-

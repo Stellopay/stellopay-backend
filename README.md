@@ -47,6 +47,11 @@ All configuration is parsed and validated in `src/config.ts`. `env.example` has 
 | `PORT`                                                         | `4000`                                          |                                                                         |
 | `CORS_ORIGIN`                                                  | `*`                                             | See the CORS Configuration section                                      |
 | `POSTGRES_CONNECTION_STRING`                                   | `postgresql://localhost:5432/stellopay_indexer` |                                                                         |
+| `DB_POOL_MAX`                                                  | `10`                                            | Maximum Postgres connections in the app pool                            |
+| `DB_POOL_IDLE_TIMEOUT_MS`                                      | `30000`                                         | Closes idle Postgres clients after this many milliseconds               |
+| `DB_POOL_CONNECTION_TIMEOUT_MS`                                | `5000`                                          | Fails connection attempts after this many milliseconds                  |
+| `DB_POOL_STATEMENT_TIMEOUT_MS`                                 | `15000`                                         | Server-side statement timeout applied to every pooled Postgres client   |
+| `DB_POOL_QUERY_TIMEOUT_MS`                                     | `20000`                                         | Client-side query timeout for `pg` calls                                |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX`                      | `900000` / `100`                                | Global rate limiter                                                     |
 | `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX`        | `300000` / `10`                                 | Auth and contact limiter                                                |
 | `TRUST_PROXY`                                                  | `1`                                             | Number of proxies, or `true`                                            |

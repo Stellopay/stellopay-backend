@@ -32,6 +32,8 @@ const EnvSchema = z.object({
   DB_POOL_MAX: z.coerce.number().int().positive().optional().default(10),
   DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(30_000),
   DB_POOL_CONNECTION_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(5_000),
+  DB_POOL_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(15_000),
+  DB_POOL_QUERY_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(20_000),
 
   // Token addresses (optional, with defaults)
   TOKEN_STRK: z.string().optional(),
