@@ -30,9 +30,7 @@ export const agreements = pgTable(
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (table) => ({
-    contractAddressIdx: index("agreements_contract_address_idx").on(
-      table.contractAddress,
-    ),
+    contractAddressIdx: index("agreements_contract_address_idx").on(table.contractAddress),
     employerIdx: index("agreements_employer_idx").on(table.employer),
     contributorIdx: index("agreements_contributor_idx").on(table.contributor),
     statusIdx: index("agreements_status_idx").on(table.status),
@@ -53,16 +51,10 @@ export const agreementEvents = pgTable(
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (table) => ({
-    agreementIdIdx: index("agreement_events_agreement_id_idx").on(
-      table.agreementId,
-    ),
-    contractAddressIdx: index("agreement_events_contract_address_idx").on(
-      table.contractAddress,
-    ),
+    agreementIdIdx: index("agreement_events_agreement_id_idx").on(table.agreementId),
+    contractAddressIdx: index("agreement_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("agreement_events_event_type_idx").on(table.eventType),
-    blockNumberIdx: index("agreement_events_block_number_idx").on(
-      table.blockNumber,
-    ),
+    blockNumberIdx: index("agreement_events_block_number_idx").on(table.blockNumber),
   }),
 );
 
@@ -131,9 +123,7 @@ export const employees = pgTable(
   },
   (table) => ({
     agreementIdIdx: index("employees_agreement_id_idx").on(table.agreementId),
-    employeeAddressIdx: index("employees_employee_address_idx").on(
-      table.employeeAddress,
-    ),
+    employeeAddressIdx: index("employees_employee_address_idx").on(table.employeeAddress),
   }),
 );
 
@@ -153,16 +143,10 @@ export const escrowEvents = pgTable(
     createdAt: timestamp("created_at").defaultNow().notNull(),
   },
   (table) => ({
-    agreementIdIdx: index("escrow_events_agreement_id_idx").on(
-      table.agreementId,
-    ),
-    contractAddressIdx: index("escrow_events_contract_address_idx").on(
-      table.contractAddress,
-    ),
+    agreementIdIdx: index("escrow_events_agreement_id_idx").on(table.agreementId),
+    contractAddressIdx: index("escrow_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("escrow_events_event_type_idx").on(table.eventType),
-    blockNumberIdx: index("escrow_events_block_number_idx").on(
-      table.blockNumber,
-    ),
+    blockNumberIdx: index("escrow_events_block_number_idx").on(table.blockNumber),
   }),
 );
 
@@ -188,9 +172,7 @@ export const billingProfiles = pgTable(
     })
       .notNull()
       .default("0"),
-    usedAmount: numeric("used_amount", { precision: 18, scale: 6 })
-      .notNull()
-      .default("0"),
+    usedAmount: numeric("used_amount", { precision: 18, scale: 6 }).notNull().default("0"),
     currency: text("currency").notNull().default("USD"),
     // General information
     firstName: text("first_name"),
@@ -217,9 +199,7 @@ export const billingProfiles = pgTable(
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (table) => ({
-    ownerAddressIdx: index("billing_profiles_owner_address_idx").on(
-      table.ownerAddress,
-    ),
+    ownerAddressIdx: index("billing_profiles_owner_address_idx").on(table.ownerAddress),
   }),
 );
 
@@ -245,9 +225,7 @@ export const billingPaymentMethods = pgTable(
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (table) => ({
-    profileIdIdx: index("billing_payment_methods_profile_id_idx").on(
-      table.profileId,
-    ),
+    profileIdIdx: index("billing_payment_methods_profile_id_idx").on(table.profileId),
   }),
 );
 

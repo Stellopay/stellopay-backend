@@ -1,11 +1,12 @@
 import { Router } from "express";
+import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, schema } from "../db/index.js";
 import { sql } from "drizzle-orm";
 
 export const diagnosticsRouter = Router();
 
 // Comprehensive diagnostic endpoint
-diagnosticsRouter.get("/diagnostics/events", async (req, res, next) => {
+diagnosticsRouter.get("/diagnostics/events", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     // Get event type counts
     const eventTypeCounts = await db.execute(sql`
@@ -70,10 +71,3 @@ diagnosticsRouter.get("/diagnostics/events", async (req, res, next) => {
     next(e);
   }
 });
-
-
-
-
-
-
-

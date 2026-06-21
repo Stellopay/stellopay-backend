@@ -1,26 +1,22 @@
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, or, gte, lte, sql, inArray } from "drizzle-orm";
-// Helper to normalize addresses
-function normalizeAddress(addr: string): string {
-  let normalized = addr.toLowerCase();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
-  }
-  const hex = normalized.replace(/^0x/, "");
-  return `0x${hex.padStart(64, "0")}`;
-}
-
-const AddressParam = z.string().min(3);
+import { eq, and, or, gte, lte, sql } from "drizzle-orm";
+import { StarknetAddress } from "../utils/validation.js";
+import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 
 export const analyticsRouter = Router();
 
 // Get analytics data (monthly payment amounts) for a user
 analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddress(req.params.user_address);
-    const year = z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) || new Date().getFullYear();
+    // Validate the path param before it is normalized so a crafted string
+    // cannot produce a surprising lookup key; an invalid address throws a
+    // ZodError that the global handler maps to a 400 before any DB query.
+    const userAddress = StarknetAddress.parse(req.params.user_address);
+    const year =
+      z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) ||
+      new Date().getFullYear();
 
     // Get all payments for the user in the specified year
     const startDate = new Date(year, 0, 1);
@@ -34,13 +30,10 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       .from(schema.payments)
       .where(
         and(
-          or(
-            eq(schema.payments.from, userAddress),
-            eq(schema.payments.to, userAddress)
-          ),
+          or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
           gte(schema.payments.createdAt, startDate),
-          lte(schema.payments.createdAt, endDate)
-        )
+          lte(schema.payments.createdAt, endDate),
+        ),
       );
 
     // Get escrow events (funding, releases, refunds)
@@ -55,11 +48,11 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         and(
           or(
             eq(schema.escrowEvents.employer, userAddress),
-            eq(schema.escrowEvents.to, userAddress)
+            eq(schema.escrowEvents.to, userAddress),
           ),
           gte(schema.escrowEvents.createdAt, startDate),
-          lte(schema.escrowEvents.createdAt, endDate)
-        )
+          lte(schema.escrowEvents.createdAt, endDate),
+        ),
       );
 
     // Get agreement creation events (for analytics - count agreements created per month)
@@ -75,16 +68,29 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
           eq(schema.agreementEvents.eventType, "AgreementCreated"),
           or(
             eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress)
+            eq(schema.agreements.contributor, userAddress),
           ),
           gte(schema.agreementEvents.createdAt, startDate),
-          lte(schema.agreementEvents.createdAt, endDate)
-        )
+          lte(schema.agreementEvents.createdAt, endDate),
+        ),
       );
 
     // Aggregate by month
     const monthlyData: Record<number, bigint> = {};
-    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+    const monthNames = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sept",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
 
     // Initialize all months to 0
     for (let i = 1; i <= 12; i++) {
@@ -127,25 +133,31 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       monthlyData[month] = (monthlyData[month] || 0n) + BigInt(count * 1000);
     });
 
-    // Convert to chart format
+    // Convert to chart format. Monthly amounts are u256 base units summed in
+    // BigInt space, so they can exceed Number.MAX_SAFE_INTEGER. Divide
+    // losslessly with formatTokenAmount before exposing the numeric display
+    // value the chart expects. Amounts are aggregated across tokens, so the
+    // 6-decimal USDC/USDT default is assumed here (DEFAULT_TOKEN_DECIMALS);
+    // a token-specific override would require per-token aggregation.
     const chartData = monthNames.map((month, index) => {
       const monthNum = index + 1;
       const value = monthlyData[monthNum] || 0n;
-      // Convert from raw token units to a display value (assuming 6 decimals for USDC)
-      // For now, just return the raw value - frontend can format it
       return {
         month,
-        views: Number(value) / 1_000_000, // Convert to display units (assuming 6 decimals)
+        views: Number(formatTokenAmount(value, DEFAULT_TOKEN_DECIMALS)),
       };
     });
 
-    res.json({ 
+    // Sum the raw BigInt amounts before formatting so the total is computed
+    // losslessly rather than by accumulating already-rounded display values.
+    const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
+
+    res.json({
       year,
       data: chartData,
-      total: chartData.reduce((sum, d) => sum + d.views, 0),
+      total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
     });
   } catch (e) {
     next(e);
   }
 });
-

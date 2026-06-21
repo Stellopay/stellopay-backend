@@ -13,7 +13,7 @@ import { Server } from "http";
 export function setupGracefulShutdown(
   server: Server,
   closePool: () => Promise<void>,
-  drainTimeoutMs: number
+  drainTimeoutMs: number,
 ): void {
   let isShuttingDown = false;
 

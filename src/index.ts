@@ -1,8 +1,9 @@
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import { ZodError } from "zod";
 import { env } from "./config.js";
+import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
 import { agreementRouter } from "./routes/agreement.js";
 import { authRouter } from "./routes/auth.js";
@@ -20,13 +21,23 @@ import { diagnosticsRouter } from "./routes/diagnostics.js";
 import { backfillEventsRouter } from "./routes/backfill-events.js";
 import { contactRouter } from "./routes/contact.js";
 import { billingRouter } from "./routes/billing.js";
-import { closePool } from "./db/index.js";
+import { apiV1NotFoundHandler } from "./routes/not-found.js";
+import { checkDbHealth, closePool } from "./db/index.js";
 import { setupGracefulShutdown } from "./shutdown.js";
+import { accessLogMiddleware } from "./middleware/access-log.js";
+import { requestIdMiddleware } from "./middleware/request-id.js";
 
-const app = express();
+export const app = express();
 
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
+
+// Mount request-ID middleware first so every downstream handler and logger
+// can read res.locals.requestId and every response carries X-Request-Id.
+app.use(requestIdMiddleware);
+
+// Apply access log middleware early
+app.use(accessLogMiddleware);
 
 // ---------------------------------------------------------------------------
 // CORS
@@ -99,47 +110,37 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-// Rate limiting: Global limiter (looser)
-const globalLimiter = rateLimit({
+// Rate limiting: limiters are built via the shared factory so the
+// keyGenerator (IP, honouring trust proxy) and JSON 429 envelope stay
+// consistent. See src/middleware/rate-limit.ts for the in-memory store
+// limitation and the shared-store (Redis) seam.
+
+// Global limiter (looser) — applied to all /api routes; /health is exempt.
+const globalLimiter = makeLimiter({
+  name: "global",
   windowMs: env.RATE_LIMIT_WINDOW_MS,
   max: env.RATE_LIMIT_MAX,
   message: "Too many requests, please try again later.",
-  standardHeaders: false, // Return rate limit info in `RateLimit-*` headers
-  skip: (req) => {
-    // Don't count /health requests against rate limit
-    return req.path === "/health";
-  },
-  keyGenerator: (req) => {
-    // Key by client IP (respects X-Forwarded-For if trust proxy is set)
-    return req.ip || "unknown";
-  },
-  handler: (_req, res) => {
-    res.status(429).json({
-      error: "Too many requests, please try again later.",
-    });
-  },
+  // Don't count /health requests against the rate limit.
+  skip: (req) => req.path === "/health",
 });
 
-// Rate limiting: Strict limiter for auth and contact endpoints
-const strictLimiter = rateLimit({
+// Strict limiter for unauthenticated, side-effecting auth and contact endpoints.
+const strictLimiter = makeLimiter({
+  name: "strict",
   windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
   max: env.RATE_LIMIT_STRICT_MAX,
   message: "Too many requests from this IP, please try again later.",
-  standardHeaders: false,
-  keyGenerator: (req) => {
-    return req.ip || "unknown";
-  },
-  handler: (_req, res) => {
-    res.status(429).json({
-      error: "Too many requests from this IP, please try again later.",
-    });
-  },
 });
 
 // Apply global rate limiter to all API routes
 app.use("/api/", globalLimiter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/ready", async (_req, res) => {
+  const isReady = await checkDbHealth();
+  res.status(isReady ? 200 : 503).json(isReady ? { ok: true } : { ok: false });
+});
 
 app.use("/api/v1", escrowRouter);
 app.use("/api/v1", agreementRouter);
@@ -162,21 +163,32 @@ app.use("/api/v1", backfillEventsRouter);
 app.use("/api/v1/contact", strictLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
+app.use("/api/v1", apiV1NotFoundHandler);
 
 // Basic error handler
 app.use(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const requestId: string | undefined = res.locals.requestId;
     // eslint-disable-next-line no-console
     console.error("[api] error", {
+      request_id: requestId,
       message: err?.message,
       cause: err?.cause,
       stack: err?.stack,
       issues: err?.issues,
     });
-    const status = typeof err?.status === "number" ? err.status : 500;
+    // Zod validation errors are client errors: surface them as 400 with the
+    // structured issue list rather than the default 500.
+    const isZodError = err instanceof ZodError;
+    const status = isZodError
+      ? 400
+      : typeof err?.status === "number"
+        ? err.status
+        : 500;
     res.status(status).json({
-      error: err?.message ?? "Internal error",
+      error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
+      request_id: requestId,
       details: err?.issues ?? undefined,
       ...(env.NODE_ENV === "development"
         ? {
@@ -188,10 +200,12 @@ app.use(
   },
 );
 
-const server = app.listen(env.PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`stellopay-backend listening on :${env.PORT}`);
-});
+if (process.env.NODE_ENV !== "test") {
+  const server = app.listen(env.PORT, () => {
+    // eslint-disable-next-line no-console
+    console.log(`stellopay-backend listening on :${env.PORT}`);
+  });
 
-// Setup graceful shutdown handling
-setupGracefulShutdown(server, closePool, env.SHUTDOWN_DRAIN_TIMEOUT_MS);
+  // Setup graceful shutdown handling
+  setupGracefulShutdown(server, closePool, env.SHUTDOWN_DRAIN_TIMEOUT_MS);
+}

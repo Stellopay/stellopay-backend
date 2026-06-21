@@ -1,30 +1,30 @@
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, or, desc, gte, lte, inArray, sql } from "drizzle-orm";
+import { eq, and, or, desc, gte, lte, inArray, sql, count } from "drizzle-orm";
 import { agreementContract } from "../starknet/client.js";
 import { toHexString } from "../utils/codec.js";
+import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 import { env } from "../config.js";
 
 const AddressParam = z.string().min(3);
 
 export const transactionsRouter = Router();
 
-// Helper to normalize addresses (for comparison)
-// Starknet addresses are 66 chars (0x + 64 hex), we normalize by lowercasing and ensuring proper format
-function normalizeAddr(addr: string): string {
-  if (!addr) return addr;
-  let normalized = addr.toLowerCase().trim();
-  if (!normalized.startsWith("0x")) {
-    normalized = `0x${normalized}`;
+/**
+ * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
+ * to "debug". These lines are noisy on the request hot path and can include
+ * token addresses, so at the default "info" level, and in production, they stay
+ * silent: this keeps sensitive routing data out of default-level logs and stops
+ * the per-request flood that previously ran on every transaction list. Genuine
+ * failures still use console.error and console.warn so errors stay visible.
+ *
+ * @param args - Values forwarded to console.debug when debug logging is on.
+ */
+function debugLog(...args: unknown[]): void {
+  if (env.LOG_LEVEL === "debug") {
+    console.debug(...args);
   }
-  // Remove 0x prefix
-  const hex = normalized.replace(/^0x/, "");
-  // Remove leading zeros, but keep at least one zero if the address is all zeros
-  const trimmedHex = hex.replace(/^0+/, "") || "0";
-  // Pad to 64 hex characters (Starknet address format: 0x + 64 hex chars = 66 total)
-  const paddedHex = trimmedHex.padStart(64, "0");
-  return `0x${paddedHex}`;
 }
 
 // Helper to format address for display (truncate like 0x1234...5678)
@@ -37,20 +37,23 @@ function formatAddress(addr: string): string {
 }
 
 // Token addresses from environment variables (with defaults)
-const STRK_TOKEN_ADDRESS = env.TOKEN_STRK || "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
-const USDC_TOKEN_ADDRESS = env.TOKEN_USDC || "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080";
-const USDT_TOKEN_ADDRESS = env.TOKEN_USDT || "0x02ab8758891e84b968ff11361789070c6b1af2df618d6d2f4a78b0757573c6eb";
+const STRK_TOKEN_ADDRESS =
+  env.TOKEN_STRK || "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+const USDC_TOKEN_ADDRESS =
+  env.TOKEN_USDC || "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080";
+const USDT_TOKEN_ADDRESS =
+  env.TOKEN_USDT || "0x02ab8758891e84b968ff11361789070c6b1af2df618d6d2f4a78b0757573c6eb";
 
 // Normalize token addresses once at module load
 const NORMALIZED_STRK = normalizeAddr(STRK_TOKEN_ADDRESS);
 const NORMALIZED_USDC = normalizeAddr(USDC_TOKEN_ADDRESS);
 const NORMALIZED_USDT = normalizeAddr(USDT_TOKEN_ADDRESS);
 
-// Log known token addresses on module load
-console.log(`[transactions] Known token addresses configured:`);
-console.log(`  - STRK: ${STRK_TOKEN_ADDRESS} (normalized: ${NORMALIZED_STRK})`);
-console.log(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
-console.log(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
+// Log known token addresses on module load (debug level only)
+debugLog(`[transactions] Known token addresses configured:`);
+debugLog(`  - STRK: ${STRK_TOKEN_ADDRESS} (normalized: ${NORMALIZED_STRK})`);
+debugLog(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
+debugLog(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
 
 // Helper to get token info from token address
 function getTokenInfo(tokenAddress: string | null | undefined): {
@@ -60,19 +63,25 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
   isSTRK: boolean;
 } {
   if (!tokenAddress) {
-    console.log(`[transactions] getTokenInfo: No token address provided, returning "-"`);
+    debugLog(`[transactions] getTokenInfo: No token address provided, returning "-"`);
     return { name: "-", icon: "", decimals: 0, isSTRK: false };
   }
-  
+
   const normalized = normalizeAddr(tokenAddress);
-  
-  console.log(`[transactions] getTokenInfo: Comparing token ${normalized}`);
-  console.log(`[transactions]   vs STRK: ${NORMALIZED_STRK} (match: ${normalized === NORMALIZED_STRK})`);
-  console.log(`[transactions]   vs USDC: ${NORMALIZED_USDC} (match: ${normalized === NORMALIZED_USDC})`);
-  console.log(`[transactions]   vs USDT: ${NORMALIZED_USDT} (match: ${normalized === NORMALIZED_USDT})`);
-  
+
+  debugLog(`[transactions] getTokenInfo: Comparing token ${normalized}`);
+  debugLog(
+    `[transactions]   vs STRK: ${NORMALIZED_STRK} (match: ${normalized === NORMALIZED_STRK})`,
+  );
+  debugLog(
+    `[transactions]   vs USDC: ${NORMALIZED_USDC} (match: ${normalized === NORMALIZED_USDC})`,
+  );
+  debugLog(
+    `[transactions]   vs USDT: ${NORMALIZED_USDT} (match: ${normalized === NORMALIZED_USDT})`,
+  );
+
   if (normalized === NORMALIZED_STRK) {
-    console.log(`[transactions] getTokenInfo: Identified as STRK`);
+    debugLog(`[transactions] getTokenInfo: Identified as STRK`);
     return {
       name: "STRK",
       icon: "/strk-logo.png", // Update with actual icon path
@@ -80,7 +89,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: true,
     };
   } else if (normalized === NORMALIZED_USDC) {
-    console.log(`[transactions] getTokenInfo: Identified as USDC`);
+    debugLog(`[transactions] getTokenInfo: Identified as USDC`);
     return {
       name: "USDC",
       icon: "/usdc-logo.png",
@@ -88,7 +97,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: false,
     };
   } else if (normalized === NORMALIZED_USDT) {
-    console.log(`[transactions] getTokenInfo: Identified as USDT`);
+    debugLog(`[transactions] getTokenInfo: Identified as USDT`);
     return {
       name: "USDT",
       icon: "/usdt-logo.png",
@@ -96,9 +105,9 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: false,
     };
   }
-  
+
   // Default to USDC format for unknown tokens
-  console.log(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
+  debugLog(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
   return {
     name: "USDC",
     icon: "/usdc-logo.png",
@@ -108,25 +117,28 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
 }
 
 // Helper to format amount based on token type
-function formatAmount(amount: string | bigint, tokenInfo: { name: string; decimals: number; isSTRK: boolean }): string {
+function formatAmount(
+  amount: string | bigint,
+  tokenInfo: { name: string; decimals: number; isSTRK: boolean },
+): string {
   if (!amount || amount === "0" || amount === BigInt(0)) {
-    console.log(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
+    debugLog(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
     return "-";
   }
-  
+
   const amountBigInt = typeof amount === "string" ? BigInt(amount) : amount;
   const divisor = BigInt(10 ** tokenInfo.decimals);
   const wholePart = amountBigInt / divisor;
   const fractionalPart = amountBigInt % divisor;
-  
-  console.log(`[transactions] formatAmount: Processing amount`);
-  console.log(`  - Raw amount: ${amount} (type: ${typeof amount})`);
-  console.log(`  - Amount as BigInt: ${amountBigInt.toString()}`);
-  console.log(`  - Token decimals: ${tokenInfo.decimals}`);
-  console.log(`  - Divisor: ${divisor.toString()}`);
-  console.log(`  - Whole part: ${wholePart.toString()}`);
-  console.log(`  - Fractional part: ${fractionalPart.toString()}`);
-  
+
+  debugLog(`[transactions] formatAmount: Processing amount`);
+  debugLog(`  - Raw amount: ${amount} (type: ${typeof amount})`);
+  debugLog(`  - Amount as BigInt: ${amountBigInt.toString()}`);
+  debugLog(`  - Token decimals: ${tokenInfo.decimals}`);
+  debugLog(`  - Divisor: ${divisor.toString()}`);
+  debugLog(`  - Whole part: ${wholePart.toString()}`);
+  debugLog(`  - Fractional part: ${fractionalPart.toString()}`);
+
   if (tokenInfo.isSTRK) {
     // Format STRK: show decimals like "0.434 strk"
     const fractionalStr = fractionalPart.toString().padStart(tokenInfo.decimals, "0");
@@ -134,21 +146,21 @@ function formatAmount(amount: string | bigint, tokenInfo: { name: string; decima
     const fractionalTrimmed = fractionalStr.replace(/0+$/, "");
     if (fractionalTrimmed === "") {
       const result = `${wholePart.toString()} ${tokenInfo.name}`;
-      console.log(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
+      debugLog(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
       return result;
     }
     // Show up to 6 significant digits in fractional part
     const fractionalDisplay = fractionalTrimmed.slice(0, 6);
     const result = `${wholePart.toString()}.${fractionalDisplay} ${tokenInfo.name}`;
-    console.log(`[transactions] formatAmount: STRK result: ${result}`);
+    debugLog(`[transactions] formatAmount: STRK result: ${result}`);
     return result;
   } else {
     // Format USDC: show as dollar amount
     const amountNum = Number(amountBigInt) / Number(divisor);
     const result = `$${amountNum.toFixed(2)}`;
-    console.log(`[transactions] formatAmount: USDC/USDT calculation:`);
-    console.log(`  - Amount as number: ${amountNum}`);
-    console.log(`  - Result: ${result}`);
+    debugLog(`[transactions] formatAmount: USDC/USDT calculation:`);
+    debugLog(`  - Amount as number: ${amountNum}`);
+    debugLog(`  - Result: ${result}`);
     return result;
   }
 }
@@ -165,35 +177,40 @@ const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 // Helper to fetch token from agreement contract
 async function getTokenFromAgreementContract(
   agreementContractAddress: string,
-  agreementId: string
+  agreementId: string,
 ): Promise<string | null> {
   const cacheKey = `${agreementContractAddress}:${agreementId}`;
   const cached = tokenCache.get(cacheKey);
-  
+
   // Return cached value if still valid
   if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL_MS) {
-    console.log(`[transactions] Using cached token for agreement ${agreementId}: ${cached.token}`);
+    debugLog(`[transactions] Using cached token for agreement ${agreementId}: ${cached.token}`);
     return cached.token;
   }
-  
+
   try {
-    console.log(`[transactions] Fetching token from agreement contract ${agreementContractAddress} for agreement ${agreementId}`);
+    debugLog(
+      `[transactions] Fetching token from agreement contract ${agreementContractAddress} for agreement ${agreementId}`,
+    );
     const c = agreementContract(agreementContractAddress);
     const out = await c.get_token(agreementId);
     const tokenAddress = toHexString(out);
     const normalizedToken = normalizeAddr(tokenAddress);
-    
-    console.log(`[transactions] Successfully fetched token for agreement ${agreementId}:`);
-    console.log(`  - Raw token: ${tokenAddress}`);
-    console.log(`  - Normalized token: ${normalizedToken}`);
-    console.log(`  - Token info: ${JSON.stringify(getTokenInfo(normalizedToken))}`);
-    
+
+    debugLog(`[transactions] Successfully fetched token for agreement ${agreementId}:`);
+    debugLog(`  - Raw token: ${tokenAddress}`);
+    debugLog(`  - Normalized token: ${normalizedToken}`);
+    debugLog(`  - Token info: ${JSON.stringify(getTokenInfo(normalizedToken))}`);
+
     // Cache the result
     tokenCache.set(cacheKey, { token: normalizedToken, timestamp: Date.now() });
-    
+
     return normalizedToken;
   } catch (error: any) {
-    console.error(`[transactions] Failed to fetch token from agreement contract ${agreementContractAddress} for agreement ${agreementId}:`, error);
+    console.error(
+      `[transactions] Failed to fetch token from agreement contract ${agreementContractAddress} for agreement ${agreementId}:`,
+      error,
+    );
     console.error(`[transactions] Error details:`, {
       message: error?.message,
       stack: error?.stack,
@@ -206,37 +223,47 @@ async function getTokenFromAgreementContract(
 
 // Batch fetch tokens for multiple agreements
 async function batchGetTokensFromAgreementContracts(
-  agreements: Array<{ agreementContractAddress: string; agreementId: string }>
+  agreements: Array<{ agreementContractAddress: string; agreementId: string }>,
 ): Promise<Map<string, string>> {
-  console.log(`[transactions] Batch fetching tokens for ${agreements.length} agreements`);
+  debugLog(`[transactions] Batch fetching tokens for ${agreements.length} agreements`);
   const tokenMap = new Map<string, string>();
-  const uncachedAgreements: Array<{ agreementContractAddress: string; agreementId: string; key: string }> = [];
-  
+  const uncachedAgreements: Array<{
+    agreementContractAddress: string;
+    agreementId: string;
+    key: string;
+  }> = [];
+
   // Check cache first
   for (const agreement of agreements) {
     const cacheKey = `${agreement.agreementContractAddress}:${agreement.agreementId}`;
     const cached = tokenCache.get(cacheKey);
-    
+
     if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL_MS) {
-      console.log(`[transactions] Using cached token for agreement ${agreement.agreementId}: ${cached.token}`);
+      debugLog(
+        `[transactions] Using cached token for agreement ${agreement.agreementId}: ${cached.token}`,
+      );
       tokenMap.set(agreement.agreementId, cached.token);
     } else {
       uncachedAgreements.push({ ...agreement, key: cacheKey });
     }
   }
-  
-  console.log(`[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`);
-  
+
+  debugLog(
+    `[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`,
+  );
+
   // Fetch uncached tokens in parallel (limit concurrency to avoid overwhelming RPC)
   const BATCH_SIZE = 10;
   for (let i = 0; i < uncachedAgreements.length; i += BATCH_SIZE) {
     const batch = uncachedAgreements.slice(i, i + BATCH_SIZE);
-    console.log(`[transactions] Fetching batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} agreements)`);
+    debugLog(
+      `[transactions] Fetching batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} agreements)`,
+    );
     const fetchPromises = batch.map(async (agreement) => {
       try {
         const token = await getTokenFromAgreementContract(
           agreement.agreementContractAddress,
-          agreement.agreementId
+          agreement.agreementId,
         );
         if (token) {
           tokenMap.set(agreement.agreementId, token);
@@ -244,21 +271,39 @@ async function batchGetTokensFromAgreementContracts(
           console.warn(`[transactions] No token returned for agreement ${agreement.agreementId}`);
         }
       } catch (error) {
-        console.error(`[transactions] Error in batch fetch for agreement ${agreement.agreementId}:`, error);
+        console.error(
+          `[transactions] Error in batch fetch for agreement ${agreement.agreementId}:`,
+          error,
+        );
       }
     });
-    
+
     await Promise.all(fetchPromises);
   }
-  
-  console.log(`[transactions] Batch fetch complete. Got ${tokenMap.size} tokens out of ${agreements.length} agreements`);
+
+  debugLog(
+    `[transactions] Batch fetch complete. Got ${tokenMap.size} tokens out of ${agreements.length} agreements`,
+  );
   return tokenMap;
 }
 
 // Format date helper
 function formatDate(date: Date) {
   const d = new Date(date);
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sept",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
   const month = months[d.getMonth()];
   const day = d.getDate();
   const year = d.getFullYear();
@@ -277,28 +322,28 @@ function formatDate(date: Date) {
 function formatEventType(eventType: string): string {
   const eventTypeMap: Record<string, string> = {
     // WorkAgreement events
-    "AgreementCreated": "Agreement Created",
-    "AgreementActivated": "Agreement Activated",
-    "AgreementPaused": "Agreement Paused",
-    "AgreementResumed": "Agreement Resumed",
-    "AgreementCancelled": "Agreement Cancelled",
-    "AgreementCompleted": "Agreement Completed",
-    "AgreementStatusChange": "Agreement Status Changed",
-    "PaymentSent": "Payment Sent",
-    "PaymentReceived": "Payment Received",
-    "MilestoneAdded": "Milestone Added",
-    "MilestoneApproved": "Milestone Approved",
-    "MilestoneClaimed": "Milestone Claimed",
-    "EmployeeAdded": "Employee Added",
-    "PayrollClaimed": "Payroll Claimed",
-    "DisputeRaised": "Dispute Raised",
-    "DisputeResolved": "Dispute Resolved",
+    AgreementCreated: "Agreement Created",
+    AgreementActivated: "Agreement Activated",
+    AgreementPaused: "Agreement Paused",
+    AgreementResumed: "Agreement Resumed",
+    AgreementCancelled: "Agreement Cancelled",
+    AgreementCompleted: "Agreement Completed",
+    AgreementStatusChange: "Agreement Status Changed",
+    PaymentSent: "Payment Sent",
+    PaymentReceived: "Payment Received",
+    MilestoneAdded: "Milestone Added",
+    MilestoneApproved: "Milestone Approved",
+    MilestoneClaimed: "Milestone Claimed",
+    EmployeeAdded: "Employee Added",
+    PayrollClaimed: "Payroll Claimed",
+    DisputeRaised: "Dispute Raised",
+    DisputeResolved: "Dispute Resolved",
     // PayrollEscrow events
-    "Funded": "Agreement Funded",
-    "Released": "Payment Released",
-    "Refunded": "Refund Received",
+    Funded: "Agreement Funded",
+    Released: "Payment Released",
+    Refunded: "Refund Received",
     // Fallback for unknown events
-    "Unknown": "Unknown Event",
+    Unknown: "Unknown Event",
   };
   return eventTypeMap[eventType] || eventType.replace(/([A-Z])/g, " $1").trim();
 }
@@ -307,71 +352,142 @@ function formatEventType(eventType: string): string {
 transactionsRouter.get("/transactions/:user_address", async (req, res, next) => {
   try {
     const userAddress = normalizeAddr(req.params.user_address);
-    const limit = z.coerce.number().int().positive().max(100).optional().parse(req.query.limit) || 50;
+    const requestedLimit =
+      z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
+    const limit = Math.min(requestedLimit, 100);
     const offset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset) || 0;
-    
+    const queryLimit = offset + limit;
+
     // Get filter for event types (comma-separated list)
-    const eventTypesFilter = req.query.eventTypes ? 
-      (req.query.eventTypes as string).split(',').map(t => t.trim()).filter(t => t.length > 0) : 
-      null;
+    const eventTypesFilter = req.query.eventTypes
+      ? (req.query.eventTypes as string)
+          .split(",")
+          .map((t) => t.trim())
+          .filter((t) => t.length > 0)
+      : null;
 
     // Get payments where user is sender or receiver
-    // Apply event type filter if provided
     const paymentConditions = [
-      or(
-        eq(schema.payments.from, userAddress),
-        eq(schema.payments.to, userAddress)
-      )
+      or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
     ];
+    // Apply event type filter if provided
     if (eventTypesFilter && eventTypesFilter.length > 0) {
-      // Only include PaymentSent and PaymentReceived if they're in the filter
-      const paymentEventTypes = eventTypesFilter.filter(et => 
-        et === "PaymentSent" || et === "PaymentReceived"
+      const paymentEventTypes = eventTypesFilter.filter(
+        (et) => et === "PaymentSent" || et === "PaymentReceived",
       );
       if (paymentEventTypes.length > 0) {
         paymentConditions.push(inArray(schema.payments.eventType, paymentEventTypes));
       } else {
-        // If filter doesn't include payment events, exclude all payments
+        // If filter is active but no matching event types for this table, ensure it returns empty
         paymentConditions.push(sql`FALSE`);
       }
     }
-    const payments = await db
-      .select()
-      .from(schema.payments)
-      .where(and(...paymentConditions))
-      .orderBy(desc(schema.payments.blockNumber))
-      .limit(limit)
-      .offset(offset);
 
     // Get escrow events where user is employer or recipient
-    // Apply event type filter if provided
     const escrowConditions = [
-      or(
-        eq(schema.escrowEvents.employer, userAddress),
-        eq(schema.escrowEvents.to, userAddress)
-      )
+      or(eq(schema.escrowEvents.employer, userAddress), eq(schema.escrowEvents.to, userAddress)),
     ];
+    // Apply event type filter if provided
     if (eventTypesFilter && eventTypesFilter.length > 0) {
-      // Only include Funded, Released, Refunded if they're in the filter
-      const escrowEventTypes = eventTypesFilter.filter(et => 
-        et === "Funded" || et === "Released" || et === "Refunded"
+      const escrowEventTypes = eventTypesFilter.filter(
+        (et) => et === "Funded" || et === "Released" || et === "Refunded",
       );
       if (escrowEventTypes.length > 0) {
         escrowConditions.push(inArray(schema.escrowEvents.eventType, escrowEventTypes));
       } else {
-        // If filter doesn't include escrow events, exclude all escrow events
         escrowConditions.push(sql`FALSE`);
       }
     }
+
+    const agreementEventConditions =
+      eventTypesFilter && eventTypesFilter.length > 0
+        ? and(
+            or(...eventTypesFilter.map((et) => eq(schema.agreementEvents.eventType, et))),
+            or(
+              eq(schema.agreements.employer, userAddress),
+              eq(schema.agreements.contributor, userAddress),
+            ),
+          )
+        : or(
+            eq(schema.agreements.employer, userAddress),
+            eq(schema.agreements.contributor, userAddress),
+          );
+
+    const employeeConditions = [
+      or(
+        eq(schema.agreements.employer, userAddress),
+        eq(schema.employees.employeeAddress, userAddress),
+      ),
+    ];
+    if (eventTypesFilter && eventTypesFilter.length > 0) {
+      if (!eventTypesFilter.includes("EmployeeAdded")) {
+        employeeConditions.push(sql`FALSE`);
+      }
+    }
+
+    const milestoneConditions = [
+      or(
+        eq(schema.agreements.employer, userAddress),
+        eq(schema.agreements.contributor, userAddress),
+      ),
+    ];
+    if (eventTypesFilter && eventTypesFilter.length > 0) {
+      if (!eventTypesFilter.includes("MilestoneAdded")) {
+        milestoneConditions.push(sql`FALSE`);
+      }
+    }
+
+    const [paymentsCount, escrowCount, agreementEventsCount, employeesCount, milestonesCount] =
+      await Promise.all([
+        db
+          .select({ count: count() })
+          .from(schema.payments)
+          .where(and(...paymentConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.escrowEvents)
+          .where(and(...escrowConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.agreementEvents)
+          .innerJoin(
+            schema.agreements,
+            eq(schema.agreementEvents.agreementId, schema.agreements.id),
+          )
+          .where(agreementEventConditions),
+        db
+          .select({ count: count() })
+          .from(schema.employees)
+          .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
+          .where(and(...employeeConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.milestones)
+          .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
+          .where(and(...milestoneConditions)),
+      ]);
+
+    const total =
+      Number(paymentsCount[0].count) +
+      Number(escrowCount[0].count) +
+      Number(agreementEventsCount[0].count) +
+      Number(employeesCount[0].count) +
+      Number(milestonesCount[0].count);
+
+    const payments = await db
+      .select()
+      .from(schema.payments)
+      .where(and(...paymentConditions))
+      .orderBy(desc(schema.payments.createdAt), desc(schema.payments.id))
+      .limit(queryLimit);
+
     const escrowEvents = await db
       .select()
       .from(schema.escrowEvents)
       .where(and(...escrowConditions))
-      .orderBy(desc(schema.escrowEvents.blockNumber))
-      .limit(limit)
-      .offset(offset);
+      .orderBy(desc(schema.escrowEvents.createdAt), desc(schema.escrowEvents.id))
+      .limit(queryLimit);
 
-    // Get all relevant agreement events where user is employer or contributor
     const agreementEvents = await db
       .select({
         id: schema.agreementEvents.id,
@@ -387,113 +503,10 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       })
       .from(schema.agreementEvents)
       .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-      .where(
-        eventTypesFilter && eventTypesFilter.length > 0 ?
-          and(
-            or(...eventTypesFilter.map(et => eq(schema.agreementEvents.eventType, et))),
-            or(
-              eq(schema.agreements.employer, userAddress),
-              eq(schema.agreements.contributor, userAddress)
-            )
-          ) :
-          // No filter - show ALL events where user is involved
-          or(
-            eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress)
-          )
-      )
-      .orderBy(desc(schema.agreementEvents.blockNumber))
-      .limit(limit)
-      .offset(offset);
+      .where(agreementEventConditions)
+      .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
+      .limit(queryLimit);
 
-    // Get token addresses for escrow events from agreements
-    // First get agreement contract addresses from database
-    const agreementIds = [...new Set(escrowEvents.map(e => e.agreementId))];
-    console.log(`[transactions] Processing ${escrowEvents.length} escrow events for ${agreementIds.length} unique agreements`);
-    
-    const agreements = agreementIds.length > 0 ? await db
-      .select({ 
-        id: schema.agreements.id, 
-        token: schema.agreements.token,
-        contractAddress: schema.agreements.contractAddress, // This is the agreement contract address
-      })
-      .from(schema.agreements)
-      .where(inArray(schema.agreements.id, agreementIds)) : [];
-    
-    console.log(`[transactions] Found ${agreements.length} agreements in database`);
-    agreements.forEach(a => {
-      console.log(`[transactions] Agreement ${a.id}: contract=${a.contractAddress}, db_token=${a.token}`);
-    });
-    
-    // Create map for fallback (database tokens)
-    const dbTokenMap = new Map(agreements.map(a => [a.id, a.token]));
-    
-    // Fetch tokens from agreement contracts
-    const agreementsForTokenFetch = agreements
-      .filter(a => a.contractAddress) // Only if we have contract address
-      .map(a => ({
-        agreementContractAddress: a.contractAddress!,
-        agreementId: a.id,
-      }));
-    
-    console.log(`[transactions] Will fetch tokens from ${agreementsForTokenFetch.length} agreement contracts`);
-    
-    const contractTokenMap = await batchGetTokensFromAgreementContracts(agreementsForTokenFetch);
-    
-    // Create final map: agreementId -> tokenAddress (prefer contract, fallback to database)
-    const tokenMap = new Map<string, string>();
-    for (const agreement of agreements) {
-      const contractToken = contractTokenMap.get(agreement.id);
-      const dbToken = agreement.token;
-      const finalToken = contractToken || dbToken;
-      
-      console.log(`[transactions] Agreement ${agreement.id} token resolution:`);
-      console.log(`  - Database token: ${dbToken}`);
-      console.log(`  - Contract token: ${contractToken || 'N/A'}`);
-      console.log(`  - Final token: ${finalToken}`);
-      console.log(`  - Token info: ${JSON.stringify(getTokenInfo(finalToken))}`);
-      
-      // Use contract token if available, otherwise use database token
-      tokenMap.set(agreement.id, finalToken);
-    }
-
-    // Format date helper
-    const formatDate = (date: Date) => {
-      const d = new Date(date);
-      const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
-      const month = months[d.getMonth()];
-      const day = d.getDate();
-      const year = d.getFullYear();
-      const hours = d.getHours();
-      const minutes = d.getMinutes();
-      const ampm = hours >= 12 ? "PM" : "AM";
-      const hour12 = hours % 12 || 12;
-      const mins = minutes.toString().padStart(2, "0");
-      return {
-        date: `${month} ${day}, ${year}`,
-        time: `${hour12}:${mins}${ampm}`,
-      };
-    };
-
-    // Get EmployeeAdded events from employees table where user is involved
-    // User can be: employer (agreement owner) or employee (being added)
-    // Use leftJoin to include events even if agreement doesn't exist in agreements table yet
-    // Apply event type filter if provided
-    const employeeConditions = [
-      or(
-        // User is employer (agreement must exist for this to match)
-        eq(schema.agreements.employer, userAddress),
-        // User is the employee being added (works even if agreement doesn't exist)
-        eq(schema.employees.employeeAddress, userAddress)
-      )
-    ];
-    // Only include EmployeeAdded events if they're in the filter
-    if (eventTypesFilter && eventTypesFilter.length > 0) {
-      if (!eventTypesFilter.includes("EmployeeAdded")) {
-        // If filter doesn't include EmployeeAdded, exclude all employee events
-        employeeConditions.push(sql`FALSE`);
-      }
-    }
     const employeeEventsData = await db
       .select({
         id: schema.employees.id,
@@ -511,30 +524,9 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       .from(schema.employees)
       .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
       .where(and(...employeeConditions))
-      .orderBy(desc(schema.employees.blockNumber))
-      .limit(limit)
-      .offset(offset);
+      .orderBy(desc(schema.employees.createdAt), desc(schema.employees.id))
+      .limit(queryLimit);
 
-    // Add eventType to employee events
-    const employeeEvents = employeeEventsData.map(e => ({ ...e, eventType: "EmployeeAdded" as const }));
-
-    // Get MilestoneAdded events from milestones table where user is involved
-    // User can be: employer (agreement owner) or contributor (milestone beneficiary)
-    // Use leftJoin to include events even if agreement doesn't exist in agreements table yet
-    // Apply event type filter if provided
-    const milestoneConditions = [
-      or(
-        eq(schema.agreements.employer, userAddress),
-        eq(schema.agreements.contributor, userAddress)
-      )
-    ];
-    // Only include MilestoneAdded events if they're in the filter
-    if (eventTypesFilter && eventTypesFilter.length > 0) {
-      if (!eventTypesFilter.includes("MilestoneAdded")) {
-        // If filter doesn't include MilestoneAdded, exclude all milestone events
-        milestoneConditions.push(sql`FALSE`);
-      }
-    }
     const milestoneEventsData = await db
       .select({
         id: schema.milestones.id,
@@ -551,59 +543,90 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       .from(schema.milestones)
       .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
       .where(and(...milestoneConditions))
-      .orderBy(desc(schema.milestones.blockNumber))
-      .limit(limit)
-      .offset(offset);
+      .orderBy(desc(schema.milestones.createdAt), desc(schema.milestones.id))
+      .limit(queryLimit);
 
-    // Add eventType to milestone events
-    const milestoneEvents = milestoneEventsData.map(m => ({ ...m, eventType: "MilestoneAdded" as const }));
+    const employeeEvents = employeeEventsData.map((e) => ({
+      ...e,
+      eventType: "EmployeeAdded" as const,
+    }));
+    const milestoneEvents = milestoneEventsData.map((m) => ({
+      ...m,
+      eventType: "MilestoneAdded" as const,
+    }));
 
-    // Combine all agreement events and remove duplicates
-    const allAgreementEvents = [...agreementEvents];
     const uniqueAgreementEvents = Array.from(
-      new Map(allAgreementEvents.map((a) => [a.id, a])).values()
+      new Map(agreementEvents.map((a) => [a.id, a])).values(),
     );
 
-    // Helper function to format event type for display
+    const agreementIds = [...new Set(escrowEvents.map((e) => e.agreementId))];
+
+    const agreements =
+      agreementIds.length > 0
+        ? await db
+            .select({
+              id: schema.agreements.id,
+              token: schema.agreements.token,
+              contractAddress: schema.agreements.contractAddress, // This is the agreement contract address
+            })
+            .from(schema.agreements)
+            .where(inArray(schema.agreements.id, agreementIds))
+        : [];
+
+    // Fetch tokens from agreement contracts
+    const agreementsForTokenFetch = agreements
+      .filter((a) => a.contractAddress) // Only if we have contract address
+      .map((a) => ({
+        agreementContractAddress: a.contractAddress!,
+        agreementId: a.id,
+      }));
+
+    const contractTokenMap = await batchGetTokensFromAgreementContracts(agreementsForTokenFetch);
+
+    // Create final map: agreementId -> tokenAddress (prefer contract, fallback to database)
+    const tokenMap = new Map<string, string>();
+    for (const agreement of agreements) {
+      const contractToken = contractTokenMap.get(agreement.id);
+      const dbToken = agreement.token;
+      tokenMap.set(agreement.id, contractToken || dbToken);
+    }
+
     const formatEventType = (eventType: string): string => {
       const eventTypeMap: Record<string, string> = {
-        "AgreementCreated": "Agreement Created",
-        "AgreementActivated": "Agreement Activated",
-        "AgreementPaused": "Agreement Paused",
-        "AgreementResumed": "Agreement Resumed",
-        "AgreementCancelled": "Agreement Cancelled",
-        "AgreementCompleted": "Agreement Completed",
-        "EmployeeAdded": "Employee Added",
-        "MilestoneAdded": "Milestone Added",
-        "MilestoneApproved": "Milestone Approved",
-        "MilestoneClaimed": "Milestone Claimed",
-        "PayrollClaimed": "Payroll Claimed",
-        "DisputeRaised": "Dispute Raised",
-        "DisputeResolved": "Dispute Resolved",
+        AgreementCreated: "Agreement Created",
+        AgreementActivated: "Agreement Activated",
+        AgreementPaused: "Agreement Paused",
+        AgreementResumed: "Agreement Resumed",
+        AgreementCancelled: "Agreement Cancelled",
+        AgreementCompleted: "Agreement Completed",
+        EmployeeAdded: "Employee Added",
+        MilestoneAdded: "Milestone Added",
+        MilestoneApproved: "Milestone Approved",
+        MilestoneClaimed: "Milestone Claimed",
+        PayrollClaimed: "Payroll Claimed",
+        DisputeRaised: "Dispute Raised",
+        DisputeResolved: "Dispute Resolved",
       };
       return eventTypeMap[eventType] || eventType;
     };
 
-    const transactions = [
-      // Agreement events (from agreement_events table)
-      // Note: Agreement events are never fund-related, so they always show "-" for token/amount
+    const allTransactions = [
       ...uniqueAgreementEvents.map((a) => {
         const dateTime = formatDate(a.createdAt);
-      return {
+        return {
           id: a.transactionHash.slice(0, 10),
           type: formatEventType(a.eventType),
-          address: formatAddress(a.employer === userAddress ? (a.contributor || "N/A") : a.employer),
-        date: dateTime.date,
-        time: dateTime.time,
+          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
+          date: dateTime.date,
+          time: dateTime.time,
           token: "-",
           amount: "-",
-        status: "Completed" as const,
+          status: "Completed" as const,
           tokenIcon: "",
           txHash: a.transactionHash,
           createdAt: a.createdAt, // Add for sorting
         };
       }),
-      // Payment events (from payments table)
       ...payments.map((p) => {
         const dateTime = formatDate(p.createdAt);
         const tokenInfo = getTokenInfo(p.token);
@@ -611,7 +634,7 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
         const isReceived = p.eventType === "PaymentReceived";
         const sign = isReceived ? "+" : "-";
         const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-        
+
         return {
           id: p.transactionHash.slice(0, 10),
           type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
@@ -626,7 +649,6 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
           createdAt: p.createdAt, // Add for sorting
         };
       }),
-      // Escrow events (from escrow_events table)
       ...escrowEvents.map((e) => {
         const dateTime = formatDate(e.createdAt);
         const tokenAddress = tokenMap.get(e.agreementId) || null;
@@ -635,22 +657,16 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
         const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
         const sign = isIncoming ? "+" : "-";
         const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-        
-        console.log(`[transactions] Escrow event ${e.eventType} for agreement ${e.agreementId}:`);
-        console.log(`  - Raw amount from DB: ${e.amount}`);
-        console.log(`  - Token address: ${tokenAddress}`);
-        console.log(`  - Token info: ${JSON.stringify(tokenInfo)}`);
-        console.log(`  - Formatted amount: ${amountStr}`);
-        console.log(`  - Final amount: ${finalAmount}`);
-        
+
         return {
           id: e.transactionHash.slice(0, 10),
-          type: e.eventType === "Funded" 
-            ? "Agreement Funded" 
-            : e.eventType === "Released" 
-            ? "Payment Released" 
-            : "Refund Received",
-          address: formatAddress(e.eventType === "Funded" ? e.employer : (e.to || "")),
+          type:
+            e.eventType === "Funded"
+              ? "Agreement Funded"
+              : e.eventType === "Released"
+                ? "Payment Released"
+                : "Refund Received",
+          address: formatAddress(e.eventType === "Funded" ? e.employer : e.to || ""),
           date: dateTime.date,
           time: dateTime.time,
           token: tokenInfo.name,
@@ -661,13 +677,12 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
           createdAt: e.createdAt, // Add for sorting
         };
       }),
-      // EmployeeAdded events (from employees table)
       ...employeeEvents.map((e) => {
         const dateTime = formatDate(e.createdAt);
-        // Handle case where agreement might not exist (employer might be null)
-        const address = e.employer === userAddress 
-          ? (e.employeeAddress || "N/A") 
-          : (e.employer || e.employeeAddress || "N/A");
+        const address =
+          e.employer === userAddress
+            ? e.employeeAddress || "N/A"
+            : e.employer || e.employeeAddress || "N/A";
         return {
           id: e.transactionHash.slice(0, 10),
           type: "Employee Added",
@@ -682,14 +697,9 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
           createdAt: e.createdAt, // Add for sorting
         };
       }),
-      // MilestoneAdded events (from milestones table)
       ...milestoneEvents.map((m) => {
         const dateTime = formatDate(m.createdAt);
-        // Handle case where agreement might not exist (employer might be null)
-        const address = m.employer === userAddress 
-          ? (m.contributor || "N/A") 
-          : (m.employer || "N/A");
-        // MilestoneAdded is not a fund event, so show "-"
+        const address = m.employer === userAddress ? m.contributor || "N/A" : m.employer || "N/A";
         return {
           id: m.transactionHash.slice(0, 10),
           type: "Milestone Added",
@@ -705,40 +715,44 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
         };
       }),
     ].sort((a, b) => {
-      // Sort by createdAt timestamp (latest first)
       const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
       const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-      return timeB - timeA; // Descending order (latest first)
+      if (timeB !== timeA) return timeB - timeA;
+      return a.txHash.localeCompare(b.txHash);
     });
 
-    res.json({ transactions, total: transactions.length });
+    const paginatedTransactions = allTransactions.slice(offset, offset + limit);
+    const hasMore = total > offset + limit;
+
+    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
   } catch (e) {
     next(e);
   }
 });
-
-// Get transactions with date range filter
 transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, next) => {
   try {
     const userAddress = normalizeAddr(req.params.user_address);
     const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
     const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
-    const limit = z.coerce.number().int().positive().max(100).optional().parse(req.query.limit) || 50;
+    const requestedLimit =
+      z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
+    const limit = Math.min(requestedLimit, 100);
     const offset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset) || 0;
+    const queryLimit = offset + limit;
 
     // Build where conditions
-    const paymentConditions = [or(
-      eq(schema.payments.from, userAddress),
-      eq(schema.payments.to, userAddress)
-    )];
-    const escrowConditions = [or(
-      eq(schema.escrowEvents.employer, userAddress),
-      eq(schema.escrowEvents.to, userAddress)
-    )];
-    const agreementEventConditions = [or(
-      eq(schema.agreements.employer, userAddress),
-      eq(schema.agreements.contributor, userAddress)
-    )];
+    const paymentConditions = [
+      or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
+    ];
+    const escrowConditions = [
+      or(eq(schema.escrowEvents.employer, userAddress), eq(schema.escrowEvents.to, userAddress)),
+    ];
+    const agreementEventConditions = [
+      or(
+        eq(schema.agreements.employer, userAddress),
+        eq(schema.agreements.contributor, userAddress),
+      ),
+    ];
 
     if (startDate) {
       paymentConditions.push(gte(schema.payments.createdAt, startDate));
@@ -751,16 +765,12 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       agreementEventConditions.push(lte(schema.agreementEvents.createdAt, endDate));
     }
 
-    // Build conditions for employees and milestones
-    // Check employee address directly (works even if agreement doesn't exist)
-    const employeeConditions = [
-      eq(schema.employees.employeeAddress, userAddress)
-    ];
+    const employeeConditions = [eq(schema.employees.employeeAddress, userAddress)];
     const milestoneConditions = [
       or(
         eq(schema.agreements.employer, userAddress),
-        eq(schema.agreements.contributor, userAddress)
-      )
+        eq(schema.agreements.contributor, userAddress),
+      ),
     ];
 
     if (startDate) {
@@ -772,111 +782,135 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       milestoneConditions.push(lte(schema.milestones.createdAt, endDate));
     }
 
+    const [paymentsCount, escrowCount, agreementEventsCount, employeesCount, milestonesCount] =
+      await Promise.all([
+        db
+          .select({ count: count() })
+          .from(schema.payments)
+          .where(and(...paymentConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.escrowEvents)
+          .where(and(...escrowConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.agreementEvents)
+          .innerJoin(
+            schema.agreements,
+            eq(schema.agreementEvents.agreementId, schema.agreements.id),
+          )
+          .where(and(...agreementEventConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.employees)
+          .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
+          .where(and(...employeeConditions)),
+        db
+          .select({ count: count() })
+          .from(schema.milestones)
+          .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
+          .where(and(...milestoneConditions)),
+      ]);
+
+    const total =
+      Number(paymentsCount[0].count) +
+      Number(escrowCount[0].count) +
+      Number(agreementEventsCount[0].count) +
+      Number(employeesCount[0].count) +
+      Number(milestonesCount[0].count);
+
     const [payments, escrowEvents, employeeEventsData, milestoneEventsData] = await Promise.all([
-      db.select().from(schema.payments)
+      db
+        .select()
+        .from(schema.payments)
         .where(and(...paymentConditions))
-        .orderBy(desc(schema.payments.blockNumber))
-        .limit(limit)
-        .offset(offset),
-      db.select().from(schema.escrowEvents)
+        .orderBy(desc(schema.payments.createdAt), desc(schema.payments.id))
+        .limit(queryLimit),
+      db
+        .select()
+        .from(schema.escrowEvents)
         .where(and(...escrowConditions))
-        .orderBy(desc(schema.escrowEvents.blockNumber))
-        .limit(limit)
-        .offset(offset),
-      // Get EmployeeAdded events from employees table
-      db.select({
-        id: schema.employees.id,
-        agreementId: schema.employees.agreementId,
-        contractAddress: schema.employees.contractAddress,
-        blockNumber: schema.employees.blockNumber,
-        transactionHash: schema.employees.transactionHash,
-        createdAt: schema.employees.createdAt,
-        employer: schema.agreements.employer,
-        contributor: schema.agreements.contributor,
-        token: schema.agreements.token,
-        employeeAddress: schema.employees.employeeAddress,
-        amount: schema.employees.salaryPerPeriod,
-      })
+        .orderBy(desc(schema.escrowEvents.createdAt), desc(schema.escrowEvents.id))
+        .limit(queryLimit),
+      db
+        .select({
+          id: schema.employees.id,
+          agreementId: schema.employees.agreementId,
+          contractAddress: schema.employees.contractAddress,
+          blockNumber: schema.employees.blockNumber,
+          transactionHash: schema.employees.transactionHash,
+          createdAt: schema.employees.createdAt,
+          employer: schema.agreements.employer,
+          contributor: schema.agreements.contributor,
+          token: schema.agreements.token,
+          employeeAddress: schema.employees.employeeAddress,
+          amount: schema.employees.salaryPerPeriod,
+        })
         .from(schema.employees)
         .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
         .where(and(...employeeConditions))
-        .orderBy(desc(schema.employees.blockNumber))
-        .limit(limit)
-        .offset(offset),
-      // Get MilestoneAdded events from milestones table
-      db.select({
-        id: schema.milestones.id,
-        agreementId: schema.milestones.agreementId,
-        contractAddress: schema.milestones.contractAddress,
-        blockNumber: schema.milestones.blockNumber,
-        transactionHash: schema.milestones.transactionHash,
-        createdAt: schema.milestones.createdAt,
-        employer: schema.agreements.employer,
-        contributor: schema.agreements.contributor,
-        token: schema.agreements.token,
-        amount: schema.milestones.amount,
-      })
+        .orderBy(desc(schema.employees.createdAt), desc(schema.employees.id))
+        .limit(queryLimit),
+      db
+        .select({
+          id: schema.milestones.id,
+          agreementId: schema.milestones.agreementId,
+          contractAddress: schema.milestones.contractAddress,
+          blockNumber: schema.milestones.blockNumber,
+          transactionHash: schema.milestones.transactionHash,
+          createdAt: schema.milestones.createdAt,
+          employer: schema.agreements.employer,
+          contributor: schema.agreements.contributor,
+          token: schema.agreements.token,
+          amount: schema.milestones.amount,
+        })
         .from(schema.milestones)
         .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
         .where(and(...milestoneConditions))
-        .orderBy(desc(schema.milestones.blockNumber))
-        .limit(limit)
-        .offset(offset),
+        .orderBy(desc(schema.milestones.createdAt), desc(schema.milestones.id))
+        .limit(queryLimit),
     ]);
 
-    // Add eventType to employee and milestone events
-    const employeeEvents = employeeEventsData.map(e => ({ ...e, eventType: "EmployeeAdded" as const }));
-    const milestoneEvents = milestoneEventsData.map(m => ({ ...m, eventType: "MilestoneAdded" as const }));
+    const employeeEvents = employeeEventsData.map((e) => ({
+      ...e,
+      eventType: "EmployeeAdded" as const,
+    }));
+    const milestoneEvents = milestoneEventsData.map((m) => ({
+      ...m,
+      eventType: "MilestoneAdded" as const,
+    }));
 
-    // Get token addresses for escrow events from agreements
-    // First get agreement contract addresses from database
-    const escrowAgreementIds = [...new Set(escrowEvents.map(e => e.agreementId))];
-    console.log(`[transactions/filtered] Processing ${escrowEvents.length} escrow events for ${escrowAgreementIds.length} unique agreements`);
-    
-    const escrowAgreements = escrowAgreementIds.length > 0 ? await db
-      .select({ 
-        id: schema.agreements.id, 
-        token: schema.agreements.token,
-        contractAddress: schema.agreements.contractAddress, // This is the agreement contract address
-      })
-      .from(schema.agreements)
-      .where(inArray(schema.agreements.id, escrowAgreementIds)) : [];
-    
-    console.log(`[transactions/filtered] Found ${escrowAgreements.length} agreements in database`);
-    escrowAgreements.forEach(a => {
-      console.log(`[transactions/filtered] Agreement ${a.id}: contract=${a.contractAddress}, db_token=${a.token}`);
-    });
-    
-    // Fetch tokens from agreement contracts
+    const escrowAgreementIds = [...new Set(escrowEvents.map((e) => e.agreementId))];
+
+    const escrowAgreements =
+      escrowAgreementIds.length > 0
+        ? await db
+            .select({
+              id: schema.agreements.id,
+              token: schema.agreements.token,
+              contractAddress: schema.agreements.contractAddress,
+            })
+            .from(schema.agreements)
+            .where(inArray(schema.agreements.id, escrowAgreementIds))
+        : [];
+
     const agreementsForTokenFetch = escrowAgreements
-      .filter(a => a.contractAddress) // Only if we have contract address
-      .map(a => ({
+      .filter((a) => a.contractAddress)
+      .map((a) => ({
         agreementContractAddress: a.contractAddress!,
         agreementId: a.id,
       }));
-    
-    console.log(`[transactions/filtered] Will fetch tokens from ${agreementsForTokenFetch.length} agreement contracts`);
-    
+
     const contractTokenMap = await batchGetTokensFromAgreementContracts(agreementsForTokenFetch);
-    
-    // Create final map: agreementId -> tokenAddress (prefer contract, fallback to database)
+
     const escrowTokenMap = new Map<string, string>();
     for (const agreement of escrowAgreements) {
       const contractToken = contractTokenMap.get(agreement.id);
       const dbToken = agreement.token;
       const finalToken = contractToken || dbToken;
-      
-      console.log(`[transactions/filtered] Agreement ${agreement.id} token resolution:`);
-      console.log(`  - Database token: ${dbToken}`);
-      console.log(`  - Contract token: ${contractToken || 'N/A'}`);
-      console.log(`  - Final token: ${finalToken}`);
-      console.log(`  - Token info: ${JSON.stringify(getTokenInfo(finalToken))}`);
-      
-      // Use contract token if available, otherwise use database token
       escrowTokenMap.set(agreement.id, finalToken);
     }
 
-    // Get all relevant agreement events where user is employer or contributor
     const agreementEvents = await db
       .select({
         id: schema.agreementEvents.id,
@@ -892,26 +926,17 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
       })
       .from(schema.agreementEvents)
       .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-      .where(
-        and(
-          ...agreementEventConditions
-          // Show ALL event types - no filter
-        )
-      )
-      .orderBy(desc(schema.agreementEvents.blockNumber))
-      .limit(limit)
-      .offset(offset);
+      .where(and(...agreementEventConditions))
+      .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
+      .limit(queryLimit);
 
-    // Transform to transaction format - include all event types
     const allTransactions = [
-      // Agreement events (from agreement_events table)
-      // Note: Agreement events are never fund-related, so they always show "-" for token/amount
       ...agreementEvents.map((a) => {
         const dateTime = formatDate(a.createdAt);
         return {
           id: a.transactionHash.slice(0, 10),
           type: formatEventType(a.eventType),
-          address: formatAddress(a.employer === userAddress ? (a.contributor || "N/A") : a.employer),
+          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
           date: dateTime.date,
           time: dateTime.time,
           token: "-",
@@ -919,7 +944,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
           status: "Completed" as const,
           tokenIcon: "",
           txHash: a.transactionHash,
-          createdAt: a.createdAt, // Add for sorting
+          createdAt: a.createdAt,
         };
       }),
       ...payments.map((p) => {
@@ -929,7 +954,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
         const isReceived = p.eventType === "PaymentReceived";
         const sign = isReceived ? "+" : "-";
         const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-        
+
         return {
           id: p.transactionHash.slice(0, 10),
           type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
@@ -941,7 +966,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
           status: "Completed" as const,
           tokenIcon: tokenInfo.icon,
           txHash: p.transactionHash,
-          createdAt: p.createdAt, // Add for sorting
+          createdAt: p.createdAt,
         };
       }),
       ...escrowEvents.map((e) => {
@@ -952,22 +977,16 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
         const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
         const sign = isIncoming ? "+" : "-";
         const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-        
-        console.log(`[transactions/filtered] Escrow event ${e.eventType} for agreement ${e.agreementId}:`);
-        console.log(`  - Raw amount from DB: ${e.amount}`);
-        console.log(`  - Token address: ${tokenAddress}`);
-        console.log(`  - Token info: ${JSON.stringify(tokenInfo)}`);
-        console.log(`  - Formatted amount: ${amountStr}`);
-        console.log(`  - Final amount: ${finalAmount}`);
-        
+
         return {
           id: e.transactionHash.slice(0, 10),
-          type: e.eventType === "Funded" 
-            ? "Agreement Funded" 
-            : e.eventType === "Released" 
-            ? "Payment Released" 
-            : "Refund Received",
-          address: formatAddress(e.eventType === "Funded" ? e.employer : (e.to || "")),
+          type:
+            e.eventType === "Funded"
+              ? "Agreement Funded"
+              : e.eventType === "Released"
+                ? "Payment Released"
+                : "Refund Received",
+          address: formatAddress(e.eventType === "Funded" ? e.employer : e.to || ""),
           date: dateTime.date,
           time: dateTime.time,
           token: tokenInfo.name,
@@ -975,7 +994,7 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
           status: "Completed" as const,
           tokenIcon: tokenInfo.icon,
           txHash: e.transactionHash,
-          createdAt: e.createdAt, // Add for sorting
+          createdAt: e.createdAt,
         };
       }),
       ...employeeEvents.map((e) => {
@@ -992,12 +1011,12 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
           status: "Completed" as const,
           tokenIcon: "",
           txHash: e.transactionHash,
-          createdAt: e.createdAt, // Add for sorting
+          createdAt: e.createdAt,
         };
       }),
       ...milestoneEvents.map((m) => {
         const dateTime = formatDate(m.createdAt);
-        const addressToFormat = m.employer === userAddress ? (m.contributor || "N/A") : m.employer;
+        const addressToFormat = m.employer === userAddress ? m.contributor || "N/A" : m.employer;
         return {
           id: m.transactionHash.slice(0, 10),
           type: "Milestone Added",
@@ -1009,21 +1028,21 @@ transactionsRouter.get("/transactions/:user_address/filtered", async (req, res, 
           status: "Completed" as const,
           tokenIcon: "",
           txHash: m.transactionHash,
-          createdAt: m.createdAt, // Add for sorting
+          createdAt: m.createdAt,
         };
       }),
     ].sort((a, b) => {
-      // Sort by createdAt timestamp (latest first)
       const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
       const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-      return timeB - timeA; // Descending order (latest first)
+      if (timeB !== timeA) return timeB - timeA;
+      return a.txHash.localeCompare(b.txHash);
     });
 
-    const transactions = allTransactions;
+    const paginatedTransactions = allTransactions.slice(offset, offset + limit);
+    const hasMore = total > offset + limit;
 
-    res.json({ transactions, total: transactions.length });
+    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
   } catch (e) {
     next(e);
   }
 });
-
