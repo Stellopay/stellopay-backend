@@ -32,6 +32,30 @@ Both indexer and backend use the same schema:
 - `milestones` - Milestone events
 - `employees` - Employee data for payroll
 
+### Database Bootstrap & Migrations
+
+The backend versions its PostgreSQL schema with Drizzle Kit. The authoritative
+schema lives in `src/db/schema.ts`, and generated SQL migrations are committed
+under `drizzle/`.
+
+```bash
+# 1. Configure the target database.
+export POSTGRES_CONNECTION_STRING=postgresql://postgres:postgres@localhost:5432/stellopay_indexer
+
+# 2. Generate a migration after changing src/db/schema.ts.
+pnpm db:generate
+
+# 3. Apply committed migrations to a database.
+pnpm db:migrate
+```
+
+The initial migration provisions the current backend schema: agreement events,
+agreements, billing invoices, billing payment methods, billing profiles,
+employees, escrow events, milestones, and payments, including the indexes
+declared in `src/db/schema.ts`. Migration tooling reads the database URL from
+`POSTGRES_CONNECTION_STRING`; do not commit environment files or connection
+strings.
+
 ## Checking Indexer Status
 
 ### 1. Check if Indexer is Running
