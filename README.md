@@ -218,6 +218,7 @@ Database schema migrations are managed using Drizzle Kit. To bootstrap or update
    ```
 
 If you make any changes to the database schema in `src/db/schema.ts`, you can generate new migration files by running:
+
 ```bash
 pnpm db:generate
 ```
@@ -251,6 +252,28 @@ pnpm test:coverage   # run with a coverage report
 Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
 the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
 on every push and pull request.
+
+### Dependency Maintenance
+
+Use pnpm as the source of truth for dependency installs and lockfile updates. The
+canonical lockfile is `pnpm-lock.yaml`. The old npm lockfile has been removed and
+`package-lock.json` is ignored so dependency changes do not create competing lock
+state. `package.json` pins the expected pnpm version through the `packageManager`
+field.
+
+Dependabot checks the npm ecosystem weekly and groups minor/patch dependency
+updates into a single pull request to reduce review noise. Security-sensitive
+updates may still be opened separately by Dependabot.
+
+Run the same audit gate locally before merging dependency changes:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm audit --prod --audit-level high
+```
+
+The CI workflow fails pull requests when production dependencies contain high or
+critical advisories, then runs linting, build, and tests.
 
 ### Linting and formatting
 

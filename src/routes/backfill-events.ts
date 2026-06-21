@@ -100,8 +100,8 @@ backfillEventsRouter.post(
 
           created++;
           results.push({
-            employeeId: employee.id,
-            agreementId: employee.agreement_id,
+            employeeId: String(employee.id),
+            agreementId: String(employee.agreement_id),
             status: "created",
           });
         }
@@ -198,8 +198,8 @@ backfillEventsRouter.post(
 
           created++;
           results.push({
-            milestoneId: milestone.id,
-            agreementId: milestone.agreement_id,
+            milestoneId: String(milestone.id),
+            agreementId: String(milestone.agreement_id),
             status: "created",
           });
         }

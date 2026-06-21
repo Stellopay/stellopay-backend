@@ -43,11 +43,10 @@ temp/
 Thumbs.db
 .DS_Store
 
-# Lock files (optional - uncomment if you want to ignore)
+# Lock files
 # pnpm-lock.yaml
-# package-lock.json
+package-lock.json
 # yarn.lock
-
 
 
 
