@@ -79,6 +79,11 @@ export const payments = pgTable(
     fromIdx: index("payments_from_idx").on(table.from),
     toIdx: index("payments_to_idx").on(table.to),
     blockNumberIdx: index("payments_block_number_idx").on(table.blockNumber),
+    tokenBlockNumberIdx: index("payments_token_block_number_idx").on(
+      table.token,
+      table.blockNumber,
+    ),
+    tokenCreatedAtIdx: index("payments_token_created_at_idx").on(table.token, table.createdAt),
   }),
 );
 

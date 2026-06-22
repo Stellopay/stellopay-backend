@@ -8,6 +8,13 @@
       "when": 1782074550149,
       "tag": "0000_faulty_mole_man",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1782144087927,
+      "tag": "0001_abnormal_captain_cross",
+      "breakpoints": true
     }
   ]
 }

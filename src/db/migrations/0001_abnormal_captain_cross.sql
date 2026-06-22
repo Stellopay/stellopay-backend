@@ -1,0 +1,2 @@
+CREATE INDEX "payments_token_block_number_idx" ON "payments" USING btree ("token","block_number");--> statement-breakpoint
+CREATE INDEX "payments_token_created_at_idx" ON "payments" USING btree ("token","created_at");

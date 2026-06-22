@@ -207,6 +207,15 @@ The service uses a configured Postgres pool with explicit limits and timeouts. T
 
 The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
 
+#### Payment query indexes
+
+The `payments` table keeps the original single-column indexes for agreement and address lookups, and adds targeted composite indexes for token-scoped analytics:
+
+- `payments_token_block_number_idx` supports token-filtered chain range scans ordered or bounded by `block_number`.
+- `payments_token_created_at_idx` supports token-filtered date windows used by analytics and transaction timelines.
+
+These indexes add write-time and storage overhead for each inserted payment row, but they avoid scans plus sorts on the hot token/time query paths as the indexer history grows. They do not expose row contents; they only change the database access path.
+
 #### Schema migrations & bootstrapping
 
 Database schema migrations are managed using Drizzle Kit. To bootstrap or update the database schema:
