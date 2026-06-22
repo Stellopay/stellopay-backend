@@ -207,6 +207,18 @@ Shows:
 - Contract addresses being indexed
 - Database connection status
 
+### Agreement index cache
+
+The backend can maintain an in-memory agreement index for fast user/agreement
+lookups. The cache is keyed by normalized Starknet addresses, exposes explicit
+`invalidate` and `clear` operations, and reports staleness from the last synced
+block. Callers that depend on fresh data should check the staleness status and
+refresh from PostgreSQL before serving cache-backed results.
+
+The index is bounded by a maximum agreement count per contract. When the limit
+is exceeded, the oldest agreement metadata and all related user lookup links are
+evicted together so stale user buckets do not retain orphaned agreement IDs.
+
 ## Best Practices
 
 1. **Keep indexer running** - It should run continuously to catch all events

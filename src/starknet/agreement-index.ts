@@ -30,9 +30,12 @@ type AgreementIndex = {
   lastSyncedBlock: number;
   // Contract address
   contractAddress: string;
+  maxEntries: number;
 };
 
 const indices = new Map<string, AgreementIndex>();
+const DEFAULT_MAX_ENTRIES = 5_000;
+const DEFAULT_STALE_AFTER_BLOCKS = 100;
 
 function getOrCreateIndex(contractAddress: string): AgreementIndex {
   if (!indices.has(contractAddress)) {
@@ -41,9 +44,46 @@ function getOrCreateIndex(contractAddress: string): AgreementIndex {
       agreements: new Map(),
       lastSyncedBlock: 0,
       contractAddress,
+      maxEntries: DEFAULT_MAX_ENTRIES,
     });
   }
   return indices.get(contractAddress)!;
+}
+
+function removeAgreementFromUser(index: AgreementIndex, userAddress: string, agreementId: string) {
+  const agreementIds = index.byUser.get(userAddress);
+  if (!agreementIds) return;
+  agreementIds.delete(agreementId);
+  if (!agreementIds.size) {
+    index.byUser.delete(userAddress);
+  }
+}
+
+function removeAgreement(index: AgreementIndex, agreementId: string) {
+  const metadata = index.agreements.get(agreementId);
+  if (metadata) {
+    removeAgreementFromUser(index, metadata.employer, agreementId);
+    if (metadata.contributor !== "0x0") {
+      removeAgreementFromUser(index, metadata.contributor, agreementId);
+    }
+  } else {
+    for (const userAddress of index.byUser.keys()) {
+      removeAgreementFromUser(index, userAddress, agreementId);
+    }
+  }
+  index.agreements.delete(agreementId);
+}
+
+function evictOldestAgreement(index: AgreementIndex) {
+  const oldestAgreementId = index.agreements.keys().next().value as string | undefined;
+  if (!oldestAgreementId) return;
+  removeAgreement(index, oldestAgreementId);
+}
+
+function enforceMaxEntries(index: AgreementIndex) {
+  while (index.agreements.size > index.maxEntries) {
+    evictOldestAgreement(index);
+  }
 }
 
 export function addAgreementToIndex(
@@ -59,6 +99,7 @@ export function addAgreementToIndex(
   },
 ) {
   const index = getOrCreateIndex(contractAddress);
+  removeAgreement(index, agreementId);
   const normalizedEmployer = normalizeAddress(employer);
   const normalizedContributor =
     contributor && contributor !== "0x0" ? normalizeAddress(contributor) : null;
@@ -84,6 +125,7 @@ export function addAgreementToIndex(
       contributor: normalizedContributor || "0x0",
       ...metadata,
     });
+    enforceMaxEntries(index);
   }
 }
 
@@ -99,8 +141,66 @@ export function getAgreementMetadata(contractAddress: string, agreementId: strin
   return index.agreements.get(agreementId);
 }
 
+export function invalidateAgreement(contractAddress: string, agreementId: string) {
+  const index = getOrCreateIndex(contractAddress);
+  removeAgreement(index, agreementId);
+}
+
 export function clearIndex(contractAddress: string) {
   indices.delete(contractAddress);
+}
+
+export function clearAllIndices() {
+  indices.clear();
+}
+
+export function markIndexSynced(contractAddress: string, blockNumber: number) {
+  const index = getOrCreateIndex(contractAddress);
+  index.lastSyncedBlock = Math.max(index.lastSyncedBlock, blockNumber);
+}
+
+export function getIndexStatus(
+  contractAddress: string,
+  currentBlock?: number,
+  staleAfterBlocks = DEFAULT_STALE_AFTER_BLOCKS,
+) {
+  const index = getOrCreateIndex(contractAddress);
+  const blocksBehind =
+    currentBlock === undefined ? null : Math.max(0, currentBlock - index.lastSyncedBlock);
+  return {
+    contractAddress,
+    agreementCount: index.agreements.size,
+    userCount: index.byUser.size,
+    lastSyncedBlock: index.lastSyncedBlock,
+    maxEntries: index.maxEntries,
+    blocksBehind,
+    isStale: blocksBehind === null ? index.lastSyncedBlock === 0 : blocksBehind > staleAfterBlocks,
+  };
+}
+
+export async function refreshIndexIfStale(
+  contractAddress: string,
+  currentBlock: number,
+  refresh: () => Promise<void>,
+  staleAfterBlocks = DEFAULT_STALE_AFTER_BLOCKS,
+) {
+  if (!getIndexStatus(contractAddress, currentBlock, staleAfterBlocks).isStale) {
+    return false;
+  }
+  await refresh();
+  markIndexSynced(contractAddress, currentBlock);
+  return true;
+}
+
+export function configureIndex(contractAddress: string, options: { maxEntries?: number }) {
+  const index = getOrCreateIndex(contractAddress);
+  if (options.maxEntries !== undefined) {
+    if (!Number.isInteger(options.maxEntries) || options.maxEntries < 1) {
+      throw new Error("maxEntries must be a positive integer");
+    }
+    index.maxEntries = options.maxEntries;
+    enforceMaxEntries(index);
+  }
 }
 
 export function getAllIndices(): Map<string, AgreementIndex> {
