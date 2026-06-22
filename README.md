@@ -409,6 +409,69 @@ handler.
 
 ---
 
+### Route inventory
+
+This human-readable inventory mirrors the routers mounted in `src/index.ts`. It is intended as the contributor-facing source until a machine-readable OpenAPI spec supersedes it.
+
+| Method | Path | Router | Purpose | Auth | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| `GET` | `/health` | process | Liveness check | No | Process only |
+| `GET` | `/ready` | process | Database readiness probe | No | DB |
+| `GET` | `/api/v1/escrow/defaults` | escrow | Return configured escrow defaults | No | Config |
+| `GET` | `/api/v1/escrow/:address/get_token` | escrow | Read escrow token address | No | Starknet RPC |
+| `GET` | `/api/v1/escrow/:address/is_initialized` | escrow | Check escrow initialization | No | Starknet RPC |
+| `GET` | `/api/v1/escrow/:address/get_agreement_balance/:agreement_id` | escrow | Read agreement balance | No | Starknet RPC |
+| `GET` | `/api/v1/escrow/:address/get_employer/:agreement_id` | escrow | Read escrow employer | No | Starknet RPC |
+| `POST` | `/api/v1/prepare/escrow/:address/initialize` | escrow | Prepare escrow initialization calldata | No | Starknet RPC |
+| `POST` | `/api/v1/prepare/escrow/:address/fund_agreement` | escrow | Prepare escrow funding calldata | No | Starknet RPC |
+| `POST` | `/api/v1/prepare/escrow/:address/release` | escrow | Prepare escrow release calldata | No | Starknet RPC |
+| `POST` | `/api/v1/prepare/escrow/:address/refund_remaining` | escrow | Prepare escrow refund calldata | No | Starknet RPC |
+| `GET` | `/api/v1/agreement/defaults` | agreement | Return configured agreement defaults | No | Config |
+| `GET` | `/api/v1/agreement/:address/get_*` | agreement | Read employer, contributor, token, status, amounts, milestone, payroll, and dispute state | No | Starknet RPC |
+| `GET` | `/api/v1/agreement/:address/list/:user_address` | agreement | List indexed or contract-backed agreements for a user | No | DB, Starknet RPC |
+| `POST` | `/api/v1/agreement/:address/get_agreement_id_from_tx` | agreement | Resolve an agreement id from a transaction | No | Starknet RPC |
+| `POST` | `/api/v1/agreement/:address/sync_index` | agreement | Sync agreement data into the local index | No | DB, Starknet RPC |
+| `POST` | `/api/v1/prepare/agreement/:address/*` | agreement | Prepare initialize, employee, funding, milestone, lifecycle, dispute, and claim calls | No | Starknet RPC |
+| `POST` | `/api/v1/auth/challenge` | auth | Issue an address challenge | Strict rate limit | Memory |
+| `POST` | `/api/v1/auth/verify` | auth | Verify signed challenge and issue a session token | Strict rate limit | Memory |
+| `POST` | `/api/v1/auth/session/validate` | auth | Validate a bearer session token | No | Memory |
+| `GET` | `/api/v1/network/chain_id` | system | Read Starknet chain id | No | Starknet RPC |
+| `GET` | `/api/v1/account/:address/nonce` | system | Read account nonce | No | Starknet RPC |
+| `GET` | `/api/v1/token/:token/balance/:owner` | read | Read token balance | No | Starknet RPC |
+| `GET` | `/api/v1/token/:token/decimals` | read | Read token decimals | No | Starknet RPC |
+| `GET` | `/api/v1/token/:token/symbol` | read | Read token symbol | No | Starknet RPC |
+| `GET` | `/api/v1/escrow/:address/balance/:agreement_id` | read | Read escrow balance summary | No | Starknet RPC |
+| `GET` | `/api/v1/escrow/:address/summary/:agreement_id` | read | Read escrow summary | No | Starknet RPC |
+| `GET` | `/api/v1/agreement/:address/summary/:agreement_id` | read | Read agreement summary | No | Starknet RPC |
+| `GET` | `/api/v1/indexed/agreements/user/:user_address` | indexed | List indexed agreements for a user | No | DB |
+| `GET` | `/api/v1/indexed/agreement/:contract_address/:agreement_id` | indexed | Fetch one indexed agreement | No | DB |
+| `GET` | `/api/v1/indexed/payments/user/:user_address` | indexed | List indexed payments for a user | No | DB |
+| `GET` | `/api/v1/indexed/events/:agreement_id` | indexed | List indexed agreement events | No | DB |
+| `GET` | `/api/v1/token/:address/allowance/:owner/:spender` | token | Read token allowance | No | Starknet RPC |
+| `POST` | `/api/v1/prepare/token/:address/approve` | token | Prepare token approval calldata | No | Starknet RPC |
+| `GET` | `/api/v1/transactions/:user_address` | transactions | Build the user transaction timeline | No | DB, Starknet RPC |
+| `GET` | `/api/v1/transactions/:user_address/filtered` | transactions | Build a date-filtered transaction timeline | No | DB, Starknet RPC |
+| `GET` | `/api/v1/notifications/:user_address` | notifications | Return user notification events | No | DB |
+| `GET` | `/api/v1/analytics/:user_address` | analytics | Return yearly payment and activity analytics | No | DB |
+| `POST` | `/api/v1/events/process_tx/:tx_hash` | events | Process a single transaction into indexed events | Session required | DB, Starknet RPC |
+| `POST` | `/api/v1/events/process_batch` | events | Process a batch of transactions | Session required | DB, Starknet RPC |
+| `GET` | `/api/v1/indexer/status` | indexer-status | Report indexer status and last processed data | No | DB |
+| `GET` | `/api/v1/indexer/user/:user_address/events` | indexer-status | Return indexed events for a user | No | DB |
+| `POST` | `/api/v1/reprocess-events/tx/:tx_hash` | reprocess-events | Reprocess one transaction | No | DB, Starknet RPC |
+| `POST` | `/api/v1/reprocess-events/status-changes` | reprocess-events | Reprocess status-change events | No | DB, Starknet RPC |
+| `POST` | `/api/v1/reprocess-events/batch` | reprocess-events | Reprocess a transaction batch | No | DB, Starknet RPC |
+| `GET` | `/api/v1/diagnostics/events` | diagnostics | Inspect event processing diagnostics | Admin headers required | DB |
+| `POST` | `/api/v1/backfill/employee-events` | backfill-events | Backfill employee events | No | DB |
+| `POST` | `/api/v1/backfill/milestone-events` | backfill-events | Backfill milestone events | No | DB |
+| `POST` | `/api/v1/contact/send-message` | contact | Send a contact-form email | Strict rate limit | Email provider |
+| `GET` | `/api/v1/billing/profiles` | billing | List billing profiles | Feature-flagged; returns `501` unless `BILLING_ENABLED=true` | DB |
+| `GET` | `/api/v1/billing/profiles/:profileId` | billing | Fetch one billing profile | Feature-flagged; returns `501` unless enabled | DB |
+| `GET` | `/api/v1/billing/profiles/:profileId/payment-methods` | billing | List billing payment methods | Feature-flagged; returns `501` unless enabled | DB |
+| `GET` | `/api/v1/billing/profiles/:profileId/invoices` | billing | List billing invoices | Feature-flagged; returns `501` unless enabled | DB |
+| `GET` | `/api/v1/billing/profiles/:profileId/summary` | billing | Return reward-limit and spend summary | Feature-flagged; returns `501` unless enabled | DB |
+
+Security notes: mutating event-processing routes use bearer session authentication where `requireAuth` is present in code; diagnostics routes additionally check `ADMIN_ADDRESSES`. The global `/api` limiter applies to all API routes, while auth and contact routes also receive the strict limiter.
+
 ### Indexed query parameters
 
 Path and query parameters on the indexed and indexer-status routes are validated with Zod before any database call:
