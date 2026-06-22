@@ -290,36 +290,55 @@ CORS_ORIGIN=*
 
 - `POST /api/v1/auth/challenge`
 - `POST /api/v1/auth/verify`
+- `POST /api/v1/auth/session/validate`
 
 #### PayrollEscrow (view)
 
-- `GET /api/v1/escrow/:address/get_employer`
-- `GET /api/v1/escrow/:address/get_agreement`
+- `GET /api/v1/escrow/defaults`
 - `GET /api/v1/escrow/:address/get_token`
+- `GET /api/v1/escrow/:address/is_initialized`
+- `GET /api/v1/escrow/:address/get_agreement_balance/:agreement_id`
+- `GET /api/v1/escrow/:address/get_agreement_employer/:agreement_id`
 
 #### PayrollEscrow (prepare to sign client-side)
 
 - `POST /api/v1/prepare/escrow/:address/initialize`
-- `POST /api/v1/prepare/escrow/:address/set_agreement`
-- `POST /api/v1/prepare/escrow/:address/deposit`
+- `POST /api/v1/prepare/escrow/:address/fund_agreement`
 - `POST /api/v1/prepare/escrow/:address/release`
 - `POST /api/v1/prepare/escrow/:address/refund_remaining`
 
 #### WorkAgreement (view)
 
-- `GET /api/v1/agreement/:address/get_employer`
-- `GET /api/v1/agreement/:address/get_contributor`
-- `GET /api/v1/agreement/:address/get_token`
+- `GET /api/v1/agreement/defaults`
+- `GET /api/v1/agreement/:address/get_employer/:agreement_id`
+- `GET /api/v1/agreement/:address/get_contributor/:agreement_id`
+- `GET /api/v1/agreement/:address/get_token/:agreement_id`
 - `GET /api/v1/agreement/:address/get_escrow`
-- `GET /api/v1/agreement/:address/get_total_amount`
-- `GET /api/v1/agreement/:address/get_paid_amount`
+- `GET /api/v1/agreement/:address/is_initialized`
+- `GET /api/v1/agreement/:address/get_total_amount/:agreement_id`
+- `GET /api/v1/agreement/:address/get_paid_amount/:agreement_id`
+- `GET /api/v1/agreement/:address/get_status/:agreement_id`
+- `GET /api/v1/agreement/:address/get_agreement_mode/:agreement_id`
+- `GET /api/v1/agreement/:address/get_employee_count/:agreement_id`
+- `GET /api/v1/agreement/:address/get_employee/:agreement_id/:index`
+- `GET /api/v1/agreement/:address/get_employee_salary/:agreement_id/:index`
+- `GET /api/v1/agreement/:address/get_dispute_status/:agreement_id`
+- `GET /api/v1/agreement/:address/is_grace_period_active/:agreement_id`
+- `GET /api/v1/agreement/:address/list/:user_address`
 
-#### WorkAgreement (invoke)
+#### WorkAgreement (index helpers)
+
+- `POST /api/v1/agreement/:address/get_agreement_id_from_tx`
+- `POST /api/v1/agreement/:address/sync_index`
 
 #### WorkAgreement (prepare to sign client-side)
 
-- `POST /api/v1/prepare/agreement/:address/initialize_time_based`
-- `POST /api/v1/prepare/agreement/:address/initialize_milestone_based`
+- `POST /api/v1/prepare/agreement/:address/initialize`
+- `POST /api/v1/prepare/agreement/:address/create_time_based_agreement`
+- `POST /api/v1/prepare/agreement/:address/create_milestone_agreement`
+- `POST /api/v1/prepare/agreement/:address/create_payroll_agreement`
+- `POST /api/v1/prepare/agreement/:address/add_employee`
+- `POST /api/v1/prepare/agreement/:address/fund_agreement`
 - `POST /api/v1/prepare/agreement/:address/add_milestone`
 - `POST /api/v1/prepare/agreement/:address/approve_milestone`
 - `POST /api/v1/prepare/agreement/:address/claim_milestone`
@@ -327,7 +346,11 @@ CORS_ORIGIN=*
 - `POST /api/v1/prepare/agreement/:address/pause`
 - `POST /api/v1/prepare/agreement/:address/resume`
 - `POST /api/v1/prepare/agreement/:address/cancel`
+- `POST /api/v1/prepare/agreement/:address/finalize_grace_period`
+- `POST /api/v1/prepare/agreement/:address/raise_dispute`
+- `POST /api/v1/prepare/agreement/:address/resolve_dispute`
 - `POST /api/v1/prepare/agreement/:address/claim_time_based`
+- `POST /api/v1/prepare/agreement/:address/claim_payroll`
 
 #### Billing Profiles _(requires `BILLING_ENABLED=true`)_
 
@@ -393,9 +416,210 @@ By default the backend loads ABI from:
 - Users first prove wallet ownership by signing a backend-issued challenge (`/auth/challenge` → sign typed data → `/auth/verify`).
 - For contract mutations, the backend returns a prepared `call` + `nonce`; the frontend wallet/account should sign + execute.
 
-### Sessions
+### Wallet-signature auth flow
 
-After `/auth/verify` succeeds, the backend issues a session token with a **sliding expiry**. The lifetime is controlled by `SESSION_TTL_MS` (default 24 hours), and `/auth/verify` returns the remaining lifetime as `expires_in_ms`. A token is refreshed for another full TTL each time it is used on a successful `/auth/session/validate`, and expired tokens are rejected and purged (lazily on use, plus a periodic background sweep) so they cannot be replayed or leak memory.
+Authentication is a wallet-ownership proof. The backend creates a short-lived
+challenge, the frontend asks the wallet to sign the returned SNIP-12 typed data,
+and the backend verifies the signature against the Starknet account contract
+through the configured RPC provider before issuing a session token.
+
+#### 1. Request a challenge
+
+`POST /api/v1/auth/challenge`
+
+Request:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS"
+}
+```
+
+Response:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS",
+  "nonce": "0xRANDOM_16_BYTE_NONCE",
+  "expires_in_ms": 300000,
+  "chain_id": "0xCHAIN_ID_FELT",
+  "typed_data": {
+    "types": {
+      "StarknetDomain": [
+        { "name": "name", "type": "felt" },
+        { "name": "version", "type": "felt" },
+        { "name": "chainId", "type": "felt" },
+        { "name": "revision", "type": "felt" }
+      ],
+      "Challenge": [
+        { "name": "action", "type": "felt" },
+        { "name": "wallet", "type": "felt" },
+        { "name": "nonce", "type": "felt" }
+      ]
+    },
+    "primaryType": "Challenge",
+    "domain": {
+      "name": "StelloPay",
+      "version": "1",
+      "chainId": "SN_SEPOLIA",
+      "revision": "1"
+    },
+    "message": {
+      "action": "LOGIN",
+      "wallet": "0xWALLET_ADDRESS",
+      "nonce": "0xRANDOM_16_BYTE_NONCE"
+    }
+  }
+}
+```
+
+`expires_in_ms` is the remaining challenge lifetime in milliseconds. Challenges
+currently live for five minutes (`300000` ms) and are stored in process memory.
+The server enforces this expiry; clients should treat the value as display or
+retry guidance, not as an authority to extend the challenge lifetime.
+
+`chain_id` is the raw chain ID returned by the configured Starknet RPC provider.
+The `typed_data` object is Starknet SNIP-12 typed data, similar in shape to
+EIP-712: it declares domain fields, a primary type, and the message fields that
+the wallet signs. `typed_data.domain.chainId` is the decoded short-string label,
+for example `SN_SEPOLIA` on Starknet Sepolia. Sign exactly the returned
+`typed_data`; do not reconstruct it with a different chain ID, nonce, domain, or
+message.
+
+Safe challenge request:
+
+```bash
+curl -sS http://localhost:4000/api/v1/auth/challenge \
+  -H 'content-type: application/json' \
+  --data '{"address":"0xWALLET_ADDRESS"}'
+```
+
+#### 2. Sign typed data and verify
+
+The frontend passes `typed_data` to the connected Starknet wallet. The backend
+does not receive or need a private key.
+
+`POST /api/v1/auth/verify`
+
+Request:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS",
+  "signature": ["0xSIGNATURE_PART_0", "0xSIGNATURE_PART_1", "0xOPTIONAL_SIGNATURE_PART_2"]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "address": "0xWALLET_ADDRESS",
+  "session_token": "SESSION_TOKEN",
+  "expires_in_ms": 86400000
+}
+```
+
+`signature` is an array of felts encoded as strings. It must contain at least two
+items, but it is intentionally variable length because Starknet wallets and
+account contracts do not all emit exactly two signature elements. Send the array
+returned by the wallet without truncating or padding it.
+
+`expires_in_ms` in the verify response is the session lifetime in milliseconds.
+It is controlled by `SESSION_TTL_MS` and defaults to 24 hours (`86400000` ms).
+Session TTL enforcement is server-side, following the fix tracked in
+[#41](https://github.com/Stellopay/stellopay-backend/issues/41); do not trust a
+client-reported timestamp or cached expiry as proof that a session is still
+valid. The used challenge is cleared after successful verification.
+
+If the challenge is missing or expired, `/auth/verify` returns `400`:
+
+```json
+{
+  "error": "No active challenge (or expired). Call /auth/challenge again."
+}
+```
+
+If the wallet signature does not validate through the Starknet account contract,
+`/auth/verify` returns `401`:
+
+```json
+{
+  "error": "Invalid signature"
+}
+```
+
+Safe verify request shape with placeholder values:
+
+```bash
+curl -sS http://localhost:4000/api/v1/auth/verify \
+  -H 'content-type: application/json' \
+  --data '{
+    "address": "0xWALLET_ADDRESS",
+    "signature": [
+      "0xSIGNATURE_PART_0",
+      "0xSIGNATURE_PART_1"
+    ]
+  }'
+```
+
+#### 3. Validate a session
+
+`POST /api/v1/auth/session/validate`
+
+Request:
+
+```json
+{
+  "address": "0xWALLET_ADDRESS",
+  "session_token": "SESSION_TOKEN"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "address": "0xWALLET_ADDRESS"
+}
+```
+
+Invalid, expired, unknown, or wrong-address tokens return `401`:
+
+```json
+{
+  "ok": false,
+  "error": "Invalid session"
+}
+```
+
+Safe validation request shape with placeholder values:
+
+```bash
+curl -sS http://localhost:4000/api/v1/auth/session/validate \
+  -H 'content-type: application/json' \
+  --data '{
+    "address": "0xWALLET_ADDRESS",
+    "session_token": "SESSION_TOKEN"
+  }'
+```
+
+Sessions have a sliding expiry. A successful `/auth/session/validate` refreshes
+the token for another full `SESSION_TTL_MS`, although the validation response
+does not include the refreshed expiry. Expired tokens are rejected and purged
+lazily on use, with a periodic background sweep for tokens that are never used
+again.
+
+Contract prepare routes currently validate sessions from the JSON request body
+with `wallet_address` and `session_token`. Middleware-protected routes use the
+same session store but expect `Authorization: Bearer <session_token>` plus an
+`x-user-address` header.
+
+Challenges and sessions are both in-memory only. Restarting the server clears
+all outstanding challenges and session tokens, so clients should handle
+`401 Invalid session` by starting the challenge → verify flow again.
 
 ### Frontend usage (starknet.js wallet)
 
@@ -429,26 +653,32 @@ async function login(address: string) {
 }
 ```
 
-2. Prepare a call (example: escrow deposit), then execute from wallet:
+2. Prepare a call (example: funding an escrow agreement), then execute from wallet:
 
 ```ts
-async function deposit({
+async function fundAgreement({
   walletAddress,
   sessionToken,
   escrowAddress,
+  agreementId,
+  employer,
   amount,
 }: {
   walletAddress: string;
   sessionToken: string;
   escrowAddress: string;
+  agreementId: string;
+  employer: string;
   amount: string; // decimal string
 }) {
-  const prepRes = await fetch(`${BACKEND}/prepare/escrow/${escrowAddress}/deposit`, {
+  const prepRes = await fetch(`${BACKEND}/prepare/escrow/${escrowAddress}/fund_agreement`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       wallet_address: walletAddress,
       session_token: sessionToken,
+      agreement_id: agreementId,
+      employer,
       amount,
     }),
   });
