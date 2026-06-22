@@ -42,7 +42,9 @@ export const agreementEvents = pgTable(
   "agreement_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id")
+      .notNull()
+      .references(() => agreements.id, { onDelete: "restrict" }),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // AgreementCreated, AgreementActivated, etc.
     blockNumber: bigint("block_number", { mode: "number" }).notNull(),
@@ -63,7 +65,9 @@ export const payments = pgTable(
   "payments",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id")
+      .notNull()
+      .references(() => agreements.id, { onDelete: "restrict" }),
     contractAddress: text("contract_address").notNull(),
     from: text("from_address").notNull(),
     to: text("to_address").notNull(),
@@ -87,7 +91,9 @@ export const milestones = pgTable(
   "milestones",
   {
     id: text("id").primaryKey(), // agreement_id + milestone_id
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id")
+      .notNull()
+      .references(() => agreements.id, { onDelete: "restrict" }),
     contractAddress: text("contract_address").notNull(),
     milestoneId: integer("milestone_id").notNull(),
     amount: text("amount").notNull(), // u256 as string
@@ -110,7 +116,9 @@ export const employees = pgTable(
   "employees",
   {
     id: text("id").primaryKey(), // agreement_id + employee_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id")
+      .notNull()
+      .references(() => agreements.id, { onDelete: "restrict" }),
     contractAddress: text("contract_address").notNull(),
     employeeAddress: text("employee_address").notNull(),
     employeeIndex: integer("employee_index").notNull(),
@@ -132,7 +140,9 @@ export const escrowEvents = pgTable(
   "escrow_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id")
+      .notNull()
+      .references(() => agreements.id, { onDelete: "restrict" }),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // Funded, Released, Refunded
     employer: text("employer").notNull(),

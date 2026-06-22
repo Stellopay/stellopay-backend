@@ -71,6 +71,28 @@ describeDbMigration("Database migration integration test", () => {
       expect(tables).toContain(table);
     }
 
+    const constraintRes = await client.query(`
+      SELECT conname
+      FROM pg_constraint
+      WHERE contype = 'f'
+        AND conrelid IN (
+          'agreement_events'::regclass,
+          'payments'::regclass,
+          'milestones'::regclass,
+          'employees'::regclass,
+          'escrow_events'::regclass
+        )
+      ORDER BY conname
+    `);
+
+    expect(constraintRes.rows.map((row) => row.conname)).toEqual([
+      "agreement_events_agreement_id_agreements_id_fk",
+      "employees_agreement_id_agreements_id_fk",
+      "escrow_events_agreement_id_agreements_id_fk",
+      "milestones_agreement_id_agreements_id_fk",
+      "payments_agreement_id_agreements_id_fk",
+    ]);
+
     await client.end();
   });
 });

@@ -32,6 +32,19 @@ Both indexer and backend use the same schema:
 - `milestones` - Milestone events
 - `employees` - Employee data for payroll
 
+### Agreement referential integrity
+
+Agreement child tables (`agreement_events`, `payments`, `escrow_events`,
+`milestones`, and `employees`) reference `agreements.id` through explicit
+foreign keys. The delete policy is intentionally restrictive: deleting an
+agreement with indexed children is rejected by PostgreSQL instead of cascading
+through historical event data.
+
+This preserves the append-only indexer history and prevents a single agreement
+delete from removing payments, milestones, payroll employees, or escrow audit
+rows. If an operator ever needs to remove test data, delete child rows first and
+then delete the parent agreement in the same controlled maintenance session.
+
 ## Checking Indexer Status
 
 ### 1. Check if Indexer is Running
