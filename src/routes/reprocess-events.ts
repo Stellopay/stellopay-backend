@@ -3,13 +3,23 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
-import { eq, inArray } from "drizzle-orm";
+import { eq, and, gte, lte } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxReceipt } from "./events.js";
+import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
 
 export const reprocessEventsRouter = Router();
+
+/** Maximum number of events to reprocess in a single status-changes request. */
+const MAX_STATUS_LIMIT = 1000;
+
+/** Zod schema for the status-changes query parameters. */
+const StatusChangesQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(MAX_STATUS_LIMIT).optional().default(100),
+  fromBlock: z.coerce.number().int().positive().optional(),
+  toBlock: z.coerce.number().int().positive().optional(),
+});
 
 // Load contract ABIs
 let workAgreementAbi: any[] | null = null;
@@ -35,30 +45,25 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
   return payrollEscrowAbi;
 }
 
-// Reprocess events for a specific transaction to update event names
+/**
+ * POST /reprocess-events/tx/:tx_hash
+ *
+ * Reprocess events for a single transaction to decode event names.
+ * Delegates to the shared `processTxReceipt` which uses `ON CONFLICT DO NOTHING`
+ * keyed on `transaction_hash + event_index` — re-runs are safe no-ops.
+ *
+ * **Validation**
+ * - `:tx_hash` must be a valid Starknet transaction hash (0x-prefixed, 3–66 chars).
+ */
 reprocessEventsRouter.post(
   "/reprocess-events/tx/:tx_hash",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
     try {
-      const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
+      const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
 
-      // Validate tx_hash format before processing to prevent invalid inputs/SSRF
-      const txHashRegex = /^0x?[0-9a-fA-F]{1,64}$/;
-      if (!tx_hash || !txHashRegex.test(tx_hash) || tx_hash.length > 66) {
-        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
-        return;
-      }
-
-      // Format tx hash
-      let formattedTxHash = tx_hash;
-      if (!tx_hash.startsWith("0x")) {
-        formattedTxHash = `0x${tx_hash}`;
-      }
-
-      // Call the shared events processing logic directly, avoiding loopback HTTP requests
-      const result = await processTxReceipt(formattedTxHash);
+      const result = await processTxReceipt(tx_hash);
 
       if (result.status === "not_found") {
         res.status(404).json({ error: "Transaction not found" });
@@ -70,6 +75,10 @@ reprocessEventsRouter.post(
         result,
       });
     } catch (e: any) {
+      if (e instanceof z.ZodError) {
+        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+        return;
+      }
       if (e.message === "Transaction not found") {
         res.status(404).json({ error: "Transaction not found" });
         return;
@@ -79,15 +88,100 @@ reprocessEventsRouter.post(
   },
 );
 
-// Reprocess all AgreementStatusChange events to decode their actual names
+/**
+ * POST /reprocess-events/batch
+ *
+ * Reprocess events for multiple transactions. Each tx hash is processed
+ * independently using the same shared `processTxReceipt` logic so the
+ * operation is fully idempotent — re-submitting the same batch produces
+ * no duplicate rows.
+ *
+ * **Validation**
+ * - `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
+ * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request.
+ *
+ * **Response**
+ * Returns a `results` array where each entry corresponds to one tx hash.
+ * A per-tx error never aborts the rest of the batch.
+ */
+reprocessEventsRouter.post(
+  "/reprocess-events/batch",
+  requireAuth,
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const { tx_hashes } = z
+        .object({
+          tx_hashes: z
+            .array(TxHashSchema)
+            .min(1, "tx_hashes must contain at least one hash")
+            .max(
+              MAX_BATCH_SIZE,
+              `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+            ),
+        })
+        .parse(req.body);
+
+      const results = [];
+
+      for (const txHash of tx_hashes) {
+        try {
+          const result = await processTxReceipt(txHash);
+          results.push(result);
+        } catch (e: any) {
+          results.push({
+            txHash,
+            status: "error",
+            eventsProcessed: 0,
+            eventLabels: [],
+            error: e?.message ?? String(e),
+          });
+        }
+      }
+
+      const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
+
+      res.json({
+        summary: {
+          total: results.length,
+          processed: results.filter((r) => r.status === "processed").length,
+          noEvents: results.filter((r) => r.status === "no_events").length,
+          notFound: results.filter((r) => r.status === "not_found").length,
+          errors: results.filter((r) => r.status === "error").length,
+          totalEventsProcessed: totalProcessed,
+        },
+        results,
+      });
+    } catch (e: any) {
+      if (e instanceof z.ZodError) {
+        res.status(400).json({ error: e.errors[0]?.message || "Invalid request body" });
+        return;
+      }
+      next(e);
+    }
+  },
+);
+
+/**
+ * POST /reprocess-events/status-changes
+ *
+ * Reprocess all AgreementStatusChange events to decode their actual names.
+ * Only processes events that still have `eventType === "AgreementStatusChange"`,
+ * so re-runs automatically skip already-updated events.  An in-memory dedup
+ * set keyed on `transaction_hash + event_index` prevents processing the same
+ * event twice within a single request.
+ *
+ * **Validation**
+ * - `limit` (query, optional, default 100, max {@link MAX_STATUS_LIMIT})
+ * - `fromBlock` / `toBlock` (query, optional) — filter by block number range.
+ */
 reprocessEventsRouter.post(
   "/reprocess-events/status-changes",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
     try {
-      const limit =
-        z.coerce.number().int().positive().max(1000).optional().parse(req.query.limit) || 100;
+      const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
 
       // Get contract ABIs
       const workAgreementAbi = await getWorkAgreementAbi();
@@ -99,17 +193,37 @@ reprocessEventsRouter.post(
       const workAgreementContract = new Contract(workAgreementAbi, workAgreementAddress, provider);
       const payrollEscrowContract = new Contract(payrollEscrowAbi, payrollEscrowAddress, provider);
 
-      // Get all AgreementStatusChange events
+      // Build where clause: only process events still tagged as AgreementStatusChange
+      const conditions = [eq(schema.agreementEvents.eventType, "AgreementStatusChange")];
+      if (fromBlock !== undefined) {
+        conditions.push(gte(schema.agreementEvents.blockNumber, fromBlock));
+      }
+      if (toBlock !== undefined) {
+        conditions.push(lte(schema.agreementEvents.blockNumber, toBlock));
+      }
+
+      // Get AgreementStatusChange events matching the filter
       const statusChangeEvents = await db
         .select()
         .from(schema.agreementEvents)
-        .where(eq(schema.agreementEvents.eventType, "AgreementStatusChange"))
+        .where(and(...conditions))
         .limit(limit);
 
       const results = [];
       let updated = 0;
+      // In-memory dedup keyed on transaction_hash + event_index to prevent
+      // processing the same event twice within a single request.
+      const processedKeys = new Set<string>();
 
       for (const event of statusChangeEvents) {
+        // Dedup on transaction_hash + event_index — skip if already seen in this request
+        const dedupKey = `${event.transactionHash}_${event.eventIndex}`;
+        if (processedKeys.has(dedupKey)) {
+          results.push({ eventId: event.id, status: "dedup_skipped" });
+          continue;
+        }
+        processedKeys.add(dedupKey);
+
         try {
           // Get transaction receipt to decode event
           const receipt = await provider.getTransactionReceipt(event.transactionHash);
@@ -212,7 +326,11 @@ reprocessEventsRouter.post(
         updated,
         results,
       });
-    } catch (e) {
+    } catch (e: any) {
+      if (e instanceof z.ZodError) {
+        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+        return;
+      }
       next(e);
     }
   },

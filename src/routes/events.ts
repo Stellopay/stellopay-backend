@@ -14,14 +14,14 @@ import { agreementContract } from "../starknet/client.js";
 const AddressParam = z.string().min(3);
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
-const MAX_BATCH_SIZE = 50;
+export const MAX_BATCH_SIZE = 50;
 
 /**
  * Zod schema for a Starknet transaction hash.
  * Accepts the canonical 0x-prefixed hex form (up to 66 chars) as well as the
  * un-padded variant emitted by some RPC providers.
  */
-const TxHashSchema = z
+export const TxHashSchema = z
   .string()
   .min(3)
   .max(66)
@@ -34,7 +34,7 @@ export const eventsRouter = Router();
  * If the hash is already 66 chars, it is returned as-is to preserve leading
  * zeros; otherwise the hex part is left-padded to 64 characters.
  */
-function normalizeTransactionHash(hash: string): string {
+export function normalizeTransactionHash(hash: string): string {
   if (!hash) return "";
   let normalized = hash.toLowerCase().trim();
   if (!normalized.startsWith("0x")) {
@@ -97,8 +97,53 @@ export interface TxProcessResult {
   eventsProcessed: number;
   /** Human-readable labels of every event that was persisted. */
   eventLabels: string[];
+  /**
+   * For a receipt containing one or more `AgreementCreated` events, whether the
+   * on-chain token verification completed for all of them. `true` when every
+   * agreement's token was checked against the contract (and corrected on
+   * mismatch), `false` when at least one check could not be completed, and
+   * `undefined` when the receipt had no `AgreementCreated` event.
+   */
+  tokenVerified?: boolean;
   /** Present only when status === "error". */
   error?: string;
+}
+
+/**
+ * Verify an agreement's token against the on-chain contract and correct the
+ * stored row when they disagree. The on-chain value is authoritative, so a
+ * mismatched event token is overwritten here before the caller responds.
+ *
+ * Errors are caught and reported through the return value rather than left as a
+ * floating promise rejection.
+ *
+ * @param agreementId - The agreement whose token is being verified.
+ * @param contractAddress - The WorkAgreement contract that emitted the event.
+ * @param eventToken - The normalized token taken from the event payload.
+ * @returns `true` when the on-chain token was read and the stored row reflects
+ *   it, `false` when the contract call or update failed.
+ */
+async function verifyAndUpdateToken(
+  agreementId: string,
+  contractAddress: string,
+  eventToken: string,
+): Promise<boolean> {
+  try {
+    const contract = agreementContract(contractAddress);
+    const contractToken = await contract.get_token(agreementId);
+    const normalizedContractToken = normalizeAddress(toHexString(contractToken));
+
+    if (normalizedContractToken !== eventToken) {
+      await db
+        .update(schema.agreements)
+        .set({ token: normalizedContractToken, updatedAt: new Date() })
+        .where(eq(schema.agreements.id, agreementId));
+    }
+    return true;
+  } catch (err: any) {
+    console.error(`[events] Token verification failed for agreement ${agreementId}:`, err?.message);
+    return false;
+  }
 }
 
 /**
@@ -171,6 +216,10 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
   const payrollEscrowContract = new Contract(pEscrowAbi, payrollEscrowAddress, provider);
 
   const eventLabels: string[] = [];
+
+  // Token verification outcome across any AgreementCreated events in this tx.
+  let sawAgreementCreated = false;
+  let allTokensVerified = true;
 
   // ------------------------------------------------------------------
   // 4. Decode and persist each event
@@ -289,34 +338,12 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
                 set: { updatedAt: new Date() },
               });
 
-            // Async token verification (non-blocking, best-effort)
-            (async () => {
-              try {
-                console.log(
-                  `[events] Verifying token for agreement ${agreementId} from contract ${fromAddress}`,
-                );
-                const c = agreementContract(fromAddress);
-                const contractToken = await c.get_token(agreementId);
-                const normalizedContractToken = normalizeAddress(toHexString(contractToken));
-
-                if (normalizedContractToken !== tokenFromEvent) {
-                  console.log(
-                    `[events] Token mismatch for agreement ${agreementId}: updating ${tokenFromEvent} → ${normalizedContractToken}`,
-                  );
-                  await db
-                    .update(schema.agreements)
-                    .set({ token: normalizedContractToken, updatedAt: new Date() })
-                    .where(eq(schema.agreements.id, agreementId!));
-                } else {
-                  console.log(`[events] Token verified for agreement ${agreementId}`);
-                }
-              } catch (err: any) {
-                console.error(
-                  `[events] Token verification failed for agreement ${agreementId}:`,
-                  err?.message,
-                );
-              }
-            })();
+            // Verify the token against the on-chain contract before responding.
+            // Awaited, not fire and forget, so the authoritative on-chain value
+            // settles the stored row before process_tx returns.
+            sawAgreementCreated = true;
+            const verified = await verifyAndUpdateToken(agreementId, fromAddress, tokenFromEvent);
+            if (!verified) allTokensVerified = false;
           }
 
           eventLabels.push(`${eventType}-${agreementId}`);
@@ -475,6 +502,7 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
     status: "processed",
     eventsProcessed: eventLabels.length,
     eventLabels,
+    tokenVerified: sawAgreementCreated ? allTokensVerified : undefined,
   };
 }
 
@@ -508,6 +536,7 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
       message: `Processed ${result.eventsProcessed} events`,
       eventsProcessed: result.eventLabels,
       transactionHash: result.txHash,
+      tokenVerified: result.tokenVerified,
     });
   } catch (e) {
     next(e);

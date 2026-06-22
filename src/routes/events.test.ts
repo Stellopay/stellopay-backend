@@ -49,9 +49,13 @@ vi.mock("../db/index.js", () => {
 vi.mock("../starknet/client.js", () => ({
   provider: { getTransactionReceipt: vi.fn() },
   agreementContract: vi.fn(() => ({
+    // Resolves to the same token as the AgreementCreated fixture so the default
+    // path verifies cleanly; the verification tests override this per case.
     get_token: vi
       .fn()
-      .mockResolvedValue("0xdeadbeef00000000000000000000000000000000000000000000000000000002"),
+      .mockResolvedValue(
+        BigInt("0xdeadbeef00000000000000000000000000000000000000000000000000000002"),
+      ),
   })),
 }));
 
@@ -89,9 +93,11 @@ vi.mock("../utils/codec.js", () => ({
 // Import SUT and mocked modules AFTER all vi.mock calls
 // ---------------------------------------------------------------------------
 
-import { processTxReceipt } from "./events.js";
+import express from "express";
+import request from "supertest";
+import { processTxReceipt, eventsRouter } from "./events.js";
 import { db } from "../db/index.js";
-import { provider } from "../starknet/client.js";
+import { provider, agreementContract } from "../starknet/client.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -402,5 +408,134 @@ describe("Zod input validation schemas", () => {
 
   it("BatchSchema rejects a batch containing even one invalid hash", () => {
     expect(() => BatchSchema.parse({ tx_hashes: [TX_A, "not-a-hash"] })).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – on-chain token verification (#29)
+// ---------------------------------------------------------------------------
+
+describe("processTxReceipt – on-chain token verification", () => {
+  // The token carried by the AgreementCreated fixture (event data[3]).
+  const EVENT_TOKEN = BigInt("0xdeadbeef00000000000000000000000000000000000000000000000000000002");
+  const ONCHAIN_MISMATCH = BigInt(
+    "0xcafebabe00000000000000000000000000000000000000000000000000000003",
+  );
+
+  let setSpy: ReturnType<typeof vi.fn>;
+
+  /** Re-wire the db.insert and db.update chains after clearAllMocks. */
+  function rewireDb() {
+    const onConflictDoNothing = vi.fn().mockResolvedValue(undefined);
+    const onConflictDoUpdate = vi.fn().mockResolvedValue(undefined);
+    const values = vi.fn().mockReturnValue({ onConflictDoNothing, onConflictDoUpdate });
+    vi.mocked(db.insert).mockReturnValue({ values } as any);
+
+    const where = vi.fn().mockResolvedValue(undefined);
+    setSpy = vi.fn().mockReturnValue({ where });
+    vi.mocked(db.update).mockReturnValue({ set: setSpy } as any);
+  }
+
+  function mockGetToken(impl: () => Promise<bigint>) {
+    vi.mocked(agreementContract).mockReturnValue({ get_token: vi.fn(impl) } as any);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rewireDb();
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+  });
+
+  it("reports tokenVerified true and does not update when the on-chain token matches", async () => {
+    mockGetToken(() => Promise.resolve(EVENT_TOKEN));
+
+    const result = await processTxReceipt(TX_A);
+
+    expect(result.status).toBe("processed");
+    expect(result.tokenVerified).toBe(true);
+    expect(vi.mocked(db.update)).not.toHaveBeenCalled();
+  });
+
+  it("corrects the stored token and still reports tokenVerified true on mismatch", async () => {
+    mockGetToken(() => Promise.resolve(ONCHAIN_MISMATCH));
+
+    const result = await processTxReceipt(TX_A);
+
+    expect(result.tokenVerified).toBe(true);
+    expect(vi.mocked(db.update)).toHaveBeenCalledWith("agreements");
+    expect(setSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ token: expect.stringContaining("cafebabe") }),
+    );
+  });
+
+  it("reports tokenVerified false when the contract call fails, without throwing", async () => {
+    mockGetToken(() => Promise.reject(new Error("RPC down")));
+
+    const result = await processTxReceipt(TX_A);
+
+    expect(result.status).toBe("processed");
+    expect(result.eventsProcessed).toBe(1);
+    expect(result.tokenVerified).toBe(false);
+    expect(vi.mocked(db.update)).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – HTTP routes (process_tx / process_batch)
+// ---------------------------------------------------------------------------
+
+describe("events routes – process_tx and process_batch responses", () => {
+  function makeApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(eventsRouter);
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rewireDbInsert();
+    // Force a deterministic "token matches" path for the default route tests.
+    vi.mocked(agreementContract).mockReturnValue({
+      get_token: vi
+        .fn()
+        .mockResolvedValue(
+          BigInt("0xdeadbeef00000000000000000000000000000000000000000000000000000002"),
+        ),
+    } as any);
+  });
+
+  it("process_tx returns 200 and surfaces tokenVerified for an AgreementCreated tx", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+
+    expect(res.status).toBe(200);
+    expect(res.body.tokenVerified).toBe(true);
+    expect(res.body.transactionHash).toBe(TX_A);
+  });
+
+  it("process_tx returns 404 when the transaction is not found", async () => {
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(null as any);
+
+    const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+
+  it("process_batch returns a per-tx summary", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary.total).toBe(1);
+    expect(res.body.results).toHaveLength(1);
   });
 });
