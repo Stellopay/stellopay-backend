@@ -11,6 +11,22 @@ const AddressParam = z.string().min(3);
 
 export const transactionsRouter = Router();
 
+/**
+ * Emits verbose token-matching and fetch diagnostics only when LOG_LEVEL is set
+ * to "debug". These lines are noisy on the request hot path and can include
+ * token addresses, so at the default "info" level, and in production, they stay
+ * silent: this keeps sensitive routing data out of default-level logs and stops
+ * the per-request flood that previously ran on every transaction list. Genuine
+ * failures still use console.error and console.warn so errors stay visible.
+ *
+ * @param args - Values forwarded to console.debug when debug logging is on.
+ */
+function debugLog(...args: unknown[]): void {
+  if (env.LOG_LEVEL === "debug") {
+    console.debug(...args);
+  }
+}
+
 // Helper to format address for display (truncate like 0x1234...5678)
 function formatAddress(addr: string): string {
   if (!addr || addr === "N/A") return addr;
@@ -33,11 +49,11 @@ const NORMALIZED_STRK = normalizeAddr(STRK_TOKEN_ADDRESS);
 const NORMALIZED_USDC = normalizeAddr(USDC_TOKEN_ADDRESS);
 const NORMALIZED_USDT = normalizeAddr(USDT_TOKEN_ADDRESS);
 
-// Log known token addresses on module load
-console.log(`[transactions] Known token addresses configured:`);
-console.log(`  - STRK: ${STRK_TOKEN_ADDRESS} (normalized: ${NORMALIZED_STRK})`);
-console.log(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
-console.log(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
+// Log known token addresses on module load (debug level only)
+debugLog(`[transactions] Known token addresses configured:`);
+debugLog(`  - STRK: ${STRK_TOKEN_ADDRESS} (normalized: ${NORMALIZED_STRK})`);
+debugLog(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
+debugLog(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
 
 // Helper to get token info from token address
 function getTokenInfo(tokenAddress: string | null | undefined): {
@@ -47,25 +63,25 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
   isSTRK: boolean;
 } {
   if (!tokenAddress) {
-    console.log(`[transactions] getTokenInfo: No token address provided, returning "-"`);
+    debugLog(`[transactions] getTokenInfo: No token address provided, returning "-"`);
     return { name: "-", icon: "", decimals: 0, isSTRK: false };
   }
 
   const normalized = normalizeAddr(tokenAddress);
 
-  console.log(`[transactions] getTokenInfo: Comparing token ${normalized}`);
-  console.log(
+  debugLog(`[transactions] getTokenInfo: Comparing token ${normalized}`);
+  debugLog(
     `[transactions]   vs STRK: ${NORMALIZED_STRK} (match: ${normalized === NORMALIZED_STRK})`,
   );
-  console.log(
+  debugLog(
     `[transactions]   vs USDC: ${NORMALIZED_USDC} (match: ${normalized === NORMALIZED_USDC})`,
   );
-  console.log(
+  debugLog(
     `[transactions]   vs USDT: ${NORMALIZED_USDT} (match: ${normalized === NORMALIZED_USDT})`,
   );
 
   if (normalized === NORMALIZED_STRK) {
-    console.log(`[transactions] getTokenInfo: Identified as STRK`);
+    debugLog(`[transactions] getTokenInfo: Identified as STRK`);
     return {
       name: "STRK",
       icon: "/strk-logo.png", // Update with actual icon path
@@ -73,7 +89,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: true,
     };
   } else if (normalized === NORMALIZED_USDC) {
-    console.log(`[transactions] getTokenInfo: Identified as USDC`);
+    debugLog(`[transactions] getTokenInfo: Identified as USDC`);
     return {
       name: "USDC",
       icon: "/usdc-logo.png",
@@ -81,7 +97,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
       isSTRK: false,
     };
   } else if (normalized === NORMALIZED_USDT) {
-    console.log(`[transactions] getTokenInfo: Identified as USDT`);
+    debugLog(`[transactions] getTokenInfo: Identified as USDT`);
     return {
       name: "USDT",
       icon: "/usdt-logo.png",
@@ -91,7 +107,7 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
   }
 
   // Default to USDC format for unknown tokens
-  console.log(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
+  debugLog(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
   return {
     name: "USDC",
     icon: "/usdc-logo.png",
@@ -106,7 +122,7 @@ function formatAmount(
   tokenInfo: { name: string; decimals: number; isSTRK: boolean },
 ): string {
   if (!amount || amount === "0" || amount === BigInt(0)) {
-    console.log(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
+    debugLog(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
     return "-";
   }
 
@@ -115,13 +131,13 @@ function formatAmount(
   const wholePart = amountBigInt / divisor;
   const fractionalPart = amountBigInt % divisor;
 
-  console.log(`[transactions] formatAmount: Processing amount`);
-  console.log(`  - Raw amount: ${amount} (type: ${typeof amount})`);
-  console.log(`  - Amount as BigInt: ${amountBigInt.toString()}`);
-  console.log(`  - Token decimals: ${tokenInfo.decimals}`);
-  console.log(`  - Divisor: ${divisor.toString()}`);
-  console.log(`  - Whole part: ${wholePart.toString()}`);
-  console.log(`  - Fractional part: ${fractionalPart.toString()}`);
+  debugLog(`[transactions] formatAmount: Processing amount`);
+  debugLog(`  - Raw amount: ${amount} (type: ${typeof amount})`);
+  debugLog(`  - Amount as BigInt: ${amountBigInt.toString()}`);
+  debugLog(`  - Token decimals: ${tokenInfo.decimals}`);
+  debugLog(`  - Divisor: ${divisor.toString()}`);
+  debugLog(`  - Whole part: ${wholePart.toString()}`);
+  debugLog(`  - Fractional part: ${fractionalPart.toString()}`);
 
   if (tokenInfo.isSTRK) {
     // Format STRK: show decimals like "0.434 strk"
@@ -130,21 +146,21 @@ function formatAmount(
     const fractionalTrimmed = fractionalStr.replace(/0+$/, "");
     if (fractionalTrimmed === "") {
       const result = `${wholePart.toString()} ${tokenInfo.name}`;
-      console.log(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
+      debugLog(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
       return result;
     }
     // Show up to 6 significant digits in fractional part
     const fractionalDisplay = fractionalTrimmed.slice(0, 6);
     const result = `${wholePart.toString()}.${fractionalDisplay} ${tokenInfo.name}`;
-    console.log(`[transactions] formatAmount: STRK result: ${result}`);
+    debugLog(`[transactions] formatAmount: STRK result: ${result}`);
     return result;
   } else {
     // Format USDC: show as dollar amount
     const amountNum = Number(amountBigInt) / Number(divisor);
     const result = `$${amountNum.toFixed(2)}`;
-    console.log(`[transactions] formatAmount: USDC/USDT calculation:`);
-    console.log(`  - Amount as number: ${amountNum}`);
-    console.log(`  - Result: ${result}`);
+    debugLog(`[transactions] formatAmount: USDC/USDT calculation:`);
+    debugLog(`  - Amount as number: ${amountNum}`);
+    debugLog(`  - Result: ${result}`);
     return result;
   }
 }
@@ -168,12 +184,12 @@ async function getTokenFromAgreementContract(
 
   // Return cached value if still valid
   if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL_MS) {
-    console.log(`[transactions] Using cached token for agreement ${agreementId}: ${cached.token}`);
+    debugLog(`[transactions] Using cached token for agreement ${agreementId}: ${cached.token}`);
     return cached.token;
   }
 
   try {
-    console.log(
+    debugLog(
       `[transactions] Fetching token from agreement contract ${agreementContractAddress} for agreement ${agreementId}`,
     );
     const c = agreementContract(agreementContractAddress);
@@ -181,10 +197,10 @@ async function getTokenFromAgreementContract(
     const tokenAddress = toHexString(out);
     const normalizedToken = normalizeAddr(tokenAddress);
 
-    console.log(`[transactions] Successfully fetched token for agreement ${agreementId}:`);
-    console.log(`  - Raw token: ${tokenAddress}`);
-    console.log(`  - Normalized token: ${normalizedToken}`);
-    console.log(`  - Token info: ${JSON.stringify(getTokenInfo(normalizedToken))}`);
+    debugLog(`[transactions] Successfully fetched token for agreement ${agreementId}:`);
+    debugLog(`  - Raw token: ${tokenAddress}`);
+    debugLog(`  - Normalized token: ${normalizedToken}`);
+    debugLog(`  - Token info: ${JSON.stringify(getTokenInfo(normalizedToken))}`);
 
     // Cache the result
     tokenCache.set(cacheKey, { token: normalizedToken, timestamp: Date.now() });
@@ -209,7 +225,7 @@ async function getTokenFromAgreementContract(
 async function batchGetTokensFromAgreementContracts(
   agreements: Array<{ agreementContractAddress: string; agreementId: string }>,
 ): Promise<Map<string, string>> {
-  console.log(`[transactions] Batch fetching tokens for ${agreements.length} agreements`);
+  debugLog(`[transactions] Batch fetching tokens for ${agreements.length} agreements`);
   const tokenMap = new Map<string, string>();
   const uncachedAgreements: Array<{
     agreementContractAddress: string;
@@ -223,7 +239,7 @@ async function batchGetTokensFromAgreementContracts(
     const cached = tokenCache.get(cacheKey);
 
     if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL_MS) {
-      console.log(
+      debugLog(
         `[transactions] Using cached token for agreement ${agreement.agreementId}: ${cached.token}`,
       );
       tokenMap.set(agreement.agreementId, cached.token);
@@ -232,7 +248,7 @@ async function batchGetTokensFromAgreementContracts(
     }
   }
 
-  console.log(
+  debugLog(
     `[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`,
   );
 
@@ -240,7 +256,7 @@ async function batchGetTokensFromAgreementContracts(
   const BATCH_SIZE = 10;
   for (let i = 0; i < uncachedAgreements.length; i += BATCH_SIZE) {
     const batch = uncachedAgreements.slice(i, i + BATCH_SIZE);
-    console.log(
+    debugLog(
       `[transactions] Fetching batch ${Math.floor(i / BATCH_SIZE) + 1} (${batch.length} agreements)`,
     );
     const fetchPromises = batch.map(async (agreement) => {
@@ -265,7 +281,7 @@ async function batchGetTokensFromAgreementContracts(
     await Promise.all(fetchPromises);
   }
 
-  console.log(
+  debugLog(
     `[transactions] Batch fetch complete. Got ${tokenMap.size} tokens out of ${agreements.length} agreements`,
   );
   return tokenMap;

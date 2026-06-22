@@ -2,18 +2,19 @@ import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, inArray } from "drizzle-orm";
-import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
+import { StarknetAddress } from "../utils/validation.js";
 import { formatTokenAmount } from "../utils/codec.js";
 import { tokenDecimals } from "../utils/token.js";
-
-const AddressParam = z.string().min(3);
 
 export const notificationsRouter = Router();
 
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
   try {
-    const userAddress = normalizeAddress(req.params.user_address);
+    // Validate the path param before it is normalized so a crafted string
+    // cannot produce a surprising lookup key; an invalid address throws a
+    // ZodError that the global handler maps to a 400 before any DB query.
+    const userAddress = StarknetAddress.parse(req.params.user_address);
     const limit =
       z.coerce.number().int().positive().max(50).optional().parse(req.query.limit) || 10;
 
