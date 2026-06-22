@@ -207,6 +207,24 @@ The service uses a configured Postgres pool with explicit limits and timeouts. T
 
 The implementation never logs the raw connection string. Any log output that references the DSN uses a masked value so credentials are not exposed.
 
+#### Schema migrations & bootstrapping
+
+Database schema migrations are managed using Drizzle Kit. To bootstrap or update the database schema:
+
+1. Ensure you have configured `POSTGRES_CONNECTION_STRING` in your `.env` file (e.g. `POSTGRES_CONNECTION_STRING=postgresql://postgres:postgres@localhost:5432/stellopay_indexer`).
+2. Run database migrations to create/update tables and indexes:
+   ```bash
+   pnpm db:migrate
+   ```
+
+If you make any changes to the database schema in `src/db/schema.ts`, you can generate new migration files by running:
+```bash
+pnpm db:generate
+```
+
+> [!IMPORTANT]
+> The database schema is shared with the external Apibara indexer (see [INDEXER_INTEGRATION.md](INDEXER_INTEGRATION.md)). Ensure any schema modifications remain compatible with the indexer's write paths.
+
 ### Deployment & graceful shutdown
 
 The server captures `SIGTERM` and `SIGINT` signals to gracefully shutdown:
