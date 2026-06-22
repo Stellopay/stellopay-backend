@@ -10,6 +10,8 @@ const poolTuning = {
   max: env.DB_POOL_MAX,
   idleTimeoutMillis: env.DB_POOL_IDLE_TIMEOUT_MS,
   connectionTimeoutMillis: env.DB_POOL_CONNECTION_TIMEOUT_MS,
+  statement_timeout: env.DB_STATEMENT_TIMEOUT_MS,
+  query_timeout: env.DB_QUERY_TIMEOUT_MS,
 };
 
 function maskConnectionString(connectionString: string): string {

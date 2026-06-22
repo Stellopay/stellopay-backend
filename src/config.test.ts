@@ -43,12 +43,32 @@ describe("config env parsing", () => {
     expect(env.SHUTDOWN_DRAIN_TIMEOUT_MS).toBe(10000);
     expect(env.TRUST_PROXY).toBe("1");
     expect(env.BILLING_ENABLED).toBe(false);
+    expect(env.DB_POOL_MAX).toBe(10);
+    expect(env.DB_POOL_IDLE_TIMEOUT_MS).toBe(30_000);
+    expect(env.DB_POOL_CONNECTION_TIMEOUT_MS).toBe(5_000);
+    expect(env.DB_STATEMENT_TIMEOUT_MS).toBe(15_000);
+    expect(env.DB_QUERY_TIMEOUT_MS).toBe(20_000);
   });
 
   it("coerces numeric env strings to numbers", async () => {
-    const { env } = await loadConfig({ PORT: "5000", RATE_LIMIT_MAX: "250" });
+    const { env } = await loadConfig({
+      PORT: "5000",
+      RATE_LIMIT_MAX: "250",
+      DB_POOL_MAX: "20",
+      DB_STATEMENT_TIMEOUT_MS: "7500",
+      DB_QUERY_TIMEOUT_MS: "8000",
+    });
     expect(env.PORT).toBe(5000);
     expect(env.RATE_LIMIT_MAX).toBe(250);
+    expect(env.DB_POOL_MAX).toBe(20);
+    expect(env.DB_STATEMENT_TIMEOUT_MS).toBe(7500);
+    expect(env.DB_QUERY_TIMEOUT_MS).toBe(8000);
+  });
+
+  it("rejects unbounded database timeout and pool values", async () => {
+    await expect(loadConfig({ DB_STATEMENT_TIMEOUT_MS: "0" })).rejects.toThrow();
+    await expect(loadConfig({ DB_QUERY_TIMEOUT_MS: "-1" })).rejects.toThrow();
+    await expect(loadConfig({ DB_POOL_MAX: "0" })).rejects.toThrow();
   });
 
   it("treats BILLING_ENABLED 'true' as true", async () => {
