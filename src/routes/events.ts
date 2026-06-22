@@ -14,14 +14,14 @@ import { agreementContract } from "../starknet/client.js";
 const AddressParam = z.string().min(3);
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
-const MAX_BATCH_SIZE = 50;
+export const MAX_BATCH_SIZE = 50;
 
 /**
  * Zod schema for a Starknet transaction hash.
  * Accepts the canonical 0x-prefixed hex form (up to 66 chars) as well as the
  * un-padded variant emitted by some RPC providers.
  */
-const TxHashSchema = z
+export const TxHashSchema = z
   .string()
   .min(3)
   .max(66)
@@ -34,7 +34,7 @@ export const eventsRouter = Router();
  * If the hash is already 66 chars, it is returned as-is to preserve leading
  * zeros; otherwise the hex part is left-padded to 64 characters.
  */
-function normalizeTransactionHash(hash: string): string {
+export function normalizeTransactionHash(hash: string): string {
   if (!hash) return "";
   let normalized = hash.toLowerCase().trim();
   if (!normalized.startsWith("0x")) {

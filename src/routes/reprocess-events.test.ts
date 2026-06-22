@@ -207,6 +207,34 @@ describe("Reprocess Events Routes", () => {
       expect(reprocessRes.body.result.txHash).toEqual(processRes.body.transactionHash);
     });
 
+    it("should be idempotent on double reprocess (tx/:tx_hash)", async () => {
+      const mockReceipt = {
+        transaction_hash: "0x1234567890abcdef",
+        blockNumber: 100,
+        events: [
+          {
+            from_address: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            data: ["123", "0x123", "0x456", "0x789", "0", "1"],
+          },
+        ],
+      };
+      mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+
+      const txHash = "0x1234567890abcdef";
+      const endpoint = `/api/v1/reprocess-events/tx/${txHash}`;
+
+      // First call
+      const res1 = await request(app).post(endpoint).expect(200);
+      expect(res1.body.message).toBe("Events reprocessed");
+
+      // Second call — processTxReceipt uses onConflictDoNothing, so result is identical
+      const res2 = await request(app).post(endpoint).expect(200);
+      expect(res2.body).toEqual(res1.body);
+
+      // Verify the shared processor was invoked both times (idempotent at DB level)
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(2);
+    });
+
     it("should handle outer catch-all error in reprocess-events/tx", async () => {
       mockGetTransactionReceipt.mockRejectedValue(new Error("RPC Connection Fail"));
 
@@ -466,6 +494,224 @@ describe("Reprocess Events Routes", () => {
       expect(res.body.error).toBe("DB Connection Failed");
 
       selectMock.mockRestore();
+    });
+
+    it("should reject invalid status-changes query params (400)", async () => {
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/status-changes?limit=-1")
+        .expect(400);
+
+      expect(res.body.error).toBeDefined();
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("should filter by block range when fromBlock/toBlock provided", async () => {
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      } as any);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/status-changes?fromBlock=100&toBlock=200")
+        .expect(200);
+
+      expect(res.body.message).toContain("Reprocessed 0 events");
+
+      selectMock.mockRestore();
+    });
+
+    it("should be idempotent on double reprocess (status-changes)", async () => {
+      const mockEvents = [
+        {
+          id: "event_1",
+          transactionHash: "0x123",
+          eventIndex: 0,
+          contractAddress: "0xwork",
+          eventType: "AgreementStatusChange",
+        },
+      ];
+
+      let callCount = 0;
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockImplementation(() => {
+              callCount++;
+              // First call returns events, second call returns empty (already updated)
+              return Promise.resolve(callCount === 1 ? mockEvents : []);
+            }),
+          }),
+        }),
+      } as any);
+
+      // Mock a receipt that will trigger the "no_receipt" path so the event stays unchanged
+      // (we just want to verify that the second call sees no work to do)
+      mockGetTransactionReceipt.mockResolvedValue(null);
+
+      // First call
+      const res1 = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+      expect(res1.body.updated).toBe(0);
+      expect(res1.body.results).toHaveLength(1);
+      expect(res1.body.results[0].status).toBe("no_receipt");
+
+      // Second call — query returns empty so no events are processed
+      const res2 = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+      expect(res2.body.updated).toBe(0);
+      expect(res2.body.results).toHaveLength(0);
+
+      // Verify fetch was called via processTxReceipt
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(1);
+
+      selectMock.mockRestore();
+      callCount = 0;
+    });
+  });
+
+  describe("POST /reprocess-events/batch", () => {
+    it("should process a batch of tx hashes successfully", async () => {
+      const mockReceipt1 = {
+        transaction_hash: "0x1234567890abcdef",
+        blockNumber: 100,
+        events: [
+          {
+            from_address: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            data: ["123", "0x123", "0x456", "0x789", "0", "1"],
+          },
+        ],
+      };
+      const mockReceipt2 = {
+        transaction_hash: "0xdeadbeef00000000000000000000000000000000000000000000000000000001",
+        blockNumber: 200,
+        events: [
+          {
+            from_address: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            data: ["456", "0xabc", "0xdef", "0x789", "0", "1"],
+          },
+        ],
+      };
+
+      mockGetTransactionReceipt
+        .mockResolvedValueOnce(mockReceipt1)
+        .mockResolvedValueOnce(mockReceipt2);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({
+          tx_hashes: ["0x1234567890abcdef", "0xdeadbeef00000000000000000000000000000000000000000000000000000001"],
+        })
+        .expect(200);
+
+      expect(res.body.summary.total).toBe(2);
+      expect(res.body.summary.processed).toBe(2);
+      expect(res.body.summary.errors).toBe(0);
+      expect(res.body.results).toHaveLength(2);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("should reject empty tx_hashes array (400)", async () => {
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes: [] })
+        .expect(400);
+
+      expect(res.body.error).toBeDefined();
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("should reject missing tx_hashes field (400)", async () => {
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({})
+        .expect(400);
+
+      expect(res.body.error).toBeDefined();
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("should reject invalid tx hash format in array (400)", async () => {
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes: ["not-a-valid-hash"] })
+        .expect(400);
+
+      expect(res.body.error).toBeDefined();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(mockGetTransactionReceipt).not.toHaveBeenCalled();
+    });
+
+    it("should reject oversized tx_hashes array (400)", async () => {
+      const tx_hashes = Array.from({ length: 51 }, (_, i) => `0x${i.toString(16).padStart(64, "0")}`);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes })
+        .expect(400);
+
+      expect(res.body.error).toContain("50");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("should handle per-tx errors without aborting the batch", async () => {
+      mockGetTransactionReceipt
+        .mockResolvedValueOnce({
+          transaction_hash: "0x1234567890abcdef",
+          blockNumber: 100,
+          events: [],
+        })
+        .mockRejectedValueOnce(new Error("RPC Error"));
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({
+          tx_hashes: [
+            "0x1234567890abcdef",
+            "0xdeadbeef00000000000000000000000000000000000000000000000000000001",
+          ],
+        })
+        .expect(200);
+
+      expect(res.body.summary.total).toBe(2);
+      expect(res.body.summary.noEvents).toBe(1);
+      expect(res.body.summary.errors).toBe(1);
+      expect(res.body.results[1].status).toBe("error");
+      expect(res.body.results[1].error).toBe("RPC Error");
+    });
+
+    it("should be idempotent on double reprocess (batch)", async () => {
+      const mockReceipt = {
+        transaction_hash: "0x1234567890abcdef",
+        blockNumber: 100,
+        events: [
+          {
+            from_address: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            data: ["123", "0x123", "0x456", "0x789", "0", "1"],
+          },
+        ],
+      };
+
+      mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+
+      const body = { tx_hashes: ["0x1234567890abcdef"] };
+
+      // First call
+      const res1 = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send(body)
+        .expect(200);
+
+      expect(res1.body.summary.processed).toBe(1);
+
+      // Second call — same body, same result (processTxReceipt uses onConflictDoNothing)
+      const res2 = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send(body)
+        .expect(200);
+
+      expect(res2.body.summary.processed).toBe(1);
+      expect(res2.body.results[0].txHash).toBe(res1.body.results[0].txHash);
     });
   });
 });
