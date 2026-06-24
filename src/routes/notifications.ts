@@ -3,8 +3,7 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, inArray } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
-import { formatTokenAmount } from "../utils/codec.js";
-import { tokenDecimals } from "../utils/token.js";
+import { formatTokenAmount, getTokenInfo } from "../utils/token-formatting.js";
 
 export const notificationsRouter = Router();
 
@@ -29,7 +28,7 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
     // Get important agreement events (disputes, activations, cancellations, and creations)
     // First, get agreement IDs where user is involved
     const userAgreements = await db
-      .select({ id: schema.agreements.id })
+      .select({ id: schema.agreements.id, token: schema.agreements.token })
       .from(schema.agreements)
       .where(
         or(
@@ -39,6 +38,7 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       );
 
     const agreementIds = userAgreements.map((a) => a.id);
+    const agreementTokensById = new Map(userAgreements.map((agreement) => [agreement.id, agreement.token]));
 
     // Get important events for user's agreements
     const importantEvents =
@@ -74,15 +74,20 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
 
     // Transform to notification format
     const notifications = [
-      ...payments.map((p) => ({
-        id: p.id,
-        title: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
-        message: `#${p.transactionHash.slice(0, 10)} · ${p.eventType === "PaymentSent" ? "You sent" : "You received"} ${formatTokenAmount(p.amount, tokenDecimals(p.token))} tokens`,
-        read: false,
-        date: p.createdAt.toISOString(),
-        type: p.eventType,
-        txHash: p.transactionHash,
-      })),
+      ...payments.map((p) => {
+        const tokenInfo = getTokenInfo(p.token);
+        const formattedAmount = formatTokenAmount(p.amount, tokenInfo.decimals);
+
+        return {
+          id: p.id,
+          title: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
+          message: `#${p.transactionHash.slice(0, 10)} · ${p.eventType === "PaymentSent" ? "You sent" : "You received"} ${formattedAmount} tokens`,
+          read: false,
+          date: p.createdAt.toISOString(),
+          type: p.eventType,
+          txHash: p.transactionHash,
+        };
+      }),
       ...importantEvents.map((e) => ({
         id: e.id,
         title:
@@ -104,20 +109,26 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
         type: e.eventType,
         txHash: e.transactionHash,
       })),
-      ...escrowEvents.map((e) => ({
-        id: e.id,
-        title:
-          e.eventType === "Funded"
-            ? "Agreement Funded"
-            : e.eventType === "Released"
-              ? "Funds Released"
-              : "Funds Refunded",
-        message: `Agreement ${e.agreementId}: ${e.eventType} of ${formatTokenAmount(e.amount)} tokens`,
-        read: false,
-        date: e.createdAt.toISOString(),
-        type: e.eventType,
-        txHash: e.transactionHash,
-      })),
+      ...escrowEvents.map((e) => {
+        const tokenAddress = agreementTokensById.get(e.agreementId) ?? null;
+        const tokenInfo = getTokenInfo(tokenAddress);
+        const formattedAmount = formatTokenAmount(e.amount, tokenInfo.decimals);
+
+        return {
+          id: e.id,
+          title:
+            e.eventType === "Funded"
+              ? "Agreement Funded"
+              : e.eventType === "Released"
+                ? "Funds Released"
+                : "Funds Refunded",
+          message: `Agreement ${e.agreementId}: ${e.eventType} of ${formattedAmount} tokens`,
+          read: false,
+          date: e.createdAt.toISOString(),
+          type: e.eventType,
+          txHash: e.transactionHash,
+        };
+      }),
     ]
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, limit);
