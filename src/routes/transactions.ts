@@ -6,6 +6,7 @@ import { agreementContract } from "../starknet/client.js";
 import { toHexString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 import { env } from "../config.js";
+import { formatTokenAmount, getTokenInfo as resolveTokenInfo, type TokenInfo } from "../utils/token-formatting.js";
 
 const AddressParam = z.string().min(3);
 
@@ -56,18 +57,14 @@ debugLog(`  - USDC: ${USDC_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDC})`);
 debugLog(`  - USDT: ${USDT_TOKEN_ADDRESS} (normalized: ${NORMALIZED_USDT})`);
 
 // Helper to get token info from token address
-function getTokenInfo(tokenAddress: string | null | undefined): {
-  name: string;
-  icon: string;
-  decimals: number;
-  isSTRK: boolean;
-} {
+function getTokenInfo(tokenAddress: string | null | undefined): TokenInfo {
   if (!tokenAddress) {
     debugLog(`[transactions] getTokenInfo: No token address provided, returning "-"`);
     return { name: "-", icon: "", decimals: 0, isSTRK: false };
   }
 
   const normalized = normalizeAddr(tokenAddress);
+  const tokenInfo = resolveTokenInfo(tokenAddress);
 
   debugLog(`[transactions] getTokenInfo: Comparing token ${normalized}`);
   debugLog(
@@ -80,94 +77,35 @@ function getTokenInfo(tokenAddress: string | null | undefined): {
     `[transactions]   vs USDT: ${NORMALIZED_USDT} (match: ${normalized === NORMALIZED_USDT})`,
   );
 
-  if (normalized === NORMALIZED_STRK) {
-    debugLog(`[transactions] getTokenInfo: Identified as STRK`);
-    return {
-      name: "STRK",
-      icon: "/strk-logo.png", // Update with actual icon path
-      decimals: 18, // STRK uses 18 decimals
-      isSTRK: true,
-    };
-  } else if (normalized === NORMALIZED_USDC) {
-    debugLog(`[transactions] getTokenInfo: Identified as USDC`);
-    return {
-      name: "USDC",
-      icon: "/usdc-logo.png",
-      decimals: 6, // USDC uses 6 decimals
-      isSTRK: false,
-    };
-  } else if (normalized === NORMALIZED_USDT) {
-    debugLog(`[transactions] getTokenInfo: Identified as USDT`);
-    return {
-      name: "USDT",
-      icon: "/usdt-logo.png",
-      decimals: 6, // USDT uses 6 decimals
-      isSTRK: false,
-    };
-  }
-
-  // Default to USDC format for unknown tokens
-  debugLog(`[transactions] getTokenInfo: Unknown token, defaulting to USDC format`);
-  return {
-    name: "USDC",
-    icon: "/usdc-logo.png",
-    decimals: 6,
-    isSTRK: false,
-  };
+  return tokenInfo;
 }
 
 // Helper to format amount based on token type
-function formatAmount(
-  amount: string | bigint,
-  tokenInfo: { name: string; decimals: number; isSTRK: boolean },
-): string {
+function formatAmount(amount: string | bigint, tokenInfo: TokenInfo): string {
   if (!amount || amount === "0" || amount === BigInt(0)) {
     debugLog(`[transactions] formatAmount: Amount is zero or empty, returning "-"`);
     return "-";
   }
 
-  const amountBigInt = typeof amount === "string" ? BigInt(amount) : amount;
-  const divisor = BigInt(10 ** tokenInfo.decimals);
-  const wholePart = amountBigInt / divisor;
-  const fractionalPart = amountBigInt % divisor;
-
   debugLog(`[transactions] formatAmount: Processing amount`);
   debugLog(`  - Raw amount: ${amount} (type: ${typeof amount})`);
-  debugLog(`  - Amount as BigInt: ${amountBigInt.toString()}`);
   debugLog(`  - Token decimals: ${tokenInfo.decimals}`);
-  debugLog(`  - Divisor: ${divisor.toString()}`);
-  debugLog(`  - Whole part: ${wholePart.toString()}`);
-  debugLog(`  - Fractional part: ${fractionalPart.toString()}`);
+
+  const formattedAmount = formatTokenAmount(amount, tokenInfo.decimals);
 
   if (tokenInfo.isSTRK) {
-    // Format STRK: show decimals like "0.434 strk"
-    const fractionalStr = fractionalPart.toString().padStart(tokenInfo.decimals, "0");
-    // Remove trailing zeros
-    const fractionalTrimmed = fractionalStr.replace(/0+$/, "");
-    if (fractionalTrimmed === "") {
-      const result = `${wholePart.toString()} ${tokenInfo.name}`;
-      debugLog(`[transactions] formatAmount: STRK result (no fractional): ${result}`);
-      return result;
-    }
-    // Show up to 6 significant digits in fractional part
-    const fractionalDisplay = fractionalTrimmed.slice(0, 6);
-    const result = `${wholePart.toString()}.${fractionalDisplay} ${tokenInfo.name}`;
+    const [wholePart, fractionalPart = ""] = formattedAmount.split(".");
+    const fractionalDisplay = fractionalPart.slice(0, 6);
+    const result = fractionalDisplay ? `${wholePart}.${fractionalDisplay} ${tokenInfo.name}` : `${wholePart} ${tokenInfo.name}`;
     debugLog(`[transactions] formatAmount: STRK result: ${result}`);
     return result;
-  } else {
-    // Format USDC: show as dollar amount
-    const amountNum = Number(amountBigInt) / Number(divisor);
-    const result = `$${amountNum.toFixed(2)}`;
-    debugLog(`[transactions] formatAmount: USDC/USDT calculation:`);
-    debugLog(`  - Amount as number: ${amountNum}`);
-    debugLog(`  - Result: ${result}`);
-    return result;
   }
-}
 
-// Check if event type is fund-related
-function isFundRelatedEvent(eventType: string): boolean {
-  return eventType === "Funded" || eventType === "Released" || eventType === "Refunded";
+  const [wholePart, fractionalPart = ""] = formattedAmount.split(".");
+  const fractionalDisplay = fractionalPart.slice(0, 2).padEnd(2, "0");
+  const result = `$${wholePart}${fractionalDisplay ? `.${fractionalDisplay}` : ".00"}`;
+  debugLog(`[transactions] formatAmount: USDC/USDT result: ${result}`);
+  return result;
 }
 
 // Cache for token addresses to avoid repeated contract calls
