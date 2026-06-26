@@ -7,6 +7,7 @@ declare global {
     interface Request {
       auth?: {
         address: string;
+        token: string;
       };
     }
   }
@@ -15,13 +16,17 @@ declare global {
 /**
  * Middleware that enforces a valid session for the request.
  * Expects:
- * - \`x-user-address\` header containing the user's Starknet address.
- * - \`Authorization\` header containing a Bearer token (the session token).
+ * - `x-user-address` header containing the user's Starknet address.
+ * - `Authorization` header containing a Bearer token (the session token).
  *
- * If valid, attaches \`req.auth = { address }\` and proceeds.
+ * If valid, attaches `req.auth = { address, token }` and proceeds.
  * Otherwise, returns a 401 Unauthorized JSON response without leaking session state.
  */
-export const requireAuth = (req: Request, res: Response, next: NextFunction): void => {
+export const requireAuth = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
   try {
     const addressHeader = req.headers["x-user-address"];
     const authHeader = req.headers["authorization"];
@@ -39,13 +44,13 @@ export const requireAuth = (req: Request, res: Response, next: NextFunction): vo
     const token = authHeader.substring(7).trim();
     const address = addressHeader.trim();
 
-    const isValid = requireSession(address, token);
+    const isValid = await requireSession(address, token);
     if (!isValid) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
-    req.auth = { address: address.toLowerCase() };
+    req.auth = { address: address.toLowerCase(), token };
     next();
   } catch (error) {
     res.status(401).json({ error: "Unauthorized" });
