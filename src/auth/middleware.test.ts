@@ -30,44 +30,44 @@ describe("Auth Middleware", () => {
   });
 
   describe("requireAuth", () => {
-    it("should return 401 if x-user-address header is missing", () => {
+    it("should return 401 if x-user-address header is missing", async () => {
       mockReq.headers = { authorization: "Bearer valid_token" };
-      requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
       expect(mockNext).not.toHaveBeenCalled();
     });
 
-    it("should return 401 if authorization header is missing", () => {
+    it("should return 401 if authorization header is missing", async () => {
       mockReq.headers = { "x-user-address": "0xuser" };
-      requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
       expect(mockNext).not.toHaveBeenCalled();
     });
 
-    it("should return 401 if authorization header is not Bearer", () => {
+    it("should return 401 if authorization header is not Bearer", async () => {
       mockReq.headers = {
         "x-user-address": "0xuser",
         authorization: "Basic some_token",
       };
-      requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
       expect(mockNext).not.toHaveBeenCalled();
     });
 
-    it("should return 401 if session is invalid", () => {
+    it("should return 401 if session is invalid", async () => {
       mockReq.headers = {
         "x-user-address": "0xuser",
         authorization: "Bearer invalid_token",
       };
-      vi.mocked(requireSession).mockReturnValue(false);
+      vi.mocked(requireSession).mockResolvedValue(false);
 
-      requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
 
       expect(requireSession).toHaveBeenCalledWith("0xuser", "invalid_token");
       expect(mockRes.status).toHaveBeenCalledWith(401);
@@ -75,17 +75,17 @@ describe("Auth Middleware", () => {
       expect(mockNext).not.toHaveBeenCalled();
     });
 
-    it("should attach address to req.auth and call next if session is valid", () => {
+    it("should attach address and token to req.auth and call next if session is valid", async () => {
       mockReq.headers = {
         "x-user-address": "0xUSER", // Test case insensitivity normalization
         authorization: "Bearer valid_token",
       };
-      vi.mocked(requireSession).mockReturnValue(true);
+      vi.mocked(requireSession).mockResolvedValue(true);
 
-      requireAuth(mockReq as Request, mockRes as Response, mockNext);
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
 
       expect(requireSession).toHaveBeenCalledWith("0xUSER", "valid_token");
-      expect(mockReq.auth).toEqual({ address: "0xuser" });
+      expect(mockReq.auth).toEqual({ address: "0xuser", token: "valid_token" });
       expect(mockNext).toHaveBeenCalled();
     });
   });
@@ -111,7 +111,7 @@ describe("Auth Middleware", () => {
     });
 
     it("should return 401 if user is not in admin allowlist", () => {
-      mockReq.auth = { address: "0xuser" };
+      mockReq.auth = { address: "0xuser", token: "testtoken" };
       requireAdmin(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
@@ -120,14 +120,14 @@ describe("Auth Middleware", () => {
     });
 
     it("should call next if user is in admin allowlist", () => {
-      mockReq.auth = { address: "0xadmin1" };
+      mockReq.auth = { address: "0xadmin1", token: "testtoken" };
       requireAdmin(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
     });
 
     it("should call next if user is in admin allowlist regardless of casing", () => {
-      mockReq.auth = { address: "0xADMIN2" };
+      mockReq.auth = { address: "0xADMIN2", token: "testtoken" };
       requireAdmin(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();

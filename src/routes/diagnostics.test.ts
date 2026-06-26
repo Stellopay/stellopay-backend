@@ -12,7 +12,7 @@ import request from "supertest";
 import express from "express";
 
 vi.mock("../auth/session.js", () => ({
-  requireSession: vi.fn(() => true),
+  requireSession: vi.fn(async () => true),
 }));
 
 vi.mock("../config.js", () => ({
@@ -82,7 +82,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(db.execute).mockReset();
-    vi.mocked(requireSession).mockReturnValue(true);
+    vi.mocked(requireSession).mockResolvedValue(true);
   });
 
   it("rejects an unauthenticated request with 401 and runs no queries", async () => {
