@@ -152,7 +152,7 @@ escrowRouter.post("/prepare/escrow/:address/initialize", async (req, res, next) 
   try {
     const address = AddressParam.parse(req.params.address);
     const body = InitBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -171,7 +171,7 @@ escrowRouter.post("/prepare/escrow/:address/fund_agreement", async (req, res, ne
   try {
     const address = AddressParam.parse(req.params.address);
     const body = FundAgreementBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -194,7 +194,7 @@ escrowRouter.post("/prepare/escrow/:address/release", async (req, res, next) => 
   try {
     const address = AddressParam.parse(req.params.address);
     const body = ReleaseBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -217,7 +217,7 @@ escrowRouter.post("/prepare/escrow/:address/refund_remaining", async (req, res, 
   try {
     const address = AddressParam.parse(req.params.address);
     const body = RefundBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }

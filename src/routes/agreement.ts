@@ -656,7 +656,7 @@ agreementRouter.post("/prepare/agreement/:address/initialize", async (req, res, 
   try {
     const address = AddressParam.parse(req.params.address);
     const body = InitAgreementBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -676,7 +676,7 @@ agreementRouter.post(
     try {
       const address = AddressParam.parse(req.params.address);
       const body = CreateTimeBasedBody.parse(req.body);
-      if (!requireSession(body.wallet_address, body.session_token)) {
+      if (!(await requireSession(body.wallet_address, body.session_token))) {
         res.status(401).json({ error: "Invalid session" });
         return;
       }
@@ -704,7 +704,7 @@ agreementRouter.post(
     try {
       const address = AddressParam.parse(req.params.address);
       const body = CreateMilestoneBody.parse(req.body);
-      if (!requireSession(body.wallet_address, body.session_token)) {
+      if (!(await requireSession(body.wallet_address, body.session_token))) {
         res.status(401).json({ error: "Invalid session" });
         return;
       }
@@ -729,7 +729,7 @@ agreementRouter.post(
     try {
       const address = AddressParam.parse(req.params.address);
       const body = CreatePayrollBody.parse(req.body);
-      if (!requireSession(body.wallet_address, body.session_token)) {
+      if (!(await requireSession(body.wallet_address, body.session_token))) {
         res.status(401).json({ error: "Invalid session" });
         return;
       }
@@ -753,7 +753,7 @@ agreementRouter.post("/prepare/agreement/:address/add_employee", async (req, res
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AddEmployeeBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -775,7 +775,7 @@ agreementRouter.post("/prepare/agreement/:address/fund_agreement", async (req, r
   try {
     const address = AddressParam.parse(req.params.address);
     const body = FundAgreementBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -796,7 +796,7 @@ agreementRouter.post("/prepare/agreement/:address/add_milestone", async (req, re
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AddMilestoneBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -817,7 +817,7 @@ agreementRouter.post("/prepare/agreement/:address/approve_milestone", async (req
   try {
     const address = AddressParam.parse(req.params.address);
     const body = MilestoneIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -835,7 +835,7 @@ agreementRouter.post("/prepare/agreement/:address/claim_milestone", async (req, 
   try {
     const address = AddressParam.parse(req.params.address);
     const body = MilestoneIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -853,7 +853,7 @@ agreementRouter.post("/prepare/agreement/:address/activate", async (req, res, ne
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AgreementIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -871,7 +871,7 @@ agreementRouter.post("/prepare/agreement/:address/pause", async (req, res, next)
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AgreementIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -889,7 +889,7 @@ agreementRouter.post("/prepare/agreement/:address/resume", async (req, res, next
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AgreementIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -907,7 +907,7 @@ agreementRouter.post("/prepare/agreement/:address/cancel", async (req, res, next
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AgreementIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -927,7 +927,7 @@ agreementRouter.post(
     try {
       const address = AddressParam.parse(req.params.address);
       const body = AgreementIdBody.parse(req.body);
-      if (!requireSession(body.wallet_address, body.session_token)) {
+      if (!(await requireSession(body.wallet_address, body.session_token))) {
         res.status(401).json({ error: "Invalid session" });
         return;
       }
@@ -946,7 +946,7 @@ agreementRouter.post("/prepare/agreement/:address/raise_dispute", async (req, re
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AgreementIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -1235,7 +1235,7 @@ agreementRouter.post("/prepare/agreement/:address/resolve_dispute", async (req, 
   try {
     const address = AddressParam.parse(req.params.address);
     const body = ResolveDisputeBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -1257,7 +1257,7 @@ agreementRouter.post("/prepare/agreement/:address/claim_time_based", async (req,
   try {
     const address = AddressParam.parse(req.params.address);
     const body = AgreementIdBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
@@ -1275,7 +1275,7 @@ agreementRouter.post("/prepare/agreement/:address/claim_payroll", async (req, re
   try {
     const address = AddressParam.parse(req.params.address);
     const body = ClaimPayrollBody.parse(req.body);
-    if (!requireSession(body.wallet_address, body.session_token)) {
+    if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
