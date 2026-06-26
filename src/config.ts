@@ -74,6 +74,14 @@ const EnvSchema = z.object({
     .optional()
     .default(24 * 60 * 60 * 1000),
 
+  // Absolute maximum session lifetime in milliseconds - default 7 days
+  SESSION_MAX_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(7 * 24 * 60 * 60 * 1000),
+
   // Feature flag: set to "true" to enable billing profile endpoints.
   // When false (default) all /billing/* routes return 501 Not Implemented.
   BILLING_ENABLED: z

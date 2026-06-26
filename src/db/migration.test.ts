@@ -41,7 +41,13 @@ describeDbMigration("Database migration integration test", () => {
 
   it("successfully applies migrations to a clean database and creates all tables", async () => {
     // Run the migration script
-    execSync(`POSTGRES_CONNECTION_STRING=${connectionString} pnpm db:migrate`, { stdio: "pipe" });
+    execSync("pnpm db:migrate", {
+      env: {
+        ...process.env,
+        POSTGRES_CONNECTION_STRING: connectionString,
+      },
+      stdio: "pipe",
+    });
 
     // Connect to database to inspect created tables
     const client = new pg.Client({ connectionString });
@@ -65,6 +71,7 @@ describeDbMigration("Database migration integration test", () => {
       "billing_profiles",
       "billing_payment_methods",
       "billing_invoices",
+      "sessions",
     ];
 
     for (const table of expectedTables) {

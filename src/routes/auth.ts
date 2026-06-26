@@ -8,7 +8,9 @@ import {
   createSession,
   getChallenge,
   requireSession,
+  revokeSession,
 } from "../auth/session.js";
+import { requireAuth } from "../auth/middleware.js";
 
 const AddressBody = z.object({ address: z.string().min(3) });
 const VerifyBody = z.object({
@@ -75,7 +77,7 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       return;
     }
     clearChallenge(address);
-    const session = createSession(address);
+    const session = await createSession(address);
     res.json({
       ok: true,
       address,
@@ -93,12 +95,25 @@ authRouter.post("/auth/verify", async (req, res, next) => {
 authRouter.post("/auth/session/validate", async (req, res, next) => {
   try {
     const { address, session_token } = SessionBody.parse(req.body);
-    const ok = requireSession(address, session_token);
+    const ok = await requireSession(address, session_token);
     if (!ok) {
       res.status(401).json({ ok: false, error: "Invalid session" });
       return;
     }
     res.json({ ok: true, address });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Step 4: logout and revoke the session
+authRouter.post("/auth/logout", requireAuth, async (req, res, next) => {
+  try {
+    const token = req.auth?.token;
+    if (token) {
+      await revokeSession(token);
+    }
+    res.json({ ok: true });
   } catch (e) {
     next(e);
   }
