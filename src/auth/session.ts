@@ -128,7 +128,6 @@ export async function requireSession(address: string, token: string): Promise<bo
 
     return true;
   } catch (error) {
-    // eslint-disable-next-line no-console
     console.error("[auth] Database error in requireSession", error);
     return false;
   }
@@ -170,7 +169,6 @@ export async function sweepExpiredSessions(now: number = Date.now()): Promise<nu
       .returning({ tokenHash: sessionsTable.tokenHash });
     return deleted.length;
   } catch (error) {
-    // eslint-disable-next-line no-console
     console.error("[auth] Database error in sweepExpiredSessions", error);
     return 0;
   }
@@ -182,7 +180,6 @@ export async function sweepExpiredSessions(now: number = Date.now()): Promise<nu
 if (env.NODE_ENV !== "test") {
   setInterval(() => {
     sweepExpiredSessions().catch((err) => {
-      // eslint-disable-next-line no-console
       console.error("[auth] Background sweeper failed", err);
     });
   }, SESSION_SWEEP_INTERVAL_MS).unref();

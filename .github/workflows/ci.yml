@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, build, and test
+    runs-on: ubuntu-latest
+
+    # The test suite mocks the DB layer for every route/unit test (see e.g.
+    # src/routes/auth.test.ts), so `pnpm test` itself does not require a live
+    # Postgres instance. We still spin one up here so we can apply the Drizzle
+    # migrations for real and catch DB-wiring issues (missing/incorrect
+    # migrations, etc.) that a fully-mocked test run would otherwise hide.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stellopay_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      NODE_ENV: test
+      # config.ts requires this at import time; tests never make real network
+      # calls, so a dummy value (matching vitest.config.ts) is sufficient.
+      STARKNET_RPC_URL: https://starknet-sepolia.public.invalid/rpc
+      POSTGRES_CONNECTION_STRING: postgresql://postgres:postgres@localhost:5432/stellopay_ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      - name: Apply database migrations
+        run: pnpm db:migrate
+
+      - name: Run tests
+        run: pnpm test
