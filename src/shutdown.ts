@@ -10,12 +10,15 @@ import { Server } from "http";
  * @param closePool - A function to close the database connection pool
  * @param drainTimeoutMs - The bounded timeout in milliseconds to wait for connections to drain
  */
+type ShutdownPhase = "starting" | "server_close" | "pool_close";
+
 export function setupGracefulShutdown(
   server: Server,
   closePool: () => Promise<void>,
   drainTimeoutMs: number,
 ): void {
   let isShuttingDown = false;
+  let currentPhase: ShutdownPhase = "starting";
 
   const shutdownHandler = async (signal: string) => {
     if (isShuttingDown) {
@@ -27,11 +30,14 @@ export function setupGracefulShutdown(
 
     // Create a bounded drain timeout
     const timeout = setTimeout(() => {
-      console.error(`[shutdown] Drain timeout (${drainTimeoutMs}ms) exceeded, forcing exit`);
+      console.warn(
+        `[shutdown] Drain timeout (${drainTimeoutMs}ms) exceeded during ${currentPhase}, forcing exit`,
+      );
       process.exit(1);
     }, drainTimeoutMs);
     timeout.unref();
 
+    currentPhase = "server_close";
     console.log("[shutdown] Stopping HTTP server from accepting new connections...");
     server.close(async (err) => {
       if (err) {
@@ -40,6 +46,7 @@ export function setupGracefulShutdown(
         console.log("[shutdown] HTTP server closed");
       }
 
+      currentPhase = "pool_close";
       try {
         await closePool();
         clearTimeout(timeout);
