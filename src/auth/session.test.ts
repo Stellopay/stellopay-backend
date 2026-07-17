@@ -99,6 +99,7 @@ import {
   createChallenge,
   getChallenge,
   clearChallenge,
+  consumeChallenge,
   createSession,
   requireSession,
   revokeSession,
@@ -133,6 +134,31 @@ describe("challenges", () => {
     createChallenge("0xfeed");
     clearChallenge("0xfeed");
     expect(getChallenge("0xfeed")).toBeNull();
+  });
+
+  it("consumeChallenge returns the record exactly once, then null on reuse", () => {
+    const { nonce } = createChallenge("0xC0FFEE");
+    const first = consumeChallenge("0xc0ffee");
+    expect(first?.nonce).toBe(nonce);
+    const second = consumeChallenge("0xc0ffee");
+    expect(second).toBeNull();
+  });
+
+  it("consumeChallenge rejects an expired challenge instead of returning it", () => {
+    createChallenge("0xdeadbeef");
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+    expect(consumeChallenge("0xdeadbeef")).toBeNull();
+  });
+
+  it("consumeChallenge deletes before any caller can read it again (closes the replay race)", () => {
+    createChallenge("0xrace");
+    // Simulates two concurrent /auth/verify requests reading the same nonce:
+    // only the first should ever see a non-null record.
+    const attempt1 = consumeChallenge("0xrace");
+    const attempt2 = consumeChallenge("0xrace");
+    expect(attempt1).not.toBeNull();
+    expect(attempt2).toBeNull();
+    expect(getChallenge("0xrace")).toBeNull();
   });
 });
 

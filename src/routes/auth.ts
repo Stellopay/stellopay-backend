@@ -3,10 +3,9 @@ import { z } from "zod";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
 import { buildTypedChallenge } from "../auth/challenge.js";
 import {
-  clearChallenge,
+  consumeChallenge,
   createChallenge,
   createSession,
-  getChallenge,
   requireSession,
   revokeSession,
 } from "../auth/session.js";
@@ -60,7 +59,10 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
 authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
-    const ch = getChallenge(address);
+    // Consume (read + delete) the challenge atomically, before the async verify call,
+    // so two concurrent requests can't both read it while it's still valid and both
+    // pass verification off the same nonce.
+    const ch = consumeChallenge(address);
     if (!ch) {
       res
         .status(400)
@@ -76,7 +78,6 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       res.status(401).json({ error: "Invalid signature" });
       return;
     }
-    clearChallenge(address);
     const session = await createSession(address);
     res.json({
       ok: true,
