@@ -11,8 +11,7 @@ export default defineConfig({
     env: {
       NODE_ENV: "test",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
-      POSTGRES_CONNECTION_STRING:
-        "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
+      POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
     },
     coverage: {
       provider: "v8",
@@ -24,6 +23,7 @@ export default defineConfig({
         "src/auth/session.ts",
         "src/auth/challenge.ts",
         "src/config.ts",
+        "src/db/migrate.ts",
         "src/middleware/rate-limit.ts",
       ],
       thresholds: {

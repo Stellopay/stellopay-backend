@@ -1,29 +1,126 @@
 import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/node-postgres";
+import fs from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import pg from "pg";
 import { env } from "../config.js";
 
-async function main() {
-  const connectionString = env.POSTGRES_CONNECTION_STRING;
-  if (!connectionString) {
-    console.error("POSTGRES_CONNECTION_STRING is required to run migrations");
-    process.exit(1);
+const MIGRATIONS_FOLDER = "./src/db/migrations";
+const MIGRATIONS_SCHEMA = "drizzle";
+const MIGRATIONS_TABLE = "__drizzle_migrations";
+
+interface MigrationJournalEntry {
+  idx: number;
+  when: number;
+  tag: string;
+}
+
+interface MigrationJournal {
+  entries: MigrationJournalEntry[];
+}
+
+function readMigrationJournal(migrationsFolder: string): MigrationJournal {
+  const journal = JSON.parse(
+    fs.readFileSync(`${migrationsFolder}/meta/_journal.json`, "utf8"),
+  ) as MigrationJournal;
+
+  return journal;
+}
+
+export function getPendingMigrationFileNames(
+  journalEntries: MigrationJournalEntry[],
+  lastAppliedMigrationTimestamp: number | null,
+) {
+  return journalEntries
+    .filter(
+      (migration) =>
+        lastAppliedMigrationTimestamp === null || lastAppliedMigrationTimestamp < migration.when,
+    )
+    .map((migration) => `${migration.tag}.sql`);
+}
+
+export async function getLastAppliedMigrationTimestamp(client: pg.Client) {
+  let lastApplied: pg.QueryResult<{ created_at: string | number | null }>;
+
+  try {
+    lastApplied = await client.query(
+      `select created_at from "${MIGRATIONS_SCHEMA}"."${MIGRATIONS_TABLE}" order by created_at desc limit 1`,
+    );
+  } catch (error) {
+    if (error instanceof pg.DatabaseError && error.code === "42P01") {
+      return null;
+    }
+
+    throw error;
   }
 
-  console.log("Running database migrations...");
+  const createdAt = lastApplied.rows[0]?.created_at;
+  return createdAt === undefined || createdAt === null ? null : Number(createdAt);
+}
+
+export async function listPendingMigrationFileNames(client: pg.Client) {
+  const journal = readMigrationJournal(MIGRATIONS_FOLDER);
+
+  // Keep Drizzle's migration file validation and timestamp parsing in the dry-run path.
+  readMigrationFiles({ migrationsFolder: MIGRATIONS_FOLDER });
+
+  const lastAppliedMigrationTimestamp = await getLastAppliedMigrationTimestamp(client);
+  return getPendingMigrationFileNames(journal.entries, lastAppliedMigrationTimestamp);
+}
+
+export async function main(argv = process.argv, connectionString = env.POSTGRES_CONNECTION_STRING) {
+  if (!connectionString) {
+    console.error("POSTGRES_CONNECTION_STRING is required to run migrations");
+    process.exitCode = 1;
+    return;
+  }
+
+  const dryRun = argv.includes("--dry-run");
+  if (!dryRun) {
+    console.log("Running database migrations...");
+  }
+
   const client = new pg.Client({ connectionString });
   await client.connect();
 
-  const db = drizzle(client);
+  try {
+    if (dryRun) {
+      const pendingMigrations = await listPendingMigrationFileNames(client);
 
-  // Apply migrations located in the src/db/migrations folder
-  await migrate(db, { migrationsFolder: "./src/db/migrations" });
+      if (pendingMigrations.length === 0) {
+        console.log("No pending migrations.");
+      } else {
+        console.log("Pending migrations:");
+        for (const migration of pendingMigrations) {
+          console.log(migration);
+        }
+      }
 
-  console.log("Migrations applied successfully!");
-  await client.end();
+      return;
+    }
+
+    const db = drizzle(client);
+
+    // Apply migrations located in the src/db/migrations folder
+    await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+
+    console.log("Migrations applied successfully!");
+  } finally {
+    await client.end();
+  }
 }
 
-main().catch((err) => {
-  console.error("Migration failed:", err);
-  process.exit(1);
-});
+export function isMainModule(argvPath: string | undefined, moduleUrl: string) {
+  return Boolean(argvPath && moduleUrl === pathToFileURL(resolve(argvPath)).href);
+}
+
+export function handleMigrationFailure(error: unknown) {
+  console.error("Migration failed:", error);
+  process.exitCode = 1;
+}
+
+if (isMainModule(process.argv[1], import.meta.url)) {
+  void main().catch(handleMigrationFailure);
+}
