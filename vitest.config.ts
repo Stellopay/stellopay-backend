@@ -25,6 +25,7 @@ export default defineConfig({
         "src/auth/challenge.ts",
         "src/config.ts",
         "src/middleware/rate-limit.ts",
+        "src/utils/token-formatting.ts",
       ],
       thresholds: {
         lines: 95,

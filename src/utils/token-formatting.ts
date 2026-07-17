@@ -65,6 +65,12 @@ export function getTokenInfo(tokenAddress: string | null | undefined): TokenInfo
 /**
  * Format an on-chain amount using BigInt arithmetic and the token's decimal precision.
  * This avoids lossy Number conversions for large u256 values while preserving the full decimal string.
+ *
+ * Rounding convention: the exact on-chain value is always preserved — no rounding or
+ * truncation is applied at any `decimals` precision (including > 18); only trailing
+ * zeros in the fraction are trimmed. Callers that want a shorter display precision
+ * (e.g. STRK shown with 6 fraction digits in the transactions route) truncate the
+ * returned string themselves.
  */
 export function formatTokenAmount(amount: string | bigint | null | undefined, decimals: number): string {
   if (amount === null || amount === undefined || amount === "" || amount === "0" || amount === 0n) {
@@ -72,10 +78,14 @@ export function formatTokenAmount(amount: string | bigint | null | undefined, de
   }
 
   const amountBigInt = typeof amount === "string" ? BigInt(amount) : amount;
+  // Format the absolute value and re-apply the sign, since BigInt `/` and `%`
+  // both carry the sign and would otherwise yield output like "-1.-5" or drop
+  // the sign entirely for values between -1 and 0.
+  const sign = amountBigInt < 0n ? "-" : "";
+  const absAmount = amountBigInt < 0n ? -amountBigInt : amountBigInt;
   const divisor = 10n ** BigInt(decimals);
-  const wholePart = amountBigInt / divisor;
-  const fractionalPart = amountBigInt % divisor;
-  const fractionalStr = fractionalPart.toString().padStart(decimals, "0").replace(/0+$/, "");
+  const wholePart = absAmount / divisor;
+  const fractionalStr = (absAmount % divisor).toString().padStart(decimals, "0").replace(/0+$/, "");
 
-  return fractionalStr ? `${wholePart.toString()}.${fractionalStr}` : wholePart.toString();
+  return fractionalStr ? `${sign}${wholePart}.${fractionalStr}` : `${sign}${wholePart}`;
 }
