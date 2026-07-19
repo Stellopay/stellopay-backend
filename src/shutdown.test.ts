@@ -90,6 +90,49 @@ describe("Graceful Shutdown", () => {
     expect(processExitSpy).toHaveBeenCalledWith(1);
   });
 
+  it("should force exit if pool close hangs within drain timeout", async () => {
+    // Pool close hangs (never resolves)
+    let poolCloseNeverResolve: () => void;
+    const hangingPoolPromise = new Promise<void>((resolve) => {
+      poolCloseNeverResolve = resolve;
+    });
+    mockClosePool.mockReturnValue(hangingPoolPromise);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    handler("SIGTERM");
+
+    expect(mockServer.close).toHaveBeenCalled();
+
+    // Call the server close callback without awaiting — it will execute
+    // synchronously up to the pending `await closePool()` and yield.
+    mockServer._closeCallback();
+
+    expect(mockClosePool).toHaveBeenCalled();
+
+    // Fast-forward past the drain timeout
+    vi.advanceTimersByTime(10001);
+
+    // Should force exit with 1 because pool close hung and timeout fired
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+
+    // Verify the timeout warning mentions the pool_close phase
+    const timeoutCall = warnSpy.mock.calls.find((call: any) =>
+      call[0].includes("Drain timeout"),
+    );
+    expect(timeoutCall).toBeDefined();
+    expect(timeoutCall[0]).toMatch(/pool_close/);
+
+    warnSpy.mockRestore();
+    // Resolve the hanging promise to clean up
+    poolCloseNeverResolve();
+  });
+
   it("should handle error during pool close", async () => {
     mockClosePool.mockRejectedValue(new Error("Pool close error"));
 
