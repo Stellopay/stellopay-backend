@@ -64,6 +64,26 @@ export function clearChallenge(address: string) {
 }
 
 /**
+ * Atomically reads and deletes the challenge for an address in a single step.
+ *
+ * This must be used (instead of getChallenge + a later clearChallenge) anywhere a
+ * challenge is about to be verified. getChallenge is read-only, so if it's read at
+ * the start of an async verification and only cleared afterwards, two concurrent
+ * requests can both read the same still-valid nonce before either one clears it —
+ * letting the same challenge be consumed twice (a replay bypass). Deleting it at
+ * read time closes that gap: the second concurrent caller sees it already gone.
+ *
+ * @param address - The user's Starknet wallet address
+ * @returns The challenge record if it existed and was still valid, otherwise null
+ */
+export function consumeChallenge(address: string) {
+  const rec = getChallenge(address);
+  if (!rec) return null;
+  challenges.delete(address.toLowerCase());
+  return rec;
+}
+
+/**
  * Creates a new session in PostgreSQL for the given wallet address.
  * Generates a random 24-byte hex token, hashes it with SHA-256 for database storage,
  * and sets sliding and absolute expires timestamps.

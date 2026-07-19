@@ -215,6 +215,81 @@ describe("Auth Routes Integration", () => {
     expect(logoutPostLogoutRes.status).toBe(401);
   });
 
+  it("rejects verify once the challenge TTL has elapsed", async () => {
+    const address = "0xExpiredChallenge";
+    const appInstance = makeApp();
+
+    const challengeRes = await request(appInstance)
+      .post("/api/v1/auth/challenge")
+      .send({ address });
+    expect(challengeRes.status).toBe(200);
+
+    vi.advanceTimersByTime(challengeRes.body.expires_in_ms + 1);
+
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    const verifyRes = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+
+    expect(verifyRes.status).toBe(400);
+    expect(verifyRes.body.error).toMatch(/No active challenge/);
+  });
+
+  it("rejects a replayed verify call reusing an already-consumed challenge", async () => {
+    const address = "0xReplayAttempt";
+    const appInstance = makeApp();
+
+    const challengeRes = await request(appInstance)
+      .post("/api/v1/auth/challenge")
+      .send({ address });
+    expect(challengeRes.status).toBe(200);
+
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+
+    const firstVerify = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+    expect(firstVerify.status).toBe(200);
+    expect(firstVerify.body.ok).toBe(true);
+
+    // Replay: same address/signature submitted again after the challenge was consumed.
+    const secondVerify = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xsig1", "0xsig2"] });
+
+    expect(secondVerify.status).toBe(400);
+    expect(secondVerify.body.error).toMatch(/No active challenge/);
+    // Only one session should have ever been created from the one valid challenge.
+    expect(mockState.sessions).toHaveLength(1);
+  });
+
+  it("accepts a valid challenge exactly once, even when verify is attempted concurrently", async () => {
+    const address = "0xConcurrentVerify";
+    const appInstance = makeApp();
+
+    const challengeRes = await request(appInstance)
+      .post("/api/v1/auth/challenge")
+      .send({ address });
+    expect(challengeRes.status).toBe(200);
+
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+
+    // Fire two verify requests concurrently off the same still-valid challenge.
+    const [res1, res2] = await Promise.all([
+      request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] }),
+      request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address, signature: ["0xsig1", "0xsig2"] }),
+    ]);
+
+    const statuses = [res1.status, res2.status].sort();
+    // Exactly one succeeds; the other finds the challenge already consumed.
+    expect(statuses).toEqual([200, 400]);
+    expect(mockState.sessions).toHaveLength(1);
+  });
+
   it("returns 401 for unauthorized endpoints with generic message", async () => {
     const appInstance = makeApp();
 
