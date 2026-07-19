@@ -217,6 +217,12 @@ Database schema migrations are managed using Drizzle Kit. To bootstrap or update
    pnpm db:migrate
    ```
 
+To preview pending migration files without applying schema changes, run:
+
+```bash
+pnpm db:migrate -- --dry-run
+```
+
 If you make any changes to the database schema in `src/db/schema.ts`, you can generate new migration files by running:
 
 ```bash
