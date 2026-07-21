@@ -8,8 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  */
 const BASE_ENV: Record<string, string> = {
   STARKNET_RPC_URL: "https://rpc.test.invalid",
-  POSTGRES_CONNECTION_STRING:
-    "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
+  POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
 };
 
 const ORIGINAL_ENV = process.env;
@@ -40,15 +39,25 @@ describe("config env parsing", () => {
     expect(env.RATE_LIMIT_MAX).toBe(100);
     expect(env.RATE_LIMIT_STRICT_WINDOW_MS).toBe(5 * 60 * 1000);
     expect(env.RATE_LIMIT_STRICT_MAX).toBe(10);
+    expect(env.TOKEN_METADATA_CACHE_TTL_MS).toBe(5 * 60 * 1000);
     expect(env.SHUTDOWN_DRAIN_TIMEOUT_MS).toBe(10000);
     expect(env.TRUST_PROXY).toBe("1");
     expect(env.BILLING_ENABLED).toBe(false);
   });
 
   it("coerces numeric env strings to numbers", async () => {
-    const { env } = await loadConfig({ PORT: "5000", RATE_LIMIT_MAX: "250" });
+    const { env } = await loadConfig({
+      PORT: "5000",
+      RATE_LIMIT_MAX: "250",
+      TOKEN_METADATA_CACHE_TTL_MS: "60000",
+    });
     expect(env.PORT).toBe(5000);
     expect(env.RATE_LIMIT_MAX).toBe(250);
+    expect(env.TOKEN_METADATA_CACHE_TTL_MS).toBe(60000);
+  });
+
+  it("rejects a non-positive token metadata cache TTL", async () => {
+    await expect(loadConfig({ TOKEN_METADATA_CACHE_TTL_MS: "0" })).rejects.toThrow();
   });
 
   it("treats BILLING_ENABLED 'true' as true", async () => {

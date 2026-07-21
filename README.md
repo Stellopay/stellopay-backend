@@ -51,11 +51,16 @@ All configuration is parsed and validated in `src/config.ts`. `env.example` has 
 | `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX`        | `300000` / `10`                                 | Auth and contact limiter                                                |
 | `TRUST_PROXY`                                                  | `1`                                             | Number of proxies, or `true`                                            |
 | `SHUTDOWN_DRAIN_TIMEOUT_MS`                                    | `10000`                                         | Graceful shutdown drain timeout                                         |
+| `TOKEN_METADATA_CACHE_TTL_MS`                                  | `300000`                                        | In-memory token metadata cache lifetime                                 |
 | `BILLING_ENABLED`                                              | `false`                                         | Only the literal `true` enables billing routes                          |
 | `CONTACT_RECIPIENT_EMAIL`                                      | (none)                                          | Must be a valid email; required to deliver contact emails               |
 | `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev                 | Required in production; startup fails if unset                          |
 | `LOG_LEVEL`                                                    | `info`                                          | Specifies the minimum logging level                                     |
 | `LOG_FORMAT`                                                   | `json`                                          | Use `json` for structured logging or `text` for readable console output |
+
+`GET /api/v1/token/:address/metadata` returns the token's `name`, `symbol`, and
+`decimals`. Results are cached in memory by canonical Starknet address for
+`TOKEN_METADATA_CACHE_TTL_MS`; expired entries are refreshed on the next request.
 
 ### Observability
 
