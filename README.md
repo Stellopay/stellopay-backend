@@ -222,11 +222,17 @@ Database schema migrations are managed using Drizzle Kit. To bootstrap or update
    pnpm db:migrate
    ```
 
+Migration execution uses a StelloPay-namespaced PostgreSQL advisory lock. If another
+migration process is already running against the same database, subsequent runs wait
+for it to finish; the lock is released after either success or failure.
+
 To preview pending migration files without applying schema changes, run:
 
 ```bash
 pnpm db:migrate -- --dry-run
 ```
+
+Dry-run only reads migration state and does not acquire the advisory lock.
 
 If you make any changes to the database schema in `src/db/schema.ts`, you can generate new migration files by running:
 
