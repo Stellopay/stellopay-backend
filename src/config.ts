@@ -37,6 +37,13 @@ const EnvSchema = z.object({
   TOKEN_STRK: z.string().optional(),
   TOKEN_USDC: z.string().optional(),
   TOKEN_USDT: z.string().optional(),
+  // Token metadata cache lifetime (milliseconds) - default 5 minutes
+  TOKEN_METADATA_CACHE_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(5 * 60 * 1000),
 
   // Email configuration for contact form
   EMAIL_USER: z.string().optional(),
