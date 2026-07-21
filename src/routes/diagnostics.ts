@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
-import { db } from "../db/index.js";
+import { db, getPoolStats } from "../db/index.js";
 import { sql } from "drizzle-orm";
 
 export const diagnosticsRouter = Router();
@@ -77,6 +77,7 @@ diagnosticsRouter.get("/diagnostics/events", async (req, res, next) => {
       paymentEventCounts: paymentEventCounts.rows,
       tableCounts: tableCounts.rows[0],
       latestEvents: recentEvents,
+      poolStats: getPoolStats(),
       summary: {
         totalAgreementEvents: tableCounts.rows[0]?.agreement_events_count || 0,
         totalEscrowEvents: tableCounts.rows[0]?.escrow_events_count || 0,

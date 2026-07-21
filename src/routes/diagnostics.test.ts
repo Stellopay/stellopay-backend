@@ -21,11 +21,12 @@ vi.mock("../config.js", () => ({
 
 vi.mock("../db/index.js", () => ({
   db: { execute: vi.fn() },
+  getPoolStats: vi.fn(() => ({ total: 8, idle: 3, active: 5, waiting: 2 })),
   schema: {},
 }));
 
 import { diagnosticsRouter } from "./diagnostics.js";
-import { db } from "../db/index.js";
+import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
 
 const ADMIN = "0xadmin";
@@ -110,6 +111,8 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.summary.totalAgreementEvents).toBe("5");
     expect(res.body.summary.latestBlock).toBe("100");
     expect(res.body.tableCounts.agreements_count).toBe("3");
+    expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
+    expect(getPoolStats).toHaveBeenCalledOnce();
   });
 
   it("redacts transaction hashes and agreement ids from recent events", async () => {
