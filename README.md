@@ -778,6 +778,7 @@ _Note: Indexed reading routes remain public because they only expose aggregated 
 `GET /api/v1/diagnostics/events` is operator-only. The whole diagnostics router is gated by `requireAuth` + `requireAdmin`, so only an authenticated address listed in `ADMIN_ADDRESSES` can reach it.
 
 - It returns **aggregate counts** (event-type counts and per-table totals) for operators.
+- The `poolStats` object reports the Postgres pool's point-in-time `total`, `idle`, `active`, and `waiting` connection counts without exposing connection details.
 - The recent-activity list is **redacted** to `event_type` and `created_at` only. Transaction hashes and agreement IDs are never returned, since the aggregate counts already convey volume and the raw identifiers aid reconnaissance.
 - Every query is static SQL with no request input, so there is no injection surface.
 

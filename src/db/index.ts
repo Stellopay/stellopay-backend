@@ -65,6 +65,32 @@ pool.on("error", (error: Error & { code?: string }) => {
 export const db = drizzle(pool, { schema });
 export { schema };
 
+/** Current utilization counters for the shared Postgres connection pool. */
+export interface PoolStats {
+  total: number;
+  idle: number;
+  active: number;
+  waiting: number;
+}
+
+/**
+ * Returns a point-in-time snapshot of the shared Postgres pool.
+ *
+ * The values come directly from `pg`'s read-only pool counters. No connection
+ * details are included, and reading the snapshot does not acquire a client.
+ */
+export function getPoolStats(): PoolStats {
+  const total = pool.totalCount;
+  const idle = pool.idleCount;
+
+  return {
+    total,
+    idle,
+    active: total - idle,
+    waiting: pool.waitingCount,
+  };
+}
+
 /**
  * Checks whether the database is reachable with a lightweight probe.
  *
@@ -92,4 +118,3 @@ export async function closePool(): Promise<void> {
 }
 
 export { maskConnectionString };
-

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Pool } from "pg";
-import { checkDbHealth, maskConnectionString } from "./index.js";
+import { checkDbHealth, getPoolStats, maskConnectionString } from "./index.js";
 
 describe("maskConnectionString", () => {
   it("redacts credentials without exposing the raw DSN", () => {
@@ -38,5 +38,26 @@ describe("checkDbHealth", () => {
     querySpy.mockRejectedValueOnce(new Error("db unavailable"));
 
     await expect(checkDbHealth()).resolves.toBe(false);
+  });
+});
+
+describe("getPoolStats", () => {
+  const poolPrototype = Object.getPrototypeOf(Pool.prototype) as Pool;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns the current total, active, idle, and waiting connection counts", () => {
+    vi.spyOn(poolPrototype, "totalCount", "get").mockReturnValue(9);
+    vi.spyOn(poolPrototype, "idleCount", "get").mockReturnValue(4);
+    vi.spyOn(poolPrototype, "waitingCount", "get").mockReturnValue(2);
+
+    expect(getPoolStats()).toEqual({
+      total: 9,
+      idle: 4,
+      active: 5,
+      waiting: 2,
+    });
   });
 });
