@@ -10,6 +10,7 @@ import {
   handleMigrationFailure,
   isMainModule,
   main,
+  withMigrationLock,
 } from "./migrate.js";
 
 vi.mock("drizzle-orm/node-postgres/migrator", () => ({
@@ -80,6 +81,9 @@ describe("migration CLI", () => {
 
     expect(connect).toHaveBeenCalledOnce();
     expect(query).toHaveBeenCalledOnce();
+    expect(query.mock.calls.some(([statement]) => String(statement).includes("pg_advisory"))).toBe(
+      false,
+    );
     expect(vi.mocked(migrate)).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith("Pending migrations:");
     expect(log).toHaveBeenCalledWith("0000_faulty_mole_man.sql");
@@ -102,20 +106,105 @@ describe("migration CLI", () => {
 
   it("keeps normal migration behavior unchanged", async () => {
     const { connect, end } = mockClient();
-    const query = vi.spyOn(pg.Client.prototype, "query");
+    const query = vi.spyOn(pg.Client.prototype, "query").mockResolvedValue({ rows: [] } as never);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.mocked(migrate).mockResolvedValue();
 
     await main(["node", "migrate.ts"], connectionString);
 
     expect(connect).toHaveBeenCalledOnce();
-    expect(query).not.toHaveBeenCalled();
+    expect(query).toHaveBeenNthCalledWith(
+      1,
+      "SELECT pg_advisory_lock($1, $2)",
+      [0x5374656c, 0x4d696772],
+    );
     expect(migrate).toHaveBeenCalledWith(expect.anything(), {
       migrationsFolder: "./src/db/migrations",
     });
+    expect(query).toHaveBeenNthCalledWith(
+      2,
+      "SELECT pg_advisory_unlock($1, $2)",
+      [0x5374656c, 0x4d696772],
+    );
     expect(log).toHaveBeenCalledWith("Running database migrations...");
     expect(log).toHaveBeenCalledWith("Migrations applied successfully!");
     expect(end).toHaveBeenCalledOnce();
+  });
+
+  it("releases the migration lock when migration execution fails", async () => {
+    const { end } = mockClient();
+    const query = vi.spyOn(pg.Client.prototype, "query").mockResolvedValue({ rows: [] } as never);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const migrationError = new Error("migration failed");
+    vi.mocked(migrate).mockRejectedValue(migrationError);
+
+    await expect(main(["node", "migrate.ts"], connectionString)).rejects.toBe(migrationError);
+
+    expect(query).toHaveBeenNthCalledWith(
+      1,
+      "SELECT pg_advisory_lock($1, $2)",
+      [0x5374656c, 0x4d696772],
+    );
+    expect(query).toHaveBeenNthCalledWith(
+      2,
+      "SELECT pg_advisory_unlock($1, $2)",
+      [0x5374656c, 0x4d696772],
+    );
+    expect(end).toHaveBeenCalledOnce();
+  });
+
+  it("waits for a held migration lock before starting another migration", async () => {
+    let finishFirstMigration!: () => void;
+    const firstMigrationFinished = new Promise<void>((resolve) => {
+      finishFirstMigration = resolve;
+    });
+    let grantSecondLock!: () => void;
+    const secondLockGranted = new Promise<void>((resolve) => {
+      grantSecondLock = resolve;
+    });
+
+    const firstClient = {
+      query: vi.fn().mockImplementation(async (statement: string) => {
+        if (statement.includes("pg_advisory_unlock")) {
+          grantSecondLock();
+        }
+        return { rows: [] };
+      }),
+    } as unknown as pg.Client;
+    const secondClient = {
+      query: vi.fn().mockImplementation(async (statement: string) => {
+        if (statement.includes("pg_advisory_lock")) {
+          await secondLockGranted;
+        }
+        return { rows: [] };
+      }),
+    } as unknown as pg.Client;
+    let activeMigrations = 0;
+    let maximumActiveMigrations = 0;
+    const firstMigration = vi.fn(async () => {
+      activeMigrations++;
+      maximumActiveMigrations = Math.max(maximumActiveMigrations, activeMigrations);
+      await firstMigrationFinished;
+      activeMigrations--;
+    });
+    const secondMigration = vi.fn(async () => {
+      activeMigrations++;
+      maximumActiveMigrations = Math.max(maximumActiveMigrations, activeMigrations);
+      activeMigrations--;
+    });
+
+    const firstRun = withMigrationLock(firstClient, firstMigration);
+    await vi.waitFor(() => expect(firstMigration).toHaveBeenCalledOnce());
+
+    const secondRun = withMigrationLock(secondClient, secondMigration);
+    await vi.waitFor(() => expect(secondClient.query).toHaveBeenCalledOnce());
+    expect(secondMigration).not.toHaveBeenCalled();
+
+    finishFirstMigration();
+    await Promise.all([firstRun, secondRun]);
+
+    expect(secondMigration).toHaveBeenCalledOnce();
+    expect(maximumActiveMigrations).toBe(1);
   });
 
   it("sets a non-zero exit code when the connection string is missing", async () => {

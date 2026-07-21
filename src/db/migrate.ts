@@ -10,6 +10,8 @@ import { env } from "../config.js";
 const MIGRATIONS_FOLDER = "./src/db/migrations";
 const MIGRATIONS_SCHEMA = "drizzle";
 const MIGRATIONS_TABLE = "__drizzle_migrations";
+// Stable two-part key for the StelloPay ("Stel") migration ("Migr") lock namespace.
+const MIGRATION_LOCK_KEYS = [0x5374656c, 0x4d696772];
 
 interface MigrationJournalEntry {
   idx: number;
@@ -70,6 +72,16 @@ export async function listPendingMigrationFileNames(client: pg.Client) {
   return getPendingMigrationFileNames(journal.entries, lastAppliedMigrationTimestamp);
 }
 
+export async function withMigrationLock<T>(client: pg.Client, runMigrations: () => Promise<T>) {
+  await client.query("SELECT pg_advisory_lock($1, $2)", MIGRATION_LOCK_KEYS);
+
+  try {
+    return await runMigrations();
+  } finally {
+    await client.query("SELECT pg_advisory_unlock($1, $2)", MIGRATION_LOCK_KEYS);
+  }
+}
+
 export async function main(argv = process.argv, connectionString = env.POSTGRES_CONNECTION_STRING) {
   if (!connectionString) {
     console.error("POSTGRES_CONNECTION_STRING is required to run migrations");
@@ -101,10 +113,12 @@ export async function main(argv = process.argv, connectionString = env.POSTGRES_
       return;
     }
 
-    const db = drizzle(client);
+    await withMigrationLock(client, async () => {
+      const db = drizzle(client);
 
-    // Apply migrations located in the src/db/migrations folder
-    await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+      // Apply migrations located in the src/db/migrations folder
+      await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+    });
 
     console.log("Migrations applied successfully!");
   } finally {
