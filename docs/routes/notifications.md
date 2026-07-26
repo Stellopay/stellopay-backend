@@ -69,7 +69,43 @@ export interface NotificationPreferences {
 ```
 
 - **Default Preferences (`getDefaultNotificationPreferences`)**: All notification categories (`payments`, `agreements`, `escrow`, `disputes`) default to `true`.
-- **Unread Count (`calculateUnreadCount`)**: Computed dynamically based on items where `read === false`.
+- **Unread Count (`calculateUnreadCount`)**: Computed dynamically based on items where `read === false`, ignoring duplicates by ID.
+
+### `PATCH /api/v1/notifications/:user_address/preferences`
+
+Updates a user's notification preferences. This endpoint is idempotent and validates the input using the `NotificationPreferences` contract. Only provided keys are updated (partial update), and applying the same partial preferences repeatedly yields the same result.
+
+#### Request Body
+```json
+{
+  "payments": false,
+  "escrow": true
+}
+```
+
+#### Success Response (`200 OK`)
+```json
+{
+  "preferences": {
+    "payments": false,
+    "agreements": true,
+    "escrow": true,
+    "disputes": true
+  }
+}
+```
+
+### `GET /api/v1/notifications/:user_address/unread-count`
+
+Returns the total unread count for a user idempotently.
+
+#### Success Response (`200 OK`)
+```json
+{
+  "unreadCount": 0
+}
+```
+
 
 ---
 

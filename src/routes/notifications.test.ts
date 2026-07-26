@@ -171,10 +171,6 @@ describe("notifications route", () => {
     ];
 
     const res = await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
-    expect(res.body.notifications).toHaveLength(1);
-  });
-});
-
     expect(res.body.total).toBe(3);
     expect(res.body.unreadCount).toBe(3);
     expect(res.body.notifications).toHaveLength(3);
@@ -186,7 +182,6 @@ describe("notifications route", () => {
     expect(queryState.limitCalls.every((limit) => limit === 10)).toBe(true);
     expect(queryState.eqValues).toContain(normalizeStarknetAddress("abc"));
   });
-
 
   it("maps every payment, agreement, and escrow event type to its notification title", async () => {
     queryState.rows.payments = [
@@ -263,7 +258,7 @@ describe("notifications route", () => {
  * NEW: Tests for Notification Preferences Hardening
  */
 describe("preferences route", () => {
-  const validPrefs = { email: true, push: false, marketing: true };
+  const validPrefs = { payments: true, agreements: false, escrow: true };
 
   it("accepts valid preference objects", async () => {
     const res = await request(makeApp())
@@ -286,16 +281,16 @@ describe("preferences route", () => {
   it("rejects non-boolean values", async () => {
     await request(makeApp())
       .patch("/api/v1/notifications/0x123/preferences")
-      .send({ email: "true" }) // String instead of boolean
+      .send({ payments: "true" }) // String instead of boolean
       .expect(400);
   });
 
   it("accepts partial updates due to .optional() if implemented or defaults", async () => {
     const res = await request(makeApp())
         .patch("/api/v1/notifications/0x123/preferences")
-        .send({ email: false })
+        .send({ payments: false })
         .expect(200);
     
-    expect(res.body.preferences.email).toBe(false);
+    expect(res.body.preferences.payments).toBe(false);
   });
 });
