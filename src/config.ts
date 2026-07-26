@@ -80,6 +80,15 @@ export const EnvSchema = z.object({
     .default(60 * 60 * 1000),
   // Contact form rate limit max requests per window - default 3
   RATE_LIMIT_CONTACT_MAX: z.coerce.number().int().positive().optional().default(3),
+  // Analytics route rate limit window (milliseconds) - default 15 minutes
+  RATE_LIMIT_ANALYTICS_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(15 * 60 * 1000),
+  // Analytics route rate limit max requests per window - default 200
+  RATE_LIMIT_ANALYTICS_MAX: z.coerce.number().int().positive().optional().default(200),
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
 

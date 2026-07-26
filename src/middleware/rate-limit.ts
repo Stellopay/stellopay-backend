@@ -149,7 +149,27 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  * ```
  */
 export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandler {
-  const { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name } = options;
+  let { windowMs, max } = options;
+  const { message = DEFAULT_MESSAGE, skip, store, name } = options;
+
+  const envWindowMsName = name === "global" ? "RATE_LIMIT_WINDOW_MS" : `RATE_LIMIT_${name.toUpperCase()}_WINDOW_MS`;
+  const envMaxName = name === "global" ? "RATE_LIMIT_MAX" : `RATE_LIMIT_${name.toUpperCase()}_MAX`;
+
+  const rawEnvWindow = process.env[envWindowMsName];
+  if (rawEnvWindow) {
+    const parsed = parseInt(rawEnvWindow, 10);
+    if (!isNaN(parsed) && parsed > 0) windowMs = parsed;
+  }
+
+  const rawEnvMax = process.env[envMaxName];
+  if (rawEnvMax) {
+    const parsed = parseInt(rawEnvMax, 10);
+    if (!isNaN(parsed) && parsed > 0) max = parsed;
+  }
+
+  if (max >= 1000) {
+    console.warn(`[rate-limit] WARNING: Limiter "${name}" has an absurdly high max of ${max}. This may effectively disable protection.`);
+  }
 
   // Pre-compute the Retry-After value; it is constant for the lifetime of the
   // limiter because the window length is fixed at construction time.
