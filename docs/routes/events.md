@@ -5,6 +5,18 @@ These endpoints ingest Starknet transaction receipts, decode `WorkAgreement` and
 
 ## Endpoints
 
+## Observability contract
+
+The route emits one telemetry record for each completed stage when `LOG_FORMAT=json` (and an equivalent concise text record otherwise). These records never change either endpoint's response body:
+
+| `operation` | Emitted for | Key fields |
+| --- | --- | --- |
+| `event_envelope_validation` | Transaction-hash envelope accepted or rejected | `status`, `duration_ms`, `batch_size`, `error` on rejection |
+| `event_ingestion` | Each receipt fetch/decode/persist attempt | `status`, `duration_ms`, normalized `tx_hash`, `result_status`, `events_processed`, `error` on failure |
+| `event_fanout_delivery` | Result prepared for the single or batch caller | `status`, `duration_ms`, `batch_size`, `unique_transactions`, `duplicates`, `events_processed` |
+
+All telemetry records include an ISO `timestamp` and log `level`. Batch fan-out metrics count unique normalized transaction hashes, while the HTTP `results` array retains its existing one-entry-per-input contract.
+
 - `POST /api/v1/events/process_tx/:tx_hash`
 - `POST /api/v1/events/process_batch`
 
@@ -104,3 +116,4 @@ Both endpoints validate transaction hash format identically via the shared `TxHa
 
 - **No cross-request idempotency-key / response-replay caching.** There is no persistent idempotency-key store (e.g. Redis, a dedup table) in this service. If a caller (or an upstream retry/fan-out mechanism) sends the *same* transaction hash as two **separate** HTTP requests — rather than twice within one `process_batch` array — each request still performs its own RPC fetch and its own call to `processTxReceipt`. This remains safe at the DB layer (no duplicate rows, thanks to `onConflictDoNothing`), but it is not free: each request pays its own RPC cost, and the two HTTP responses are computed independently rather than one replaying the other's exact response body.
 - Adding true cross-request idempotency (an `Idempotency-Key` header with response replay, backed by a persistent store) would require new infrastructure and is intentionally out of scope for this change. The within-request dedup and envelope validation fixes above address the ambiguity that was actually reported without requiring that infrastructure.
+- **No external metrics exporter.** The route emits structured metric fields through the existing logging sink; wiring them to a metrics backend or tracing system is intentionally out of scope.
