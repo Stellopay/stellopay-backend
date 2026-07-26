@@ -253,7 +253,7 @@ async function requireBillingOwner(
 
   try {
     const [row] = await db
-      .select({ ownerAddress: schema.billingProfiles.ownerAddress })
+      .select()
       .from(schema.billingProfiles)
       .where(eq(schema.billingProfiles.id, profileId))
       .limit(1);
@@ -263,6 +263,7 @@ async function requireBillingOwner(
       return;
     }
 
+    res.locals.profile = row;
     next();
   } catch (err: any) {
     console.error("[billing] Error in ownership check:", err);
@@ -318,11 +319,7 @@ billingRouter.get(
     const profileId: string = res.locals.profileId;
 
     try {
-      const [profile] = await db
-        .select()
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
+      const profile = res.locals.profile;
 
       // Ownership already verified by requireBillingOwner; this is a
       // safety net for a very unlikely TOCTOU race (profile deleted
@@ -369,11 +366,7 @@ billingRouter.get(
     const profileId: string = res.locals.profileId;
 
     try {
-      const [profile] = await db
-        .select()
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
+      const profile = res.locals.profile;
 
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);
@@ -462,17 +455,7 @@ billingRouter.get(
     const profileId: string = res.locals.profileId;
 
     try {
-      const [profile] = await db
-        .select({
-          id: schema.billingProfiles.id,
-          profileType: schema.billingProfiles.profileType,
-          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
-          usedAmount: schema.billingProfiles.usedAmount,
-          currency: schema.billingProfiles.currency,
-        })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
+      const profile = res.locals.profile;
 
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);
