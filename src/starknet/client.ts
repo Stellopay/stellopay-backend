@@ -17,22 +17,41 @@ function rpcFailoverOrder(): number[] {
   return order;
 }
 
-/**
- * Invokes a method on the first healthy RPC provider in failover order.
- *
- * **Idempotency contract**: `invokeWithFailover` retries the call on a
- * different provider only when the current one returns an error before a
- * successful response is received.  If a call succeeds on provider N, the
- * result is returned immediately and no duplicate call is made to any other
- * provider.  Callers that perform state mutations (e.g. `addInvokeTransaction`)
- * must handle the case where the primary succeeded but the response was lost in
- * transit — in that scenario a retry reaches a different provider which may
- * treat the call as a duplicate; the Starknet protocol's own nonce enforcement
- * prevents double-execution at the chain level.
- *
- * Read-only calls (`getChainId`, `getSpecVersion`, `getTransactionReceipt`,
- * `estimateFee`, etc.) are always safe to retry without side effects.
- */
+function cloneRpcArgs(args: unknown[]): unknown[] {
+  return args.map((argument) => cloneRpcValue(argument));
+}
+
+function cloneRpcValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneRpcValue(item));
+  }
+
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value instanceof Map) {
+    return new Map(Array.from(value.entries(), ([key, entryValue]) => [cloneRpcValue(key), cloneRpcValue(entryValue)]));
+  }
+
+  if (value instanceof Set) {
+    return new Set(Array.from(value.values(), (entryValue) => cloneRpcValue(entryValue)));
+  }
+
+  if (value && typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      const clone: Record<string, unknown> = {};
+      for (const [key, entryValue] of Object.entries(value as Record<string, unknown>)) {
+        clone[key] = cloneRpcValue(entryValue);
+      }
+      return clone;
+    }
+  }
+
+  return value;
+}
+
 async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
@@ -45,7 +64,8 @@ async function invokeWithFailover(
       if (typeof fn !== "function") {
         throw new TypeError(`RpcProvider.${String(method)} is not a function`);
       }
-      const result = await fn.apply(candidate, args);
+      const attemptArgs = cloneRpcArgs(args);
+      const result = await fn.apply(candidate, attemptArgs);
       if (index !== healthyRpcIndex) {
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,

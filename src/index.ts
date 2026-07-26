@@ -1,4 +1,5 @@
 import express from "express";
+import { initLogger } from "./utils/logger.js";
 import cors from "cors";
 import helmet from "helmet";
 import { ZodError } from "zod";
@@ -29,6 +30,8 @@ import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
 
 export const app = express();
+initLogger();
+
 
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);

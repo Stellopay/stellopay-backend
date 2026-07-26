@@ -40,23 +40,23 @@ pnpm start
 
 All configuration is parsed and validated in `src/config.ts`. `env.example` has the full annotated list; the main settings and their defaults are:
 
-| Variable                                                       | Default                                         | Notes                                                                   |
-| -------------------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------- |
+| Variable                                                       | Default                                         | Notes                                                                           |
+| -------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------- |
 | `STARKNET_RPC_URL`                                             | (required)                                      | Comma-separated HTTPS JSON-RPC URLs; failover tries each in order on RPC errors |
-| `NODE_ENV`                                                     | `development`                                   | `production` enforces the ABI path guard below                          |
-| `PORT`                                                         | `4000`                                          |                                                                         |
-| `CORS_ORIGIN`                                                  | `*`                                             | See the CORS Configuration section                                      |
-| `POSTGRES_CONNECTION_STRING`                                   | `postgresql://localhost:5432/stellopay_indexer` |                                                                         |
-| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX`                      | `900000` / `100`                                | Global rate limiter                                                     |
-| `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX`        | `300000` / `10`                                 | Auth and contact limiter                                                |
-| `TRUST_PROXY`                                                  | `1`                                             | Number of proxies, or `true`                                            |
-| `SHUTDOWN_DRAIN_TIMEOUT_MS`                                    | `10000`                                         | Graceful shutdown drain timeout                                         |
-| `TOKEN_METADATA_CACHE_TTL_MS`                                  | `300000`                                        | In-memory token metadata cache lifetime                                 |
-| `BILLING_ENABLED`                                              | `false`                                         | Only the literal `true` enables billing routes                          |
-| `CONTACT_RECIPIENT_EMAIL`                                      | (none)                                          | Must be a valid email; required to deliver contact emails               |
-| `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev                 | Required in production; startup fails if unset                          |
-| `LOG_LEVEL`                                                    | `info`                                          | Specifies the minimum logging level                                     |
-| `LOG_FORMAT`                                                   | `json`                                          | Use `json` for structured logging or `text` for readable console output |
+| `NODE_ENV`                                                     | `development`                                   | `production` enforces the ABI path guard below                                  |
+| `PORT`                                                         | `4000`                                          |                                                                                 |
+| `CORS_ORIGIN`                                                  | `*`                                             | See the CORS Configuration section                                              |
+| `POSTGRES_CONNECTION_STRING`                                   | `postgresql://localhost:5432/stellopay_indexer` |                                                                                 |
+| `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX`                      | `900000` / `100`                                | Global rate limiter                                                             |
+| `RATE_LIMIT_STRICT_WINDOW_MS` / `RATE_LIMIT_STRICT_MAX`        | `300000` / `10`                                 | Auth and contact limiter                                                        |
+| `TRUST_PROXY`                                                  | `1`                                             | Number of proxies, or `true`                                                    |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS`                                    | `10000`                                         | Graceful shutdown drain timeout                                                 |
+| `TOKEN_METADATA_CACHE_TTL_MS`                                  | `300000`                                        | In-memory token metadata cache lifetime                                         |
+| `BILLING_ENABLED`                                              | `false`                                         | Only the literal `true` enables billing routes                                  |
+| `CONTACT_RECIPIENT_EMAIL`                                      | (none)                                          | Must be a valid email; required to deliver contact emails                       |
+| `ESCROW_CONTRACT_CLASS_JSON` / `AGREEMENT_CONTRACT_CLASS_JSON` | local `contracts/` files in dev                 | Required in production; startup fails if unset                                  |
+| `LOG_LEVEL`                                                    | `info`                                          | Specifies the minimum logging level                                             |
+| `LOG_FORMAT`                                                   | `json`                                          | Use `json` for structured logging or `text` for readable console output         |
 
 `GET /api/v1/token/:address/metadata` returns the token's `name`, `symbol`, and
 `decimals`. Results are cached in memory by canonical Starknet address for
@@ -104,9 +104,7 @@ const response = await fetch("/api/v1/escrow/0x123/deposit", {
     "X-Request-Id": requestId,
     "Content-Type": "application/json",
   },
-  body: JSON.stringify({
-    /* ... */
-  }),
+  body: JSON.stringify({/* ... */}),
 });
 console.log("[app]", requestId, "server echo:", response.headers.get("X-Request-Id"));
 ```
@@ -447,10 +445,27 @@ Until then every route returns `HTTP 501 Not Implemented` — no mock PII is ser
 { "success": false, "error": "message" }
 ```
 
-Unmatched `/api/v1` routes also return this JSON envelope with HTTP 404. The
-response includes the requested HTTP method and normalized path in `data`, while
-`/health` remains outside the API router and is not intercepted by the not-found
-handler.
+**404 envelopes** (route-level resource not-found + unmatched-route catch-all)
+all use this same shape — see `src/routes/not-found.ts`:
+
+```json
+{ "success": false, "error": "Resource not found" }
+```
+
+The unmatched-route catch-all additionally attaches the requested method and
+normalized path under `data`:
+
+```json
+{
+  "success": false,
+  "error": "Route not found",
+  "data": { "method": "GET", "path": "/api/v1/missing-route" }
+}
+```
+
+All 404 responses serialize as JSON (never HTML), so user-controlled paths are
+never reflected as markup. `/health` remains outside the API router and is not
+intercepted by the not-found handler.
 
 **Database tables added** (see `src/db/schema.ts`):
 

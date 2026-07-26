@@ -12,6 +12,13 @@
  * All routes are gated behind the BILLING_ENABLED feature flag.
  * When the flag is false every endpoint returns HTTP 501 with a clear message.
  *
+ * All routes require a valid session (see src/auth/middleware.ts).
+ * Every route verifies that the calling wallet address matches the
+ * billing profile's ownerAddress before returning any data. A 404 is
+ * always returned when the profile does not exist OR the caller is not
+ * the owner — the two cases are intentionally indistinguishable to the
+ * caller so attackers cannot enumerate billing profile IDs.
+ *
  * All responses follow the envelope:  { success: boolean, data?: T, error?: string }
  *
  * NOTE: Sensitive fields (taxId, dateOfBirth) are omitted from all API responses.
@@ -24,8 +31,27 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
+import { requireAuth } from "../auth/middleware.js";
 
 export const billingRouter = express.Router();
+
+// ---------------------------------------------------------------------------
+// Safe financial math
+// ---------------------------------------------------------------------------
+
+/**
+ * Safely parses a Postgres numeric(18,6) value (returned as a string by
+ * Drizzle) into a JavaScript number.  Returns 0 instead of NaN / Infinity
+ * when the input is missing, malformed, or negative.  Every arithmetic
+ * result is rounded to 6 decimal places to stay lossless within the
+ * column's declared scale.
+ */
+function parseSafeAmount(value: unknown): number {
+  if (typeof value !== "string" || value.trim() === "") return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n * 1e6) / 1e6;
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -216,8 +242,38 @@ function requireBillingEnabled(_req: Request, res: Response, next: NextFunction)
   next();
 }
 
-// Apply the feature-flag gate to every route in this router
-billingRouter.use("/billing", requireBillingEnabled);
+/** Middleware: verify the caller owns the billing profile identified by :profileId */
+async function requireBillingOwner(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const profileId: string = res.locals.profileId;
+  const callerAddress = req.auth!.address;
+
+  try {
+    const [row] = await db
+      .select({ ownerAddress: schema.billingProfiles.ownerAddress })
+      .from(schema.billingProfiles)
+      .where(eq(schema.billingProfiles.id, profileId))
+      .limit(1);
+
+    if (!row || row.ownerAddress !== callerAddress) {
+      fail(res, 404, `Billing profile '${profileId}' not found`);
+      return;
+    }
+
+    next();
+  } catch (err: any) {
+    console.error("[billing] Error in ownership check:", err);
+    fail(res, 500, "Failed to verify billing profile ownership");
+  }
+}
+
+// Apply the feature-flag gate, authentication, and ownership check to every
+// billing route.  validateProfileId must run first so res.locals.profileId is
+// available for the ownership lookup.
+billingRouter.use("/billing", requireBillingEnabled, requireAuth);
 
 // Mutating billing routes can opt into request replay protection via Idempotency-Key.
 billingRouter.use("/billing", (req, res, next) => {
@@ -257,6 +313,7 @@ function stripSensitive(profile: ProfileRow): SafeProfile {
 billingRouter.get(
   "/billing/profiles/:profileId",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
@@ -267,6 +324,9 @@ billingRouter.get(
         .where(eq(schema.billingProfiles.id, profileId))
         .limit(1);
 
+      // Ownership already verified by requireBillingOwner; this is a
+      // safety net for a very unlikely TOCTOU race (profile deleted
+      // between middleware and handler).
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);
         return;
@@ -304,6 +364,7 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/general-information",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
@@ -344,22 +405,11 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/payment-methods",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
     try {
-      // Verify the profile exists first to give a meaningful 404
-      const [profile] = await db
-        .select({ id: schema.billingProfiles.id })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
-
-      if (!profile) {
-        fail(res, 404, `Billing profile '${profileId}' not found`);
-        return;
-      }
-
       const paymentMethods = await db
         .select()
         .from(schema.billingPaymentMethods)
@@ -381,21 +431,11 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/invoices",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
     try {
-      const [profile] = await db
-        .select({ id: schema.billingProfiles.id })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
-
-      if (!profile) {
-        fail(res, 404, `Billing profile '${profileId}' not found`);
-        return;
-      }
-
       const invoices = await db
         .select()
         .from(schema.billingInvoices)
@@ -417,6 +457,7 @@ billingRouter.get(
 billingRouter.get(
   "/billing/profiles/:profileId/summary",
   validateProfileId,
+  requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
@@ -438,8 +479,12 @@ billingRouter.get(
         return;
       }
 
-      const limit = parseFloat(profile.annualRewardLimit ?? "0");
-      const used = parseFloat(profile.usedAmount ?? "0");
+      // Use safe parsing to avoid NaN / Infinity from malformed or
+      // excessively large numeric strings.
+      const limit = parseSafeAmount(profile.annualRewardLimit);
+      const used = parseSafeAmount(profile.usedAmount);
+      // Clamp remaining to a minimum of 0 to avoid negative values
+      // when usedAmount has overrun the limit in the database.
       const remaining = Math.max(0, limit - used);
       const progressPct = limit > 0 ? (used / limit) * 100 : 0;
 

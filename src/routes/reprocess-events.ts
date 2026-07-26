@@ -3,11 +3,12 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
-import { eq, and, gte, lte } from "drizzle-orm";
+import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { notFoundResponse } from "./not-found.js";
 
 export const reprocessEventsRouter = Router();
 
@@ -99,13 +100,7 @@ reprocessEventsRouter.post(
       const result = await processTxReceipt(tx_hash);
 
       if (result.status === "not_found") {
-        logReprocess("warn", "tx_reprocess", {
-          txHash: tx_hash,
-          outcome: "quarantine",
-          reason: "not_found",
-          elapsed_ms: Date.now() - start,
-        });
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
 
@@ -126,12 +121,7 @@ reprocessEventsRouter.post(
         return;
       }
       if (e.message === "Transaction not found") {
-        logReprocess("warn", "tx_reprocess", {
-          outcome: "quarantine",
-          reason: "not_found",
-          elapsed_ms: Date.now() - start,
-        });
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
       logReprocess("error", "tx_reprocess", {
@@ -159,14 +149,21 @@ reprocessEventsRouter.post(
  * - `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
  * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request.
  *
- * **Response**
- * Returns a `results` array where each entry corresponds to one tx hash.
- * A per-tx error never aborts the rest of the batch.
+ * **Batching contract**
+ * Duplicate hashes (including hashes that differ only by leading-zero
+ * padding, e.g. `0x1` vs `0x0...01`) are deduped before processing: each
+ * unique hash — keyed by its {@link normalizeTransactionHash} form — is
+ * passed to `processTxReceipt` exactly once, regardless of how many times
+ * it appears in the request. This avoids redundant RPC calls and keeps the
+ * `summary` counts an accurate reflection of the work actually performed.
  *
- * **Telemetry**
- * - Emits one structured `batch` log entry per transaction attempt with
- *   outcome=processed|no_events|not_found|error.
- * - Emits a summary log at INFO level after all txs are processed.
+ * **Response**
+ * Returns a `results` array with the same length and index-correspondence
+ * as the input `tx_hashes` array — `results[i]` always corresponds to
+ * `tx_hashes[i]`, even for duplicates (which reuse the first occurrence's
+ * result object). `summary.duplicates` reports how many entries were
+ * duplicates of an earlier hash in the same request. A per-tx error never
+ * aborts the rest of the batch.
  */
 reprocessEventsRouter.post(
   "/reprocess-events/batch",
@@ -188,34 +185,36 @@ reprocessEventsRouter.post(
         .parse(req.body);
 
       const results = [];
+      // Cache of normalized hash -> result object, so duplicate hashes reuse
+      // the first occurrence's result instead of triggering another RPC call.
+      const resultByNormalizedHash = new Map<string, (typeof results)[number]>();
+      let duplicates = 0;
 
       for (const txHash of tx_hashes) {
-        const txStart = Date.now();
+        const normalizedHash = normalizeTransactionHash(txHash);
+        const cached = resultByNormalizedHash.get(normalizedHash);
+
+        if (cached) {
+          duplicates++;
+          results.push(cached);
+          continue;
+        }
+
+        let result;
         try {
-          const result = await processTxReceipt(txHash);
-          logReprocess("info", "batch", {
-            txHash: result.txHash,
-            outcome: result.status,
-            eventsProcessed: result.eventsProcessed,
-            elapsed_ms: Date.now() - txStart,
-          });
-          results.push(result);
+          result = await processTxReceipt(txHash);
         } catch (e: any) {
-          const reason = e?.message ?? String(e);
-          logReprocess("error", "batch", {
-            txHash,
-            outcome: "error",
-            reason,
-            elapsed_ms: Date.now() - txStart,
-          });
-          results.push({
+          result = {
             txHash,
             status: "error",
             eventsProcessed: 0,
             eventLabels: [],
-            error: reason,
-          });
+            error: e?.message ?? String(e),
+          };
         }
+
+        resultByNormalizedHash.set(normalizedHash, result);
+        results.push(result);
       }
 
       const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
@@ -228,15 +227,23 @@ reprocessEventsRouter.post(
         totalEventsProcessed: totalProcessed,
       };
 
-      logReprocess("info", "batch_summary", {
-        ...summary,
-        elapsed_ms: Date.now() - batchStart,
+      res.json({
+        summary: {
+          total: results.length,
+          processed: results.filter((r) => r.status === "processed").length,
+          noEvents: results.filter((r) => r.status === "no_events").length,
+          notFound: results.filter((r) => r.status === "not_found").length,
+          errors: results.filter((r) => r.status === "error").length,
+          totalEventsProcessed: totalProcessed,
+          duplicates,
+        },
+        results,
       });
 
       res.json({ summary, results });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request body" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
         return;
       }
       next(e);
@@ -253,9 +260,21 @@ reprocessEventsRouter.post(
  * set keyed on `transaction_hash + event_index` prevents processing the same
  * event twice within a single request.
  *
- * **Idempotency guarantee**: the query filter selects only unresolved
- * `AgreementStatusChange` events, so already-decoded events are automatically
- * skipped on repeat invocations — the operation is fully safe to retry.
+ * **Pagination contract**
+ * Results are ordered deterministically by `blockNumber` then `eventIndex`
+ * (both ascending), so repeated calls with the same filters page through
+ * the backlog in a stable, forward-progressing order instead of relying on
+ * the database's unspecified default row order. The response includes
+ * `hasMore: true` whenever the page returned exactly `limit` rows (i.e.
+ * more matching rows may exist beyond it); callers should page forward by
+ * re-invoking with `fromBlock` set to one past the last-seen `blockNumber`.
+ *
+ * **Known limitation**: events that fail to update (`no_receipt`,
+ * `event_not_found`, `error`) keep `eventType === "AgreementStatusChange"`
+ * and therefore remain eligible for reprocessing on every subsequent call
+ * unless the caller advances `fromBlock` past them. There is no persistent
+ * retry-count or quarantine state (would require a schema migration) — see
+ * `docs/routes/reprocess-events.md` for details.
  *
  * **Validation**
  * - `limit` (query, optional, default 100, max {@link MAX_STATUS_LIMIT})
@@ -297,11 +316,14 @@ reprocessEventsRouter.post(
         conditions.push(lte(schema.agreementEvents.blockNumber, toBlock));
       }
 
-      // Get AgreementStatusChange events matching the filter
+      // Get AgreementStatusChange events matching the filter, ordered
+      // deterministically so repeated calls page through the backlog in a
+      // stable, forward-progressing order.
       const statusChangeEvents = await db
         .select()
         .from(schema.agreementEvents)
         .where(and(...conditions))
+        .orderBy(asc(schema.agreementEvents.blockNumber), asc(schema.agreementEvents.eventIndex))
         .limit(limit);
 
       logReprocess("info", "status_changes_start", {
@@ -467,25 +489,20 @@ reprocessEventsRouter.post(
         }
       }
 
-      logReprocess("info", "status_changes_summary", {
-        totalCandidates: statusChangeEvents.length,
-        updated,
-        noChange: results.filter((r) => r.status === "no_change").length,
-        quarantined: results.filter((r) =>
-          ["no_receipt", "event_not_found"].includes(r.status),
-        ).length,
-        errors: results.filter((r) => r.status === "error").length,
-        elapsed_ms: Date.now() - batchStart,
-      });
+      // hasMore is true when the page came back full, signaling there may be
+      // more matching rows beyond it for the caller to fetch with a
+      // follow-up call (advancing fromBlock past the last-seen blockNumber).
+      const hasMore = statusChangeEvents.length === limit;
 
       res.json({
         message: `Reprocessed ${results.length} events, updated ${updated}`,
         updated,
         results,
+        hasMore,
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);

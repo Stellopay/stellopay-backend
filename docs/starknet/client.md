@@ -23,17 +23,11 @@ through `invokeWithFailover`, which:
 `estimateFee`, etc.) are always safe to retry — they observe state without
 modifying it.
 
-**Write calls** (e.g. `addInvokeTransaction`): the backend does not hold
-private keys and does not call write RPCs directly. All contract mutations are
-prepared server-side and executed client-side by the user's wallet. If the
-frontend retries a prepared call, the Starknet protocol's nonce enforcement
-prevents double-execution at the chain level.
-
-`invokeWithFailover` retries on a different provider only when the current one
-returns an error **before** a successful response. It never issues duplicate
-calls after a successful response is received.
-
----
+- invokeWithFailover() tries endpoints in failover order
+- healthyRpcIndex tracks the last working endpoint
+- Failed-over events log a console.warn with the old and new URL
+- Each retry receives a fresh copy of the RPC arguments so pagination and batching payloads are not mutated by an earlier failed attempt
+- The helper is intentionally scoped to plain JSON-like payloads used by current callers; custom class instances and cyclic structures are out of scope for this change
 
 ## Fee Quotes
 

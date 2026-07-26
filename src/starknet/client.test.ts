@@ -6,6 +6,7 @@ const mockRpcProviders = vi.hoisted(() =>
     nodeUrl: string;
     getChainId: ReturnType<typeof vi.fn>;
     getSpecVersion: ReturnType<typeof vi.fn>;
+    getBlock: ReturnType<typeof vi.fn>;
   }>,
 );
 
@@ -15,11 +16,13 @@ vi.mock("starknet", async (importOriginal) => {
     nodeUrl: string;
     getChainId: ReturnType<typeof vi.fn>;
     getSpecVersion: ReturnType<typeof vi.fn>;
+    getBlock: ReturnType<typeof vi.fn>;
 
     constructor({ nodeUrl }: { nodeUrl: string }) {
       this.nodeUrl = nodeUrl;
       this.getChainId = vi.fn();
       this.getSpecVersion = vi.fn().mockResolvedValue("0.6.0");
+      this.getBlock = vi.fn();
       mockRpcProviders.push(this);
     }
   }
@@ -249,5 +252,33 @@ describe("RPC endpoint failover", () => {
     expect(primary!.getSpecVersion).not.toHaveBeenCalled();
     expect(secondary!.getChainId).toHaveBeenCalledTimes(1);
     expect(secondary!.getSpecVersion).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries with a fresh copy of the request arguments", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+
+    const [primary, secondary] = mockRpcProviders;
+    const request = {
+      blockIdentifier: "latest",
+      pagination: { offset: 0, limit: 10 },
+    };
+
+    primary!.getBlock.mockImplementationOnce((payload: typeof request) => {
+      payload.pagination.limit = 99;
+      throw new Error("primary down");
+    });
+    secondary!.getBlock.mockImplementationOnce((payload: typeof request) => {
+      return Promise.resolve({ blockNumber: 1, pagination: payload.pagination });
+    });
+
+    const result = await client.provider.getBlock(request);
+
+    expect(result).toEqual({ blockNumber: 1, pagination: { offset: 0, limit: 10 } });
+    expect(request.pagination.limit).toBe(10);
+    expect(secondary!.getBlock).toHaveBeenCalledTimes(1);
+    expect(secondary!.getBlock.mock.calls[0]?.[0]).toEqual(request);
   });
 });

@@ -8,39 +8,47 @@ import { requireSession } from "../auth/session.js";
 // Removed in-memory index - using database only
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
+import { StarknetAddress } from "../utils/validation.js";
+import { TxHashSchema } from "./events.js";
+import { notFoundResponse } from "./not-found.js";
 
-const AddressParam = z.string().min(3);
+const AddressParam = StarknetAddress;
 const AgreementIdParam = z.coerce.bigint().positive();
 
+const U256String = z
+  .string()
+  .trim()
+  .regex(/^(0|[1-9][0-9]{0,77})$/, "must be a valid 256-bit unsigned integer string");
+
 const WalletSession = z.object({
-  wallet_address: z.string().min(3),
+  wallet_address: StarknetAddress,
   session_token: z.string().min(10),
 });
 
 const CreateTimeBasedBody = z
   .object({
-    employer: z.string().min(3),
-    contributor: z.string().min(3),
-    token: z.string().min(3),
-    amount_per_period: z.string().min(1),
-    period_seconds: z.coerce.bigint(),
+    employer: StarknetAddress,
+    contributor: StarknetAddress,
+    token: StarknetAddress,
+    amount_per_period: U256String,
+    period_seconds: z.coerce.bigint().positive(),
     num_periods: z.coerce.number().int().positive(),
   })
   .and(WalletSession);
 
 const CreateMilestoneBody = z
   .object({
-    employer: z.string().min(3),
-    contributor: z.string().min(3),
-    token: z.string().min(3),
+    employer: StarknetAddress,
+    contributor: StarknetAddress,
+    token: StarknetAddress,
   })
   .and(WalletSession);
 
 const CreatePayrollBody = z
   .object({
-    employer: z.string().min(3),
-    token: z.string().min(3),
-    period_seconds: z.coerce.bigint(),
+    employer: StarknetAddress,
+    token: StarknetAddress,
+    period_seconds: z.coerce.bigint().positive(),
     num_periods: z.coerce.number().int().positive(),
   })
   .and(WalletSession);
@@ -54,7 +62,7 @@ const AgreementIdBody = z
 const AddMilestoneBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    amount: z.string().min(1),
+    amount: U256String,
   })
   .and(WalletSession);
 
@@ -68,15 +76,15 @@ const MilestoneIdBody = z
 const FundAgreementBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    amount: z.string().min(1),
+    amount: U256String,
   })
   .and(WalletSession);
 
 const AddEmployeeBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    employee: z.string().min(3),
-    salary_per_period: z.string().min(1),
+    employee: StarknetAddress,
+    salary_per_period: U256String,
   })
   .and(WalletSession);
 
@@ -90,14 +98,14 @@ const ClaimPayrollBody = z
 const ResolveDisputeBody = z
   .object({
     agreement_id: z.coerce.bigint().positive(),
-    pay_contributor: z.string().min(1),
-    refund_employer: z.string().min(1),
+    pay_contributor: U256String,
+    refund_employer: U256String,
   })
   .and(WalletSession);
 
 const InitAgreementBody = WalletSession.extend({
-  escrow: z.string().min(3),
-  arbiter: z.string().min(3),
+  escrow: StarknetAddress,
+  arbiter: StarknetAddress,
 });
 
 export const agreementRouter = Router();
@@ -964,7 +972,7 @@ agreementRouter.post("/prepare/agreement/:address/raise_dispute", async (req, re
 agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
-    const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.body);
+    const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.body);
 
     // Ensure tx_hash is properly formatted (should start with 0x and be 66 chars)
     let formattedTxHash = tx_hash;
@@ -975,7 +983,7 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
     try {
       const receipt = await provider.getTransactionReceipt(formattedTxHash);
       if (!receipt) {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
 
@@ -1001,7 +1009,7 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
       }
 
       if (!agreementId) {
-        res.status(404).json({ error: "AgreementCreated event not found in transaction" });
+        notFoundResponse(res, "AgreementCreated event not found in transaction");
         return;
       }
 
@@ -1043,10 +1051,11 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
     } catch (e: any) {
       // Handle transaction not found or not yet mined
       if (e?.message?.includes("Transaction hash not found") || e?.message?.includes("not found")) {
-        res.status(404).json({
-          error: "Transaction not found or not yet mined. Please wait a few moments and try again.",
-          details: e.message,
-        });
+        notFoundResponse(
+          res,
+          "Transaction not found or not yet mined. Please wait a few moments and try again.",
+          { details: e.message },
+        );
         return;
       }
       throw e; // Re-throw other errors
@@ -1056,19 +1065,53 @@ agreementRouter.post("/agreement/:address/get_agreement_id_from_tx", async (req,
   }
 });
 
+// -------- query-param schemas for agreement listing --------
+
+/** Maximum agreements returned per page. Clamped server-side regardless of client input. */
+const LIST_MAX_LIMIT = 100;
+
+/** Default page size when the caller omits the limit parameter. */
+const LIST_DEFAULT_LIMIT = 50;
+
+const ListAgreementsQuery = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .catch(LIST_DEFAULT_LIMIT),
+  cursor: z.string().optional(),
+  status: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(5)
+    .optional(),
+});
+
 // List all agreements for a user (as employer or contributor/employee)
 agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
     const userAddress = normalizeStarknetAddress(req.params.user_address);
 
+    // Parse and clamp query params
+    const rawQuery = ListAgreementsQuery.parse(req.query);
+    const limit = Math.min(Math.max(rawQuery.limit, 1), LIST_MAX_LIMIT);
+    const cursor = rawQuery.cursor ?? null;
+    const statusFilter = rawQuery.status ?? null;
+
     console.log(
-      `[list-agreements] Querying database for agreements for user: ${userAddress} in contract: ${address}`,
+      `[list-agreements] Querying database for agreements for user: ${userAddress} in contract: ${address}` +
+        ` limit=${limit} cursor=${cursor ?? "none"} status=${statusFilter ?? "none"}`,
     );
 
     // ONLY USE DATABASE - No contract scanning, no in-memory cache, no fallbacks
     try {
-      // Get agreements where user is employer or contributor
+      // Build filter predicates inline so spread satisfies drizzle's SQLWrapper signature.
+      const cursorFilter = cursor !== null ? [lt(schema.agreements.id, cursor)] : [];
+      const statusConstraint =
+        statusFilter !== null ? [eq(schema.agreements.status, statusFilter)] : [];
+
+      // Fetch limit + 1 to determine hasMore
       const indexedAgreements = await db
         .select()
         .from(schema.agreements)
@@ -1079,9 +1122,12 @@ agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, n
               eq(schema.agreements.employer, userAddress),
               eq(schema.agreements.contributor, userAddress),
             ),
+            ...cursorFilter,
+            ...statusConstraint,
           ),
         )
-        .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt), desc(schema.agreements.id))
+        .limit(limit + 1);
 
       // Also check if user is an employee in any payroll agreements
       const employeeAgreements = await db
@@ -1095,25 +1141,37 @@ agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, n
             eq(schema.agreements.contractAddress, address),
             eq(schema.employees.employeeAddress, userAddress),
             eq(schema.agreements.mode, 1), // Payroll mode
+            ...cursorFilter,
+            ...statusConstraint,
           ),
         )
-        .orderBy(desc(schema.agreements.createdAt));
+        .orderBy(desc(schema.agreements.createdAt), desc(schema.agreements.id))
+        .limit(limit + 1);
 
       // Combine and deduplicate
       const allAgreements = [...indexedAgreements, ...employeeAgreements.map((e) => e.agreement)];
 
-      // Remove duplicates by agreement ID
-      const uniqueAgreementsMap = new Map<string, any>();
-      allAgreements.forEach((a) => {
-        uniqueAgreementsMap.set(a.id, a);
-      });
+      // Remove duplicates by agreement ID while preserving order (first occurrence wins)
+      const seen = new Set<string>();
+      const uniqueAgreements: typeof indexedAgreements = [];
+      for (const a of allAgreements) {
+        if (!seen.has(a.id)) {
+          seen.add(a.id);
+          uniqueAgreements.push(a);
+        }
+      }
 
-      const uniqueAgreements = Array.from(uniqueAgreementsMap.values());
+      const hasMore = uniqueAgreements.length > limit;
+      const page = uniqueAgreements.slice(0, limit);
+      const nextCursor: string | null =
+        page.length > 0 && hasMore ? page[page.length - 1].id : null;
 
-      console.log(`[list-agreements] Found ${uniqueAgreements.length} agreements from database`);
+      console.log(
+        `[list-agreements] Found ${uniqueAgreements.length} agreements (page=${page.length}, hasMore=${hasMore})`,
+      );
 
       return res.json({
-        agreements: uniqueAgreements.map((a) => ({
+        agreements: page.map((a) => ({
           agreement_id: a.id,
           employer: a.employer,
           contributor: a.contributor,
@@ -1123,6 +1181,9 @@ agreementRouter.get("/agreement/:address/list/:user_address", async (req, res, n
           paid_amount: a.paidAmount,
         })),
         source: "indexed",
+        limit,
+        cursor: nextCursor,
+        hasMore,
       });
     } catch (dbError) {
       console.error(`[list-agreements] Database query failed:`, dbError);
