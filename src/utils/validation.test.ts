@@ -7,6 +7,7 @@ import {
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
   loggedParse,
+  mapZodError,
 } from "./validation";
 
 // --------------------------------------------------------------------------
@@ -469,5 +470,36 @@ describe("loggedParse", () => {
     loggedParse(schema, "ok", "silentOnSuccess");
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+// ---- mapZodError ----
+
+describe("mapZodError", () => {
+  it("returns custom code for checksum fail",()=>{
+    try{
+      StarknetAddress.parse("0x4718F5a0FC34Cc1AF16A1cdee98ffB20C31f5cd61d6ab07201858f4287c938d");
+    } catch (e) {
+      const mapped = mapZodError(e);
+      expect(mapped).toBeDefined();
+      expect(mapped!.code).toBe("custom");
+      expect(mapped!.message).toContain("checksum");
+      expect(mapped!.path).toEqual([]);
+    }
+  });
+  it("returns invalid_string for AgreementId", () => {
+    try {
+      AgreementId.parse("abc");
+    } catch (e) {
+      const mapped = mapZodError(e);
+      expect(mapped).toBeDefined();
+      expect(mapped!.code).toBe("invalid_format");
+      expect(mapped!.message).toContain("numeric");
+      expect(mapped!.path).toEqual([]);
+    }
+  });
+  it("returns undefined for non-ZodError", () => {
+    const mapped = mapZodError(new Error("boom"));
+    expect(mapped).toBeUndefined();
   });
 });

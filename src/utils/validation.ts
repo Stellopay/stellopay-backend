@@ -44,6 +44,37 @@ export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validator
   return result.data;
 }
 
+/**
+ * Categorised validation failure that callers can inspect programmatically.
+ * The `code` mirrors the Zod issue code so downstream error handlers can
+ * decide how to phrase the response without parsing the raw ZodError.
+ */
+export interface MappedValidationError {
+  code: string;
+  message: string;
+  path: (string | number)[];
+}
+
+/**
+ * Extracts the first issue from a {@link z.ZodError} into a plain object so
+ * callers and error handlers don't need to traverse the issue list themselves.
+ * Returns `undefined` when the error is not a ZodError or has no issues.
+ *
+ * @example
+ * try { StarknetAddress.parse("nothex"); }
+ * catch (e) {
+ *   const mapped = mapZodError(e);
+ *   // { code: "invalid_string", message: "must be a hex string of ...", path: [] }
+ * }
+ */
+export function mapZodError(error: unknown): MappedValidationError | undefined {
+  if (error instanceof z.ZodError && error.issues.length > 0) {
+    const issue = error.issues[0];
+    return { code: issue.code, message: issue.message, path: issue.path };
+  }
+  return undefined;
+}
+
 export const StarknetAddress = z
   .string()
   .trim()
@@ -51,7 +82,14 @@ export const StarknetAddress = z
     /^(0x)?[0-9a-fA-F]{1,64}$/,
     "must be a hex string of up to 64 hex characters, with an optional 0x prefix",
   )
-  .transform((value) => normalizeStarknetAddress(value));
+  .transform((value, ctx) => {
+    try {
+      return normalizeStarknetAddress(value);
+    } catch (e) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: e instanceof Error ? e.message : String(e) });
+      return z.NEVER;
+    }
+  });
 
 /**
  * Shared Zod schema for a numeric agreement identifier passed as a string. The
