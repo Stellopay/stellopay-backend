@@ -6,6 +6,14 @@ All three routes require the caller to be authenticated (`requireAuth`) and
 hold an admin role (`requireAdmin`). Unauthenticated or non-admin requests
 receive a `401`/`403` before any of the logic below runs.
 
+## Idempotency
+
+All endpoints in this router support request-level idempotency via the `Idempotency-Key` header.
+When this header is provided, the first successful JSON response is cached in memory for 24 hours.
+Replays with the same key and the same request body will immediately return the cached response
+without re-executing the handler (ensuring robust retries). Replays with the same key but a
+different request body will be rejected with `409 Conflict`.
+
 ## `POST /reprocess-events/tx/:tx_hash`
 
 Reprocess a single transaction's events to (re)decode their event names.

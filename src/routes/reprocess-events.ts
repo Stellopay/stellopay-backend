@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
@@ -7,7 +7,7 @@ import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE, normalizeTransactionHash } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 
 export const reprocessEventsRouter = Router();
@@ -46,6 +46,128 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
   return payrollEscrowAbi;
 }
 
+const REPROCESS_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+type ReprocessIdempotencyEntry = {
+  createdAt: number;
+  expiresAt: number;
+  bodyFingerprint: string;
+  statusCode: number;
+  responseBody: unknown;
+};
+
+const reprocessIdempotencyStore = new Map<string, ReprocessIdempotencyEntry>();
+
+function stableSerialize(value: unknown): string {
+  if (typeof value === "undefined") return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+      left.localeCompare(right),
+    );
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`).join(",")}}`;
+  }
+  return String(value);
+}
+
+function getHeader(req: Request, name: string): string | undefined {
+  const value = req.get(name);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function getReprocessIdempotencyCacheKey(req: Request, idempotencyKey: string): string {
+  const routeKey = req.originalUrl || req.path || "/";
+  return `reprocess:${req.method}:${routeKey}:${idempotencyKey}`;
+}
+
+function pruneExpiredEntries(now = Date.now()): void {
+  for (const [cacheKey, entry] of reprocessIdempotencyStore.entries()) {
+    if (entry.expiresAt <= now) {
+      reprocessIdempotencyStore.delete(cacheKey);
+    }
+  }
+}
+
+export function clearReprocessIdempotencyStore(): void {
+  reprocessIdempotencyStore.clear();
+}
+
+/**
+ * Wrap a mutating reprocess handler with idempotency support.
+ *
+ * When an Idempotency-Key header is present, the first successful response for
+ * that route/body combination is cached for 24 hours. Replays with the same key
+ * and body return the cached response; replays with the same key but a different
+ * body are rejected with 409 Conflict.
+ */
+export function withReprocessIdempotency(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const idempotencyKey = getHeader(req, "Idempotency-Key") ?? getHeader(req, "idempotency-key");
+    const method = req.method.toUpperCase();
+
+    if (!idempotencyKey || ["GET", "HEAD", "OPTIONS"].includes(method)) {
+      await handler(req, res, next);
+      return;
+    }
+
+    const now = Date.now();
+    pruneExpiredEntries(now);
+
+    const cacheKey = getReprocessIdempotencyCacheKey(req, idempotencyKey);
+    const existingEntry = reprocessIdempotencyStore.get(cacheKey);
+
+    if (existingEntry && existingEntry.expiresAt > now) {
+      if (existingEntry.bodyFingerprint !== stableSerialize(req.body)) {
+        res.status(409).json({ error: "Idempotency key already used with a different request body" });
+        return;
+      }
+
+      res.status(existingEntry.statusCode).json(existingEntry.responseBody);
+      return;
+    }
+
+    if (existingEntry && existingEntry.expiresAt <= now) {
+      reprocessIdempotencyStore.delete(cacheKey);
+    }
+
+    const originalJson = res.json.bind(res);
+    let cachedResponse: ReprocessIdempotencyEntry | undefined;
+
+    const persistResponse = (body: unknown): void => {
+      if (cachedResponse) {
+        return;
+      }
+      cachedResponse = {
+        createdAt: Date.now(),
+        expiresAt: Date.now() + REPROCESS_IDEMPOTENCY_TTL_MS,
+        bodyFingerprint: stableSerialize(req.body),
+        statusCode: res.statusCode,
+        responseBody: body,
+      };
+      reprocessIdempotencyStore.set(cacheKey, cachedResponse);
+    };
+
+    res.json = ((body: unknown) => {
+      persistResponse(body);
+      return originalJson(body);
+    }) as any;
+
+    try {
+      await handler(req, res, next);
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
 /**
  * POST /reprocess-events/tx/:tx_hash
  *
@@ -60,7 +182,7 @@ reprocessEventsRouter.post(
   "/reprocess-events/tx/:tx_hash",
   requireAuth,
   requireAdmin,
-  async (req, res, next) => {
+  withReprocessIdempotency(async (req, res, next) => {
     try {
       const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
 
@@ -86,7 +208,7 @@ reprocessEventsRouter.post(
       }
       next(e);
     }
-  },
+  }),
 );
 
 /**
@@ -121,7 +243,7 @@ reprocessEventsRouter.post(
   "/reprocess-events/batch",
   requireAuth,
   requireAdmin,
-  async (req, res, next) => {
+  withReprocessIdempotency(async (req, res, next) => {
     try {
       const { tx_hashes } = z
         .object({
@@ -189,7 +311,7 @@ reprocessEventsRouter.post(
       }
       next(e);
     }
-  },
+  }),
 );
 
 /**
@@ -225,7 +347,7 @@ reprocessEventsRouter.post(
   "/reprocess-events/status-changes",
   requireAuth,
   requireAdmin,
-  async (req, res, next) => {
+  withReprocessIdempotency(async (req, res, next) => {
     try {
       const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
 
@@ -388,5 +510,5 @@ reprocessEventsRouter.post(
       }
       next(e);
     }
-  },
+  }),
 );

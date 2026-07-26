@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
 import express from "express";
-import { reprocessEventsRouter } from "./reprocess-events.js";
+import { reprocessEventsRouter, clearReprocessIdempotencyStore } from "./reprocess-events.js";
 import { eventsRouter } from "./events.js";
 import { db } from "../db/index.js";
 
@@ -897,6 +897,64 @@ describe("Reprocess Events Routes", () => {
       expect(res.body.summary.duplicates).toBe(0);
       expect(res.body.summary.total).toBe(2);
       expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("Reprocess Idempotency", () => {
+    beforeEach(() => {
+      clearReprocessIdempotencyStore();
+    });
+
+    afterEach(() => {
+      clearReprocessIdempotencyStore();
+    });
+
+    it("reuses the original response for the same idempotency key and body on /tx/:tx_hash", async () => {
+      const mockReceipt = {
+        transaction_hash: "0x123",
+        blockNumber: 100,
+        events: [],
+      };
+      mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+
+      const txHash = "0x123";
+      
+      const res1 = await request(app)
+        .post(`/api/v1/reprocess-events/tx/${txHash}`)
+        .set("Idempotency-Key", "key-123")
+        .expect(200);
+
+      const res2 = await request(app)
+        .post(`/api/v1/reprocess-events/tx/${txHash}`)
+        .set("Idempotency-Key", "key-123")
+        .expect(200);
+
+      expect(res1.body).toEqual(res2.body);
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a repeated idempotency key when the body differs on /batch", async () => {
+      mockGetTransactionReceipt.mockResolvedValue({
+        transaction_hash: "0x123",
+        blockNumber: 100,
+        events: [],
+      });
+
+      await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes: ["0x123"] })
+        .set("Idempotency-Key", "key-456")
+        .expect(200);
+
+      const res2 = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes: ["0x123", "0x456"] })
+        .set("Idempotency-Key", "key-456")
+        .expect(409);
+
+      expect(res2.body).toEqual({
+        error: "Idempotency key already used with a different request body",
+      });
     });
   });
 });
