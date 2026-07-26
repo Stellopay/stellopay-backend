@@ -400,13 +400,46 @@ export function clampPageLimit(requested: number): number {
 
 /**
  * Clamp a caller-supplied batch size to the allowed range [1, MAX_BATCH_SIZE].
- * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 — callers must
+ * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 â€” callers must
  * validate before proceeding with a bulk operation.
  */
 export function clampBatchSize(requested: number): number {
   if (requested <= 0 || requested > MAX_BATCH_SIZE) return 0;
   return requested;
 }
+
+// Backfill progress table - persists per-job checkpoint state for the
+// backfill-events routes so a long-running backfill can report progress and
+// resume from its last checkpoint after a crash/restart instead of
+// rescanning from scratch.
+export const backfillProgress = pgTable(
+  "backfill_progress",
+  {
+    jobName: text("job_name").primaryKey(), // "employee-events" | "milestone-events"
+    status: text("status").notNull().default("idle"), // idle | running | completed | failed
+    lastCursor: timestamp("last_cursor"), // resume point: created_at of the oldest row checkpointed so far
+    totalScanned: integer("total_scanned").notNull().default(0),
+    totalCreated: integer("total_created").notNull().default(0),
+    lastError: text("last_error"),
+    startedAt: timestamp("started_at"),
+    completedAt: timestamp("completed_at"),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    statusCheck: check(
+      "backfill_progress_status_check",
+      sql`${table.status} IN ('idle', 'running', 'completed', 'failed')`,
+    ),
+    totalScannedCheck: check(
+      "backfill_progress_total_scanned_check",
+      sql`${table.totalScanned} >= 0`,
+    ),
+    totalCreatedCheck: check(
+      "backfill_progress_total_created_check",
+      sql`${table.totalCreated} >= 0`,
+    ),
+  }),
+);
 
 // Sessions table - stores auth sessions with sliding and absolute expiry
 export const sessions = pgTable(
