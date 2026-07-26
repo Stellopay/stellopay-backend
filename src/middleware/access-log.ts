@@ -35,13 +35,17 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
     };
 
     if (env.LOG_FORMAT === "json") {
+      // The global logger override will handle JSON formatting and injecting request_id
       // eslint-disable-next-line no-console
-      console.info(JSON.stringify(logEntry));
+      console.info({
+        method: logEntry.method,
+        path: logEntry.path,
+        status: logEntry.status,
+        duration_ms: logEntry.duration_ms,
+      });
     } else {
       // eslint-disable-next-line no-console
-      console.info(
-        `[${logEntry.timestamp}] INFO ${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms [${logEntry.request_id}]`,
-      );
+      console.info(`${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms`);
     }
   });
 

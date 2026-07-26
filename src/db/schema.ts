@@ -375,6 +375,39 @@ export const billingInvoices = pgTable(
   }),
 );
 
+
+// ---------------------------------------------------------------------------
+// Pagination & Batching Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum rows per page across all list endpoints. */
+export const MAX_PAGE_SIZE = 100;
+
+/** Default page size when the caller does not specify a limit. */
+export const DEFAULT_PAGE_SIZE = 50;
+
+/** Maximum batch size for bulk operations (inserts, updates, deletes). */
+export const MAX_BATCH_SIZE = 100;
+
+/**
+ * Clamp a caller-supplied limit to the allowed pagination range [1, MAX_PAGE_SIZE].
+ * Values <= 0 default to DEFAULT_PAGE_SIZE. Values > MAX_PAGE_SIZE are capped.
+ */
+export function clampPageLimit(requested: number): number {
+  if (requested <= 0) return DEFAULT_PAGE_SIZE;
+  return Math.min(requested, MAX_PAGE_SIZE);
+}
+
+/**
+ * Clamp a caller-supplied batch size to the allowed range [1, MAX_BATCH_SIZE].
+ * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 — callers must
+ * validate before proceeding with a bulk operation.
+ */
+export function clampBatchSize(requested: number): number {
+  if (requested <= 0 || requested > MAX_BATCH_SIZE) return 0;
+  return requested;
+}
+
 // Sessions table - stores auth sessions with sliding and absolute expiry
 export const sessions = pgTable(
   "sessions",
@@ -398,3 +431,4 @@ export const sessions = pgTable(
     familyIdIdx: index("sessions_family_id_idx").on(table.familyId),
   }),
 );
+

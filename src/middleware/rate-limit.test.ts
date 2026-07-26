@@ -1,8 +1,46 @@
 import express from "express";
 import request from "supertest";
 import { describe, it, expect, vi, afterEach } from "vitest";
+import type { Store, ClientRateLimitInfo } from "express-rate-limit";
 
 import { makeLimiter, keyByIp, retryAfterSeconds } from "./rate-limit";
+
+/**
+ * Minimal in-memory `Store` for asserting distributed wiring. Each instance
+ * wraps a *shared* backing `Map` passed into its constructor, so two
+ * independent `FakeSharedStore` instances (one per limiter/"replica") pool
+ * counts through that shared backend — mirroring how two RedisStore
+ * instances in separate processes pool counts through one Redis, without
+ * tripping express-rate-limit's "don't reuse a single store instance across
+ * limiters" validation (which is about sharing one *object*, not one
+ * *backend*).
+ */
+class FakeSharedStore implements Store {
+  constructor(private readonly backing: Map<string, number>) {}
+
+  async increment(key: string): Promise<ClientRateLimitInfo> {
+    const totalHits = (this.backing.get(key) ?? 0) + 1;
+    this.backing.set(key, totalHits);
+    return { totalHits, resetTime: undefined };
+  }
+
+  async decrement(key: string): Promise<void> {
+    this.backing.set(key, Math.max(0, (this.backing.get(key) ?? 0) - 1));
+  }
+
+  async resetKey(key: string): Promise<void> {
+    this.backing.delete(key);
+  }
+}
+
+/** A `Store` whose `increment` always rejects, simulating a backend outage. */
+class ThrowingStore implements Store {
+  async increment(): Promise<ClientRateLimitInfo> {
+    throw new Error("simulated store outage");
+  }
+  async decrement(): Promise<void> {}
+  async resetKey(): Promise<void> {}
+}
 
 /**
  * Build a minimal app that mounts the given limiter on `/api` and exposes a
@@ -181,6 +219,37 @@ describe("keyByIp", () => {
     expect(keyByIp({ ip: "203.0.113.7" } as express.Request)).toBe("203.0.113.7");
   });
 
+  it("passes keyByIp itself as express-rate-limit's keyGenerator, not a re-implementation", async () => {
+    // Regression guard for the historical bug: makeLimiter used to
+    // re-implement the "unknown" fallback/warn logic inline instead of
+    // reusing keyByIp, so the two could silently drift apart. Intercepting
+    // the express-rate-limit call and asserting reference identity proves a
+    // single implementation is now in play.
+    vi.resetModules();
+    let capturedOptions: { keyGenerator?: unknown } | undefined;
+    vi.doMock("express-rate-limit", async () => {
+      const actual = await vi.importActual<typeof import("express-rate-limit")>(
+        "express-rate-limit",
+      );
+      return {
+        ...actual,
+        default: (options: { keyGenerator?: unknown }) => {
+          capturedOptions = options;
+          return actual.default(options);
+        },
+      };
+    });
+
+    try {
+      const mod = await import("./rate-limit");
+      mod.makeLimiter({ name: "capture", windowMs: 1000, max: 5 });
+      expect(capturedOptions?.keyGenerator).toBe(mod.keyByIp);
+    } finally {
+      vi.doUnmock("express-rate-limit");
+      vi.resetModules();
+    }
+  });
+
   it("falls back to 'unknown' when the IP cannot be resolved", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const key = keyByIp({ ip: undefined } as unknown as express.Request);
@@ -209,6 +278,45 @@ describe("keyByIp", () => {
 
     // Client B (different forwarded IP) is unaffected.
     await request(app).get("/api/ping").set("X-Forwarded-For", "198.51.100.2").expect(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// store (distributed backend)
+// ---------------------------------------------------------------------------
+
+describe("makeLimiter store option", () => {
+  it("success path: pools counts across independently-built limiters sharing one backend, like replicas sharing Redis", async () => {
+    const backing = new Map<string, number>();
+    const appA = makeApp(
+      makeLimiter({ name: "replica-a", windowMs: 60_000, max: 2, store: new FakeSharedStore(backing) }),
+    );
+    const appB = makeApp(
+      makeLimiter({ name: "replica-b", windowMs: 60_000, max: 2, store: new FakeSharedStore(backing) }),
+    );
+
+    // Two separately-built limiters ("replicas"), each with its own store
+    // instance pointed at the same backing map, share the same counter for
+    // the same key — exactly like two replicas behind a load balancer, each
+    // with its own RedisStore instance, pooling through one Redis.
+    await request(appA).get("/api/ping").expect(200); // hit 1 (via replica-a)
+    await request(appB).get("/api/ping").expect(200); // hit 2 (via replica-b)
+    await request(appA).get("/api/ping").expect(429); // hit 3 exceeds shared max=2
+  });
+
+  it("failure/boundary path: fails open (200, not an error) when the store throws, per the documented distributed contract", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const app = makeApp(
+      makeLimiter({ name: "store-outage", windowMs: 60_000, max: 1, store: new ThrowingStore() }),
+    );
+
+    // Even though the store always throws, the request must be allowed
+    // through (fail open) rather than surfacing a 500 — this is the
+    // "passOnStoreError" contract documented for distributed deployments.
+    const res = await request(app).get("/api/ping");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(errorSpy).toHaveBeenCalled();
   });
 });
 

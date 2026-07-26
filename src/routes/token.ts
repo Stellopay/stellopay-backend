@@ -7,7 +7,7 @@ import { requireSession } from "../auth/session.js";
 import { env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
-const AddressParam = z.string().min(3);
+
 
 const WalletSession = z.object({
   wallet_address: z.string().min(3),
@@ -148,9 +148,17 @@ export const tokenRouter = Router();
 // Get ERC-20 metadata, backed by the configured in-memory TTL cache.
 tokenRouter.get("/token/:address/metadata", async (req, res, next) => {
   try {
-    const tokenAddress = AddressParam.parse(req.params.address);
+    const tokenAddress = normalizeStarknetAddress(req.params.address);
     res.json(await getTokenMetadata(tokenAddress));
-  } catch (e) {
+  } catch (e: any) {
+    if (e.message && e.message.startsWith("Starknet address")) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
+    if (e.message && e.message.includes("Contract not found")) {
+      res.status(404).json({ error: "Token not found" });
+      return;
+    }
     next(e);
   }
 });
@@ -158,9 +166,9 @@ tokenRouter.get("/token/:address/metadata", async (req, res, next) => {
 // Get current allowance
 tokenRouter.get("/token/:address/allowance/:owner/:spender", async (req, res, next) => {
   try {
-    const tokenAddress = AddressParam.parse(req.params.address);
-    const owner = AddressParam.parse(req.params.owner);
-    const spender = AddressParam.parse(req.params.spender);
+    const tokenAddress = normalizeStarknetAddress(req.params.address);
+    const owner = normalizeStarknetAddress(req.params.owner);
+    const spender = normalizeStarknetAddress(req.params.spender);
 
     const { Contract } = await import("starknet");
     const tokenContract = new Contract(ERC20_ABI, tokenAddress, provider);
@@ -173,7 +181,15 @@ tokenRouter.get("/token/:address/allowance/:owner/:spender", async (req, res, ne
       spender,
       allowance: toHexString(allowance),
     });
-  } catch (e) {
+  } catch (e: any) {
+    if (e.message && e.message.startsWith("Starknet address")) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
+    if (e.message && e.message.includes("Contract not found")) {
+      res.status(404).json({ error: "Token not found" });
+      return;
+    }
     next(e);
   }
 });
@@ -181,24 +197,29 @@ tokenRouter.get("/token/:address/allowance/:owner/:spender", async (req, res, ne
 // Prepare approve transaction
 tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
   try {
-    const tokenAddress = AddressParam.parse(req.params.address);
+    const tokenAddress = normalizeStarknetAddress(req.params.address);
     const body = ApproveBody.parse(req.body);
 
     if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
+    const spender = normalizeStarknetAddress(body.spender);
 
     const tokenContract = new (await import("starknet")).Contract(
       ERC20_ABI,
       tokenAddress,
       provider,
     );
-    const call = tokenContract.populate("approve", [body.spender, parseU256(body.amount)]);
+    const call = tokenContract.populate("approve", [spender, parseU256(body.amount)]);
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
     res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
-  } catch (e) {
+  } catch (e: any) {
+    if (e.message && e.message.startsWith("Starknet address")) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
     next(e);
   }
 });

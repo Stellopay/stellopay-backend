@@ -146,11 +146,16 @@ const globalLimiter = makeLimiter({
 
 ### Fail-open on store errors
 
-`express-rate-limit` fails **open** when the backing store throws — the
-request is allowed through rather than rejected. This is the right trade-off
-for availability (a Redis outage should not take down the API), but it means
-distributed enforcement silently degrades to no enforcement while the store is
-unavailable. Monitor your store health independently and alert on the
+`makeLimiter` sets `passOnStoreError: true` explicitly, so when the backing
+store throws (e.g. a Redis outage) the request is allowed through rather than
+rejected. Without this, `express-rate-limit`'s own default
+(`passOnStoreError: false`) propagates the error to Express's error handling
+and fails **closed** — the opposite of the intended trade-off. Failing open is
+the right choice for availability (a Redis outage should not take down the
+API), but it means distributed enforcement silently degrades to no
+enforcement while the store is unavailable. The error is logged via
+`express-rate-limit`'s default logger (`console.error`). Monitor your store
+health independently and alert on store errors or on the
 `[rate-limit] limit reached` log line going silent during high traffic.
 
 ---
@@ -175,3 +180,7 @@ Configured in `src/index.ts` from environment variables:
   vars. Runtime reconfiguration (e.g. via feature flags) is not implemented.
 - **Request cost weights** — all requests count as 1. Weighted counting
   (e.g. expensive queries count as 5) is not implemented.
+- **Store-level retries/backoff** — `passOnStoreError: true` fails open on the
+  *first* store error rather than retrying the operation. Adding retry logic
+  belongs in the `Store` implementation (e.g. `rate-limit-redis`'s own client
+  options), not in `makeLimiter`.

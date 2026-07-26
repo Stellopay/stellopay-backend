@@ -8,8 +8,12 @@ import {
   revokeSession,
   rotateSession,
   revokeAllSessionsForAddress,
+  getSessionByHash,
+  revokeSessionByHash,
 } from "../auth/session.js";
 import { requireAuth } from "../auth/middleware.js";
+import { env } from "../config.js";
+import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
 const AddressBody = z.object({ address: z.string().min(3) });
 const VerifyBody = z.object({
@@ -25,6 +29,10 @@ const SessionBody = z.object({
 const RefreshBody = z.object({
   address: z.string().min(3),
   refresh_token: z.string().min(10),
+});
+
+const RevokeSessionBody = z.object({
+  token_hash: z.string().length(64),
 });
 
 export const authRouter = Router();
@@ -44,7 +52,13 @@ authRouter.use((req, _res, next) => {
   next();
 });
 
-// Step 1: backend issues a nonce for wallet ownership proof
+// Step 1: backend issues a nonce for wallet ownership proof.
+//
+// IDEMPOTENCY: this endpoint is idempotent on retry within the active TTL window
+// because `createChallenge` in src/auth/challenge.ts returns the existing nonce
+// (and emits a `challenge_replayed` metric) rather than overwriting it. A retry
+// therefore CANNOT invalidate an in-flight verify attempt for the same address.
+// See docs/routes/auth.md for the per-endpoint idempotency contract.
 authRouter.post("/auth/challenge", async (req, res, next) => {
   try {
     const { address } = AddressBody.parse(req.body);
@@ -77,7 +91,8 @@ authRouter.post("/auth/verify", async (req, res, next) => {
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
     if (!ok) {
-      res.status(401).json({ error: "Invalid signature" });
+      recordFailure(address);
+      res.status(401).json({ error: "Invalid signature or account locked" });
       return;
     }
 
@@ -158,6 +173,10 @@ authRouter.post("/auth/refresh", async (req, res, next) => {
       ok: true,
       address,
       refresh_token: result.token,
+      // The rotated token is likewise dual-role: it is both the next
+      // refresh_token and a valid bearer session_token for protected
+      // routes / /auth/session/validate. See docs/routes/auth.md.
+      session_token: result.token,
       expires_in_ms: result.expires_in_ms,
     });
   } catch (e) {
@@ -174,6 +193,37 @@ authRouter.post("/auth/revoke", requireAuth, async (req, res, next) => {
       return;
     }
     await revokeAllSessionsForAddress(address);
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Step 6: revoke a specific active session. Caller must be the session owner or an admin.
+authRouter.post("/auth/session/revoke", requireAuth, async (req, res, next) => {
+  try {
+    const { token_hash } = RevokeSessionBody.parse(req.body);
+    const callerAddress = req.auth?.address;
+    if (!callerAddress) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const session = await getSessionByHash(token_hash);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    const isOwner = session.address.toLowerCase() === callerAddress.toLowerCase();
+    const isAdmin = env.ADMIN_ADDRESSES.map((a) => a.toLowerCase()).includes(callerAddress.toLowerCase());
+
+    if (!isOwner && !isAdmin) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    await revokeSessionByHash(token_hash);
     res.json({ ok: true });
   } catch (e) {
     next(e);

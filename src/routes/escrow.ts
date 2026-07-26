@@ -109,6 +109,9 @@ escrowRouter.get("/escrow/:address/get_agreement_balance/:agreement_id", async (
             balance -= BigInt(event.amount);
           }
         }
+        if (balance < 0n) {
+          balance = 0n;
+        }
         return res.json({
           agreement_id: agreement_id.toString(),
           balance: balance.toString(),

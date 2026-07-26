@@ -109,11 +109,15 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  *
  * ## Store errors / fail-open behaviour
  *
- * `express-rate-limit` fails **open** when the backing store throws — the
- * request is allowed through rather than rejected. This is the correct
- * trade-off for availability (a Redis outage should not bring down the API),
- * but it means distributed enforcement silently degrades to no enforcement.
- * The `store` error is logged at `warn` level so the operator can alert on it.
+ * `passOnStoreError: true` is set explicitly below so that when the backing
+ * store throws (e.g. a Redis outage), the request is allowed through rather
+ * than rejected — `express-rate-limit`'s own default is `passOnStoreError:
+ * false`, which instead propagates the error to Express's error handling and
+ * fails **closed**. Failing open is the correct trade-off for availability (a
+ * Redis outage should not bring down the API), but it means distributed
+ * enforcement silently degrades to no enforcement. The store error is logged
+ * via `express-rate-limit`'s default logger (`console.error`) so the operator
+ * can alert on it.
  *
  * ## Store limitation (in-memory default)
  *
@@ -161,28 +165,21 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
     // count/remaining headers whose semantics vary across stores and versions.
     standardHeaders: false,
     legacyHeaders: false,
-    // Use ipKeyGenerator (the library's own normalising key generator) so that
-    // IPv6 addresses are handled correctly (e.g. ::ffff: prefixes stripped).
-    // We compose it with the "unknown" fallback: when req.ip is absent we emit
-    // a warn and return "unknown" before ipKeyGenerator is reached.
-    keyGenerator: (req: Request) => {
-      if (!req.ip) {
-        console.warn(
-          "[rate-limit] req.ip is undefined — all unresolved clients share the 'unknown' bucket. " +
-            "Check your TRUST_PROXY setting.",
-        );
-        return "unknown";
-      }
-      return ipKeyGenerator(req.ip);
-    },
+    // Delegate to keyByIp instead of re-implementing the same fallback/warn
+    // logic inline. Keeping a single implementation means the "unknown"
+    // fallback and its warning can't silently drift out of sync between the
+    // exported helper and what limiters actually enforce at runtime.
+    keyGenerator: keyByIp,
     ...(skip ? { skip } : {}),
     // ---- Shared-store seam --------------------------------------------------
     // Pass a `store` option to share counts across replicas:
     //   import { RedisStore } from "rate-limit-redis";
     //   store: new RedisStore({ sendCommand: (...a) => redisClient.sendCommand(a) })
-    // When the store throws, express-rate-limit fails open (allows the
-    // request) and logs the error via the handler below.
+    // When the store throws, fail open (allow the request) instead of the
+    // library's default of propagating the error. See "Store errors /
+    // fail-open behaviour" above.
     ...(store ? { store } : {}),
+    passOnStoreError: true,
     // -------------------------------------------------------------------------
     handler: (_req: Request, res: Response) => {
       console.warn(`[rate-limit] limit reached for limiter="${name}"`);

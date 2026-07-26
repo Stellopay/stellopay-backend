@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "scripts/**/*.test.ts"],
     globals: false,
     // config.ts requires STARKNET_RPC_URL at import time. Provide a dummy value so
     // any test file that imports config (directly or transitively) loads cleanly;
@@ -26,8 +26,11 @@ export default defineConfig({
         "src/db/migrate.ts",
         "src/middleware/rate-limit.ts",
         "src/routes/token.ts",
+        "src/routes/not-found.ts",
         "src/utils/token-formatting.ts",
+        "src/utils/validation.ts",
         "src/shutdown.ts",
+        "scripts/check-env-sync.ts",
       ],
       thresholds: {
         lines: 95,

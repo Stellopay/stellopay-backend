@@ -5,7 +5,7 @@ import { parseStarknetRpcUrls } from "./starknet/rpc-urls.js";
 
 dotenv.config();
 
-const EnvSchema = z.object({
+export const EnvSchema = z.object({
   NODE_ENV: z.string().optional().default("development"),
   PORT: z.coerce.number().int().positive().optional().default(4000),
   CORS_ORIGIN: z.string().optional().default("*"),
