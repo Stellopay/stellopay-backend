@@ -17,6 +17,22 @@ function rpcFailoverOrder(): number[] {
   return order;
 }
 
+/**
+ * Invokes a method on the first healthy RPC provider in failover order.
+ *
+ * **Idempotency contract**: `invokeWithFailover` retries the call on a
+ * different provider only when the current one returns an error before a
+ * successful response is received.  If a call succeeds on provider N, the
+ * result is returned immediately and no duplicate call is made to any other
+ * provider.  Callers that perform state mutations (e.g. `addInvokeTransaction`)
+ * must handle the case where the primary succeeded but the response was lost in
+ * transit — in that scenario a retry reaches a different provider which may
+ * treat the call as a duplicate; the Starknet protocol's own nonce enforcement
+ * prevents double-execution at the chain level.
+ *
+ * Read-only calls (`getChainId`, `getSpecVersion`, `getTransactionReceipt`,
+ * `estimateFee`, etc.) are always safe to retry without side effects.
+ */
 async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
@@ -47,6 +63,16 @@ async function invokeWithFailover(
 /**
  * Starknet RPC client with automatic failover across configured endpoints.
  * Subsequent calls reuse the last healthy endpoint until it fails again.
+ *
+ * **Idempotency of read calls**: all methods that only read chain state
+ * (`getChainId`, `getSpecVersion`, `getTransactionReceipt`, `estimateFee`, etc.)
+ * are safe to call multiple times — the provider proxy routes them through
+ * `invokeWithFailover` which retries on failure without duplicating effects.
+ *
+ * **Fee quotes**: `estimateFee` calls are read-only and idempotent.  The
+ * in-flight dedup map below (`pendingNetworkInfo`) ensures that concurrent
+ * calls for the same cached data share a single in-flight RPC request rather
+ * than fanning out N identical calls during a cache miss.
  */
 export const provider = new Proxy(rpcProviders[0]!, {
   get(_target, prop, _receiver) {
@@ -149,8 +175,26 @@ let cachedSpecVersion: string | undefined;
 let cacheExpiryTime = 0;
 
 /**
+ * In-flight deduplication for getCachedNetworkInfo.
+ *
+ * When multiple concurrent callers hit a cache miss at the same instant,
+ * only a single RPC request is issued; all callers await the same Promise.
+ * This prevents N×2 simultaneous `getChainId` + `getSpecVersion` fan-out
+ * calls during a cold start or TTL expiry under load — a form of duplicate
+ * request protection that keeps fee-quote and chain-interaction paths
+ * idempotent at the RPC level.
+ */
+let pendingNetworkInfo: Promise<{ chainId: string; specVersion: string }> | undefined;
+
+/**
  * Gets the chain ID and spec version from the Starknet RPC,
  * caching the result in memory for the specified TTL.
+ *
+ * **Idempotency**: repeated calls within the TTL window return the cached
+ * value without issuing any RPC call. Concurrent calls during a cache miss
+ * share a single in-flight request (see `pendingNetworkInfo`). The cache is
+ * not poisoned on failure: a rejected call leaves the cache empty so the
+ * next caller retries cleanly.
  *
  * @param ttlMs - Time-to-live in milliseconds (default: 5 minutes)
  * @returns An object containing the stringified chainId and specVersion
@@ -163,18 +207,32 @@ export async function getCachedNetworkInfo(
     return { chainId: cachedChainId, specVersion: cachedSpecVersion };
   }
 
-  const [rawChainId, rawSpecVersion] = await Promise.all([
-    provider.getChainId(),
-    provider.getSpecVersion(),
-  ]);
+  // Deduplicate concurrent cache-miss fetches so only one RPC round-trip goes
+  // out regardless of how many callers hit the miss simultaneously.
+  if (!pendingNetworkInfo) {
+    pendingNetworkInfo = (async () => {
+      try {
+        const [rawChainId, rawSpecVersion] = await Promise.all([
+          provider.getChainId(),
+          provider.getSpecVersion(),
+        ]);
 
-  const chainId = String(rawChainId);
-  const specVersion = String(rawSpecVersion);
-  cachedChainId = chainId;
-  cachedSpecVersion = specVersion;
-  cacheExpiryTime = now + ttlMs;
+        const chainId = String(rawChainId);
+        const specVersion = String(rawSpecVersion);
+        cachedChainId = chainId;
+        cachedSpecVersion = specVersion;
+        cacheExpiryTime = Date.now() + ttlMs;
 
-  return { chainId, specVersion };
+        return { chainId, specVersion };
+      } finally {
+        // Always clear the pending promise — whether the fetch succeeded or
+        // failed — so the next caller can issue a fresh request.
+        pendingNetworkInfo = undefined;
+      }
+    })();
+  }
+
+  return pendingNetworkInfo;
 }
 
 /**
@@ -184,6 +242,7 @@ export function clearNetworkCache(): void {
   cachedChainId = undefined;
   cachedSpecVersion = undefined;
   cacheExpiryTime = 0;
+  pendingNetworkInfo = undefined;
 }
 
 /**

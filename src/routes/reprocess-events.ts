@@ -21,6 +21,30 @@ const StatusChangesQuerySchema = z.object({
   toBlock: z.coerce.number().int().positive().optional(),
 });
 
+// ---------------------------------------------------------------------------
+// Structured telemetry helpers
+//
+// All log output is emitted via these helpers so the message shape is
+// consistent and machine-parseable. Fields:
+//   level     — "info" | "warn" | "error"
+//   module    — always "reprocess-events" for grep/log-aggregator queries
+//   op        — the logical operation (e.g. "tx_reprocess", "batch", "status_changes")
+//   txHash    — transaction hash being processed, when applicable
+//   eventId   — database row ID of the event being processed, when applicable
+//   outcome   — result label (e.g. "processed", "quarantine", "dedup_skipped", "error")
+//   reason    — short human-readable reason for non-success outcomes
+//   elapsed_ms — wall-clock milliseconds for the operation, when applicable
+// ---------------------------------------------------------------------------
+
+function logReprocess(
+  level: "info" | "warn" | "error",
+  op: string,
+  fields: Record<string, unknown>,
+): void {
+  // eslint-disable-next-line no-console
+  console[level](JSON.stringify({ level, module: "reprocess-events", op, ...fields }));
+}
+
 // Load contract ABIs
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
@@ -52,23 +76,45 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
  * Delegates to the shared `processTxReceipt` which uses `ON CONFLICT DO NOTHING`
  * keyed on `transaction_hash + event_index` — re-runs are safe no-ops.
  *
+ * **Idempotency guarantee**: repeated calls with the same tx hash produce the
+ * same result and do not create duplicate rows (ON CONFLICT DO NOTHING).
+ *
  * **Validation**
  * - `:tx_hash` must be a valid Starknet transaction hash (0x-prefixed, 3–66 chars).
+ *
+ * **Telemetry**
+ * - Emits a structured `reprocess-events / tx_reprocess` log entry on every call.
+ * - On not-found, logs outcome=quarantine with reason=not_found.
+ * - On RPC/DB error, logs outcome=error with reason=error_message.
  */
 reprocessEventsRouter.post(
   "/reprocess-events/tx/:tx_hash",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    const start = Date.now();
     try {
       const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
 
       const result = await processTxReceipt(tx_hash);
 
       if (result.status === "not_found") {
+        logReprocess("warn", "tx_reprocess", {
+          txHash: tx_hash,
+          outcome: "quarantine",
+          reason: "not_found",
+          elapsed_ms: Date.now() - start,
+        });
         res.status(404).json({ error: "Transaction not found" });
         return;
       }
+
+      logReprocess("info", "tx_reprocess", {
+        txHash: result.txHash,
+        outcome: result.status,
+        eventsProcessed: result.eventsProcessed,
+        elapsed_ms: Date.now() - start,
+      });
 
       res.json({
         message: "Events reprocessed",
@@ -80,9 +126,19 @@ reprocessEventsRouter.post(
         return;
       }
       if (e.message === "Transaction not found") {
+        logReprocess("warn", "tx_reprocess", {
+          outcome: "quarantine",
+          reason: "not_found",
+          elapsed_ms: Date.now() - start,
+        });
         res.status(404).json({ error: "Transaction not found" });
         return;
       }
+      logReprocess("error", "tx_reprocess", {
+        outcome: "error",
+        reason: e?.message ?? String(e),
+        elapsed_ms: Date.now() - start,
+      });
       next(e);
     }
   },
@@ -96,6 +152,9 @@ reprocessEventsRouter.post(
  * operation is fully idempotent — re-submitting the same batch produces
  * no duplicate rows.
  *
+ * **Idempotency guarantee**: each tx is processed with ON CONFLICT DO NOTHING;
+ * resubmitting the same batch is a safe no-op for already-processed hashes.
+ *
  * **Validation**
  * - `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
  * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request.
@@ -103,12 +162,18 @@ reprocessEventsRouter.post(
  * **Response**
  * Returns a `results` array where each entry corresponds to one tx hash.
  * A per-tx error never aborts the rest of the batch.
+ *
+ * **Telemetry**
+ * - Emits one structured `batch` log entry per transaction attempt with
+ *   outcome=processed|no_events|not_found|error.
+ * - Emits a summary log at INFO level after all txs are processed.
  */
 reprocessEventsRouter.post(
   "/reprocess-events/batch",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    const batchStart = Date.now();
     try {
       const { tx_hashes } = z
         .object({
@@ -125,33 +190,50 @@ reprocessEventsRouter.post(
       const results = [];
 
       for (const txHash of tx_hashes) {
+        const txStart = Date.now();
         try {
           const result = await processTxReceipt(txHash);
+          logReprocess("info", "batch", {
+            txHash: result.txHash,
+            outcome: result.status,
+            eventsProcessed: result.eventsProcessed,
+            elapsed_ms: Date.now() - txStart,
+          });
           results.push(result);
         } catch (e: any) {
+          const reason = e?.message ?? String(e);
+          logReprocess("error", "batch", {
+            txHash,
+            outcome: "error",
+            reason,
+            elapsed_ms: Date.now() - txStart,
+          });
           results.push({
             txHash,
             status: "error",
             eventsProcessed: 0,
             eventLabels: [],
-            error: e?.message ?? String(e),
+            error: reason,
           });
         }
       }
 
       const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
+      const summary = {
+        total: results.length,
+        processed: results.filter((r) => r.status === "processed").length,
+        noEvents: results.filter((r) => r.status === "no_events").length,
+        notFound: results.filter((r) => r.status === "not_found").length,
+        errors: results.filter((r) => r.status === "error").length,
+        totalEventsProcessed: totalProcessed,
+      };
 
-      res.json({
-        summary: {
-          total: results.length,
-          processed: results.filter((r) => r.status === "processed").length,
-          noEvents: results.filter((r) => r.status === "no_events").length,
-          notFound: results.filter((r) => r.status === "not_found").length,
-          errors: results.filter((r) => r.status === "error").length,
-          totalEventsProcessed: totalProcessed,
-        },
-        results,
+      logReprocess("info", "batch_summary", {
+        ...summary,
+        elapsed_ms: Date.now() - batchStart,
       });
+
+      res.json({ summary, results });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.errors[0]?.message || "Invalid request body" });
@@ -171,15 +253,28 @@ reprocessEventsRouter.post(
  * set keyed on `transaction_hash + event_index` prevents processing the same
  * event twice within a single request.
  *
+ * **Idempotency guarantee**: the query filter selects only unresolved
+ * `AgreementStatusChange` events, so already-decoded events are automatically
+ * skipped on repeat invocations — the operation is fully safe to retry.
+ *
  * **Validation**
  * - `limit` (query, optional, default 100, max {@link MAX_STATUS_LIMIT})
  * - `fromBlock` / `toBlock` (query, optional) — filter by block number range.
+ *
+ * **Telemetry** (structured JSON via logReprocess)
+ * - Per-event log entry with outcome=updated|no_change|dedup_skipped|
+ *   no_receipt|event_not_found|error.
+ * - Summary log at INFO level after all events are processed, including
+ *   updated count and total elapsed time.
+ * - Quarantine path (events that could not be decoded and remain as
+ *   AgreementStatusChange) are logged at WARN with outcome=no_change.
  */
 reprocessEventsRouter.post(
   "/reprocess-events/status-changes",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    const batchStart = Date.now();
     try {
       const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
 
@@ -209,6 +304,13 @@ reprocessEventsRouter.post(
         .where(and(...conditions))
         .limit(limit);
 
+      logReprocess("info", "status_changes_start", {
+        limit,
+        fromBlock,
+        toBlock,
+        candidateCount: statusChangeEvents.length,
+      });
+
       const results = [];
       let updated = 0;
       // In-memory dedup keyed on transaction_hash + event_index to prevent
@@ -216,9 +318,16 @@ reprocessEventsRouter.post(
       const processedKeys = new Set<string>();
 
       for (const event of statusChangeEvents) {
+        const evtStart = Date.now();
         // Dedup on transaction_hash + event_index — skip if already seen in this request
         const dedupKey = `${event.transactionHash}_${event.eventIndex}`;
         if (processedKeys.has(dedupKey)) {
+          logReprocess("info", "status_changes", {
+            eventId: event.id,
+            outcome: "dedup_skipped",
+            dedupKey,
+            elapsed_ms: Date.now() - evtStart,
+          });
           results.push({ eventId: event.id, status: "dedup_skipped" });
           continue;
         }
@@ -228,6 +337,13 @@ reprocessEventsRouter.post(
           // Get transaction receipt to decode event
           const receipt = await provider.getTransactionReceipt(event.transactionHash);
           if (!receipt || !("events" in receipt && receipt.events)) {
+            logReprocess("warn", "status_changes", {
+              eventId: event.id,
+              outcome: "quarantine",
+              reason: "no_receipt",
+              txHash: event.transactionHash,
+              elapsed_ms: Date.now() - evtStart,
+            });
             results.push({ eventId: event.id, status: "no_receipt" });
             continue;
           }
@@ -235,6 +351,14 @@ reprocessEventsRouter.post(
           // Find the event in the receipt
           const receiptEvent = receipt.events[event.eventIndex];
           if (!receiptEvent) {
+            logReprocess("warn", "status_changes", {
+              eventId: event.id,
+              outcome: "quarantine",
+              reason: "event_not_found",
+              txHash: event.transactionHash,
+              eventIndex: event.eventIndex,
+              elapsed_ms: Date.now() - evtStart,
+            });
             results.push({ eventId: event.id, status: "event_not_found" });
             continue;
           }
@@ -294,9 +418,12 @@ reprocessEventsRouter.post(
               }
             }
           } catch (parseError) {
-            console.log(
-              `[reprocess] Could not parse event ${event.id}, keeping AgreementStatusChange`,
-            );
+            logReprocess("warn", "status_changes", {
+              eventId: event.id,
+              outcome: "parse_error_swallowed",
+              reason: String(parseError),
+              elapsed_ms: Date.now() - evtStart,
+            });
           }
 
           // Update the event type in the database
@@ -307,6 +434,13 @@ reprocessEventsRouter.post(
               .where(eq(schema.agreementEvents.id, event.id));
 
             updated++;
+            logReprocess("info", "status_changes", {
+              eventId: event.id,
+              outcome: "updated",
+              oldType: "AgreementStatusChange",
+              newType: eventType,
+              elapsed_ms: Date.now() - evtStart,
+            });
             results.push({
               eventId: event.id,
               status: "updated",
@@ -314,12 +448,35 @@ reprocessEventsRouter.post(
               newType: eventType,
             });
           } else {
+            logReprocess("warn", "status_changes", {
+              eventId: event.id,
+              outcome: "no_change",
+              reason: "could_not_decode",
+              elapsed_ms: Date.now() - evtStart,
+            });
             results.push({ eventId: event.id, status: "no_change", eventType });
           }
         } catch (e) {
+          logReprocess("error", "status_changes", {
+            eventId: event.id,
+            outcome: "error",
+            reason: String(e),
+            elapsed_ms: Date.now() - evtStart,
+          });
           results.push({ eventId: event.id, status: "error", error: String(e) });
         }
       }
+
+      logReprocess("info", "status_changes_summary", {
+        totalCandidates: statusChangeEvents.length,
+        updated,
+        noChange: results.filter((r) => r.status === "no_change").length,
+        quarantined: results.filter((r) =>
+          ["no_receipt", "event_not_found"].includes(r.status),
+        ).length,
+        errors: results.filter((r) => r.status === "error").length,
+        elapsed_ms: Date.now() - batchStart,
+      });
 
       res.json({
         message: `Reprocessed ${results.length} events, updated ${updated}`,
