@@ -121,6 +121,26 @@ export const EnvSchema = z.object({
         .map((a) => a.trim().toLowerCase())
         .filter((a) => a.length > 0),
     ),
+
+  // Read-path reliability: bounded retry for Starknet RPC reads.
+  // Mirrors the auth-subsystem policy in src/auth/session-retry.ts but is
+  // scoped to read.ts so write paths are unaffected.
+  READ_RETRY_ENABLED: z
+    .string()
+    .optional()
+    .default("true")
+    .transform((v) => v === "true"),
+  // Max attempts per individual RPC read (1 = no retries, original behaviour).
+  READ_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().optional().default(3),
+  // Base delay for exponential backoff between attempts (milliseconds).
+  READ_RETRY_BASE_DELAY_MS: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .default(50),
+  // Hard cap on the per-attempt backoff (milliseconds).
+  READ_RETRY_MAX_DELAY_MS: z.coerce.number().int().positive().optional().default(500),
 });
 
 export const env = EnvSchema.parse(process.env);
