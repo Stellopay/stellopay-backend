@@ -3,8 +3,14 @@ import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
 import { notFoundResponse } from "./not-found.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
+import { env, defaults } from "../config.js";
+import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 
 export const indexedRouter = Router();
+
+/** Shared cache options driven by the env – applied to every indexed read. */
+const cacheOpts = { maxAgeSeconds: env.INDEXED_CACHE_MAX_AGE_SECONDS };
 
 // Get all agreements for a user (employer or contributor/employee)
 indexedRouter.get(
@@ -65,11 +71,14 @@ indexedRouter.get(
         new Map(allAgreements.map((a) => [a.id, a])).values(),
       ).slice(0, limit);
 
-      res.json({
+      const body = {
         agreements: uniqueAgreements,
         count: uniqueAgreements.length,
         source: "indexed",
-      });
+      };
+
+      applyIndexedCacheHeaders(res, body, cacheOpts);
+      res.json(body);
     } catch (e) {
       next(e);
     }
@@ -140,14 +149,17 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
         .orderBy(desc(schema.escrowEvents.blockNumber)),
     ]);
 
-    res.json({
+    const body = {
       agreement: agreement[0],
       events,
       payments,
       milestones,
       employees,
       escrowEvents,
-    });
+    };
+
+    applyIndexedCacheHeaders(res, body, cacheOpts);
+    res.json(body);
   } catch (e) {
     next(e);
   }
@@ -167,7 +179,10 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
       .limit(limit)
       .offset(offset);
 
-    res.json({ payments, count: payments.length });
+    const body = { payments, count: payments.length };
+
+    applyIndexedCacheHeaders(res, body, cacheOpts);
+    res.json(body);
   } catch (e) {
     next(e);
   }
@@ -206,11 +221,14 @@ indexedRouter.get(
         }
       }
 
-      res.json({
+      const body = {
         agreement_id: agreementId,
         balance: balance.toString(),
         events: escrowEvents,
-      });
+      };
+
+      applyIndexedCacheHeaders(res, body, cacheOpts);
+      res.json(body);
     } catch (e) {
       next(e);
     }

@@ -83,6 +83,11 @@ export const EnvSchema = z.object({
   // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
   TRUST_PROXY: z.string().optional().default("1"),
 
+  // Indexed query cache max-age in seconds.
+  // Controls Cache-Control: public, max-age=<N> on indexed read responses.
+  // A Starknet block is produced roughly every 6–12 s; 12 s is a safe default.
+  INDEXED_CACHE_MAX_AGE_SECONDS: z.coerce.number().int().positive().optional().default(12),
+
   // Session token lifetime in milliseconds (sliding expiry) - default 24 hours
   SESSION_TTL_MS: z.coerce
     .number()
