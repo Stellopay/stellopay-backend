@@ -708,6 +708,8 @@ describe("sessions", () => {
     await revokeSessionByHash(tokenHash);
     const session = await getSessionByHash(tokenHash);
     expect(session!.revokedAt).toBeInstanceOf(Date);
+  });
+
   // ---------------------------------------------------------------------------
   // Input validation: hardened boundary and malformed-input paths (#307)
   // ---------------------------------------------------------------------------
@@ -824,6 +826,8 @@ describe("sessions", () => {
     const { token } = await createSession("0xTrimMe");
     // Padded address supplied by the caller — should still match
     expect(await requireSession("  0xTrimMe  ", token)).toBe(true);
+  });
+
   // Reliability: bounded retry + idempotent re-revoke detection (issue #125)
   //
   // These tests use `vi.useRealTimers()` inside the test body because the
@@ -1101,6 +1105,145 @@ describe("sessions", () => {
  
     } finally {
       dbMock.select = originalSelect;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Idempotency for revokeSessionByHash (issue #129)
+  // ---------------------------------------------------------------------------
+
+  it("revokeSessionByHash is idempotent: repeat call does not double-bump REVOKED", async () => {
+    const { token } = await createSession("0xIdemHash");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+    await revokeSessionByHash(tokenHash);
+    const before = getSessionMetricsSnapshot().counters;
+    expect(before[SESSION_METRICS.REVOKED]).toBe(1);
+    expect(before[SESSION_METRICS.REVOKED_ALREADY] ?? 0).toBe(0);
+
+    await revokeSessionByHash(tokenHash); // repeat
+    const after = getSessionMetricsSnapshot().counters;
+    expect(after[SESSION_METRICS.REVOKED]).toBe(1); // unchanged
+    expect(after[SESSION_METRICS.REVOKED_ALREADY]).toBe(1);
+  });
+
+  it("revokeSessionByHash is a no-op for an empty hash", async () => {
+    await revokeSessionByHash("");
+    expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKED] ?? 0).toBe(0);
+  });
+
+  it("revokeSessionByHash emits session.revoke_already on repeat call", async () => {
+    const { token } = await createSession("0xIdemHashLog");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    await revokeSessionByHash(tokenHash);
+    consoleInfoSpy.mockClear();
+    await revokeSessionByHash(tokenHash);
+    const already = consoleInfoSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("session.revoke_already"),
+    );
+    expect(already).toBeDefined();
+    expect(already![0]).toContain("kind=single");
+  });
+
+  it("revokeSessionByHash retries on a transient DB error and ultimately succeeds", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xHashRetry");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          if (attempts === 1) throw new Error("synthetic hash retry");
+          await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
+        },
+      }),
+    });
+    try {
+      await revokeSessionByHash(tokenHash);
+      expect(attempts).toBe(2);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKE_RETRY]).toBe(1);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKED]).toBe(1);
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  it("revokeSessionByHash rethrows after retry exhaustion", async () => {
+    vi.useRealTimers();
+    const { token } = await createSession("0xHashExhaust");
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          throw new Error("synthetic permanent hash failure");
+        },
+      }),
+    });
+    try {
+      await expect(revokeSessionByHash(tokenHash)).rejects.toThrow(
+        "synthetic permanent hash failure",
+      );
+      expect(attempts).toBe(3);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKE_FAILED]).toBe(1);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKED] ?? 0).toBe(0);
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Idempotency for revokeAllSessionsForAddress (issue #129)
+  // ---------------------------------------------------------------------------
+
+  it("revokeAllSessionsForAddress retries on a transient DB error and bumps REVOKE_RETRY", async () => {
+    vi.useRealTimers();
+    await createSession("0xAddrRetry");
+    const originalUpdate = dbMock.update;
+    let attempts = 0;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          attempts++;
+          if (attempts === 1) throw new Error("synthetic addr retry");
+          await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
+        },
+      }),
+    });
+    try {
+      await revokeAllSessionsForAddress("0xAddrRetry");
+      expect(attempts).toBe(2);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.REVOKE_RETRY]).toBe(1);
+      expect(getSessionMetricsSnapshot().counters[SESSION_METRICS.ALL_REVOKED]).toBe(1);
+    } finally {
+      dbMock.update = originalUpdate;
+    }
+  });
+
+  it("revokeAllSessionsForAddress rethrows after retry exhaustion", async () => {
+    vi.useRealTimers();
+    await createSession("0xAddrExhaust");
+    const originalUpdate = dbMock.update;
+    dbMock.update = (table: any) => ({
+      set: (_data: any) => ({
+        where: async (_cond: any) => {
+          throw new Error("synthetic permanent addr failure");
+        },
+      }),
+    });
+    try {
+      await expect(revokeAllSessionsForAddress("0xAddrExhaust")).rejects.toThrow(
+        "synthetic permanent addr failure",
+      );
+      const counters = getSessionMetricsSnapshot().counters;
+      expect(counters[SESSION_METRICS.REVOKE_FAILED]).toBe(1);
+      expect(counters[SESSION_METRICS.ALL_REVOKED] ?? 0).toBe(0);
+    } finally {
+      dbMock.update = originalUpdate;
     }
   });
 });

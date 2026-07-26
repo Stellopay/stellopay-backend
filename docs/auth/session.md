@@ -368,6 +368,7 @@ Wrapped in `withBoundedRetry` (3 attempts, 50ms backoff, see
 | `revokeSession` (UPDATE)                        | `SET revokedAt = now()` applied to the same row twice produces the same final state. |
 | `revokeFamily` (UPDATE)                         | Same as above; per-family write is idempotent.                             |
 | `revokeAllSessionsForAddress` (UPDATE)          | Same as above; per-address write is idempotent.                            |
+| `revokeSessionByHash` (UPDATE)                  | Same as above; per-token-hash write is idempotent.                         |
 | `sweepExpiredSessions` (DELETE)                 | Predicate is on `expiresAt` / `revokedAt`; the second attempt simply deletes fewer rows. |
 
 Deliberately **NOT** wrapped (throws on first DB error):
@@ -395,6 +396,7 @@ so, an **additional** `session.revoke_already` info log is emitted and an
 | `revokeSession`                  | `session_revoke_already_total`                  |
 | `revokeFamily`                   | `session_family_revoke_already_total`           |
 | `revokeAllSessionsForAddress`    | `session_all_revoke_already_total`              |
+| `revokeSessionByHash`            | `session_revoke_already_total`                  |
 
 The pre-existing `session_revoked_total` / `session_family_revoked_total`
 / `session_all_revoked_total` counters are **NOT** double-bumped on a
@@ -408,10 +410,10 @@ many were idempotent re-plays".
 
 | Event name               | Level | Bumped counter                    | Emitted by                                  |
 | ------------------------ | ----- | --------------------------------- | ------------------------------------------- |
-| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all`) |
-| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` |
+| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all` / `single-hash`) |
+| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` / `revokeSessionByHash` |
 | `session.sweep_retry`    | warn  | `session_sweep_retry_total`       | `withBoundedRetry` between attempts in `sweepExpiredSessions` |
-| `session.revoke_already` | info  | `session_revoke_already_total` (family / all variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
+| `session.revoke_already` | info  | `session_revoke_already_total` (family / all / single-hash variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
 
 `session.revoke_failed` always rethrows the original error so the route
 handler can return a 5xx. The pre-existing `session.sweep_failed` path
@@ -446,3 +448,35 @@ withBoundedRetry<T>(
 It is small enough to be re-used by future session mutations (e.g. an
 upcoming "freeze session" / "rename family" feature) so the entire
 session module keeps one retry policy.
+
+## Dead code / bug fixes (issue #129)
+
+### `revokeAllSessionsForAddress`
+
+The original version had two bugs introduced during the issue #124 (retry)
+refactor:
+
+1. **Dead code behind a guard**: The early-return guard (`if (!isNonEmptyString(address))`)
+   appeared *after* the bare `UPDATE` and was never reachable at runtime because
+   `const normalizedAddress = normalizeSessionAddress(address);` would throw on
+   the next line if `address` was empty. Fixed by moving the guard to the top of
+   the function and making the `normalizeSessionAddress` call unconditional.
+
+2. **`normalizeSessionAddress` now also trims input**: Previously only called
+   `.toLowerCase()`. It now calls `.trim().toLowerCase()` so that `createSession`
+   behaves consistently with `requireSession` (which already trimmed its input).
+   This prevents a padded address like `"  0xAbC  "` from being stored with
+   leading/trailing spaces in the database.
+
+### `rotateSession`
+
+Lines 419--446 (in the original) contained a dead, non-transactional UPDATE
+path that was never reachable because an early `return` on line 408 always exited
+the function before reaching it. Removed.
+
+### `revokeSessionByHash`
+
+Added idempotency protection (consistent with `revokeSession` / `revokeFamily`):
+- Pre-checks `revokedAt` via a `SELECT` before the `UPDATE`.
+- Emits `session.revoke_already` (kind = `single-hash`) on a repeat call.
+- Uses `withBoundedRetry` for transient DB errors (3 attempts, 50 ms backoff).
