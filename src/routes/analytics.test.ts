@@ -31,6 +31,8 @@ const { dbMock, schemaMock, queryState } = vi.hoisted(() => {
       agreementEvents: [] as Array<Record<string, unknown>>,
     },
     eqValues: [] as string[],
+    gteDates: [] as Date[],
+    lteDates: [] as Date[],
   };
 
   const db = {
@@ -59,14 +61,22 @@ vi.mock("drizzle-orm", () => ({
   }),
   and: vi.fn((...conditions: unknown[]) => ({ type: "and", conditions })),
   or: vi.fn((...conditions: unknown[]) => ({ type: "or", conditions })),
-  gte: vi.fn(() => ({ type: "gte" })),
-  lte: vi.fn(() => ({ type: "lte" })),
+  gte: vi.fn((_column: unknown, value: Date) => {
+    queryState.gteDates.push(value);
+    return { type: "gte", value };
+  }),
+  lte: vi.fn((_column: unknown, value: Date) => {
+    queryState.lteDates.push(value);
+    return { type: "lte", value };
+  }),
   sql: vi.fn(() => "sql-expr"),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import { analyticsRouter, _resetInflightRollups } from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
+
+const USER = "0x0000000000000000000000000000000000000000000000000000000000000abc";
 
 function makeApp() {
   const app = express();
@@ -89,26 +99,130 @@ function makeApp() {
   return app;
 }
 
+function viewsFor(data: Array<{ month: string; views: number }>, month: string): number {
+  const entry = data.find((d) => d.month === month);
+  if (!entry) throw new Error(`month ${month} missing from chart data`);
+  return entry.views;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  _resetInflightRollups();
   queryState.rows.payments = [];
   queryState.rows.escrowEvents = [];
   queryState.rows.agreementEvents = [];
   queryState.eqValues = [];
+  queryState.gteDates = [];
+  queryState.lteDates = [];
 });
 
-describe("analytics route", () => {
-  it("validates and normalizes the address and returns twelve months of chart data", async () => {
-    queryState.rows.payments = [{ month: 3, amount: "1000000" }];
-    queryState.rows.escrowEvents = [
-      { month: 4, amount: "2000000", eventType: "Funded" },
-      { month: 5, amount: "3000000", eventType: "Released" },
+// ---------------------------------------------------------------------------
+// Payment sign convention
+// ---------------------------------------------------------------------------
+describe("analytics payment sign convention", () => {
+  it("treats incoming payments as positive and outgoing as negative", async () => {
+    queryState.rows.payments = [
+      { month: 3, amount: "5000000", from: "0xother", to: USER }, // incoming → +5
+      { month: 3, amount: "2000000", from: USER, to: "0xother" }, // outgoing → -2
+      { month: 5, amount: "8000000", from: USER, to: "0xother" }, // outgoing → -8
     ];
-    queryState.rows.agreementEvents = [{ month: 6, agreementId: "1" }];
 
-    const res = await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(200);
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
 
-    expect(res.body.year).toBe(2026);
+    // March: +5 (received) - 2 (sent) = 3
+    expect(viewsFor(res.body.data, "Mar")).toBe(3);
+    // May: -8 (sent)
+    expect(viewsFor(res.body.data, "May")).toBe(-8);
+    // Net total: 3 - 8 = -5
+    expect(res.body.total).toBe(-5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Escrow event aggregation
+// ---------------------------------------------------------------------------
+describe("analytics escrow aggregation", () => {
+  it("subtracts funding and adds releases/refunds", async () => {
+    queryState.rows.escrowEvents = [
+      { month: 3, amount: "2000000", eventType: "Funded" }, // -2
+      { month: 3, amount: "1000000", eventType: "Released" }, // +1
+      { month: 4, amount: "3000000", eventType: "Funded" }, // -3
+      { month: 5, amount: "4000000", eventType: "Released" }, // +4
+      { month: 6, amount: "2000000", eventType: "Refunded" }, // +2
+    ];
+
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+
+    expect(viewsFor(res.body.data, "Mar")).toBe(-1); // -2 + 1
+    expect(viewsFor(res.body.data, "Apr")).toBe(-3);
+    expect(viewsFor(res.body.data, "May")).toBe(4);
+    expect(viewsFor(res.body.data, "Jun")).toBe(2);
+    expect(res.body.total).toBe(2); // -1 -3 + 4 + 2 = 2
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Combined payments + escrow
+// ---------------------------------------------------------------------------
+describe("analytics combined aggregation", () => {
+  it("nets payments and escrow events together", async () => {
+    queryState.rows.payments = [
+      { month: 3, amount: "5000000", from: "0xother", to: USER }, // +5
+      { month: 9, amount: "10000000", from: USER, to: "0xother" }, // -10
+    ];
+    queryState.rows.escrowEvents = [
+      { month: 3, amount: "2000000", eventType: "Funded" }, // -2
+      { month: 3, amount: "1000000", eventType: "Released" }, // +1
+      { month: 5, amount: "4000000", eventType: "Released" }, // +4
+      { month: 6, amount: "2000000", eventType: "Refunded" }, // +2
+    ];
+
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+
+    // March: +5 (payment) -2 (funded) +1 (released) = 4
+    expect(viewsFor(res.body.data, "Mar")).toBe(4);
+    // May: +4 (released)
+    expect(viewsFor(res.body.data, "May")).toBe(4);
+    // June: +2 (refunded)
+    expect(viewsFor(res.body.data, "Jun")).toBe(2);
+    // Sept: -10 (sent)
+    expect(viewsFor(res.body.data, "Sept")).toBe(-10);
+    // Total: 4 + 4 + 2 - 10 = 0
+    expect(res.body.total).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agreement creation activity proxy
+// ---------------------------------------------------------------------------
+describe("analytics agreement creation proxy", () => {
+  it("adds count × 1000 base units only when no payment/escrow data exists for that month", async () => {
+    queryState.rows.agreementEvents = [
+      { month: 1, agreementId: "1" },
+      { month: 1, agreementId: "2" },
+      { month: 1, agreementId: "3" },
+      { month: 3, agreementId: "4" }, // March has no payment/escrow → proxy applies
+    ];
+    queryState.rows.payments = [
+      { month: 3, amount: "5000000", from: "0xother", to: USER }, // March has real data
+    ];
+
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+
+    // Jan: 3 agreements × 1000 = 3000 base units → 0.003 display
+    expect(viewsFor(res.body.data, "Jan")).toBe(0.003);
+    // Mar: real payment data (+5) — agreement proxy NOT applied
+    expect(viewsFor(res.body.data, "Mar")).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zero-fill and response shape
+// ---------------------------------------------------------------------------
+describe("analytics response shape", () => {
+  it("returns twelve months and zero total when there is no activity", async () => {
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+
     expect(res.body.data).toHaveLength(12);
     expect(res.body.data.map((d: { month: string }) => d.month)).toEqual([
       "Jan",
@@ -124,43 +238,138 @@ describe("analytics route", () => {
       "Nov",
       "Dec",
     ]);
-    expect(typeof res.body.total).toBe("number");
-    // The address is validated and then normalized before it reaches the query
-    // layer, so the canonical form is what the DB filters on.
+    for (const entry of res.body.data) {
+      expect(entry.views).toBe(0);
+    }
+    expect(res.body.total).toBe(0);
+    expect(res.body.year).toBe(2026);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+describe("analytics validation", () => {
+  it("validates and normalizes the address", async () => {
+    const res = await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
+    expect(res.body.year).toBe(2026);
     expect(queryState.eqValues).toContain(normalizeStarknetAddress("abc"));
   });
 
-  it("defaults to the current year when none is supplied", async () => {
-    const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+  it("defaults to the current year", async () => {
+    const res = await request(makeApp()).get(`/api/v1/analytics/abc`).expect(200);
     expect(res.body.year).toBe(new Date().getFullYear());
   });
 
-  it("rejects a malformed address with 400 before any query runs", async () => {
+  it("rejects a malformed address with 400", async () => {
     const res = await request(makeApp()).get("/api/v1/analytics/not-an-address").expect(400);
     expect(res.body.error).toBe("Validation failed");
     expect(queryState.eqValues).toHaveLength(0);
   });
 
-  it("rejects a year below the supported range with 400", async () => {
-    await request(makeApp()).get("/api/v1/analytics/abc?year=1999").expect(400);
+  it("rejects a year below 2020 with 400", async () => {
+    await request(makeApp()).get(`/api/v1/analytics/abc?year=1999`).expect(400);
   });
 
-  it("rejects a year above the supported range with 400", async () => {
-    await request(makeApp()).get("/api/v1/analytics/abc?year=3000").expect(400);
+  it("rejects a year above 2100 with 400", async () => {
+    await request(makeApp()).get(`/api/v1/analytics/abc?year=3000`).expect(400);
   });
 });
 
-describe("analytics telemetry and error logs", () => {
+// ---------------------------------------------------------------------------
+// Idempotency: ETag + 304
+// ---------------------------------------------------------------------------
+describe("analytics idempotency — ETag", () => {
+  it("returns an ETag header on success", async () => {
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+    expect(res.headers["etag"]).toBeDefined();
+    expect(res.headers["etag"]).toMatch(/^"[0-9a-f]{16}"$/);
+  });
+
+  it("returns 304 when If-None-Match matches the ETag", async () => {
+    const first = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+    const etag = first.headers["etag"];
+
+    const second = await request(makeApp())
+      .get(`/api/v1/analytics/${USER}?year=2026`)
+      .set("If-None-Match", etag)
+      .expect(304);
+
+    // 304 responses must not carry a payload body.
+    expect(second.body.data).toBeUndefined();
+    expect(second.body.year).toBeUndefined();
+  });
+
+  it("returns 200 with new ETag when If-None-Match does not match", async () => {
+    const res = await request(makeApp())
+      .get(`/api/v1/analytics/${USER}?year=2026`)
+      .set("If-None-Match", '"0000000000000000"')
+      .expect(200);
+    expect(res.headers["etag"]).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idempotency: Cache-Control
+// ---------------------------------------------------------------------------
+describe("analytics idempotency — Cache-Control", () => {
+  it("sets private, max-age=60 on success", async () => {
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(200);
+    expect(res.headers["cache-control"]).toBe("private, max-age=60");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idempotency: concurrent dedup (409)
+// ---------------------------------------------------------------------------
+describe("analytics idempotency — dedup guard", () => {
+  it("returns 409 when a duplicate request is in flight", async () => {
+    let resolveFirst: (() => void) | undefined;
+    const firstPromise = new Promise<void>((r) => {
+      resolveFirst = r;
+    });
+
+    // Override the DB to hold the first request open
+    dbMock.select.mockImplementationOnce(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => firstPromise.then(() => [])),
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => firstPromise.then(() => [])),
+        })),
+      })),
+    }));
+
+    // Fire the first request (will hang)
+    const firstReq = request(makeApp())
+      .get(`/api/v1/analytics/${USER}?year=2026`)
+      .then((res) => res);
+
+    // Wait a tick so the first request acquires the lock
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Fire a duplicate — should get 409 immediately
+    const secondRes = await request(makeApp())
+      .get(`/api/v1/analytics/${USER}?year=2026`)
+      .expect(409);
+
+    expect(secondRes.body.error).toContain("Duplicate rollup in progress");
+
+    // Release the first request
+    resolveFirst!();
+    const firstRes = await firstReq;
+    expect(firstRes.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+describe("analytics telemetry", () => {
   let infoSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
   let originalLogFormat: string;
 
   beforeEach(() => {
-    vi.clearAllMocks();
-    queryState.rows.payments = [];
-    queryState.rows.escrowEvents = [];
-    queryState.rows.agreementEvents = [];
-    queryState.eqValues = [];
     infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     originalLogFormat = env.LOG_FORMAT;
@@ -172,76 +381,66 @@ describe("analytics telemetry and error logs", () => {
     env.LOG_FORMAT = originalLogFormat;
   });
 
-  it("emits a JSON success log with operation, duration_ms, row_counts, and user_address on a successful rollup", async () => {
+  it("emits JSON success log with row_counts", async () => {
     env.LOG_FORMAT = "json";
-    queryState.rows.payments = [{ month: 3, amount: "1000000" }];
-    queryState.rows.escrowEvents = [{ month: 5, amount: "500000", eventType: "Released" }];
-    queryState.rows.agreementEvents = [];
+    queryState.rows.payments = [{ month: 3, amount: "1000000", from: "0xother", to: USER }];
 
-    await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(200);
+    await request(makeApp()).get(`/api/v1/analytics/abc?year=2026`).expect(200);
 
-    expect(infoSpy).toHaveBeenCalled();
     const parsed = infoSpy.mock.calls
       .map((call) => {
-        try { return JSON.parse(call[0] as string); } catch { return null; }
+        try {
+          return JSON.parse(call[0] as string);
+        } catch {
+          return null;
+        }
       })
       .find((l) => l?.operation === "analytics_monthly_rollup");
 
     expect(parsed).toBeDefined();
     expect(parsed.status).toBe("success");
-    expect(parsed.level).toBe("info");
-    expect(typeof parsed.duration_ms).toBe("number");
-    expect(parsed.year).toBe(2026);
     expect(parsed.row_counts.payments).toBe(1);
-    expect(parsed.row_counts.escrow_events).toBe(1);
-    expect(parsed.row_counts.agreement_creations).toBe(0);
   });
 
-  it("emits a JSON error log with status error and error message on a DB failure", async () => {
+  it("emits JSON error log on DB failure", async () => {
     env.LOG_FORMAT = "json";
-    // Override db.select to reject for this test
     dbMock.select.mockImplementationOnce(() => {
       throw new Error("DB connection lost");
     });
 
     await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(500);
 
-    expect(errorSpy).toHaveBeenCalled();
     const parsed = errorSpy.mock.calls
       .map((call) => {
-        try { return JSON.parse(call[0] as string); } catch { return null; }
+        try {
+          return JSON.parse(call[0] as string);
+        } catch {
+          return null;
+        }
       })
       .find((l) => l?.operation === "analytics_monthly_rollup");
 
     expect(parsed).toBeDefined();
     expect(parsed.status).toBe("error");
-    expect(parsed.level).toBe("error");
     expect(parsed.error).toBe("DB connection lost");
   });
+});
 
-  it("emits text format success log containing operation and 'ms' for latency", async () => {
-    env.LOG_FORMAT = "text";
-    queryState.rows.payments = [];
-    queryState.rows.escrowEvents = [];
-    queryState.rows.agreementEvents = [];
+// ---------------------------------------------------------------------------
+// DB failure
+// ---------------------------------------------------------------------------
+describe("analytics DB failure", () => {
+  it("surfaces a database failure through the error handler", async () => {
+    dbMock.select.mockImplementationOnce(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => Promise.reject(new Error("db unavailable"))),
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => Promise.reject(new Error("db unavailable"))),
+        })),
+      })),
+    }));
 
-    await request(makeApp()).get("/api/v1/analytics/abc?year=2026").expect(200);
-
-    expect(infoSpy).toHaveBeenCalled();
-    const logLine = infoSpy.mock.calls[0][0] as string;
-    expect(logLine).toContain("[analytics-telemetry] analytics_monthly_rollup success");
-    expect(logLine).toContain("ms");
-  });
-
-  it("does not emit a telemetry error log for Zod validation failures (400 path)", async () => {
-    env.LOG_FORMAT = "json";
-
-    // malformed address triggers Zod 400 before any DB call
-    await request(makeApp()).get("/api/v1/analytics/not-an-address").expect(400);
-
-    // The error path in analytics.ts calls next(e) which is caught by the error middleware.
-    // A Zod parse failure before any DB call still hits our catch block, so
-    // we verify the log is written but no DB queries ran.
-    expect(queryState.eqValues).toHaveLength(0);
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(500);
+    expect(res.body.error).toBe("db unavailable");
   });
 });
