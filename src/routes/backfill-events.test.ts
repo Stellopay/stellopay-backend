@@ -145,14 +145,15 @@ describe("BackfillQuerySchema", () => {
     expect(result.agreementId).toBeUndefined();
   });
 
-  it("accepts an optional cursor parameter", () => {
-    const result = BackfillQuerySchema.parse({ cursor: "2024-06-01T00:00:00.000Z" });
-    expect(result.cursor).toBe("2024-06-01T00:00:00.000Z");
+  it("accepts an optional `before` resume cursor parameter", () => {
+    const result = BackfillQuerySchema.parse({ before: "2024-06-01T00:00:00.000Z" });
+    expect(result.before).toBeInstanceOf(Date);
+    expect(result.before!.toISOString()).toBe("2024-06-01T00:00:00.000Z");
   });
 
-  it("leaves cursor undefined when not provided", () => {
+  it("leaves `before` undefined when not provided", () => {
     const result = BackfillQuerySchema.parse({});
-    expect(result.cursor).toBeUndefined();
+    expect(result.before).toBeUndefined();
   });
 });
 
@@ -177,21 +178,20 @@ describe("Backfill Events Routes", () => {
   });
 
   describe("Input Validation & Resume Tokens", () => {
-    it("rejects a malformed resumeToken (not an ISO date)", async () => {
+    it("rejects a malformed `before` value (not an ISO date)", async () => {
       const res = await request(app)
-        .post("/api/v1/backfill/employee-events?resumeToken=invalid-date")
+        .post("/api/v1/backfill/employee-events?before=invalid-date")
         .expect(400);
 
       expect(res.body.error).toBeDefined();
     });
 
-    it("accepts a valid resumeToken and passes it to the query", async () => {
+    it("accepts a valid ISO `before` value and passes it to the query", async () => {
       const validToken = "2026-07-25T10:00:00.000Z";
       await request(app)
-        .post(`/api/v1/backfill/employee-events?resumeToken=${validToken}`)
+        .post(`/api/v1/backfill/employee-events?before=${validToken}`)
         .expect(200);
 
-      // Verify the DB execute was called (SQL check happens in integration, here we verify call)
       expect(mockDb.execute).toHaveBeenCalled();
     });
   });
@@ -306,16 +306,17 @@ describe("Backfill Events Routes", () => {
   });
 
   describe("POST /backfill/employee-events", () => {
+    const mockDate = new Date("2024-01-01T00:00:00.000Z");
     const mockEmployeeRow = {
       id: "emp_1",
       agreement_id: "agr_123",
       contract_address: "0xabc",
       block_number: 100,
       transaction_hash: "0xtx1",
-      created_at: mockDate.toISOString(),
+      created_at: mockDate,
     };
 
-    it("returns nextResumeToken and durationMs on success", async () => {
+    it("returns nextCursor and hasMore on success", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
       mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
@@ -323,12 +324,9 @@ describe("Backfill Events Routes", () => {
         .post("/api/v1/backfill/employee-events")
         .expect(200);
 
-      // Check for Replay Window support
-      expect(res.body.nextResumeToken).toBe(mockEmployeeRow.created_at);
-      
-      // Check for Telemetry/Metrics
-      expect(res.body.durationMs).toBeGreaterThanOrEqual(0);
-      expect(typeof res.body.durationMs).toBe("number");
+      expect(res.body.nextCursor).toBe(mockDate.toISOString());
+      expect(typeof res.body.nextCursor).toBe("string");
+      expect(res.body.hasMore).toBe(false);
     });
 
     it("is idempotent on re-run (no new employees without events)", async () => {
@@ -409,7 +407,7 @@ describe("Backfill Events Routes", () => {
           scanned: 1,
           created: 1,
           durationMs: expect.any(Number),
-          nextResumeToken: mockEmployeeRow.created_at
+          nextCursor: mockDate.toISOString()
         })
       );
     });
@@ -469,7 +467,9 @@ describe("Backfill Events Routes", () => {
         .post("/api/v1/backfill/employee-events")
         .expect(200);
 
-      expect(res.body.nextResumeToken).toBeNull();
+      expect(res.body.results.length).toBeLessThanOrEqual(10);
+      expect(res.body.nextCursor).toBe(new Date("2024-01-01").toISOString());
+      expect(res.body.hasMore).toBe(false);
     });
 
     it("results preview size matches RESULTS_PREVIEW_SIZE constant", async () => {
@@ -607,7 +607,7 @@ describe("Backfill Events Routes", () => {
       });
     });
 
-    it("returns cursor from last row's created_at", async () => {
+    it("returns nextCursor from last row's created_at", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
       mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
 
@@ -615,25 +615,25 @@ describe("Backfill Events Routes", () => {
         .post("/api/v1/backfill/employee-events")
         .expect(200);
 
-      expect(res.body.cursor).toBe("2024-01-01T00:00:00.000Z");
+      expect(res.body.nextCursor).toBe(mockDate.toISOString());
     });
 
-    it("returns null cursor when no rows", async () => {
+    it("returns null nextCursor when no rows", async () => {
       const res = await request(app)
         .post("/api/v1/backfill/employee-events")
         .expect(200);
 
-      expect(res.body.cursor).toBeNull();
+      expect(res.body.nextCursor).toBeNull();
     });
 
-    it("accepts cursor query parameter", async () => {
+    it("ignores unknown query parameters", async () => {
       mockDb.execute.mockResolvedValue({ rows: [] });
 
       const res = await request(app)
-        .post("/api/v1/backfill/employee-events?cursor=2024-06-01T00:00:00.000Z")
+        .post("/api/v1/backfill/employee-events?unknownParam=value")
         .expect(200);
 
-      expect(res.body.cursor).toBeNull();
+      expect(res.body.nextCursor).toBeNull();
       expect(mockDb.execute).toHaveBeenCalledTimes(1);
     });
 
@@ -894,7 +894,7 @@ describe("Backfill Events Routes", () => {
       });
     });
 
-    it("returns cursor from last row's created_at for milestones", async () => {
+    it("returns nextCursor from last row's created_at for milestones", async () => {
       mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
       mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
 
@@ -902,25 +902,25 @@ describe("Backfill Events Routes", () => {
         .post("/api/v1/backfill/milestone-events")
         .expect(200);
 
-      expect(res.body.cursor).toBe("2024-02-01T00:00:00.000Z");
+      expect(res.body.nextCursor).toBe(new Date(mockMilestoneRow.created_at).toISOString());
     });
 
-    it("returns null cursor when no milestone rows", async () => {
+    it("returns null nextCursor when no milestone rows", async () => {
       const res = await request(app)
         .post("/api/v1/backfill/milestone-events")
         .expect(200);
 
-      expect(res.body.cursor).toBeNull();
+      expect(res.body.nextCursor).toBeNull();
     });
 
-    it("accepts cursor query parameter for milestones", async () => {
+    it("ignores unknown query parameters for milestones", async () => {
       mockDb.execute.mockResolvedValue({ rows: [] });
 
       const res = await request(app)
-        .post("/api/v1/backfill/milestone-events?cursor=2024-06-01T00:00:00.000Z")
+        .post("/api/v1/backfill/milestone-events?unknown=value")
         .expect(200);
 
-      expect(res.body.cursor).toBeNull();
+      expect(res.body.nextCursor).toBeNull();
       expect(mockDb.execute).toHaveBeenCalledTimes(1);
     });
 

@@ -72,13 +72,11 @@ export const BackfillQuerySchema = z.object({
 // Response shape
 // ---------------------------------------------------------------------------
 
-/** A single entry inside the response `results` array. */
 export interface BackfillResultEntry {
   employeeId?: string;
   milestoneId?: string;
   agreementId: string;
   status: string;
-  error?: string;
 }
 
 /** Shape returned by both backfill endpoints on success. */
@@ -101,234 +99,155 @@ export interface BackfillResponse {
   hasMore: boolean;
 }
 
-/**
- * POST /backfill/employee-events
- *
- * Backfill `EmployeeAdded` events for employees that don't yet have a
- * corresponding event in `agreement_events`.
- *
- * **Authentication:** Requires an active admin session (`requireAuth` +
- * `requireAdmin`).
- *
- * **Validation:** Query params are validated via {@link BackfillQuerySchema}.
- * - `limit` (optional, default 1000, max 5000) — number of candidate rows to scan.
- * - `agreementId` (optional) — restrict backfill to a single agreement.
- * - `before` (optional, ISO-8601 date) — resume cursor; only scans rows with
- *   `created_at` strictly older than this timestamp.
- *
- * **Resume tokens / replay windows:** Every response includes `nextCursor`
- * (the oldest `created_at` seen in the page, or `null` if empty) and
- * `hasMore` (whether the page was full). Callers page through a large
- * backlog by repeatedly passing the previous response's `nextCursor` as the
- * next call's `before`, stopping once `hasMore` is `false` or `nextCursor`
- * is `null`. Omitting `before` preserves today's behavior exactly.
- *
- * **Idempotency:** Synthetic event IDs use the form
- * `{transactionHash}_backfill_EmployeeAdded_{employeeId}` which cannot collide
- * with real event IDs (`{txHash}_{eventIndex}`).  The `eventIndex` is set to
- * `-1` — a value real on-chain events can never have — making every row
- * trivially distinguishable from genuine indexed events.  The full insert loop
- * runs inside a single database transaction; on conflict the row is silently
- * skipped (`onConflictDoNothing`). Because the cursor only narrows the
- * candidate set, replaying any page (with or without `before`) is a safe
- * no-op for rows already backfilled.
- *
- * **Response** returns the total number of employees scanned, how many events
- * were created, a sample of the first 10 results, and the `nextCursor` /
- * `hasMore` pagination fields.
- */
+// ---------------------------------------------------------------------------
+// Shared backfill logic
+// ---------------------------------------------------------------------------
+
+type BackfillKind = "employees" | "milestones";
+type BackfillEventType = "EmployeeAdded" | "MilestoneAdded";
+
+interface BackfillRow {
+  id: string;
+  agreement_id: string;
+  contract_address: string;
+  block_number: number;
+  transaction_hash: string;
+  created_at: Date;
+}
+
+async function performBackfill(
+  kind: BackfillKind,
+  eventType: BackfillEventType,
+  params: z.infer<typeof BackfillQuerySchema>,
+): Promise<BackfillResponse> {
+  const { limit, agreementId, before } = params;
+
+  const result = await db.execute<BackfillRow>(sql`
+    SELECT ${sql.identifier(kind)}.id,
+           ${sql.identifier(kind)}.agreement_id,
+           ${sql.identifier(kind)}.contract_address,
+           ${sql.identifier(kind)}.block_number,
+           ${sql.identifier(kind)}.transaction_hash,
+           ${sql.identifier(kind)}.created_at
+    FROM ${sql.identifier(kind)}
+    LEFT JOIN agreement_events ae
+      ON ae.transaction_hash = ${sql.identifier(kind)}.transaction_hash
+      AND ae.event_type = ${eventType}
+    WHERE ae.id IS NULL
+    ${agreementId ? sql`AND ${sql.identifier(kind)}.agreement_id = ${agreementId}` : sql``}
+    ${before ? sql`AND ${sql.identifier(kind)}.created_at < ${before}` : sql``}
+    ORDER BY ${sql.identifier(kind)}.created_at DESC
+    LIMIT ${limit}
+  `);
+
+  const scannedRows = result.rows ?? [];
+  let created = 0;
+  const results: BackfillResultEntry[] = [];
+
+  const startMs = Date.now();
+
+  await db.transaction(async (tx) => {
+    for (const row of scannedRows) {
+      const eventId = buildBackfillEventId(
+        String(row.transaction_hash),
+        eventType,
+        String(row.id),
+      );
+
+      const inserted = await tx
+        .insert(schema.agreementEvents)
+        .values({
+          id: eventId,
+          agreementId: String(row.agreement_id),
+          contractAddress: String(row.contract_address),
+          eventType,
+          blockNumber: Number(row.block_number),
+          transactionHash: String(row.transaction_hash),
+          eventIndex: BACKFILL_EVENT_INDEX,
+        })
+        .onConflictDoNothing()
+        .returning();
+
+      if (inserted.length > 0) {
+        created++;
+      }
+
+      const entry: BackfillResultEntry = {
+        agreementId: String(row.agreement_id),
+        status: inserted.length > 0 ? "created" : "skipped",
+      };
+      if (kind === "employees") {
+        entry.employeeId = String(row.id);
+      } else {
+        entry.milestoneId = String(row.id);
+      }
+      results.push(entry);
+    }
+  });
+
+  const durationMs = Date.now() - startMs;
+  const lastRow = scannedRows[scannedRows.length - 1];
+  const nextCursor = lastRow ? new Date(lastRow.created_at).toISOString() : null;
+
+  const idLabel = kind === "employees" ? "employee" : "milestone";
+  console.info({
+    op: `backfill_${idLabel}_events`,
+    kind,
+    scanned: scannedRows.length,
+    created,
+    durationMs,
+    nextCursor,
+    hasMore: scannedRows.length === limit,
+  });
+
+  return {
+    message: `Backfilled ${created} ${eventType} events`,
+    totalScanned: scannedRows.length,
+    created,
+    results: results.slice(0, RESULTS_PREVIEW_SIZE),
+    nextCursor,
+    hasMore: scannedRows.length === limit,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Route: POST /backfill/employee-events
+// ---------------------------------------------------------------------------
+
 backfillEventsRouter.post(
   "/backfill/employee-events",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
     try {
-      const { limit, agreementId, before } = BackfillQuerySchema.parse(req.query);
-
-      const conditions = sql`1=1`;
-      if (agreementId) {
-        conditions.append(sql` AND e.agreement_id = ${agreementId}`);
-      }
-      if (before) {
-        conditions.append(sql` AND e.created_at < ${before}`);
-      }
-
-  const tableName = type === "EmployeeAdded" ? "employees" : "milestones";
-  const tableAlias = type === "EmployeeAdded" ? "e" : "m";
-  
-  const conditions = sql`1=1`;
-  if (agreementId) conditions.append(sql` AND ${sql.identifier(tableAlias)}.agreement_id = ${agreementId}`);
-  if (resumeToken) conditions.append(sql` AND ${sql.identifier(tableAlias)}.created_at < ${resumeToken}`);
-
-      let created = 0;
-      const results: BackfillResultEntry[] = [];
-
-      await db.transaction(async (tx) => {
-        for (const employee of employeesWithoutEvents.rows) {
-          const eventId = buildBackfillEventId(
-            String(employee.transaction_hash),
-            "EmployeeAdded",
-            String(employee.id),
-          );
-
-          const inserted = await tx
-            .insert(schema.agreementEvents)
-            .values({
-              id: eventId,
-              agreementId: String(employee.agreement_id),
-              contractAddress: String(employee.contract_address),
-              eventType: "EmployeeAdded",
-              blockNumber: Number(employee.block_number),
-              transactionHash: String(employee.transaction_hash),
-              eventIndex: BACKFILL_EVENT_INDEX,
-            })
-            .onConflictDoNothing()
-            .returning();
-
-          if (inserted.length > 0) {
-            created++;
-          }
-          results.push({
-            employeeId: String(employee.id),
-            agreementId: String(employee.agreement_id),
-            status: inserted.length > 0 ? "created" : "skipped",
-          });
-        }
-      });
-
-      const scannedRows = employeesWithoutEvents.rows;
-      const lastRow = scannedRows[scannedRows.length - 1];
-      const nextCursor = lastRow ? new Date(lastRow.created_at as any).toISOString() : null;
-
-      const body: BackfillResponse = {
-        message: `Backfilled ${created} EmployeeAdded events`,
-        totalScanned: scannedRows.length,
-        created,
-        results: results.slice(0, RESULTS_PREVIEW_SIZE),
-        nextCursor,
-        hasMore: scannedRows.length === limit,
-      };
+      const params = BackfillQuerySchema.parse(req.query);
+      const body = await performBackfill("employees", "EmployeeAdded", params);
       res.json(body);
     } catch (e: any) {
-      if (e instanceof z.ZodError || e?.name === "ZodError") {
+      if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);
     }
-  });
+  },
+);
 
-/**
- * POST /backfill/milestone-events
- *
- * Backfill `MilestoneAdded` events for milestones that don't yet have a
- * corresponding event in `agreement_events`.
- *
- * **Authentication:** Requires an active admin session (`requireAuth` +
- * `requireAdmin`).
- *
- * **Validation:** Query params are validated via {@link BackfillQuerySchema}.
- * - `limit` (optional, default 1000, max 5000) — number of candidate rows to scan.
- * - `agreementId` (optional) — restrict backfill to a single agreement.
- * - `before` (optional, ISO-8601 date) — resume cursor; only scans rows with
- *   `created_at` strictly older than this timestamp.
- *
- * **Resume tokens / replay windows:** Identical contract to the
- * employee-events sibling — every response includes `nextCursor` (the oldest
- * `created_at` seen in the page, or `null` if empty) and `hasMore` (whether
- * the page was full). Page through a large backlog by repeatedly passing the
- * previous response's `nextCursor` as the next call's `before`, stopping once
- * `hasMore` is `false` or `nextCursor` is `null`. Omitting `before` preserves
- * today's behavior exactly.
- *
- * **Idempotency:** Identical approach to the employee-events sibling — synthetic
- * IDs with a `_backfill_MilestoneAdded_` segment, `eventIndex: -1`, and
- * `onConflictDoNothing` inside a transaction.  Re-runs are safe no-ops, and the
- * `before` cursor only narrows the candidate set so replaying any page never
- * creates duplicates.
- *
- * **Response** returns the total number of milestones scanned, how many events
- * were created, a sample of the first 10 results, and the `nextCursor` /
- * `hasMore` pagination fields.
- */
+// ---------------------------------------------------------------------------
+// Route: POST /backfill/milestone-events
+// ---------------------------------------------------------------------------
+
 backfillEventsRouter.post(
   "/backfill/milestone-events",
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
     try {
-      const { limit, agreementId, before } = BackfillQuerySchema.parse(req.query);
-
-      const conditions = sql`1=1`;
-      if (agreementId) {
-        conditions.append(sql` AND m.agreement_id = ${agreementId}`);
-      }
-      if (before) {
-        conditions.append(sql` AND m.created_at < ${before}`);
-      }
-
-backfillEventsRouter.post("/backfill/employee-events", requireAuth, requireAdmin, async (req, res, next) => {
-  try {
-    const params = BackfillQuerySchema.parse(req.query);
-    const result = await performBackfill("EmployeeAdded", params);
-    res.json(result);
-  } catch (e) {
-    if (e instanceof z.ZodError) return res.status(400).json({ error: "Invalid parameters", details: err.issues });
-    next(e);
-  }
-});
-
-      let created = 0;
-      const results: BackfillResultEntry[] = [];
-
-      await db.transaction(async (tx) => {
-        for (const milestone of milestonesWithoutEvents.rows) {
-          const eventId = buildBackfillEventId(
-            String(milestone.transaction_hash),
-            "MilestoneAdded",
-            String(milestone.id),
-          );
-
-          const inserted = await tx
-            .insert(schema.agreementEvents)
-            .values({
-              id: eventId,
-              agreementId: String(milestone.agreement_id),
-              contractAddress: String(milestone.contract_address),
-              eventType: "MilestoneAdded",
-              blockNumber: Number(milestone.block_number),
-              transactionHash: String(milestone.transaction_hash),
-              eventIndex: BACKFILL_EVENT_INDEX,
-            })
-            .onConflictDoNothing()
-            .returning();
-
-          if (inserted.length > 0) {
-            created++;
-          }
-          results.push({
-            milestoneId: String(milestone.id),
-            agreementId: String(milestone.agreement_id),
-            status: inserted.length > 0 ? "created" : "skipped",
-          });
-        }
-      });
-
-      const scannedRows = milestonesWithoutEvents.rows;
-      const lastRow = scannedRows[scannedRows.length - 1];
-      const nextCursor = lastRow ? new Date(lastRow.created_at as any).toISOString() : null;
-
-      const body: BackfillResponse = {
-        message: `Backfilled ${created} MilestoneAdded events`,
-        totalScanned: scannedRows.length,
-        created,
-        results: results.slice(0, RESULTS_PREVIEW_SIZE),
-        nextCursor,
-        hasMore: scannedRows.length === limit,
-      };
+      const params = BackfillQuerySchema.parse(req.query);
+      const body = await performBackfill("milestones", "MilestoneAdded", params);
       res.json(body);
     } catch (e: any) {
-      if (e instanceof z.ZodError || e?.name === "ZodError") {
+      if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
       }
