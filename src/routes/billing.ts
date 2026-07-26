@@ -14,6 +14,30 @@
  *
  * All responses follow the envelope:  { success: boolean, data?: T, error?: string }
  *
+ * Backward-compatibility contract (issue #304)
+ * ─────────────────────────────────────────────
+ * • Response envelope shape is frozen: { success, data? } on success,
+ *   { success, error } on failure.  Neither key may be present on the wrong
+ *   branch.  See docs/routes/billing.md for the full contract.
+ *
+ * • profileId validation: alphanumeric + dash/underscore, 1–128 chars.
+ *   Violations → 400.  Shape must not change without a major-version bump.
+ *
+ * • Sensitive fields (taxId, dateOfBirth) are stripped by stripSensitive()
+ *   before any profile row reaches a handler response.  This invariant is
+ *   enforced by tests and must be preserved by all future changes.
+ *
+ * • Billing math (summary endpoint):
+ *     remainingAmount    = Math.max(0, limit − used)   // never negative
+ *     progressPercentage = limit > 0 ? round2(used/limit*100) : 0
+ *   These formulas are load-bearing; do not change them without updating
+ *   docs/routes/billing.md and the corresponding tests.
+ *
+ * • fullAddress (general-information endpoint):
+ *     [street, city, state, zipCode, country].filter(Boolean).join(", ")
+ *     null when every part is absent.
+ *   Order and separator must not change — callers display this string directly.
+ *
  * NOTE: Sensitive fields (taxId, dateOfBirth) are omitted from all API responses.
  *       They are stored in the database but must only be accessed through
  *       separately-authorised, audited internal processes.
@@ -31,17 +55,21 @@ export const billingRouter = express.Router();
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/** Uniform success envelope */
+/** Uniform success envelope — shape is frozen per #304 contract. */
 function ok<T>(res: Response, data: T, status = 200): void {
   res.status(status).json({ success: true, data });
 }
 
-/** Uniform error envelope */
+/** Uniform error envelope — shape is frozen per #304 contract. */
 function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
 }
 
-/** Zod schema for the :profileId path param – non-empty string, max 128 chars */
+/**
+ * Zod schema for the :profileId path param.
+ * Contract: non-empty string, max 128 chars, characters [A-Za-z0-9_-] only.
+ * Frozen — changing this regex is a breaking change for existing callers.
+ */
 const profileIdSchema = z.object({
   profileId: z
     .string()
@@ -78,16 +106,60 @@ function requireBillingEnabled(_req: Request, res: Response, next: NextFunction)
 billingRouter.use("/billing", requireBillingEnabled);
 
 // ---------------------------------------------------------------------------
-// Strip sensitive fields before returning a profile row to the client.
-// taxId and dateOfBirth are never included in API responses.
+// Sensitive-field stripping
+// Strip taxId and dateOfBirth before returning a profile row to the client.
+// These fields are stored in the DB but must never appear in API responses.
+// This function is the single enforcement point — do not bypass it.
 // ---------------------------------------------------------------------------
 type ProfileRow = typeof schema.billingProfiles.$inferSelect;
 type SafeProfile = Omit<ProfileRow, "taxId" | "dateOfBirth">;
 
 function stripSensitive(profile: ProfileRow): SafeProfile {
-  // Destructure to drop the sensitive fields; the rest is safe to return.
   const { taxId: _taxId, dateOfBirth: _dob, ...safe } = profile;
   return safe;
+}
+
+// ---------------------------------------------------------------------------
+// Billing math helpers (issue #304 — stable contract)
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the reward-limit summary fields from raw DB numeric strings.
+ *
+ * Contract (frozen):
+ *   remainingAmount    = Math.max(0, limit − used)
+ *   progressPercentage = limit > 0 ? round2(used / limit * 100) : 0
+ *
+ * progressPercentage may exceed 100 when used > limit — callers clamp for display.
+ */
+export function computeBillingSummary(
+  annualRewardLimit: string | null,
+  usedAmount: string | null,
+): { limit: number; used: number; remainingAmount: number; progressPercentage: number } {
+  const limit = parseFloat(annualRewardLimit ?? "0");
+  const used = parseFloat(usedAmount ?? "0");
+  const remainingAmount = Math.max(0, limit - used);
+  const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+  const progressPercentage = Math.round(progressPct * 100) / 100;
+  return { limit, used, remainingAmount, progressPercentage };
+}
+
+/**
+ * Build the fullAddress convenience string for general-information responses.
+ *
+ * Contract (frozen — callers display this string directly):
+ *   [street, city, state, zipCode, country].filter(Boolean).join(", ")
+ *   Returns null when every part is absent.
+ */
+export function buildFullAddress(
+  street: string | null,
+  city: string | null,
+  state: string | null,
+  zipCode: string | null,
+  country: string | null,
+): string | null {
+  const parts = [street, city, state, zipCode, country].filter(Boolean);
+  return parts.length ? parts.join(", ") : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +171,11 @@ function stripSensitive(profile: ProfileRow): SafeProfile {
  *
  * Returns the full billing profile (general info + payment methods + invoices)
  * in a single response for clients that need everything at once.
+ *
+ * Success 200: { profile: SafeProfile, paymentMethods: [], invoices: [] }
+ * Error  404: profile not found
+ * Error  500: unexpected db error (internal detail never leaked)
+ * Error  501: BILLING_ENABLED=false
  */
 billingRouter.get(
   "/billing/profiles/:profileId",
@@ -134,7 +211,7 @@ billingRouter.get(
         paymentMethods,
         invoices,
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[billing] Error fetching full profile:", err);
       fail(res, 500, "Failed to fetch billing profile");
     }
@@ -146,6 +223,12 @@ billingRouter.get(
  *
  * Returns identity / contact fields for the profile.
  * Sensitive fields (taxId, dateOfBirth) are excluded.
+ *
+ * Adds a computed `fullAddress` field:
+ *   [street, city, state, zipCode, country].filter(Boolean).join(", ")
+ *   null when every address part is absent.
+ *
+ * The fullAddress format is stable — existing callers render it directly.
  */
 billingRouter.get(
   "/billing/profiles/:profileId/general-information",
@@ -166,15 +249,16 @@ billingRouter.get(
       }
 
       const safe = stripSensitive(profile);
-
-      // Compute a convenience fullAddress for UI display
-      const addrParts = [safe.street, safe.city, safe.state, safe.zipCode, safe.country].filter(
-        Boolean,
+      const fullAddress = buildFullAddress(
+        safe.street,
+        safe.city,
+        safe.state,
+        safe.zipCode,
+        safe.country,
       );
-      const fullAddress = addrParts.length ? addrParts.join(", ") : null;
 
       ok(res, { ...safe, fullAddress });
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[billing] Error fetching general information:", err);
       fail(res, 500, "Failed to fetch general information");
     }
@@ -186,6 +270,9 @@ billingRouter.get(
  *
  * Returns the list of payment methods for the profile.
  * Only masked/safe representations are stored and returned (no raw account numbers).
+ *
+ * Returns an empty paymentMethods array (not an error) when the profile exists
+ * but has no methods attached.
  */
 billingRouter.get(
   "/billing/profiles/:profileId/payment-methods",
@@ -212,7 +299,7 @@ billingRouter.get(
         .where(eq(schema.billingPaymentMethods.profileId, profileId));
 
       ok(res, { profileId, paymentMethods });
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[billing] Error fetching payment methods:", err);
       fail(res, 500, "Failed to fetch payment methods");
     }
@@ -223,6 +310,12 @@ billingRouter.get(
  * GET /api/v1/billing/profiles/:profileId/invoices
  *
  * Returns the invoice history for the profile.
+ *
+ * invoice.amount is the raw numeric string from the DB (precision 18, scale 6).
+ * Callers are responsible for display formatting.
+ *
+ * Valid status values: pending | paid | void  (closed set — adding a new value
+ * requires a migration and a note in docs/routes/billing.md).
  */
 billingRouter.get(
   "/billing/profiles/:profileId/invoices",
@@ -248,7 +341,7 @@ billingRouter.get(
         .where(eq(schema.billingInvoices.profileId, profileId));
 
       ok(res, { profileId, invoices });
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[billing] Error fetching invoices:", err);
       fail(res, 500, "Failed to fetch invoices");
     }
@@ -259,6 +352,11 @@ billingRouter.get(
  * GET /api/v1/billing/profiles/:profileId/summary
  *
  * Returns the reward-limit / spend summary for the profile.
+ * This endpoint drives progress-bar UI and billing gate checks — its math is
+ * load-bearing.  See computeBillingSummary() for the frozen formula.
+ *
+ * Note: progressPercentage can exceed 100 when usedAmount > annualRewardLimit.
+ * This is intentional — callers should clamp the display value themselves.
  */
 billingRouter.get(
   "/billing/profiles/:profileId/summary",
@@ -284,21 +382,21 @@ billingRouter.get(
         return;
       }
 
-      const limit = parseFloat(profile.annualRewardLimit ?? "0");
-      const used = parseFloat(profile.usedAmount ?? "0");
-      const remaining = Math.max(0, limit - used);
-      const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+      const { limit, used, remainingAmount, progressPercentage } = computeBillingSummary(
+        profile.annualRewardLimit,
+        profile.usedAmount,
+      );
 
       ok(res, {
         profileId: profile.id,
         profileType: profile.profileType,
         annualRewardLimit: limit,
         usedAmount: used,
-        remainingAmount: remaining,
+        remainingAmount,
         currency: profile.currency,
-        progressPercentage: Math.round(progressPct * 100) / 100,
+        progressPercentage,
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[billing] Error fetching billing summary:", err);
       fail(res, 500, "Failed to fetch billing summary");
     }
