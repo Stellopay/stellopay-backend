@@ -9,6 +9,12 @@ Exposes `GET /api/v1/analytics/:user_address` — a monthly aggregation rollup t
 
 Each query is a DB-side `EXTRACT(MONTH FROM ...)` grouping, filtered to the caller's address and the requested year. Results are formatted as 12-month chart data suitable for UI rendering.
 
+## Rollup batching contract
+
+The endpoint retains its existing response shape and does not expose client pagination. Internally, each of its three event sources is read in batches of at most `ANALYTICS_ROLLUP_BATCH_SIZE` (500 rows). Pages use the ascending `(created_at, id)` keyset, with both fields forming the cursor. This makes a timestamp tie deterministic and prevents offset drift from skipping or repeating pre-existing rows as the tables grow.
+
+The route continues until a short page is received. If a full page fails to advance the cursor, it fails the request rather than looping indefinitely or returning a silently incomplete rollup. This contract intentionally does not provide a cross-query database snapshot: events committed while a rollup is in progress may be included if they sort after the current cursor.
+
 ---
 
 ## Telemetry & Metrics
@@ -90,4 +96,5 @@ Every invocation of the rollup endpoint is instrumented. Telemetry fires **after
 | Per-table query timers | All three queries are sequential; the aggregate time is sufficient for diagnosing slow paths. Split timers can be added if per-query breakdown is needed. |
 | Token-specific breakdowns | Amounts are aggregated across all tokens with `DEFAULT_TOKEN_DECIMALS`; per-token aggregation requires schema changes. |
 | Caching / memoization metrics | No caching is applied at the route layer; cache hit/miss telemetry is out of scope here. |
+| Cross-query snapshot consistency | The route does not open a database transaction; concurrent writes can appear in an in-progress rollup when they sort after its cursor. |
 | WCAG / accessibility | Not applicable to this server-side route. |

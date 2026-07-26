@@ -1,12 +1,58 @@
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, or, gte, lte, sql } from "drizzle-orm";
+import { asc, eq, and, gt, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
 
 export const analyticsRouter = Router();
+
+/**
+ * Maximum number of source events read by one analytics rollup query.
+ *
+ * This is an internal database batching limit, not a client-facing response
+ * limit: the endpoint keeps its existing twelve-month response shape.
+ */
+export const ANALYTICS_ROLLUP_BATCH_SIZE = 500;
+
+interface AnalyticsRollupCursor {
+  createdAt: Date;
+  id: string;
+}
+
+interface AnalyticsRollupRow extends AnalyticsRollupCursor {}
+
+/**
+ * Reads a complete rollup source in deterministic, keyset-paginated batches.
+ * `(createdAt, id)` is the cursor so ties in a timestamp never cause rows to
+ * be skipped or repeated. A non-advancing page is rejected rather than risking
+ * an unbounded request loop if a query is changed incompatibly.
+ */
+export async function collectAnalyticsRollupBatches<T extends AnalyticsRollupRow>(
+  fetchPage: (cursor?: AnalyticsRollupCursor) => Promise<T[]>,
+): Promise<T[]> {
+  const rows: T[] = [];
+  let cursor: AnalyticsRollupCursor | undefined;
+
+  while (true) {
+    const page = await fetchPage(cursor);
+    if (page.length === 0) return rows;
+
+    const last = page[page.length - 1];
+    if (
+      cursor &&
+      (last.createdAt < cursor.createdAt ||
+        (last.createdAt.getTime() === cursor.createdAt.getTime() && last.id <= cursor.id))
+    ) {
+      throw new Error("Analytics rollup batch cursor did not advance");
+    }
+
+    rows.push(...page);
+    if (page.length < ANALYTICS_ROLLUP_BATCH_SIZE) return rows;
+    cursor = { createdAt: last.createdAt, id: last.id };
+  }
+}
 
 interface AnalyticsTelemetryEntry {
   operation: string;
@@ -82,58 +128,100 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     const startDate = new Date(year, 0, 1);
     const endDate = new Date(year, 11, 31, 23, 59, 59);
 
-    const payments = await db
-      .select({
-        month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
-        amount: schema.payments.amount,
-      })
-      .from(schema.payments)
-      .where(
-        and(
-          or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
-          gte(schema.payments.createdAt, startDate),
-          lte(schema.payments.createdAt, endDate),
-        ),
+    const payments = await collectAnalyticsRollupBatches((cursor) => {
+      const filters = and(
+        or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
+        gte(schema.payments.createdAt, startDate),
+        lte(schema.payments.createdAt, endDate),
       );
+      const cursorFilter = cursor
+        ? or(
+            gt(schema.payments.createdAt, cursor.createdAt),
+            and(eq(schema.payments.createdAt, cursor.createdAt), gt(schema.payments.id, cursor.id)),
+          )
+        : undefined;
+
+      return db
+        .select({
+          id: schema.payments.id,
+          createdAt: schema.payments.createdAt,
+          month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
+          amount: schema.payments.amount,
+        })
+        .from(schema.payments)
+        .where(cursorFilter ? and(filters, cursorFilter) : filters)
+        .orderBy(asc(schema.payments.createdAt), asc(schema.payments.id))
+        .limit(ANALYTICS_ROLLUP_BATCH_SIZE);
+    });
 
     // Get escrow events (funding, releases, refunds)
-    const escrowEvents = await db
-      .select({
-        month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
-        amount: schema.escrowEvents.amount,
-        eventType: schema.escrowEvents.eventType,
-      })
-      .from(schema.escrowEvents)
-      .where(
-        and(
-          or(
-            eq(schema.escrowEvents.employer, userAddress),
-            eq(schema.escrowEvents.to, userAddress),
-          ),
-          gte(schema.escrowEvents.createdAt, startDate),
-          lte(schema.escrowEvents.createdAt, endDate),
+    const escrowEvents = await collectAnalyticsRollupBatches((cursor) => {
+      const filters = and(
+        or(
+          eq(schema.escrowEvents.employer, userAddress),
+          eq(schema.escrowEvents.to, userAddress),
         ),
+        gte(schema.escrowEvents.createdAt, startDate),
+        lte(schema.escrowEvents.createdAt, endDate),
       );
+      const cursorFilter = cursor
+        ? or(
+            gt(schema.escrowEvents.createdAt, cursor.createdAt),
+            and(
+              eq(schema.escrowEvents.createdAt, cursor.createdAt),
+              gt(schema.escrowEvents.id, cursor.id),
+            ),
+          )
+        : undefined;
+
+      return db
+        .select({
+          id: schema.escrowEvents.id,
+          createdAt: schema.escrowEvents.createdAt,
+          month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
+          amount: schema.escrowEvents.amount,
+          eventType: schema.escrowEvents.eventType,
+        })
+        .from(schema.escrowEvents)
+        .where(cursorFilter ? and(filters, cursorFilter) : filters)
+        .orderBy(asc(schema.escrowEvents.createdAt), asc(schema.escrowEvents.id))
+        .limit(ANALYTICS_ROLLUP_BATCH_SIZE);
+    });
 
     // Get agreement creation events (for analytics - count agreements created per month)
-    const agreementCreations = await db
-      .select({
-        month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
-        agreementId: schema.agreementEvents.agreementId,
-      })
-      .from(schema.agreementEvents)
-      .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-      .where(
-        and(
-          eq(schema.agreementEvents.eventType, "AgreementCreated"),
-          or(
-            eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress),
-          ),
-          gte(schema.agreementEvents.createdAt, startDate),
-          lte(schema.agreementEvents.createdAt, endDate),
+    const agreementCreations = await collectAnalyticsRollupBatches((cursor) => {
+      const filters = and(
+        eq(schema.agreementEvents.eventType, "AgreementCreated"),
+        or(
+          eq(schema.agreements.employer, userAddress),
+          eq(schema.agreements.contributor, userAddress),
         ),
+        gte(schema.agreementEvents.createdAt, startDate),
+        lte(schema.agreementEvents.createdAt, endDate),
       );
+      const cursorFilter = cursor
+        ? or(
+            gt(schema.agreementEvents.createdAt, cursor.createdAt),
+            and(
+              eq(schema.agreementEvents.createdAt, cursor.createdAt),
+              gt(schema.agreementEvents.id, cursor.id),
+            ),
+          )
+        : undefined;
+
+      return db
+        .select({
+          id: schema.agreementEvents.id,
+          createdAt: schema.agreementEvents.createdAt,
+          month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
+          agreementId: schema.agreementEvents.agreementId,
+        })
+        .from(schema.agreementEvents)
+        .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
+        .where(cursorFilter ? and(filters, cursorFilter) : filters)
+        .orderBy(asc(schema.agreementEvents.createdAt), asc(schema.agreementEvents.id))
+        .limit(ANALYTICS_ROLLUP_BATCH_SIZE);
+    });
 
     // Aggregate by month
     const monthlyData: Record<number, bigint> = {};

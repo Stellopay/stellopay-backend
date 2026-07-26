@@ -37,11 +37,12 @@ const { dbMock, schemaMock, queryState } = vi.hoisted(() => {
     select: vi.fn(() => ({
       from: vi.fn((table: { __name: TableName }) => {
         const rows = state.rows[table.__name] ?? [];
+        const paginatedQuery = {
+          orderBy: vi.fn(() => ({ limit: vi.fn(() => Promise.resolve(rows)) })),
+        };
         return {
-          where: vi.fn(() => Promise.resolve(rows)),
-          innerJoin: vi.fn(() => ({
-            where: vi.fn(() => Promise.resolve(rows)),
-          })),
+          where: vi.fn(() => paginatedQuery),
+          innerJoin: vi.fn(() => ({ where: vi.fn(() => paginatedQuery) })),
         };
       }),
     })),
@@ -62,9 +63,15 @@ vi.mock("drizzle-orm", () => ({
   gte: vi.fn(() => ({ type: "gte" })),
   lte: vi.fn(() => ({ type: "lte" })),
   sql: vi.fn(() => "sql-expr"),
+  asc: vi.fn((value: unknown) => value),
+  gt: vi.fn((_column: unknown, value: unknown) => ({ type: "gt", value })),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import {
+  ANALYTICS_ROLLUP_BATCH_SIZE,
+  analyticsRouter,
+  collectAnalyticsRollupBatches,
+} from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
 
@@ -98,6 +105,34 @@ beforeEach(() => {
 });
 
 describe("analytics route", () => {
+  it("reads rollup sources in bounded, keyset-paginated batches", async () => {
+    const firstPage = Array.from({ length: ANALYTICS_ROLLUP_BATCH_SIZE }, (_, index) => ({
+      id: String(index),
+      createdAt: new Date(2026, 0, 1),
+    }));
+    const finalPage = [{ id: "final", createdAt: new Date(2026, 0, 2) }];
+    const fetchPage = vi.fn().mockResolvedValueOnce(firstPage).mockResolvedValueOnce(finalPage);
+
+    await expect(collectAnalyticsRollupBatches(fetchPage)).resolves.toEqual([
+      ...firstPage,
+      ...finalPage,
+    ]);
+    expect(fetchPage).toHaveBeenNthCalledWith(1, undefined);
+    expect(fetchPage).toHaveBeenNthCalledWith(2, { createdAt: firstPage.at(-1)!.createdAt, id: "499" });
+  });
+
+  it("rejects a full batch that does not advance its cursor", async () => {
+    const page = Array.from({ length: ANALYTICS_ROLLUP_BATCH_SIZE }, (_, index) => ({
+      id: String(index),
+      createdAt: new Date(2026, 0, 1),
+    }));
+    const fetchPage = vi.fn().mockResolvedValue(page);
+
+    await expect(collectAnalyticsRollupBatches(fetchPage)).rejects.toThrow(
+      "Analytics rollup batch cursor did not advance",
+    );
+  });
+
   it("validates and normalizes the address and returns twelve months of chart data", async () => {
     queryState.rows.payments = [{ month: 3, amount: "1000000" }];
     queryState.rows.escrowEvents = [
