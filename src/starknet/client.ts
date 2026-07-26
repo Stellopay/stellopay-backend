@@ -17,6 +17,41 @@ function rpcFailoverOrder(): number[] {
   return order;
 }
 
+function cloneRpcArgs(args: unknown[]): unknown[] {
+  return args.map((argument) => cloneRpcValue(argument));
+}
+
+function cloneRpcValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneRpcValue(item));
+  }
+
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value instanceof Map) {
+    return new Map(Array.from(value.entries(), ([key, entryValue]) => [cloneRpcValue(key), cloneRpcValue(entryValue)]));
+  }
+
+  if (value instanceof Set) {
+    return new Set(Array.from(value.values(), (entryValue) => cloneRpcValue(entryValue)));
+  }
+
+  if (value && typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      const clone: Record<string, unknown> = {};
+      for (const [key, entryValue] of Object.entries(value as Record<string, unknown>)) {
+        clone[key] = cloneRpcValue(entryValue);
+      }
+      return clone;
+    }
+  }
+
+  return value;
+}
+
 async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
@@ -29,7 +64,8 @@ async function invokeWithFailover(
       if (typeof fn !== "function") {
         throw new TypeError(`RpcProvider.${String(method)} is not a function`);
       }
-      const result = await fn.apply(candidate, args);
+      const attemptArgs = cloneRpcArgs(args);
+      const result = await fn.apply(candidate, attemptArgs);
       if (index !== healthyRpcIndex) {
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,

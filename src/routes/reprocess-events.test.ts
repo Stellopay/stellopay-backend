@@ -174,6 +174,7 @@ describe("Reprocess Events Routes", () => {
       const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(404);
 
       expect(res.body).toEqual({
+        success: false,
         error: "Transaction not found",
       });
     });
@@ -250,7 +251,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([]),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([]),
+            }),
           }),
         }),
       } as any);
@@ -277,7 +280,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue(mockEvents),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
           }),
         }),
       } as any);
@@ -308,7 +313,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue(mockEvents),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
           }),
         }),
       } as any);
@@ -341,7 +348,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue(mockEvents),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
           }),
         }),
       } as any);
@@ -383,7 +392,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue(mockEvents),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
           }),
         }),
       } as any);
@@ -424,7 +435,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue(mockEvents),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
           }),
         }),
       } as any);
@@ -467,7 +480,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue(mockEvents),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
           }),
         }),
       } as any);
@@ -510,7 +525,9 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([]),
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([]),
+            }),
           }),
         }),
       } as any);
@@ -539,10 +556,12 @@ describe("Reprocess Events Routes", () => {
       const selectMock = vi.spyOn(db, "select").mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockImplementation(() => {
-              callCount++;
-              // First call returns events, second call returns empty (already updated)
-              return Promise.resolve(callCount === 1 ? mockEvents : []);
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockImplementation(() => {
+                callCount++;
+                // First call returns events, second call returns empty (already updated)
+                return Promise.resolve(callCount === 1 ? mockEvents : []);
+              }),
             }),
           }),
         }),
@@ -568,6 +587,87 @@ describe("Reprocess Events Routes", () => {
 
       selectMock.mockRestore();
       callCount = 0;
+    });
+
+    it("should invoke orderBy for deterministic pagination", async () => {
+      const orderByMock = vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue([]),
+      });
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: orderByMock,
+          }),
+        }),
+      } as any);
+
+      await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+
+      expect(orderByMock).toHaveBeenCalledTimes(1);
+
+      selectMock.mockRestore();
+    });
+
+    it("should report hasMore: true when the page returns exactly `limit` rows", async () => {
+      const mockEvents = Array.from({ length: 2 }, (_, i) => ({
+        id: `event_${i}`,
+        transactionHash: `0x${i}`,
+        eventIndex: 0,
+        contractAddress: "0xwork",
+        eventType: "AgreementStatusChange",
+      }));
+
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
+          }),
+        }),
+      } as any);
+
+      mockGetTransactionReceipt.mockResolvedValue(null);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/status-changes?limit=2")
+        .expect(200);
+
+      expect(res.body.hasMore).toBe(true);
+
+      selectMock.mockRestore();
+    });
+
+    it("should report hasMore: false when the page returns fewer than `limit` rows", async () => {
+      const mockEvents = [
+        {
+          id: "event_1",
+          transactionHash: "0x123",
+          eventIndex: 0,
+          contractAddress: "0xwork",
+          eventType: "AgreementStatusChange",
+        },
+      ];
+
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(mockEvents),
+            }),
+          }),
+        }),
+      } as any);
+
+      mockGetTransactionReceipt.mockResolvedValue(null);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/status-changes?limit=100")
+        .expect(200);
+
+      expect(res.body.hasMore).toBe(false);
+
+      selectMock.mockRestore();
     });
   });
 
@@ -713,6 +813,90 @@ describe("Reprocess Events Routes", () => {
 
       expect(res2.body.summary.processed).toBe(1);
       expect(res2.body.results[0].txHash).toBe(res1.body.results[0].txHash);
+    });
+
+    it("should dedupe an exact duplicate tx hash to a single RPC call", async () => {
+      const mockReceipt = {
+        transaction_hash: "0xaaaa",
+        blockNumber: 100,
+        events: [
+          {
+            from_address: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            data: ["123", "0x123", "0x456", "0x789", "0", "1"],
+          },
+        ],
+      };
+      mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes: ["0xaaaa", "0xaaaa"] })
+        .expect(200);
+
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(1);
+      expect(res.body.results).toHaveLength(2);
+      expect(res.body.results[0]).toEqual(res.body.results[1]);
+      expect(res.body.summary.duplicates).toBe(1);
+      expect(res.body.summary.total).toBe(2);
+    });
+
+    it("should dedupe hashes that differ only by leading-zero padding", async () => {
+      const mockReceipt = {
+        transaction_hash: "0x1234567890abcdef",
+        blockNumber: 100,
+        events: [
+          {
+            from_address: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+            data: ["123", "0x123", "0x456", "0x789", "0", "1"],
+          },
+        ],
+      };
+      mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+
+      const unpadded = "0x1234567890abcdef";
+      const padded = `0x${"0".repeat(48)}1234567890abcdef`; // 66 chars, same value normalized
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({ tx_hashes: [unpadded, padded] })
+        .expect(200);
+
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(1);
+      expect(res.body.results).toHaveLength(2);
+      expect(res.body.results[0]).toEqual(res.body.results[1]);
+      expect(res.body.summary.duplicates).toBe(1);
+      expect(res.body.summary.total).toBe(2);
+    });
+
+    it("should report duplicates: 0 for an all-unique batch (backward compat)", async () => {
+      const mockReceipt1 = {
+        transaction_hash: "0x1234567890abcdef",
+        blockNumber: 100,
+        events: [],
+      };
+      const mockReceipt2 = {
+        transaction_hash: "0xdeadbeef00000000000000000000000000000000000000000000000000000001",
+        blockNumber: 200,
+        events: [],
+      };
+
+      mockGetTransactionReceipt
+        .mockResolvedValueOnce(mockReceipt1)
+        .mockResolvedValueOnce(mockReceipt2);
+
+      const res = await request(app)
+        .post("/api/v1/reprocess-events/batch")
+        .send({
+          tx_hashes: [
+            "0x1234567890abcdef",
+            "0xdeadbeef00000000000000000000000000000000000000000000000000000001",
+          ],
+        })
+        .expect(200);
+
+      expect(res.body.summary.duplicates).toBe(0);
+      expect(res.body.summary.total).toBe(2);
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(2);
     });
   });
 });

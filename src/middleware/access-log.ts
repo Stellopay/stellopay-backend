@@ -163,6 +163,31 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
       // A logging failure must never affect the caller.
       // eslint-disable-next-line no-console
       console.error("[access-log] failed to emit log entry", err);
+    const endHrTime = process.hrtime.bigint();
+    const durationMs = Number(endHrTime - startHrTime) / 1_000_000;
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      level: "info",
+      method: req.method,
+      path: req.originalUrl || req.path,
+      status: res.statusCode,
+      duration_ms: Math.round(durationMs * 100) / 100,
+      request_id: res.locals.requestId ?? requestId,
+    };
+
+    if (env.LOG_FORMAT === "json") {
+      // The global logger override will handle JSON formatting and injecting request_id
+      // eslint-disable-next-line no-console
+      console.info({
+        method: logEntry.method,
+        path: logEntry.path,
+        status: logEntry.status,
+        duration_ms: logEntry.duration_ms,
+      });
+    } else {
+      // eslint-disable-next-line no-console
+      console.info(`${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms`);
     }
   });
 

@@ -36,14 +36,10 @@ export function calculateUnreadCount(notifications: Array<{ read: boolean }>): n
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
   try {
-    // Validate the path param before it is normalized so a crafted string
-    // cannot produce a surprising lookup key; an invalid address throws a
-    // ZodError that the global handler maps to a 400 before any DB query.
     const userAddress = StarknetAddress.parse(req.params.user_address);
     const limit =
       z.coerce.number().int().positive().max(50).optional().parse(req.query.limit) || 10;
 
-    // Get payment notifications
     const payments = await db
       .select()
       .from(schema.payments)
@@ -51,8 +47,6 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       .orderBy(desc(schema.payments.blockNumber))
       .limit(limit);
 
-    // Get important agreement events (disputes, activations, cancellations, and creations)
-    // First, get agreement IDs where user is involved
     const userAgreements = await db
       .select({ id: schema.agreements.id, token: schema.agreements.token })
       .from(schema.agreements)
@@ -64,9 +58,8 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       );
 
     const agreementIds = userAgreements.map((a) => a.id);
-    const agreementTokensById = new Map(userAgreements.map((agreement) => [agreement.id, agreement.token]));
+    const agreementTokensById = new Map(userAgreements.map((a) => [a.id, a.token]));
 
-    // Get important events for user's agreements
     const importantEvents =
       agreementIds.length > 0
         ? await db
@@ -88,7 +81,6 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
             .limit(limit)
         : [];
 
-    // Get escrow events (Funded, Released, Refunded)
     const escrowEvents = await db
       .select()
       .from(schema.escrowEvents)
@@ -98,12 +90,10 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       .orderBy(desc(schema.escrowEvents.blockNumber))
       .limit(limit);
 
-    // Transform to notification format
-    const notifications = [
+    const rawNotifications = [
       ...payments.map((p) => {
         const tokenInfo = getTokenInfo(p.token);
         const formattedAmount = formatTokenAmount(p.amount, tokenInfo.decimals);
-
         return {
           id: p.id,
           title: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
@@ -116,18 +106,8 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       }),
       ...importantEvents.map((e) => ({
         id: e.id,
-        title:
-          e.eventType === "DisputeRaised"
-            ? "Dispute Raised"
-            : e.eventType === "DisputeResolved"
-              ? "Dispute Resolved"
-              : e.eventType === "AgreementActivated"
-                ? "Agreement Activated"
-                : e.eventType === "AgreementCreated"
-                  ? "Agreement Created"
-                  : "Agreement Cancelled",
-        message:
-          e.eventType === "AgreementCreated"
+        title: e.eventType.replace(/([A-Z])/g, ' $1').trim(),
+        message: e.eventType === "AgreementCreated"
             ? `Agreement #${e.agreementId} has been created`
             : `Agreement ${e.agreementId}: ${e.eventType}`,
         read: false,
@@ -136,19 +116,11 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
         txHash: e.transactionHash,
       })),
       ...escrowEvents.map((e) => {
-        const tokenAddress = agreementTokensById.get(e.agreementId) ?? null;
-        const tokenInfo = getTokenInfo(tokenAddress);
-        const formattedAmount = formatTokenAmount(e.amount, tokenInfo.decimals);
-
+        const tokenInfo = getTokenInfo(agreementTokensById.get(e.agreementId) ?? null);
         return {
           id: e.id,
-          title:
-            e.eventType === "Funded"
-              ? "Agreement Funded"
-              : e.eventType === "Released"
-                ? "Funds Released"
-                : "Funds Refunded",
-          message: `Agreement ${e.agreementId}: ${e.eventType} of ${formattedAmount} tokens`,
+          title: e.eventType === "Funded" ? "Agreement Funded" : `Funds ${e.eventType}`,
+          message: `Agreement ${e.agreementId}: ${e.eventType} of ${formatTokenAmount(e.amount, tokenInfo.decimals)} tokens`,
           read: false,
           date: e.createdAt.toISOString(),
           type: e.eventType,

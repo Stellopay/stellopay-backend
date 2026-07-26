@@ -4,11 +4,71 @@ import { db, schema } from "../db/index.js";
 import { eq, and, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
+import { env } from "../config.js";
 
 export const analyticsRouter = Router();
 
+interface AnalyticsTelemetryEntry {
+  operation: string;
+  duration_ms: number;
+  status: "success" | "error";
+  request_id?: string;
+  user_address?: string;
+  year?: number;
+  row_counts?: Record<string, number>;
+  error?: string;
+}
+
+/**
+ * Emits a structured telemetry log entry for each analytics aggregation rollup.
+ *
+ * Respects env.LOG_FORMAT:
+ * - "json" → single-line JSON via console.info / console.error (production default)
+ * - anything else → human-readable text via console.info / console.error (development)
+ *
+ * Respects env.LOG_LEVEL: debug entries are suppressed when LOG_LEVEL is not "debug".
+ */
+function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    if (logEntry.level === "error") {
+      // eslint-disable-next-line no-console
+      console.error(JSON.stringify(logEntry));
+    } else {
+      // eslint-disable-next-line no-console
+      console.info(JSON.stringify(logEntry));
+    }
+  } else {
+    const counts = logEntry.row_counts
+      ? ` rows=${JSON.stringify(logEntry.row_counts)}`
+      : "";
+    const msg =
+      `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [analytics-telemetry] ` +
+      `${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+      `${logEntry.request_id ? ` [${logEntry.request_id}]` : ""}` +
+      `${counts}` +
+      `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+
+    if (logEntry.level === "error") {
+      // eslint-disable-next-line no-console
+      console.error(msg);
+    } else {
+      // eslint-disable-next-line no-console
+      console.info(msg);
+    }
+  }
+}
+
 // Get analytics data (monthly payment amounts) for a user
 analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId: string | undefined = res.locals.requestId;
+
   try {
     // Validate the path param before it is normalized so a crafted string
     // cannot produce a surprising lookup key; an invalid address throws a
@@ -152,12 +212,39 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     // losslessly rather than by accumulating already-rounded display values.
     const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logAnalyticsTelemetry({
+      operation: "analytics_monthly_rollup",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "success",
+      request_id: requestId,
+      user_address: userAddress,
+      year,
+      row_counts: {
+        payments: payments.length,
+        escrow_events: escrowEvents.length,
+        agreement_creations: agreementCreations.length,
+      },
+    });
+
     res.json({
       year,
       data: chartData,
       total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
     });
-  } catch (e) {
+  } catch (e: any) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    // Only log telemetry for errors that are not Zod validation failures;
+    // those are surfaced as 400s by the global error handler and do not
+    // represent a backend data path failure.
+    logAnalyticsTelemetry({
+      operation: "analytics_monthly_rollup",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "error",
+      request_id: requestId,
+      user_address: req.params.user_address,
+      error: e?.message || String(e),
+    });
     next(e);
   }
 });

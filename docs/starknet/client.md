@@ -7,6 +7,8 @@ The provider wraps multiple RPC endpoints with automatic failover. When the acti
 - invokeWithFailover() tries endpoints in failover order
 - healthyRpcIndex tracks the last working endpoint
 - Failed-over events log a console.warn with the old and new URL
+- Each retry receives a fresh copy of the RPC arguments so pagination and batching payloads are not mutated by an earlier failed attempt
+- The helper is intentionally scoped to plain JSON-like payloads used by current callers; custom class instances and cyclic structures are out of scope for this change
 
 ## Fee Quotes
 

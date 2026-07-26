@@ -62,6 +62,9 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      - name: Check env sync
+        run: pnpm check:env
+
       - name: Build
         run: pnpm build
 

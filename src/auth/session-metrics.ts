@@ -36,7 +36,11 @@ export type SessionEventName =
   | "session.all_revoked"
   | "session.sweep_completed"
   | "session.sweep_failed"
-  | "session.sweeper_crashed";
+  | "session.sweeper_crashed"
+  | "session.revoke_retry"
+  | "session.revoke_failed"
+  | "session.sweep_retry"
+  | "session.revoke_already";
 
 /**
  * Bounded set of reason codes used for `session.rejected` log events. The
@@ -183,6 +187,15 @@ export const SESSION_METRICS = {
   SWEEP_RUNS: "session_sweep_runs_total",
   SWEEP_DELETED: "session_sweep_deleted_total",
   SWEEPER_ERRORS: "session_sweeper_errors_total",
+  // Reliability: retry counters and idempotency counters for revoke-family
+  // style operations. Separate names so dashboards can split "we retried a
+  // write because of a transient blip" from "we wrote it once and it stuck".
+  REVOKE_RETRY: "session_revoke_retry_total",
+  REVOKE_FAILED: "session_revoke_failed_total",
+  SWEEP_RETRY: "session_sweep_retry_total",
+  REVOKED_ALREADY: "session_revoke_already_total",
+  FAMILY_REVOKED_ALREADY: "session_family_revoke_already_total",
+  ALL_REVOKED_ALREADY: "session_all_revoke_already_total",
 } as const;
 
 export const SESSION_GAUGES = {

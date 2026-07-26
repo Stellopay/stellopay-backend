@@ -194,9 +194,19 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
+// Named via vi.hoisted so individual tests can override behavior (e.g.
+// simulate requireAdmin rejecting a non-admin caller) with mockImplementationOnce.
+// vi.clearAllMocks() (used throughout this file) clears call history but not
+// the base implementation set here, so the default "always call next()"
+// behavior persists across tests unless explicitly overridden.
+const { mockRequireAuth, mockRequireAdmin } = vi.hoisted(() => ({
+  mockRequireAuth: vi.fn((_req: any, _res: any, next: any) => next()),
+  mockRequireAdmin: vi.fn((_req: any, _res: any, next: any) => next()),
+}));
+
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: mockRequireAuth,
+  requireAdmin: mockRequireAdmin,
 }));
 describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
@@ -523,6 +533,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
 
     expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ success: false });
     expect(res.body.error).toMatch(/not found/i);
   });
 
@@ -537,5 +548,73 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.summary.total).toBe(1);
     expect(res.body.results).toHaveLength(1);
+  });
+
+  it("process_tx returns 400 with a clean error for a malformed hash", async () => {
+    const res = await request(makeApp()).post("/events/process_tx/not-a-tx-hash").send();
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    // Never should have reached the provider with garbage input.
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  it("process_tx still works for valid TX_A/TX_B-style hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp()).post(`/events/process_tx/${TX_B}`).send();
+
+    expect(res.status).toBe(200);
+    expect(res.body.transactionHash).toBe(TX_B);
+  });
+
+  it("process_batch dedupes an exact duplicate hash within the same batch", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_A] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.results[0]).toEqual(res.body.results[1]);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch dedupes hashes that differ only by leading-zero padding", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const unpadded = "0xaaaa";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, unpadded] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch reports zero duplicates for all-unique hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(2);
+    expect(res.body.summary.duplicates).toBe(0);
+    expect(res.body.summary.total).toBe(2);
   });
 });

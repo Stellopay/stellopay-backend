@@ -3,11 +3,12 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
-import { eq, and, gte, lte } from "drizzle-orm";
+import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { notFoundResponse } from "./not-found.js";
 
 export const reprocessEventsRouter = Router();
 
@@ -66,7 +67,7 @@ reprocessEventsRouter.post(
       const result = await processTxReceipt(tx_hash);
 
       if (result.status === "not_found") {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
 
@@ -80,7 +81,7 @@ reprocessEventsRouter.post(
         return;
       }
       if (e.message === "Transaction not found") {
-        res.status(404).json({ error: "Transaction not found" });
+        notFoundResponse(res, "Transaction not found");
         return;
       }
       next(e);
@@ -100,9 +101,21 @@ reprocessEventsRouter.post(
  * - `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
  * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request.
  *
+ * **Batching contract**
+ * Duplicate hashes (including hashes that differ only by leading-zero
+ * padding, e.g. `0x1` vs `0x0...01`) are deduped before processing: each
+ * unique hash — keyed by its {@link normalizeTransactionHash} form — is
+ * passed to `processTxReceipt` exactly once, regardless of how many times
+ * it appears in the request. This avoids redundant RPC calls and keeps the
+ * `summary` counts an accurate reflection of the work actually performed.
+ *
  * **Response**
- * Returns a `results` array where each entry corresponds to one tx hash.
- * A per-tx error never aborts the rest of the batch.
+ * Returns a `results` array with the same length and index-correspondence
+ * as the input `tx_hashes` array — `results[i]` always corresponds to
+ * `tx_hashes[i]`, even for duplicates (which reuse the first occurrence's
+ * result object). `summary.duplicates` reports how many entries were
+ * duplicates of an earlier hash in the same request. A per-tx error never
+ * aborts the rest of the batch.
  */
 reprocessEventsRouter.post(
   "/reprocess-events/batch",
@@ -123,20 +136,36 @@ reprocessEventsRouter.post(
         .parse(req.body);
 
       const results = [];
+      // Cache of normalized hash -> result object, so duplicate hashes reuse
+      // the first occurrence's result instead of triggering another RPC call.
+      const resultByNormalizedHash = new Map<string, (typeof results)[number]>();
+      let duplicates = 0;
 
       for (const txHash of tx_hashes) {
+        const normalizedHash = normalizeTransactionHash(txHash);
+        const cached = resultByNormalizedHash.get(normalizedHash);
+
+        if (cached) {
+          duplicates++;
+          results.push(cached);
+          continue;
+        }
+
+        let result;
         try {
-          const result = await processTxReceipt(txHash);
-          results.push(result);
+          result = await processTxReceipt(txHash);
         } catch (e: any) {
-          results.push({
+          result = {
             txHash,
             status: "error",
             eventsProcessed: 0,
             eventLabels: [],
             error: e?.message ?? String(e),
-          });
+          };
         }
+
+        resultByNormalizedHash.set(normalizedHash, result);
+        results.push(result);
       }
 
       const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
@@ -149,12 +178,13 @@ reprocessEventsRouter.post(
           notFound: results.filter((r) => r.status === "not_found").length,
           errors: results.filter((r) => r.status === "error").length,
           totalEventsProcessed: totalProcessed,
+          duplicates,
         },
         results,
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request body" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
         return;
       }
       next(e);
@@ -170,6 +200,22 @@ reprocessEventsRouter.post(
  * so re-runs automatically skip already-updated events.  An in-memory dedup
  * set keyed on `transaction_hash + event_index` prevents processing the same
  * event twice within a single request.
+ *
+ * **Pagination contract**
+ * Results are ordered deterministically by `blockNumber` then `eventIndex`
+ * (both ascending), so repeated calls with the same filters page through
+ * the backlog in a stable, forward-progressing order instead of relying on
+ * the database's unspecified default row order. The response includes
+ * `hasMore: true` whenever the page returned exactly `limit` rows (i.e.
+ * more matching rows may exist beyond it); callers should page forward by
+ * re-invoking with `fromBlock` set to one past the last-seen `blockNumber`.
+ *
+ * **Known limitation**: events that fail to update (`no_receipt`,
+ * `event_not_found`, `error`) keep `eventType === "AgreementStatusChange"`
+ * and therefore remain eligible for reprocessing on every subsequent call
+ * unless the caller advances `fromBlock` past them. There is no persistent
+ * retry-count or quarantine state (would require a schema migration) — see
+ * `docs/routes/reprocess-events.md` for details.
  *
  * **Validation**
  * - `limit` (query, optional, default 100, max {@link MAX_STATUS_LIMIT})
@@ -202,11 +248,14 @@ reprocessEventsRouter.post(
         conditions.push(lte(schema.agreementEvents.blockNumber, toBlock));
       }
 
-      // Get AgreementStatusChange events matching the filter
+      // Get AgreementStatusChange events matching the filter, ordered
+      // deterministically so repeated calls page through the backlog in a
+      // stable, forward-progressing order.
       const statusChangeEvents = await db
         .select()
         .from(schema.agreementEvents)
         .where(and(...conditions))
+        .orderBy(asc(schema.agreementEvents.blockNumber), asc(schema.agreementEvents.eventIndex))
         .limit(limit);
 
       const results = [];
@@ -321,14 +370,20 @@ reprocessEventsRouter.post(
         }
       }
 
+      // hasMore is true when the page came back full, signaling there may be
+      // more matching rows beyond it for the caller to fetch with a
+      // follow-up call (advancing fromBlock past the last-seen blockNumber).
+      const hasMore = statusChangeEvents.length === limit;
+
       res.json({
         message: `Reprocessed ${results.length} events, updated ${updated}`,
         updated,
         results,
+        hasMore,
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });
         return;
       }
       next(e);

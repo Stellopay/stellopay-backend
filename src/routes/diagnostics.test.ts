@@ -16,7 +16,7 @@ vi.mock("../auth/session.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  env: { ADMIN_ADDRESSES: ["0xadmin"] },
+  env: { ADMIN_ADDRESSES: ["0xabc1"] },
 }));
 
 vi.mock("../db/index.js", () => ({
@@ -29,9 +29,11 @@ import { redactRecentEvent, fetchDiagnosticsData, diagnosticsRouter } from "./di
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
 
-
-const ADMIN = "0xadmin";
-const NON_ADMIN = "0xnotadmin";
+// Use valid-hex addresses: the auth middleware now compares the
+// principal against the admin allowlist through normalizeStarknetAddress,
+// which rejects anything outside [0-9a-f] (e.g. `m`, `n`, `o`, `t`).
+const ADMIN = "0xabc1";
+const NON_ADMIN = "0xdef2";
 
 function makeApp() {
   const app = express();
@@ -149,7 +151,6 @@ describe("fetchDiagnosticsData helper", () => {
   });
 });
 
-
 describe("GET /diagnostics/events – admin gating and redaction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -164,21 +165,24 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(db.execute).not.toHaveBeenCalled();
   });
 
-  it("rejects an authenticated non-admin with 401 and runs no queries", async () => {
+  it("rejects an authenticated non-admin with 403 and runs no queries", async () => {
+    // requireAuth was satisfied by the session mock, but requireAdmin
+    // denies because NON_ADMIN is not in the admin allowlist. The 401/403
+    // split in src/auth/middleware.ts intentionally distinguishes "no
+    // session" from "wrong role".
     const res = await request(makeApp())
       .get("/api/v1/diagnostics/events")
       .set(authHeaders(NON_ADMIN));
 
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Forbidden" });
     expect(db.execute).not.toHaveBeenCalled();
   });
 
   it("rejects requests when requireSession invalidates session", async () => {
     vi.mocked(requireSession).mockResolvedValueOnce(false);
 
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
+    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
 
     expect(res.status).toBe(401);
     expect(db.execute).not.toHaveBeenCalled();
@@ -262,4 +266,3 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.status).toBe(500);
   });
 });
-
