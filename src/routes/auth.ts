@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
-import { buildTypedChallenge, consumeChallenge, createChallenge } from "../auth/challenge.js";
+import { buildTypedChallenge, consumeChallenge, createChallenge, getChallenge } from "../auth/challenge.js";
 import {
   createSession,
   requireSession,
@@ -64,18 +64,15 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
 authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
-    // Consume (read + delete) the challenge atomically, before the async verify call,
-    // so two concurrent requests can't both read it while it's still valid and both
-    // pass verification off the same nonce.
-    const ch = consumeChallenge(address);
+    const ch = getChallenge(address);
     if (!ch) {
       res
         .status(400)
         .json({ error: "No active challenge (or expired). Call /auth/challenge again." });
       return;
     }
-    const { chainId } = await getCachedNetworkInfo();
 
+    const { chainId } = await getCachedNetworkInfo();
     const typedData = buildTypedChallenge(address, chainId, ch.nonce);
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
@@ -83,13 +80,29 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       res.status(401).json({ error: "Invalid signature" });
       return;
     }
-    const session = await createSession(address);
-    res.json({
-      ok: true,
-      address,
-      session_token: session.token,
-      expires_in_ms: session.expires_in_ms,
-    });
+
+    const consumedChallenge = consumeChallenge(address);
+    if (!consumedChallenge) {
+      res
+        .status(400)
+        .json({ error: "No active challenge (or expired). Call /auth/challenge again." });
+      return;
+    }
+
+    try {
+      const session = await createSession(address);
+      res.json({
+        ok: true,
+        address,
+        session_token: session.token,
+        expires_in_ms: session.expires_in_ms,
+      });
+    } catch (e) {
+      createChallenge(address);
+      // eslint-disable-next-line no-console
+      console.error("[auth] /auth/verify session issuance error", e);
+      res.status(500).json({ error: "Unable to issue session. Please try again." });
+    }
   } catch (e) {
     // eslint-disable-next-line no-console
     console.error("[auth] /auth/verify error", e);
