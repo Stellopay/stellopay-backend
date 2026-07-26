@@ -1,19 +1,64 @@
 import { z } from "zod";
 import { normalizeStarknetAddress } from "./address.js";
 
-/**
- * Shared Zod schema for a Starknet address supplied as a path or query
- * parameter. Accepts a hex string of up to 64 hex characters (the felt width),
- * with or without a 0x prefix, and transforms it to the canonical lookup form
- * via {@link normalizeStarknetAddress}, so callers receive an address ready for
- * a database lookup. The 0x prefix is optional to match the canonical
- * normalizer; non-hex, oversized, or empty values are rejected before any
- * database or RPC call.
- *
- * @example
- * StarknetAddress.parse("0x4718F5a..."); // canonical normalized address
- * StarknetAddress.parse("abc");          // also accepted, normalized to 0x..0abc
- */
+export class ValidationError extends Error {
+  readonly validator: string;
+  readonly issues: Array<{ path: (string | number)[]; message: string; code: string }>;
+  readonly input: string;
+  readonly timestamp: string;
+  readonly status: number;
+
+  constructor(opts: {
+    validator: string;
+    message: string;
+    issues: Array<{ path: (string | number)[]; message: string; code: string }>;
+    input: string;
+    cause?: unknown;
+    status?: number;
+  }) {
+    super(opts.message);
+    this.name = "ValidationError";
+    this.validator = opts.validator;
+    this.issues = opts.issues;
+    this.input = opts.input;
+    this.timestamp = new Date().toISOString();
+    this.status = opts.status ?? 400;
+    if (opts.cause !== undefined) {
+      this.cause = opts.cause instanceof Error ? opts.cause : new Error(String(opts.cause));
+    }
+  }
+
+  static fromZodError(
+    zodError: z.ZodError,
+    validator: string,
+    input: string,
+  ): ValidationError {
+    return new ValidationError({
+      validator,
+      message: zodError.issues.map((i) => i.message).join("; "),
+      issues: zodError.issues.map((i) => ({
+        path: i.path,
+        message: i.message,
+        code: i.code,
+      })),
+      input,
+      cause: zodError,
+      status: 400,
+    });
+  }
+
+  toJSON(): Record<string, unknown> {
+    return {
+      name: this.name,
+      message: this.message,
+      validator: this.validator,
+      issues: this.issues,
+      input: this.input,
+      timestamp: this.timestamp,
+      status: this.status,
+    };
+  }
+}
 
 interface ValidationErrorMetric {
   validator: string;
@@ -28,18 +73,24 @@ function logValidationError(metric: ValidationErrorMetric): void {
 
 /**
  * Wraps a Zod schema with error logging. On parse failure, logs structured
- * diagnostics before re-throwing so production failures are traceable.
+ * diagnostics before throwing a serializable {@link ValidationError} so
+ * production failures are traceable and safe to serialize for retry/replay.
+ *
+ * The thrown {@link ValidationError} carries `status: 400` so Express-level
+ * error handlers that respect `err.status` map it to a client error response.
  */
 export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
+    const inputPreview =
+      typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40);
     logValidationError({
       validator: validatorName,
-      input: typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40),
+      input: inputPreview,
       error: result.error.issues.map((i) => i.message).join("; "),
       timestamp: new Date().toISOString(),
     });
-    throw result.error;
+    throw ValidationError.fromZodError(result.error, validatorName, inputPreview);
   }
   return result.data;
 }
@@ -53,51 +104,22 @@ export const StarknetAddress = z
   )
   .transform((value) => normalizeStarknetAddress(value));
 
-/**
- * Shared Zod schema for a numeric agreement identifier passed as a string. The
- * id is stored as text, so it stays a string but must contain only digits,
- * which keeps malformed identifiers out of the database query.
- */
 export const AgreementId = z
   .string()
   .trim()
   .regex(/^\d+$/, "agreement_id must be a numeric string");
 
-/** Largest page a list endpoint will return in a single response. */
 export const MAX_PAGE_LIMIT = 100;
 
-/** Page size used when the caller does not supply a usable limit. */
 export const DEFAULT_PAGE_LIMIT = 50;
 
-/**
- * Parses and clamps pagination query parameters. Clamping happens server-side
- * so a client cannot request an unbounded, zero, or negative page: the limit is
- * forced into the range 1 to {@link MAX_PAGE_LIMIT} and the offset to 0 or more.
- * Missing or non-numeric values fall back to safe defaults rather than failing
- * the request.
- *
- * @param query - The request query object (req.query).
- * @returns A clamped pair of limit and offset.
- *
- * @example
- * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
- * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
- */
-/**
- * Normalizes "missing-like" values — an explicit `null` or empty string — to
- * `undefined` before delegating to Zod so the `.catch()` fallback engages.
- *
- * Without this normalization, Zod's `z.coerce.number()` would coerce both
- * `null` and `""` to the number `0`, which then passes `.int()` and is
- * silently clamped to a limit of `1`. That is a fail-open that bypasses
- * {@link DEFAULT_PAGE_LIMIT} and makes a pagination request return only a
- * single row — inconsistent with `undefined`, which falls back to the
- * documented default. Treating `null` / `""` and `undefined` uniformly
- * removes the inconsistency.
- */
 function coerceNullOrEmptyToUndefined(value: unknown): unknown {
   if (value === null || value === "") return undefined;
   return value;
+}
+
+function guardFinite(value: number, fallback: number): number {
+  return Number.isFinite(value) ? value : fallback;
 }
 
 export function parsePagination(query: unknown): {
@@ -105,16 +127,22 @@ export function parsePagination(query: unknown): {
   offset: number;
 } {
   const source = (query ?? {}) as Record<string, unknown>;
-  const limitRaw = z.coerce
-    .number()
-    .int()
-    .catch(DEFAULT_PAGE_LIMIT)
-    .parse(coerceNullOrEmptyToUndefined(source.limit));
-  const offsetRaw = z.coerce
-    .number()
-    .int()
-    .catch(0)
-    .parse(coerceNullOrEmptyToUndefined(source.offset));
+  const limitRaw = guardFinite(
+    z.coerce
+      .number()
+      .int()
+      .catch(DEFAULT_PAGE_LIMIT)
+      .parse(coerceNullOrEmptyToUndefined(source.limit)),
+    DEFAULT_PAGE_LIMIT,
+  );
+  const offsetRaw = guardFinite(
+    z.coerce
+      .number()
+      .int()
+      .catch(0)
+      .parse(coerceNullOrEmptyToUndefined(source.offset)),
+    0,
+  );
   return {
     limit: Math.min(Math.max(limitRaw, 1), MAX_PAGE_LIMIT),
     offset: Math.max(offsetRaw, 0),

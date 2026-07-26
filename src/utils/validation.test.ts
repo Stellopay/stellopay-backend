@@ -7,7 +7,130 @@ import {
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
   loggedParse,
+  ValidationError,
 } from "./validation";
+
+// --------------------------------------------------------------------------
+// ValidationError
+// --------------------------------------------------------------------------
+
+describe("ValidationError", () => {
+  it("captures validator name, message, and issues", () => {
+    const err = new ValidationError({
+      validator: "test",
+      message: "something went wrong",
+      issues: [{ path: ["name"], message: "too short", code: "too_small" }],
+      input: "ab",
+    });
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("ValidationError");
+    expect(err.validator).toBe("test");
+    expect(err.message).toBe("something went wrong");
+    expect(err.issues).toEqual([
+      { path: ["name"], message: "too short", code: "too_small" },
+    ]);
+    expect(err.input).toBe("ab");
+  });
+
+  it("sets a default status of 400", () => {
+    const err = new ValidationError({
+      validator: "test",
+      message: "fail",
+      issues: [],
+      input: "",
+    });
+    expect(err.status).toBe(400);
+  });
+
+  it("accepts an explicit status override", () => {
+    const err = new ValidationError({
+      validator: "test",
+      message: "fail",
+      issues: [],
+      input: "",
+      status: 422,
+    });
+    expect(err.status).toBe(422);
+  });
+
+  it("attaches the cause when provided", () => {
+    const cause = new Error("root cause");
+    const err = new ValidationError({
+      validator: "test",
+      message: "fail",
+      issues: [],
+      input: "",
+      cause,
+    });
+    expect(err.cause).toBe(cause);
+  });
+
+  it("generates an ISO timestamp", () => {
+    const err = new ValidationError({
+      validator: "test",
+      message: "fail",
+      issues: [],
+      input: "",
+    });
+    expect(Number.isNaN(Date.parse(err.timestamp))).toBe(false);
+  });
+
+  it("serializes to a plain JSON object via toJSON()", () => {
+    const err = new ValidationError({
+      validator: "vw",
+      message: "invalid value",
+      issues: [{ path: [], message: "invalid", code: "invalid_string" }],
+      input: "bad",
+    });
+    const json = err.toJSON();
+    expect(json).toMatchObject({
+      name: "ValidationError",
+      message: "invalid value",
+      validator: "vw",
+      issues: [{ path: [], message: "invalid", code: "invalid_string" }],
+      input: "bad",
+      status: 400,
+    });
+    expect(json).toHaveProperty("timestamp");
+    expect(JSON.parse(JSON.stringify(err))).toMatchObject({
+      name: "ValidationError",
+      validator: "vw",
+      issues: [{ path: [], message: "invalid", code: "invalid_string" }],
+    });
+  });
+
+  it("round-trips through JSON.stringify without losing structure", () => {
+    const err = new ValidationError({
+      validator: "rt",
+      message: "round trip",
+      issues: [{ path: ["x"], message: "bad", code: "custom" }],
+      input: "input",
+    });
+    const roundTripped = JSON.parse(JSON.stringify(err)) as Record<string, unknown>;
+    expect(roundTripped.name).toBe("ValidationError");
+    expect(roundTripped.validator).toBe("rt");
+    expect(Array.isArray(roundTripped.issues)).toBe(true);
+    expect(roundTripped.status).toBe(400);
+  });
+
+  it("fromZodError extracts issues, message, and cause from a ZodError", () => {
+    const schema = z.string().min(5).email();
+    const result = schema.safeParse("ab");
+    expect(result.success).toBe(false);
+    if (result.success) return;
+
+    const err = ValidationError.fromZodError(result.error, "emailTest", "ab");
+    expect(err.validator).toBe("emailTest");
+    expect(err.input).toBe("ab");
+    expect(err.message).toContain("Too small");
+    expect(err.issues.length).toBeGreaterThanOrEqual(2);
+    expect(err.issues[0]).toHaveProperty("path");
+    expect(err.issues[0]).toHaveProperty("message");
+    expect(err.issues[0]).toHaveProperty("code");
+    expect(err.cause).toBe(result.error);
+    expect(err.status).toBe(400);
+  });
+});
 
 // --------------------------------------------------------------------------
 // StarknetAddress
@@ -45,7 +168,6 @@ describe("StarknetAddress", () => {
   });
 
   it("trims surrounding whitespace before validation", () => {
-    // Boundary: well-formed but with surrounding whitespace — must NOT throw.
     expect(StarknetAddress.parse("  0x1  ")).toMatch(/^0x[0-9a-f]{64}$/);
     expect(StarknetAddress.parse("\tabc\n")).toMatch(/^0x[0-9a-f]{64}$/);
   });
@@ -60,7 +182,6 @@ describe("StarknetAddress", () => {
   });
 
   it("rejects an extremely long hex string without a 0x prefix", () => {
-    // 10,000 chars — well beyond the 64-char felt width. Must not hang or throw unexpectedly.
     expect(() => StarknetAddress.parse("a".repeat(10_000))).toThrow(/hex/);
   });
 
@@ -75,13 +196,10 @@ describe("StarknetAddress", () => {
 
   it("rejects a '0x' prefix with no hex digits", () => {
     expect(() => StarknetAddress.parse("0x")).toThrow();
-    // `0X` is uppercase `X` which is not a hex digit, so the whole token
-    // fails the regex.
     expect(() => StarknetAddress.parse("0X")).toThrow();
   });
 
   it("rejects unicode that looks like hex digits", () => {
-    // Fullwidth digits, Arabic-Indic digits, Devanagari digit — none are [0-9a-fA-F].
     expect(() => StarknetAddress.parse("0xＡＢＣ")).toThrow();
     expect(() => StarknetAddress.parse("٠١٢٣")).toThrow();
     expect(() => StarknetAddress.parse("०१२३")).toThrow();
@@ -129,7 +247,6 @@ describe("AgreementId", () => {
   });
 
   it("trims surrounding whitespace before validation", () => {
-    // Boundary: well-formed but whitespace-wrapped — must NOT throw.
     expect(AgreementId.parse("  42  ")).toBe("42");
   });
 
@@ -198,8 +315,6 @@ describe("parsePagination", () => {
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
     });
-    // Boundary: literal null query — must hit the nullish-coalescing branch
-    // and return the same defaults as `undefined`.
     expect(parsePagination(null)).toEqual({
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
@@ -207,10 +322,6 @@ describe("parsePagination", () => {
   });
 
   it("uses defaults when limit/offset are explicit null or empty strings", () => {
-    // Security boundary: previously these silently fell through Zod's
-    // `coerce.number` → `Number(null) === 0` / `Number("") === 0` → `int()`
-    // passes → clamps to 1, returning a single page. That was an
-    // inconsistent fail-open. Now they fall back to the safe default.
     expect(parsePagination({ limit: null, offset: null })).toEqual({
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
@@ -233,8 +344,6 @@ describe("parsePagination", () => {
   });
 
   it("falls back to defaults when the numeric string exceeds safe-integer range", () => {
-    // 1e20 is finite and integer-shaped, but exceeds MAX_SAFE_INTEGER
-    // (~9.0e15), so Zod's `.int()` check rejects it; `.catch()` returns DEFAULT.
     expect(parsePagination({ limit: "1e20" })).toEqual({
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
@@ -251,9 +360,7 @@ describe("parsePagination", () => {
       limit: 10,
       offset: 20,
     });
-    // Boundary: number that's already > MAX — should be clamped.
     expect(parsePagination({ limit: 1000 }).limit).toBe(MAX_PAGE_LIMIT);
-    // Boundary: numeric zero — must clamp to 1, NOT to default.
     expect(parsePagination({ limit: 0 }).limit).toBe(1);
   });
 
@@ -263,7 +370,6 @@ describe("parsePagination", () => {
       limit: 10,
       offset: 20,
     });
-    // Boundary: numeric (non-string) offset.
     expect(parsePagination({ offset: -1 }).offset).toBe(0);
   });
 
@@ -275,7 +381,6 @@ describe("parsePagination", () => {
   });
 
   it("falls back to defaults for non-integer (true float) numeric strings", () => {
-    // Float strings: Zod's .int() check uses Number.isInteger so 1.5 fails.
     expect(parsePagination({ limit: "1.5" })).toEqual({
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
@@ -287,9 +392,6 @@ describe("parsePagination", () => {
   });
 
   it("treats scientific-notation and hex-prefixed integer strings as integers", () => {
-    // JS Number() resolves "1e2" → 100, "1.5e2" → 150, "0x10" → 16 — all
-    // finite integers within safe-integer range, so .int() passes and the
-    // values are clamped (or used as-is).
     expect(parsePagination({ limit: "1e2" })).toEqual({
       limit: MAX_PAGE_LIMIT,
       offset: 0,
@@ -313,22 +415,16 @@ describe("parsePagination", () => {
   });
 
   it("accepts extremely large offset (no upper bound on offset, only >= 0)", () => {
-    // offset has no upper clamp — large offsets are allowed and just skip
-    // many rows. Must not throw.
     const huge = String(Number.MAX_SAFE_INTEGER);
     expect(parsePagination({ offset: huge }).offset).toBe(Number.MAX_SAFE_INTEGER);
   });
 
   it("does not throw on array, object, or boolean query values", () => {
-    // Express can deliver arrays for repeated query keys. The function
-    // MUST never throw — these just fall through to clamped values.
     expect(() => parsePagination({ limit: ["10"], offset: ["5"] })).not.toThrow();
-    // Single-element arrays coerce to numbers via Number([x]).
     expect(parsePagination({ limit: ["10"], offset: ["5"] })).toEqual({
       limit: 10,
       offset: 5,
     });
-    // Multi-element arrays coerce to NaN → fallback to DEFAULT.
     expect(parsePagination({ limit: ["10", "20"], offset: ["5", "6"] })).toEqual({
       limit: DEFAULT_PAGE_LIMIT,
       offset: 0,
@@ -337,11 +433,21 @@ describe("parsePagination", () => {
     expect(() => parsePagination({ limit: true, offset: false })).not.toThrow();
   });
 
+  it("guards against Infinity and NaN limit values", () => {
+    // Infinity string: Number("Infinity") === Infinity, which would pass
+    // Zod's .int() check. guardFinite catches it and falls back.
+    expect(parsePagination({ limit: "Infinity" }).limit).toBe(DEFAULT_PAGE_LIMIT);
+    expect(parsePagination({ limit: "NaN" }).limit).toBe(DEFAULT_PAGE_LIMIT);
+    expect(parsePagination({ limit: "-Infinity" }).limit).toBe(DEFAULT_PAGE_LIMIT);
+  });
+
+  it("guards against Infinity and NaN offset values", () => {
+    expect(parsePagination({ offset: "Infinity" }).offset).toBe(0);
+    expect(parsePagination({ offset: "NaN" }).offset).toBe(0);
+    expect(parsePagination({ offset: "-Infinity" }).offset).toBe(0);
+  });
+
   it("never throws regardless of input shape", () => {
-    // The function must return a clamped object for any input — there's no
-    // legitimate scenario where it should reject the request entirely; the
-    // goal is graceful degradation. Each call must return finite numbers
-    // within the documented bounds.
     const calls = [
       () => parsePagination(undefined),
       () => parsePagination(null),
@@ -355,9 +461,11 @@ describe("parsePagination", () => {
       () => parsePagination({ limit: Number.MIN_SAFE_INTEGER }),
       () => parsePagination({ offset: "" }),
       () => parsePagination({ offset: null }),
-      () => parsePagination({ limit: "  10  " }), // whitespace string coerces to 10
+      () => parsePagination({ limit: "  10  " }),
       () => parsePagination({ limit: "Infinity" }),
       () => parsePagination({ limit: "NaN" }),
+      () => parsePagination({ offset: "Infinity" }),
+      () => parsePagination({ offset: "NaN" }),
     ];
     for (const c of calls) {
       expect(c).not.toThrow();
@@ -373,7 +481,6 @@ describe("parsePagination", () => {
   });
 
   it("trims whitespace from numeric string values", () => {
-    // Boundary: well-formed-but-edge, whitespace-wrapped numeric.
     expect(parsePagination({ limit: "  10  " })).toEqual({ limit: 10, offset: 0 });
   });
 });
@@ -389,11 +496,18 @@ describe("loggedParse", () => {
     expect(result).toBe("hello");
   });
 
-  it("logs and throws on validation failure", () => {
+  it("logs and throws a ValidationError on validation failure", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const schema = z.string().min(1);
-    expect(() => loggedParse(schema, "", "testSchema")).toThrow();
-    expect(warn).toHaveBeenCalledOnce();
+    expect(() => loggedParse(schema, "", "testSchema")).toThrow(ValidationError);
+    try {
+      loggedParse(schema, "", "testSchema");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      expect((e as ValidationError).validator).toBe("testSchema");
+      expect((e as ValidationError).status).toBe(400);
+    }
+    expect(warn).toHaveBeenCalled();
     const call = warn.mock.calls[0][0] as string;
     expect(call).toContain("[validation:error]");
     expect(call).toContain("testSchema");
@@ -402,29 +516,21 @@ describe("loggedParse", () => {
 
   it("includes a truncated input preview in the log payload (max 40 chars)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // Schema must actually REJECT the 200-char input for loggedParse to log
-    // and throw. z.string().min(1) accepts any non-empty string, so we add
-    // an explicit upper bound to force a failure.
     const schema = z.string().min(1).max(50);
     const long = "a".repeat(200);
-    expect(() => loggedParse(schema, long, "longerSchema")).toThrow();
+    expect(() => loggedParse(schema, long, "longerSchema")).toThrow(ValidationError);
     const call = warn.mock.calls[0][0] as string;
-    // The truncated 40-char substring is present in the log payload.
     const truncated = long.slice(0, 40);
     expect(call).toContain(truncated);
-    // The full 200-char input must NOT appear — proves truncation worked.
     expect(call).not.toContain(long);
     warn.mockRestore();
   });
 
   it("stringifies non-string input via String() before logging", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // 12345 is a number. z.string().min(1) rejects any non-string, so the
-    // failure path runs through loggedParse's `String(value)` branch.
-    expect(() => loggedParse(z.string().min(1), 12345, "numInput")).toThrow();
+    expect(() => loggedParse(z.string().min(1), 12345, "numInput")).toThrow(ValidationError);
     const call = warn.mock.calls[0][0] as string;
     expect(call).toContain("numInput");
-    // String(12345) === "12345" — confirm the non-string → string path.
     expect(call).toContain("12345");
     warn.mockRestore();
   });
@@ -432,7 +538,7 @@ describe("loggedParse", () => {
   it("emits a JSON-formatted log with validator / input / error / timestamp", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const schema = z.string().min(1);
-    expect(() => loggedParse(schema, "", "abc")).toThrow();
+    expect(() => loggedParse(schema, "", "abc")).toThrow(ValidationError);
     const raw = warn.mock.calls[0][0] as string;
     const json = raw.replace("[validation:error] ", "");
     const parsed: unknown = JSON.parse(json);
@@ -442,7 +548,6 @@ describe("loggedParse", () => {
       error: expect.any(String),
       timestamp: expect.any(String),
     });
-    // Timestamp must be ISO 8601 — parseable as a Date and within reason.
     const ts = (parsed as { timestamp: string }).timestamp;
     expect(Number.isNaN(Date.parse(ts))).toBe(false);
     expect(Math.abs(Date.now() - Date.parse(ts))).toBeLessThan(60_000);
@@ -451,11 +556,8 @@ describe("loggedParse", () => {
 
   it("joins multiple issue messages with '; '", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // Schema must be valid (min <= max) — zod pre-compiles a regex that
-    // throws SyntaxError if the bounds are inverted.
-    // .min(5).email() with input "ab" produces 2 issues: "Too small" AND "Invalid email".
     const schema = z.string().min(5).email();
-    expect(() => loggedParse(schema, "ab", "joined")).toThrow();
+    expect(() => loggedParse(schema, "ab", "joined")).toThrow(ValidationError);
     const raw = warn.mock.calls[0][0] as string;
     const json = raw.replace("[validation:error] ", "");
     const parsed = JSON.parse(json) as { error: string };
@@ -469,5 +571,24 @@ describe("loggedParse", () => {
     loggedParse(schema, "ok", "silentOnSuccess");
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  it("thrown ValidationError has a serializable JSON shape", () => {
+    const schema = z.string().min(5).email();
+    try {
+      loggedParse(schema, "ab", "serTest");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      const json = JSON.parse(JSON.stringify(e));
+      expect(json).toMatchObject({
+        name: "ValidationError",
+        validator: "serTest",
+        status: 400,
+      });
+      expect(json).toHaveProperty("issues");
+      expect(json).toHaveProperty("input");
+      expect(json).toHaveProperty("message");
+      expect(json).toHaveProperty("timestamp");
+    }
   });
 });
