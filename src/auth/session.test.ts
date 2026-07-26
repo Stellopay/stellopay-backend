@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import crypto from "node:crypto";
+import { env } from "../config.js";
 
 // Force the session logger into line-based (non-JSON) output and lower the
 // minimum level to "debug" so the new observability tests can grep for
@@ -204,6 +205,29 @@ describe("sessions", () => {
   it("returns a real expires_in_ms instead of null", async () => {
     const { expires_in_ms } = await createSession("0x111");
     expect(expires_in_ms).toBeGreaterThan(0);
+  });
+
+  it("persists a sliding expiry and an absolute expiry cap for each session", async () => {
+    const { expires_in_ms } = await createSession("0xPersist");
+    const stored = mockState.sessions[0];
+
+    expect(stored.address).toBe("0xpersist");
+    expect(stored.expiresAt.getTime()).toBe(Date.now() + expires_in_ms);
+    expect(stored.absoluteExpiresAt.getTime()).toBe(Date.now() + env.SESSION_MAX_TTL_MS);
+  });
+
+  it("refreshes the sliding expiry without extending past the absolute cap", async () => {
+    const { token } = await createSession("0xContract");
+    const before = mockState.sessions[0];
+    const beforeExpiresAtMs = before.expiresAt.getTime();
+    const beforeAbsoluteExpiresAtMs = before.absoluteExpiresAt.getTime();
+
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    await requireSession("0xcontract", token);
+
+    const after = mockState.sessions[0];
+    expect(after.expiresAt.getTime()).toBeGreaterThan(beforeExpiresAtMs);
+    expect(after.absoluteExpiresAt.getTime()).toBe(beforeAbsoluteExpiresAtMs);
   });
 
   it("rejects and removes a session once its TTL elapses", async () => {
