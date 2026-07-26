@@ -1,9 +1,99 @@
-import { Router } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats } from "../db/index.js";
 import { sql } from "drizzle-orm";
 
 export const diagnosticsRouter = Router();
+
+const DIAGNOSTICS_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+type DiagnosticsIdempotencyEntry = {
+  createdAt: number;
+  expiresAt: number;
+  statusCode: number;
+  responseBody: unknown;
+};
+
+const diagnosticsIdempotencyStore = new Map<string, DiagnosticsIdempotencyEntry>();
+
+export function clearDiagnosticsIdempotencyStore(): void {
+  diagnosticsIdempotencyStore.clear();
+}
+
+function pruneExpiredEntries(now: number): void {
+  for (const [cacheKey, entry] of diagnosticsIdempotencyStore.entries()) {
+    if (entry.expiresAt <= now) {
+      diagnosticsIdempotencyStore.delete(cacheKey);
+    }
+  }
+}
+
+/**
+ * Wrap a diagnostics handler with idempotency support.
+ *
+ * When an Idempotency-Key header is present, the first successful response for
+ * that route/key combination is cached for 24 hours. Replays with the same key
+ * return the cached response, preventing ambiguous outcomes on retries.
+ */
+export function withDiagnosticsIdempotency(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const idempotencyKey =
+      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
+
+    if (!idempotencyKey || Array.isArray(idempotencyKey)) {
+      await handler(req, res, next);
+      return;
+    }
+
+    const now = Date.now();
+    pruneExpiredEntries(now);
+
+    const userAddress = Array.isArray(req.headers["x-user-address"])
+      ? req.headers["x-user-address"][0]
+      : req.headers["x-user-address"];
+
+    const cacheKey = `diagnostics:${userAddress}:${req.method}:${req.path}:${idempotencyKey}`;
+    const existingEntry = diagnosticsIdempotencyStore.get(cacheKey);
+
+    if (existingEntry && existingEntry.expiresAt > now) {
+      res.status(existingEntry.statusCode).json(existingEntry.responseBody);
+      return;
+    }
+
+    if (existingEntry && existingEntry.expiresAt <= now) {
+      diagnosticsIdempotencyStore.delete(cacheKey);
+    }
+
+    const originalJson = res.json.bind(res);
+    let cachedResponse: DiagnosticsIdempotencyEntry | undefined;
+
+    const persistResponse = (body: unknown): void => {
+      if (cachedResponse) {
+        return;
+      }
+      cachedResponse = {
+        createdAt: Date.now(),
+        expiresAt: Date.now() + DIAGNOSTICS_IDEMPOTENCY_TTL_MS,
+        statusCode: res.statusCode,
+        responseBody: body,
+      };
+      diagnosticsIdempotencyStore.set(cacheKey, cachedResponse);
+    };
+
+    res.json = ((body: unknown) => {
+      persistResponse(body);
+      return originalJson(body);
+    }) as typeof res.json;
+
+    try {
+      await handler(req, res, next);
+    } catch (err) {
+      next(err);
+    }
+  };
+}
 
 // Diagnostics expose internal data shapes and volumes, so the whole router is
 // operator only: every /diagnostics/* route requires a valid session and an
@@ -119,14 +209,14 @@ diagnosticsRouter.get(
   "/diagnostics/events",
   requireAuth,
   requireAdmin,
-  async (_req, res, next) => {
+  withDiagnosticsIdempotency(async (_req, res, next) => {
     try {
       const data = await fetchDiagnosticsData();
       res.json(data);
     } catch (e) {
       next(e);
     }
-  },
+  }),
 );
 
 

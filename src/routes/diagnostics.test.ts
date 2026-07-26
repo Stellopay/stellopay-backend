@@ -266,3 +266,58 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.status).toBe(500);
   });
 });
+
+describe("GET /diagnostics/events – idempotency", () => {
+  const { clearDiagnosticsIdempotencyStore } = require("./diagnostics.js");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.execute).mockReset();
+    vi.mocked(requireSession).mockResolvedValue(true);
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("reuses the cached response on identical request with Idempotency-Key", async () => {
+    wireDbRows();
+
+    const res1 = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN))
+      .set("Idempotency-Key", "test-key-1");
+
+    expect(res1.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+    vi.mocked(db.execute).mockClear();
+
+    const res2 = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN))
+      .set("Idempotency-Key", "test-key-1");
+
+    expect(res2.status).toBe(200);
+    expect(res2.body).toEqual(res1.body);
+    // Cached, so no new db queries executed
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
+  it("executes again if the idempotency key is missing", async () => {
+    wireDbRows();
+
+    const res1 = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN));
+
+    expect(res1.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+    vi.mocked(db.execute).mockClear();
+    
+    wireDbRows();
+
+    const res2 = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN));
+
+    expect(res2.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+});

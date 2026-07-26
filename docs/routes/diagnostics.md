@@ -29,6 +29,7 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 | :--- | :--- | :--- | :--- |
 | `x-user-address` | String | Starknet wallet address of the requesting operator | Yes |
 | `Authorization` | String | Format: `Bearer <session_token>` | Yes |
+| `Idempotency-Key` | String | Client-provided deduplication key | No |
 
 #### Request Parameters
 - **Query Parameters**: None.
@@ -87,6 +88,7 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 
 - **Concurrent Execution (`Promise.all`)**: Read queries for event types, escrow events, payment events, table totals, and recent activity are executed in parallel via `fetchDiagnosticsData`. This minimizes latency and prevents cascading roundtrip bottlenecks.
 - **Idempotency & Replay Safety**: All queries are side-effect-free static `SELECT` statements. Replaying requests or polling from monitoring scripts and incident reporting tools is 100% idempotent and safe.
+  - To prevent ambiguous outcomes during retries, operators can provide an `Idempotency-Key` header. When present, the first successful response is cached for 24 hours and returned for identical subsequent requests.
 - **Null Safety**: Fallbacks (`[]` and `{}`) ensure that empty table states or partial query responses will not cause runtime `TypeError` exceptions.
 
 ---
