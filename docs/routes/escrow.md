@@ -13,6 +13,7 @@ Retrieves the balance for a specific agreement on a given escrow contract.
 2. If indexed data is found, it replays the events (`Funded`, `Released`, `Refunded`) to compute the balance.
 3. If the resulting balance would be negative (due to processing delays or out-of-order events), it is clamped to `0`.
 4. If indexed data fails or is completely empty, it gracefully falls back to querying the Starknet contract directly via `get_agreement_balance(agreement_id)`.
+5. The escrow contract address and agreement identifier are validated before the DB or contract layer is touched. Malformed values return `400` with `Validation failed` and a `details` array instead of reaching downstream code.
 
 **Backward Compatibility:**
 - The response format remains `{ agreement_id: string, balance: string, source: "indexed" | "contract" }`.
@@ -23,10 +24,15 @@ Prepares a transaction payload to release funds from the escrow.
 
 **Behavior:**
 - Expects a valid session (`wallet_address` and `session_token`).
+- Validates the request body before any call preparation occurs.
+- Accepts unsigned decimal-string or integer amounts for `agreement_id` and `amount`, and validates Starknet-style addresses for `wallet_address`, `to`, and the route address.
 - Returns the calldata required for the `release` entrypoint on the Starknet contract.
 - Includes the `nonce` and `chain_id` necessary to sign the payload client-side.
 
-**Backward Compatibility:**
-- Uses the standard session verification shared across routes.
-- The `ReleaseBody` requires `agreement_id` (positive bigint), `to` (string min 3 chars), and `amount` (string min 1 char) for proper validation.
-- Unchanged shape ensures existing clients parsing `call`, `nonce`, `chain_id` do not break.
+**Validation contract:**
+- Malformed escrow addresses or non-numeric agreement identifiers return `400` with `Validation failed` and a `details` array.
+- Amounts must be unsigned decimal strings or integers; negative, decimal-fraction, or non-numeric values are rejected before downstream RPC preparation.
+- Existing clients keep the same response envelope for successful calls (`call`, `nonce`, `chain_id`, `wallet_address`).
+
+**Out of scope:**
+- Decimal token amounts with fractional precision are intentionally rejected; the route accepts only unsigned integer values that can be encoded as a U256 without ambiguity.
