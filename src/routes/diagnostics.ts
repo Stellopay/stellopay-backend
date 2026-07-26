@@ -1,3 +1,44 @@
+/**
+ * Admin Diagnostics Routes
+ *
+ * Canonical route surface (all under /api/v1):
+ *
+ *   GET  /diagnostics/events   – aggregate event counts, table volumes, pool
+ *                                stats, and a redacted recent-activity feed
+ *
+ * Backward-compatibility contract (issue #279)
+ * ─────────────────────────────────────────────
+ * • Every route requires a valid session AND an admin address
+ *   (requireAuth + requireAdmin). Unauthenticated or non-admin requests get
+ *   401 — no query is executed.
+ *
+ * • Response shape for GET /diagnostics/events is frozen:
+ *     {
+ *       eventTypeCounts:    Array<{ event_type, count }>
+ *       escrowEventCounts:  Array<{ event_type, count }>
+ *       paymentEventCounts: Array<{ event_type, count }>
+ *       tableCounts:        { agreement_events_count, escrow_events_count,
+ *                             payments_count, employees_count,
+ *                             milestones_count, agreements_count, latest_block }
+ *                           | undefined   (when DB returns no rows)
+ *       latestEvents:       Array<{ event_type, created_at }>
+ *       poolStats:          { total, idle, active, waiting }
+ *       summary:            { totalAgreementEvents, totalEscrowEvents,
+ *                             totalPayments, totalEmployees,
+ *                             totalMilestones, latestBlock }
+ *     }
+ *
+ * • Redaction invariant: transaction_hash and agreement_id are NEVER present
+ *   in latestEvents. Only event_type and created_at are returned.
+ *
+ * • All SQL is static and parameter-free — no request input reaches a query.
+ *
+ * • summary fallback: every numeric field uses `|| 0` so an empty DB always
+ *   returns 0 rather than undefined/null.
+ *
+ * • Errors are forwarded via next(e) to the Express error handler.
+ */
+
 import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats } from "../db/index.js";
