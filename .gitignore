@@ -8,12 +8,9 @@ dist/
 *.tsbuildinfo
 
 # Environment variables
-.env
-.env.local
 .env.*.local
 
 # IDE and editor files
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -51,3 +48,7 @@ package-lock.json
 
 
 
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
