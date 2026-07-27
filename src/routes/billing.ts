@@ -35,7 +35,7 @@
 
 import express, { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
 import { requireAuth } from "../auth/middleware.js";
@@ -192,6 +192,52 @@ function logBillingFailure(
     message: err instanceof Error ? err.message : String(err),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Pagination helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Default page size when `limit` is not provided by the caller.
+ * When omitted entirely the route returns all rows (backward-compatible).
+ */
+export const DEFAULT_INVOICE_PAGE_LIMIT = 50;
+
+/**
+ * Hard upper bound on a single page to prevent runaway queries even with a
+ * misconfigured client. Matches the column-scale contract for row counts.
+ */
+export const MAX_INVOICE_PAGE_LIMIT = 200;
+
+/**
+ * Zod schema for the optional pagination query parameters on the invoices
+ * endpoint. Both fields are optional so callers who omit them see the
+ * original unpaginated behaviour.
+ */
+const invoicePaginationSchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(MAX_INVOICE_PAGE_LIMIT).optional(),
+    offset: z.coerce.number().int().min(0).optional(),
+  })
+  .strict();
+
+type InvoicePagination = z.infer<typeof invoicePaginationSchema>;
+
+/**
+ * Checks whether the caller supplied at least one pagination parameter.
+ * When neither is present the invoices endpoint returns all rows with the
+ * original response envelope (backward compatible). When either is present
+ * the response gains a `pagination` block with `{ limit, offset, hasMore }`.
+ */
+function hasActivePagination(query: Record<string, unknown>): boolean {
+  return "limit" in query || "offset" in query;
+}
+
+export type InvoicePaginationMeta = {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -363,13 +409,14 @@ export function withBillingIdempotency(
 }
 
 /** Zod schema for the :profileId path param – non-empty string, max 128 chars */
-const profileIdSchema = z.object({
-  profileId: z
-    .string()
-    .min(1)
-    .max(128)
-    .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash"),
-});
+const profileIdParamSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash");
+
+/** Convenience object schema for optional programmatic reuse. */
+const profileIdSchema = z.object({ profileId: profileIdParamSchema });
 
 /** Middleware: parse + validate :profileId, attach to res.locals */
 function validateProfileId(req: Request, res: Response, next: NextFunction): void {
@@ -458,67 +505,6 @@ function stripSensitive(profile: ProfileRow) {
 // ---------------------------------------------------------------------------
 
 /**
- * GET /api/v1/billing/profiles/:profileId/summary
- * Hardened math to prevent NaN and division by zero.
- */
-billingRouter.get(
-  "/billing/profiles/:profileId/summary",
-  validateProfileId,
-  requireBillingOwner,
-  async (req: Request, res: Response) => {
-    const profileId: string = res.locals.profileId;
-
-    try {
-      const [profile] = await db
-        .select({
-          id: schema.billingProfiles.id,
-          profileType: schema.billingProfiles.profileType,
-          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
-          usedAmount: schema.billingProfiles.usedAmount,
-          currency: schema.billingProfiles.currency,
-        })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
-
-      // Ownership already verified by requireBillingOwner; this is a
-      // safety net for a very unlikely TOCTOU race (profile deleted
-      // between middleware and handler).
-      if (!profile) {
-        fail(res, 404, `Billing profile '${profileId}' not found`);
-        return;
-      }
-
-      // Bounded Math: Ensure values are finite and non-negative
-      const limit = numericString.parse(profile.annualRewardLimit ?? "0");
-      const used = numericString.parse(profile.usedAmount ?? "0");
-      
-      const remaining = Math.max(0, limit - used);
-      
-      // Prevent division by zero and cap progress at 100%
-      const rawPct = limit > 0 ? (used / limit) * 100 : 0;
-      const progressPct = Math.min(100, Math.max(0, Math.round(rawPct * 100) / 100));
-
-      incBillingMetric(BILLING_METRICS.PROFILE_FETCHED);
-      logBillingEvent("info", "billing.profile.fetched", {
-        profileId,
-        paymentMethodCount: paymentMethods.length,
-        invoiceCount: invoices.length,
-      });
-
-      ok(res, {
-        profile: stripSensitive(profile),
-        paymentMethods,
-        invoices,
-      });
-    } catch (err: any) {
-      logBillingFailure("billing.profile.failed", err, { profileId });
-      fail(res, 500, "Failed to fetch billing profile");
-    }
-  },
-);
-
-/**
  * GET /api/v1/billing/profiles/:profileId/general-information
  *
  * Returns identity / contact fields for the profile.
@@ -598,6 +584,8 @@ billingRouter.get(
 
 /**
  * GET /api/v1/billing/profiles/:profileId/invoices
+ * Supports optional pagination via `limit` and `offset` query parameters.
+ * When both are omitted the response envelope is unchanged (backward-compatible).
  * Hardened to validate every invoice row.
  */
 billingRouter.get(
@@ -608,14 +596,40 @@ billingRouter.get(
     const profileId: string = res.locals.profileId;
     const startedAt = Date.now();
 
+    // Parse optional pagination params (fail-fast on malformed values).
+    const parsedQuery = invoicePaginationSchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      fail(res, 400, "Invalid pagination parameters: limit must be 1–200, offset must be 0 or greater");
+      return;
+    }
+    const { limit, offset } = parsedQuery.data;
+    const activePagination = hasActivePagination(req.query);
+
     try {
-      const invoices = await db
+      // Fetch with deterministic ordering. In the paginated case we ask for
+      // one extra row so we can compute hasMore without a second COUNT query.
+      const fetchLimit = limit !== undefined ? limit + 1 : undefined;
+      let query = db
         .select()
         .from(schema.billingInvoices)
-        .where(eq(schema.billingInvoices.profileId, profileId));
+        .where(eq(schema.billingInvoices.profileId, profileId))
+        .orderBy(desc(schema.billingInvoices.createdAt), desc(schema.billingInvoices.id));
+
+      if (fetchLimit !== undefined) {
+        query = query.limit(fetchLimit);
+      }
+      if (offset !== undefined && offset > 0) {
+        query = query.offset(offset);
+      }
+
+      const fetchedRows = await query;
+
+      // Slice the extra probe row away when paginating.
+      const hasMore = limit !== undefined && fetchedRows.length > limit;
+      const invoices = hasMore ? fetchedRows.slice(0, limit) : fetchedRows;
 
       // Read-side aggregate for telemetry only — the response body is
-      // unchanged, so existing callers see exactly the same shape.
+      // unchanged for non-paginated callers.
       const totals = summarizeInvoices(invoices);
       const durationMs = Date.now() - startedAt;
 
@@ -641,9 +655,18 @@ billingRouter.get(
         statusCounts: totals.statusCounts,
         coercedCount: totals.coercedCount,
         durationMs,
+        ...(activePagination ? { pageLimit: limit ?? DEFAULT_INVOICE_PAGE_LIMIT, pageOffset: offset ?? 0, hasMore } : {}),
       });
 
-      ok(res, { profileId, invoices });
+      const data: Record<string, unknown> = { profileId, invoices };
+      if (activePagination) {
+        data.pagination = {
+          limit: limit ?? DEFAULT_INVOICE_PAGE_LIMIT,
+          offset: offset ?? 0,
+          hasMore,
+        };
+      }
+      ok(res, data);
     } catch (err: any) {
       logBillingFailure("billing.invoices.failed", err, {
         profileId,

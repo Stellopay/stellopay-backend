@@ -73,3 +73,23 @@ A request is identified as duplicate if:
 - **Horizontal Scaling:** The idempotency cache is in-memory and node-local. If scaled horizontally, a shared store (like Redis) should be used.
 - **Pre-auth Cache:** Requests that fail authentication (`401 Unauthorized`) or validation (`400 Bad Request` due to schema issues) are not cached.
 - **Out of Order Indexing:** The balance calculation clamps to 0 on database sync lags, but final consistency is achieved when events catch up or via the contract call fallback.
+
+---
+
+## Observability & Structured Logging
+
+All key operations emit structured log events through `console.log` (info)
+and `console.warn` (warning). In JSON log format these appear as parseable
+objects; operators should monitor the following event types:
+
+| Event | Level | Meaning |
+| :--- | :--- | :--- |
+| `escrow_balance_resolved` | info | Balance was successfully resolved via indexed data or contract call. Includes `source`, `balance`, `agreement_id`, and `event_count` (indexed only). |
+| `escrow_balance_fallback` | info / warn | Indexed data was unavailable (`reason: "no_indexed_data"`) or the DB query failed (`reason: "db_error"`); falling back to on-chain contract call. |
+| `escrow_balance_clamped` | warn | The event-replay balance was negative; clamped to 0. Includes `raw_balance` for diagnostics. |
+| `escrow_release_prepared` | info | A release transaction payload was prepared successfully. Includes `amount`, `agreement_id`, `balance`, and `source`. |
+| `escrow_release_insufficient_balance` | warn | Release rejected because the current agreement balance is less than the requested amount. Includes `requested`, `available`, and `source`. |
+| `escrow_auth_failed` | warn | Session validation failed for a write operation. Includes `route` and `wallet_address`. |
+| `escrow_idempotency_cache_hit` | info | A previously cached response was replayed from the idempotency store. |
+| `escrow_idempotency_conflict` | warn | A retry with the same idempotency key but a different request body was rejected with 409. |
+| `escrow_initialization_check_failed` | warn | The `get_token` contract call failed during initialization check; returning `initialized: false`. |

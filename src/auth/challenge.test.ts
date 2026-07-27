@@ -36,6 +36,7 @@ import {
   createChallenge,
   getChallenge,
   MAX_CHALLENGES,
+  SWEEP_BATCH_SIZE,
 } from "./challenge.js";
 
 // SN_SEPOLIA / SN_MAIN encoded as felt short strings, as the RPC returns them.
@@ -372,6 +373,167 @@ describe("expired-challenge sweep", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Batch sweep pagination — cursor-based entry processing under growth
+// ---------------------------------------------------------------------------
+
+describe("batch sweep pagination", () => {
+  /**
+   * Adds `count` entries directly to the store with the given TTL offset.
+   * Does NOT touch `creationsSinceSweep`, so the sweep counter is unaffected.
+   */
+  function addEntries(count: number, ttlOffset: number): void {
+    for (let i = 0; i < count; i++) {
+      challenges.set(canonical((0x200000 + i).toString(16)), {
+        nonce: `0x${i.toString(16).padStart(32, "0")}`,
+        expiresAtMs: Date.now() + ttlOffset,
+      });
+    }
+  }
+
+  /**
+   * Global counter for `createTraffic` key ranges so each call produces
+   * unique addresses that never collide with previous traffic or addEntries.
+   */
+  let trafficBase = 0x400000;
+
+  /**
+   * Calls `createChallenge` `count` times with distinct addresses.
+   */
+  function createTraffic(count: number): void {
+    const base = trafficBase;
+    trafficBase += count;
+    for (let i = 0; i < count; i++) {
+      createChallenge(canonical((base + i).toString(16)));
+    }
+  }
+
+  beforeEach(() => {
+    trafficBase = 0x400000;
+  });
+
+  it("success path: processes at most SWEEP_BATCH_SIZE entries per invocation", () => {
+    // Populate the store with more expired entries than one batch can handle.
+    const extra = 100;
+    addEntries(SWEEP_BATCH_SIZE + extra, -1);
+
+    // Call createChallenge until the sweep triggers on the 50th call.
+    // Before the sweep: 600 (expired) + 49 (traffic) = 649 entries.
+    // The 50th call increments creationsSinceSweep to 50, triggering sweep.
+    // Sweep snapshot: 649 entries. Processes [0, 500), removes 500 expired.
+    // After sweep: 100 expired + 49 traffic + 1 trigger = 150 entries.
+    createTraffic(49);
+    createChallenge("0xbbbb"); // this call triggers the sweep
+
+    // The first SWEEP_BATCH_SIZE expired entries are gone;
+    // `extra` expired + 49 traffic + 1 trigger = 150 survive.
+    expect(challenges.size).toBe(extra + 49 + 1);
+  });
+
+  it("success path: advances cursor across multiple sweeps until all expired entries are removed", () => {
+    addEntries(SWEEP_BATCH_SIZE + 200, -1);
+
+    // Sweep 1 — triggered on the 50th createChallenge call.
+    // Processes [0, 500), removes 500 expired. sweepOffset = 500.
+    // After sweep 1: 200 expired + 49 traffic + 1 trigger = 250 survive.
+    createTraffic(49);
+    createChallenge("0xcccc"); // triggers sweep 1
+    expect(challenges.size).toBe(200 + 49 + 1);
+
+    // Sweep 2 — creationsSinceSweep reset to 0. We need 50 more calls.
+    // Before sweep 2: 200 expired + 49 traffic + 1 trigger + 49 new traffic
+    //   + 1 new trigger = 300 entries.
+    // sweepOffset (500) >= 300, so resets to 0.
+    // Snapshot: 300 entries. Processes [0, 300), removes all 200 expired.
+    // After sweep 2: 49 + 1 + 49 + 1 = 100 survive.
+    createTraffic(49);
+    createChallenge("0xdddd"); // triggers sweep 2
+
+    expect(challenges.size).toBe(49 + 1 + 49 + 1);
+    expect(getChallenge("0xcccc")).not.toBeNull();
+    expect(getChallenge("0xdddd")).not.toBeNull();
+  });
+
+  it("boundary path: cursor wraps to 0 after sweeping the entire store", () => {
+    // Fill with fewer entries than one batch so a single sweep
+    // consumes everything and the cursor wraps to 0.
+    const smallCount = SWEEP_BATCH_SIZE - 100;
+    addEntries(smallCount, -1); // all expired
+
+    // Trigger sweep 1: 400 expired + 49 traffic = 449 entries.
+    // Processes [0, 449) — all expired. sweepOffset wraps to 0.
+    // After sweep 1: 49 traffic + 1 trigger = 50 survive.
+    createTraffic(49);
+    createChallenge("0xeeee"); // triggers sweep 1
+    expect(challenges.size).toBe(49 + 1);
+
+    // Add fresh non-expired entries
+    addEntries(smallCount, CHALLENGE_TTL_MS);
+
+    // Sweep 2: triggered by another 50 calls.
+    // sweepOffset is 0. Snapshot: 400 fresh + 50 old + 50 new = 500 entries.
+    // Processes [0, 500) — none expired. All survive.
+    createTraffic(49);
+    createChallenge("0xffff"); // triggers sweep 2
+
+    expect(challenges.size).toBe(smallCount + 49 + 1 + 49 + 1);
+  });
+
+  it("boundary path: handles an empty store without error", () => {
+    clearChallengesForTesting();
+    expect(() => createChallenge("0xface")).not.toThrow();
+    expect(challenges.size).toBe(1);
+  });
+
+  it("boundary path: resets cursor when store has shrunk below offset", () => {
+    // Fill with entries beyond one batch.
+    addEntries(SWEEP_BATCH_SIZE + 50, -1);
+
+    // Sweep 1: 550 expired + 49 traffic = 599 entries in snapshot.
+    // Processes [0, 500), removes 500 expired. sweepOffset = 500.
+    // After sweep 1: 50 expired + 49 traffic + 1 trigger = 100.
+    createTraffic(49);
+    createChallenge("0xcafe"); // triggers sweep 1
+    expect(challenges.size).toBe(50 + 49 + 1);
+
+    // Directly delete all but one entry, shrinking store below offset 500.
+    const keys = [...challenges.keys()];
+    for (const key of keys) {
+      if (key !== canonical("cafe")) challenges.delete(key);
+    }
+    expect(challenges.size).toBe(1); // only "0xcafe" remains
+
+    // Sweep 2: triggered by 50 more calls.
+    // Before sweep: 1 (0xcafe) + 49 traffic + 1 trigger = 51 entries.
+    // sweepOffset (500) >= 51, resets to 0.
+    // Processes [0, 51), none expired. All survive.
+    createTraffic(49);
+    createChallenge("0xbeef"); // triggers sweep 2
+
+    expect(challenges.size).toBe(1 + 49 + 1);
+    expect(getChallenge("0xcafe")).not.toBeNull();
+  });
+
+  it("failure path: full sweep (last-resort) removes all expired entries in one pass", () => {
+    // Fill to MAX_CHALLENGES with live entries, all with the full TTL.
+    addEntries(MAX_CHALLENGES, CHALLENGE_TTL_MS);
+    expect(challenges.size).toBe(MAX_CHALLENGES);
+
+    // Advance time past TTL so all entries expire.
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+
+    // createChallenge sees the store is at MAX_CHALLENGES, runs the full
+    // sweep (full=true) to reclaim all expired entries, then stores the
+    // new entry.
+    createChallenge("0xade0");
+
+    // All MAX_CHALLENGES entries were expired and removed; only the new
+    // entry remains.
+    expect(challenges.size).toBe(1);
+    expect(getChallenge("0xade0")).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getChallenge / clearChallenge / consumeChallenge
 // ---------------------------------------------------------------------------
 
@@ -495,3 +657,103 @@ describe("consumeChallenge", () => {
     expect(challenges.size).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Nonce Challenge Security and Validation Contract Boundary Tests
+// ---------------------------------------------------------------------------
+
+describe("Nonce Challenge Security and Validation Contract Boundary", () => {
+  it("rejects missing, null, undefined, and whitespace addresses fail-closed", () => {
+    const invalidInputs = [null, undefined, "", "   ", "\t\n"];
+
+    for (const input of invalidInputs) {
+      expect(() => createChallenge(input)).toThrow(/parseable Starknet address/);
+      expect(getChallenge(input)).toBeNull();
+      expect(() => clearChallenge(input)).not.toThrow();
+      expect(consumeChallenge(input)).toBeNull();
+    }
+  });
+
+  it("rejects invalid data types (number, boolean, object, array) fail-closed", () => {
+    const invalidTypes = [12345, true, false, {}, { address: "0x1" }, ["0x1"]];
+
+    for (const input of invalidTypes) {
+      expect(() => createChallenge(input as any)).toThrow(/parseable Starknet address/);
+      expect(getChallenge(input as any)).toBeNull();
+      expect(consumeChallenge(input as any)).toBeNull();
+      expect(() => buildTypedChallenge(input as any, CHAIN_ID_SEPOLIA, "0xnonce")).toThrow(
+        /parseable Starknet address/,
+      );
+    }
+  });
+
+  it("buildTypedChallenge strictly validates chainId and nonce parameter shapes", () => {
+    const invalidInputs = [null, undefined, "", "   ", 123, {}];
+
+    for (const badChainId of invalidInputs) {
+      expect(() => buildTypedChallenge(ADDR_CANONICAL, badChainId as any, "0xnonce")).toThrow(
+        /chainId must be a non-empty string/,
+      );
+    }
+
+    for (const badNonce of invalidInputs) {
+      expect(() => buildTypedChallenge(ADDR_CANONICAL, CHAIN_ID_SEPOLIA, badNonce as any)).toThrow(
+        /nonce must be a non-empty string/,
+      );
+    }
+  });
+
+  it("nonce generation produces 16-byte hex nonces with expected entropy", () => {
+    const issuedNonces = new Set<string>();
+
+    for (let i = 0; i < 20; i++) {
+      const address = canonical(i.toString(16));
+      const { nonce, expires_in_ms } = createChallenge(address);
+
+      expect(nonce).toMatch(/^0x[0-9a-f]{32}$/);
+      expect(expires_in_ms).toBe(CHALLENGE_TTL_MS);
+      expect(issuedNonces.has(nonce)).toBe(false);
+      issuedNonces.add(nonce);
+    }
+
+    expect(issuedNonces.size).toBe(20);
+  });
+
+  it("replay protection ensures consumed challenges cannot be validated or reused", () => {
+    const { nonce } = createChallenge("0x12345");
+
+    // First consume succeeds
+    const record = consumeChallenge("0x12345");
+    expect(record).not.toBeNull();
+    expect(record?.nonce).toBe(nonce);
+
+    // Immediate second consume (replay) returns null
+    expect(consumeChallenge("0x12345")).toBeNull();
+    expect(getChallenge("0x12345")).toBeNull();
+  });
+
+  it("enforces boundary conditions around expiration timing", () => {
+    const { nonce } = createChallenge("0x9999");
+
+    // Valid at exact TTL boundary
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS);
+    expect(getChallenge("0x9999")?.nonce).toBe(nonce);
+
+    // Expired 1ms past boundary
+    vi.advanceTimersByTime(1);
+    expect(getChallenge("0x9999")).toBeNull();
+    expect(consumeChallenge("0x9999")).toBeNull();
+  });
+
+  it("failure responses and telemetry omit raw malformed inputs to prevent log pollution", () => {
+    const maliciousPayload = "<script>alert('xss')</script>";
+
+    expect(getChallenge(maliciousPayload)).toBeNull();
+
+    const loggedMiss = metrics().find((m) => m.metric === "challenge_miss");
+    expect(loggedMiss).toBeDefined();
+    expect(loggedMiss?.reason).toBe("invalid_address");
+    expect(loggedMiss?.address).toBeUndefined();
+  });
+});
+

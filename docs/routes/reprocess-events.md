@@ -32,49 +32,10 @@ Exported helpers (used by tests and monitoring):
 
 ## Retry Budget and Quarantine
 
-### Per-transaction (tx and batch routes)
-
-Failed transactions accumulate a retry counter keyed on their canonical
-`0x` + 64-hex hash (produced by `normalizeTransactionHash`).
-
-| Attempts | Behaviour |
-|---|---|
-| 1 – `RETRY_BUDGET` | `500` with `{ attempts, error }` |
-| `> RETRY_BUDGET` | `200` quarantine response; JSON file written to `QUARANTINE_PATH` |
-
-Quarantine file written to `<QUARANTINE_PATH>/<normalizedHash>.json`:
-```json
-{ "txHash": "0x000...abc", "error": "RPC timeout" }
-```
-
-### Per-event (status-changes route)
-
-The status-changes route tracks failures **per event ID** independently, exported for tests:
-
-```ts
-export const statusChangeRetryCounts: Map<string, number>
-export const statusChangeQuarantine: Set<string>
-```
-
-| Attempts | Behaviour |
-|---|---|
-| 1 – (`RETRY_BUDGET - 1`) | Result entry: `{ eventId, status: "<reason>" }` |
-| `>= RETRY_BUDGET` (first) | Result entry: `{ eventId, status: "quarantined", reason }` — ID added to `statusChangeQuarantine` |
-| Any call after quarantine | Result entry: `{ eventId, status: "quarantined" }` — RPC call skipped entirely |
-
-Possible `reason` values: `"no_receipt"`, `"event_not_found"`.
-
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `RETRY_BUDGET` | `3` | Max failures before quarantine |
-| `QUARANTINE_PATH` | `<cwd>/quarantine` | Directory for quarantine JSON files |
-
-Calling `__resetRetryCounts()` clears both the per-tx `retryCounts` map and the per-event
-`statusChangeRetryCounts` / `statusChangeQuarantine` state. For test isolation only.
-
----
+Request-level idempotency via `Idempotency-Key` is **not currently implemented** on this router.
+Retry safety relies on the in-flight guard (see above) and the database's `ON CONFLICT DO NOTHING`
+in the underlying `processTxReceipt` helper. Clients should wait for a response before retrying;
+a locked endpoint returns `409 Conflict`.
 
 ## `POST /reprocess-events/tx/:tx_hash`
 
@@ -175,60 +136,16 @@ on-chain receipt, updating their `eventType` to the correct value.
 
 **Query parameters:**
 
-| Param | Default | Max | Description |
-|---|---|---|---|
-| `limit` | `100` | `1000` (`MAX_STATUS_LIMIT`) | Max rows to process per call |
-| `fromBlock` | — | — | Only events at or above this block number |
-| `toBlock` | — | — | Only events at or below this block number |
+- **Deterministic order**: matching rows are ordered by `block_number ASC, event_index ASC`.
+- **`hasMore` flag**: `true` whenever the page returned exactly `limit` rows. `false` when fewer than `limit` rows were returned.
 
-**Success `200`:**
-```json
-{
-  "message": "Reprocessed 3 events, updated 1",
-  "updated": 1,
-  "results": [
-    { "eventId": "evt_1", "status": "updated", "oldType": "AgreementStatusChange", "newType": "AgreementActivated" },
-    { "eventId": "evt_2", "status": "no_receipt" },
-    { "eventId": "evt_3", "status": "quarantined", "reason": "no_receipt" }
-  ],
-  "hasMore": false
-}
-```
+### Retry budget and quarantine
 
-**Error responses:**
+Each event gets at most `MAX_RETRIES` (3) attempts per status-changes run. A per-event retry count
+is kept in an in-memory `Map` and incremented on each failure. When the count exceeds
+`MAX_RETRIES`, that event's ID is added to a `Set`-based quarantine. On subsequent runs within the
+same process lifetime, quarantined IDs are skipped at the start of the loop — they are logged as
+`"skipping"` events. A failed event result includes both `status: "error"` and an `error` field.
 
-| Status | Condition |
-|---|---|
-| `400` | Non-positive `limit`, non-integer block numbers |
-| `409` | Concurrent reprocess operation in progress |
-
-**Result `status` values:**
-
-| `status` | Meaning |
-|---|---|
-| `"updated"` | `eventType` was corrected; DB row updated |
-| `"no_change"` | Decoded as `AgreementStatusChange`; no update needed |
-| `"dedup_skipped"` | Same `transactionHash + eventIndex` already processed in this batch |
-| `"no_receipt"` | `provider.getTransactionReceipt` returned null (below quarantine threshold) |
-| `"event_not_found"` | `receipt.events[eventIndex]` is undefined (below quarantine threshold) |
-| `"quarantined"` | Per-event retry budget exceeded; RPC call skipped |
-| `"error"` | Unexpected exception; body has `{ eventId, status: "error", error: string }` |
-
-**Decoding strategy (in order):**
-1. `workAgreementContract.parseEvent(receiptEvent)` — uses the full work-agreement ABI.
-2. On failure: `payrollEscrowContract.parseEvent(receiptEvent)` — uses the escrow ABI.
-3. On failure: look up `receiptEvent.keys[0]` in a built-in selector map of known Starknet event signatures.
-4. If all three fail: retain `"AgreementStatusChange"` and log a warning.
-
-**Pagination:**
-- Rows ordered `block_number ASC, event_index ASC` for deterministic results.
-- `hasMore: true` when the page returns exactly `limit` rows.
-- `hasMore: false` when fewer than `limit` rows are returned (final page).
-
----
-
-## Known Limitations / Out of Scope
-
-- **Retry state is in-memory only.** Restarting the server resets all counters and the quarantine set. A persistent quarantine store (e.g. a DB table) is a potential follow-up.
-- **Single-process lock.** In a multi-replica deployment two replicas can run concurrently. A distributed lock (e.g. Redis) would be needed for strict single-flight semantics across replicas.
-- **Quarantine directory** is created on first use (`fs.mkdirSync({ recursive: true })`). Write failures are logged to `stderr` and do not affect the HTTP response.
+The quarantine and retry maps are in-memory only (not persisted across restarts) and are reset by
+the `__resetStatusChangeState()` export (used in tests, not intended for production callers).
