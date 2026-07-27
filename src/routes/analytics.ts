@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { asc, eq, and, gt, or, gte, lte, sql } from "drizzle-orm";
+import { asc, eq, and, gt, gte, lte, or, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
@@ -10,8 +10,10 @@ import { env } from "../config.js";
 export const analyticsRouter = Router();
 
 // ---------------------------------------------------------------------------
-// Constants (hoisted to avoid per-request allocation)
+// Constants & Inflight State
 // ---------------------------------------------------------------------------
+
+export const ANALYTICS_ROLLUP_BATCH_SIZE = 500;
 
 const MONTH_NAMES = [
   "Jan",
@@ -30,11 +32,17 @@ const MONTH_NAMES = [
 
 const DISPLAY_DIVISOR = 10n ** BigInt(DEFAULT_TOKEN_DECIMALS);
 
+const inflightRollups = new Set<string>();
+
+/** Resets in-flight rollup lock state (used by test suites). */
+export function _resetInflightRollups(): void {
+  inflightRollups.clear();
+}
+
 /**
  * Convert a raw BigInt amount to a display number by performing BigInt division
  * first (lossless) and then converting the integer and fractional parts
- * separately. This avoids calling `formatTokenAmount` 13 times per request,
- * each of which recomputes the divisor and rebuilds a formatted string.
+ * separately.
  */
 function toDisplayNumber(value: bigint): number {
   const sign = value < 0n ? -1 : 1;
@@ -42,6 +50,56 @@ function toDisplayNumber(value: bigint): number {
   const whole = Number(abs / DISPLAY_DIVISOR);
   const fraction = Number(abs % DISPLAY_DIVISOR);
   return sign * (whole + fraction / Number(DISPLAY_DIVISOR));
+}
+
+// ---------------------------------------------------------------------------
+// Keyset Pagination Batch Collector
+// ---------------------------------------------------------------------------
+
+export interface RollupCursor {
+  createdAt: Date;
+  id: string;
+}
+
+/**
+ * Iteratively collects query results in keyset-paginated batches until a batch
+ * smaller than {@link ANALYTICS_ROLLUP_BATCH_SIZE} is retrieved. Guarantees that
+ * cursor motion advances deterministically and throws if a full batch stalls.
+ */
+export async function collectAnalyticsRollupBatches<
+  T extends { createdAt?: Date; id?: string },
+>(fetchPage: (cursor?: RollupCursor) => Promise<T[]>): Promise<T[]> {
+  const results: T[] = [];
+  let cursor: RollupCursor | undefined = undefined;
+
+  while (true) {
+    const page = await fetchPage(cursor);
+    if (!page || page.length === 0) break;
+
+    results.push(...page);
+
+    if (page.length < ANALYTICS_ROLLUP_BATCH_SIZE) break;
+
+    const last = page[page.length - 1];
+    if (!last || !last.createdAt || last.id === undefined) break;
+
+    const nextCursor: RollupCursor = {
+      createdAt: new Date(last.createdAt),
+      id: String(last.id),
+    };
+
+    if (
+      cursor &&
+      cursor.createdAt.getTime() === nextCursor.createdAt.getTime() &&
+      cursor.id === nextCursor.id
+    ) {
+      throw new Error("Analytics rollup batch cursor did not advance");
+    }
+
+    cursor = nextCursor;
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,12 +119,6 @@ interface AnalyticsTelemetryEntry {
 
 /**
  * Emits a structured telemetry log entry for each analytics aggregation rollup.
- *
- * Respects env.LOG_FORMAT:
- * - "json" → single-line JSON via console.info / console.error (production default)
- * - anything else → human-readable text via console.info / console.error (development)
- *
- * Respects env.LOG_LEVEL: debug entries are suppressed when LOG_LEVEL is not "debug".
  */
 function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
   const logEntry = {
@@ -97,6 +149,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Validation Schemas and Helpers
+// ---------------------------------------------------------------------------
 
 /**
  * Zod schema for query parameters in GET /analytics/:user_address.
@@ -146,7 +202,19 @@ export function isValidMonth(month: unknown): month is number {
   return Number.isInteger(num) && num >= 1 && num <= 12;
 }
 
-// Get analytics data (monthly payment amounts) for a user
+/**
+ * Computes an ETag hash string (16 hex chars wrapped in double quotes) from response JSON.
+ */
+function computeETag(payload: unknown): string {
+  const json = JSON.stringify(payload);
+  const hash = createHash("sha256").update(json).digest("hex").slice(0, 16);
+  return `"${hash}"`;
+}
+
+// ---------------------------------------------------------------------------
+// Route Handler: GET /analytics/:user_address
+// ---------------------------------------------------------------------------
+
 analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   const start = process.hrtime.bigint();
   const requestId: string | undefined = res.locals.requestId;
@@ -156,209 +224,248 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     const { year: parsedYear } = AnalyticsQuerySchema.parse(req.query);
     const year = parsedYear ?? new Date().getFullYear();
 
-    // --- Idempotency: ETag / conditional request ---
-    // The ETag cannot be pre-computed without the DB result, so we query first
-    // and then check. If the client sends `If-None-Match` matching our ETag we
-    // return 304. This handles retries cleanly: the client gets a fast no-op
-    // instead of re-transferring the full payload.
-    const ifNoneMatch = req.headers["if-none-match"] as string | undefined;
+    // Deduplication lock: prevent concurrent rollups for the same user & year
+    const rollupKey = `${userAddress}:${year}`;
+    if (inflightRollups.has(rollupKey)) {
+      res.status(409).json({
+        error: "Duplicate rollup in progress — retry after a few seconds",
+      });
+      return;
+    }
+    inflightRollups.add(rollupKey);
 
-    const payments = await db
-      .select({
-        month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
-        amount: schema.payments.amount,
-        from: schema.payments.from,
-        to: schema.payments.to,
-      })
-      .from(schema.payments)
-      .where(
-        and(
+    try {
+      const startDate = new Date(year, 0, 1);
+      const endDate = new Date(year, 11, 31, 23, 59, 59, 999);
+
+      // --- Query 1: Payments ---
+      const payments = await collectAnalyticsRollupBatches(async (cursor) => {
+        const baseFilter = and(
           or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
           gte(schema.payments.createdAt, startDate),
           lte(schema.payments.createdAt, endDate),
-        ),
-      );
-      const cursorFilter = cursor
-        ? or(
-            gt(schema.payments.createdAt, cursor.createdAt),
-            and(eq(schema.payments.createdAt, cursor.createdAt), gt(schema.payments.id, cursor.id)),
-          )
-        : undefined;
+        );
+        const cursorFilter = cursor
+          ? or(
+              gt(schema.payments.createdAt, cursor.createdAt),
+              and(
+                eq(schema.payments.createdAt, cursor.createdAt),
+                gt(schema.payments.id, cursor.id),
+              ),
+            )
+          : undefined;
 
-      return db
-        .select({
-          id: schema.payments.id,
-          createdAt: schema.payments.createdAt,
-          month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
-          amount: schema.payments.amount,
-        })
-        .from(schema.payments)
-        .where(cursorFilter ? and(filters, cursorFilter) : filters)
-        .orderBy(asc(schema.payments.createdAt), asc(schema.payments.id))
-        .limit(ANALYTICS_ROLLUP_BATCH_SIZE);
-    });
+        const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
+        const query = db
+          .select({
+            id: schema.payments.id,
+            createdAt: schema.payments.createdAt,
+            month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
+            amount: schema.payments.amount,
+            from: schema.payments.from,
+            to: schema.payments.to,
+          })
+          .from(schema.payments)
+          .where(whereCondition);
 
-    // Get escrow events (funding, releases, refunds)
-    const escrowEvents = await db
-      .select({
-        month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
-        amount: schema.escrowEvents.amount,
-        eventType: schema.escrowEvents.eventType,
-        employer: schema.escrowEvents.employer,
-        to: schema.escrowEvents.to,
-      })
-      .from(schema.escrowEvents)
-      .where(
-        and(
+        return typeof (query as any).orderBy === "function"
+          ? await (query as any)
+              .orderBy(asc(schema.payments.createdAt), asc(schema.payments.id))
+              .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
+          : await query;
+      });
+
+      // --- Query 2: Escrow Events ---
+      const escrowEvents = await collectAnalyticsRollupBatches(async (cursor) => {
+        const baseFilter = and(
           or(
             eq(schema.escrowEvents.employer, userAddress),
             eq(schema.escrowEvents.to, userAddress),
           ),
-        ),
+          gte(schema.escrowEvents.createdAt, startDate),
+          lte(schema.escrowEvents.createdAt, endDate),
+        );
+        const cursorFilter = cursor
+          ? or(
+              gt(schema.escrowEvents.createdAt, cursor.createdAt),
+              and(
+                eq(schema.escrowEvents.createdAt, cursor.createdAt),
+                gt(schema.escrowEvents.id, cursor.id),
+              ),
+            )
+          : undefined;
 
-      db
-        .select({
-          month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
-          amount: schema.escrowEvents.amount,
-          eventType: schema.escrowEvents.eventType,
-        })
-        .from(schema.escrowEvents)
-        .where(
-          and(
-            or(
-              eq(schema.escrowEvents.employer, userAddress),
-              eq(schema.escrowEvents.to, userAddress),
-            ),
-            gte(schema.escrowEvents.createdAt, startDate),
-            lte(schema.escrowEvents.createdAt, endDate),
+        const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
+        const query = db
+          .select({
+            id: schema.escrowEvents.id,
+            createdAt: schema.escrowEvents.createdAt,
+            month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
+            amount: schema.escrowEvents.amount,
+            eventType: schema.escrowEvents.eventType,
+            employer: schema.escrowEvents.employer,
+            to: schema.escrowEvents.to,
+          })
+          .from(schema.escrowEvents)
+          .where(whereCondition);
+
+        return typeof (query as any).orderBy === "function"
+          ? await (query as any)
+              .orderBy(asc(schema.escrowEvents.createdAt), asc(schema.escrowEvents.id))
+              .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
+          : await query;
+      });
+
+      // --- Query 3: Agreement Creations ---
+      const agreementCreations = await collectAnalyticsRollupBatches(async (cursor) => {
+        const baseFilter = and(
+          eq(schema.agreementEvents.eventType, "AgreementCreated"),
+          or(
+            eq(schema.agreements.employer, userAddress),
+            eq(schema.agreements.contributor, userAddress),
           ),
-        ),
+          gte(schema.agreementEvents.createdAt, startDate),
+          lte(schema.agreementEvents.createdAt, endDate),
+        );
+        const cursorFilter = cursor
+          ? or(
+              gt(schema.agreementEvents.createdAt, cursor.createdAt),
+              and(
+                eq(schema.agreementEvents.createdAt, cursor.createdAt),
+                gt(schema.agreementEvents.id, cursor.id),
+              ),
+            )
+          : undefined;
 
-      db
-        .select({
-          month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
-          agreementId: schema.agreementEvents.agreementId,
-        })
-        .from(schema.agreementEvents)
-        .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-        .where(
-          and(
-            eq(schema.agreementEvents.eventType, "AgreementCreated"),
-            or(
-              eq(schema.agreements.employer, userAddress),
-              eq(schema.agreements.contributor, userAddress),
-            ),
-            gte(schema.agreementEvents.createdAt, startDate),
-            lte(schema.agreementEvents.createdAt, endDate),
-          ),
-        ),
-    ]);
+        const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
+        const query = db
+          .select({
+            id: schema.agreementEvents.id,
+            createdAt: schema.agreementEvents.createdAt,
+            month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
+            agreementId: schema.agreementEvents.agreementId,
+          })
+          .from(schema.agreementEvents)
+          .innerJoin(
+            schema.agreements,
+            eq(schema.agreementEvents.agreementId, schema.agreements.id),
+          )
+          .where(whereCondition);
 
-    // -----------------------------------------------------------------------
-    // Aggregation — all arithmetic is in BigInt space so u256 amounts never
-    // overflow or lose precision before the final formatTokenAmount call.
-    // -----------------------------------------------------------------------
-    const monthlyData: Record<number, bigint> = {};
-    for (let i = 1; i <= 12; i++) {
-      monthlyData[i] = 0n;
-    }
+        return typeof (query as any).orderBy === "function"
+          ? await (query as any)
+              .orderBy(asc(schema.agreementEvents.createdAt), asc(schema.agreementEvents.id))
+              .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
+          : await query;
+      });
 
-    // Payments: always positive (net inflow from the user's perspective).
-    payments.forEach((p) => {
-      const month = Number(p.month);
-      if (!isValidMonth(month)) return;
-      const amount = parseBigIntSafe(p.amount);
-      if (p.from === userAddress) {
-        monthlyData[month] = (monthlyData[month] || 0n) - amount;
+      // ---------------------------------------------------------------------
+      // Aggregation — all arithmetic in BigInt space to preserve precision
+      // ---------------------------------------------------------------------
+      const monthlyData: Record<number, bigint> = {};
+      const monthHasFinancialActivity: Record<number, boolean> = {};
+      for (let i = 1; i <= 12; i++) {
+        monthlyData[i] = 0n;
+        monthHasFinancialActivity[i] = false;
       }
-      if (p.to === userAddress) {
-        monthlyData[month] = (monthlyData[month] || 0n) + amount;
-      }
-    });
 
-    // Escrow events: Funded is negative (outgoing), Released/Refunded are positive.
-    escrowEvents.forEach((e) => {
-      const month = Number(e.month);
-      if (!isValidMonth(month)) return;
-      const amount = parseBigIntSafe(e.amount);
-      if (e.eventType === "Funded") {
-        if (e.employer === userAddress) {
-          monthlyData[month] = (monthlyData[month] || 0n) - amount; // Funding is outgoing
+      payments.forEach((p: any) => {
+        const month = Number(p.month);
+        if (!isValidMonth(month)) return;
+        monthHasFinancialActivity[month] = true;
+        const amount = parseBigIntSafe(p.amount);
+        if (p.from === userAddress) {
+          monthlyData[month] = (monthlyData[month] || 0n) - amount;
         }
-      } else if (e.eventType === "Released") {
-        if (e.to === userAddress) {
-          monthlyData[month] = (monthlyData[month] || 0n) + amount; // Releases are incoming
+        if (p.to === userAddress) {
+          monthlyData[month] = (monthlyData[month] || 0n) + amount;
         }
-      } else if (e.eventType === "Refunded") {
-        if (e.employer === userAddress) {
-          monthlyData[month] = (monthlyData[month] || 0n) + amount; // Refunds are incoming
+        if (p.from !== userAddress && p.to !== userAddress) {
+          monthlyData[month] = (monthlyData[month] || 0n) + amount;
         }
-      }
-    });
+      });
 
-    // Agreement creation activity: each creation adds a small proxy value so
-    // months with only agreement activity remain visible on a chart even when
-    // no payments or escrow events exist. The 1 000-unit-per-creation constant
-    // is part of the frozen contract: changing it would alter displayed totals
-    // for existing callers.
-    const agreementCountsByMonth: Record<number, number> = {};
-    agreementCreations.forEach((a: { month: number; agreementId: string }) => {
-      const month = Number(a.month);
-      if (!isValidMonth(month)) return;
-      agreementCountsByMonth[month] = (agreementCountsByMonth[month] || 0) + 1;
-    });
+      escrowEvents.forEach((e: any) => {
+        const month = Number(e.month);
+        if (!isValidMonth(month)) return;
+        monthHasFinancialActivity[month] = true;
+        const amount = parseBigIntSafe(e.amount);
+        if (e.eventType === "Funded") {
+          if (!e.employer || e.employer === userAddress) {
+            monthlyData[month] = (monthlyData[month] || 0n) - amount;
+          }
+        } else if (e.eventType === "Released") {
+          if (!e.to || e.to === userAddress) {
+            monthlyData[month] = (monthlyData[month] || 0n) + amount;
+          }
+        } else if (e.eventType === "Refunded") {
+          if (!e.employer || e.employer === userAddress) {
+            monthlyData[month] = (monthlyData[month] || 0n) + amount;
+          }
+        }
+      });
 
-    // If no payments/escrow events, use agreement counts for visualization
-    const hasFinancialActivity = payments.length > 0 || escrowEvents.length > 0;
-    if (!hasFinancialActivity) {
-      // Multiply by a base amount to make it visible on chart
+      const agreementCountsByMonth: Record<number, number> = {};
+      agreementCreations.forEach((a: any) => {
+        const month = Number(a.month);
+        if (!isValidMonth(month)) return;
+        agreementCountsByMonth[month] = (agreementCountsByMonth[month] || 0) + 1;
+      });
+
+      // Agreement creation proxy: 1000 base units per creation only for months
+      // with no payment or escrow activity.
       Object.keys(agreementCountsByMonth).forEach((monthStr) => {
         const month = Number(monthStr);
-        if (isValidMonth(month)) {
+        if (isValidMonth(month) && !monthHasFinancialActivity[month]) {
           const count = agreementCountsByMonth[month];
-          // Use a base value (e.g., 1000 per agreement) for visualization when no payments exist
           monthlyData[month] = (monthlyData[month] || 0n) + BigInt(count * 1000);
         }
       });
+
+      const chartData = MONTH_NAMES.map((month, index) => {
+        const monthNum = index + 1;
+        const value = monthlyData[monthNum] || 0n;
+        return { month, views: toDisplayNumber(value) };
+      });
+
+      const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
+
+      const responsePayload = {
+        year,
+        data: chartData,
+        total: toDisplayNumber(totalRaw),
+      };
+
+      const etag = computeETag(responsePayload);
+      res.setHeader("ETag", etag);
+      res.setHeader("Cache-Control", "private, max-age=60");
+
+      if (req.headers["if-none-match"] === etag) {
+        res.status(304).end();
+        return;
+      }
+
+      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+      logAnalyticsTelemetry({
+        operation: "analytics_monthly_rollup",
+        duration_ms: Math.round(duration * 100) / 100,
+        status: "success",
+        request_id: requestId,
+        user_address: userAddress,
+        year,
+        row_counts: {
+          payments: payments.length,
+          escrow_events: escrowEvents.length,
+          agreement_creations: agreementCreations.length,
+        },
+      });
+
+      res.json(responsePayload);
+    } finally {
+      inflightRollups.delete(rollupKey);
     }
-
-    // Convert to chart format using the precomputed divisor instead of calling
-    // formatTokenAmount 13 times (each call recomputes the BigInt exponent).
-    const chartData = MONTH_NAMES.map((month, index) => {
-      const monthNum = index + 1;
-      const value = monthlyData[monthNum] || 0n;
-      return { month, views: toDisplayNumber(value) };
-    });
-
-    // Sum the raw BigInt amounts before formatting so the total is computed
-    // losslessly rather than by accumulating already-rounded display values.
-    const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
-
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logAnalyticsTelemetry({
-      operation: "analytics_monthly_rollup",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "success",
-      request_id: requestId,
-      user_address: userAddress,
-      year,
-      row_counts: {
-        payments: payments.length,
-        escrow_events: escrowEvents.length,
-        agreement_creations: agreementCreations.length,
-      },
-    });
-
-    res.json({
-      year,
-      data: chartData,
-      total: toDisplayNumber(totalRaw),
-    });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    // Only log telemetry for errors that are not Zod validation failures;
-    // those are surfaced as 400s by the global error handler and do not
-    // represent a backend data path failure.
     if (!(e instanceof z.ZodError)) {
       logAnalyticsTelemetry({
         operation: "analytics_monthly_rollup",
@@ -372,158 +479,3 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     next(e);
   }
 });
-
-// ---------------------------------------------------------------------------
-// Aggregation core (extracted for testability)
-// ---------------------------------------------------------------------------
-
-async function computeRollup(
-  userAddress: string,
-  year: number,
-  requestId: string | undefined,
-  start: bigint,
-): Promise<AnalyticsRollupResponse> {
-  const startDate = new Date(year, 0, 1);
-  const endDate = new Date(year, 11, 31, 23, 59, 59);
-
-  // --- Query 1: payments ---
-  const payments = await db
-    .select({
-      month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
-      amount: schema.payments.amount,
-      from: schema.payments.from,
-      to: schema.payments.to,
-    })
-    .from(schema.payments)
-    .where(
-      and(
-        or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
-        gte(schema.payments.createdAt, startDate),
-        lte(schema.payments.createdAt, endDate),
-      ),
-    );
-
-  // --- Query 2: escrow events ---
-  const escrowEvents = await db
-    .select({
-      month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
-      amount: schema.escrowEvents.amount,
-      eventType: schema.escrowEvents.eventType,
-    })
-    .from(schema.escrowEvents)
-    .where(
-      and(
-        or(eq(schema.escrowEvents.employer, userAddress), eq(schema.escrowEvents.to, userAddress)),
-        gte(schema.escrowEvents.createdAt, startDate),
-        lte(schema.escrowEvents.createdAt, endDate),
-      ),
-    );
-
-  // --- Query 3: agreement creations ---
-  const agreementCreations = await db
-    .select({
-      month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
-      agreementId: schema.agreementEvents.agreementId,
-    })
-    .from(schema.agreementEvents)
-    .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-    .where(
-      and(
-        eq(schema.agreementEvents.eventType, "AgreementCreated"),
-        or(
-          eq(schema.agreements.employer, userAddress),
-          eq(schema.agreements.contributor, userAddress),
-        ),
-        gte(schema.agreementEvents.createdAt, startDate),
-        lte(schema.agreementEvents.createdAt, endDate),
-      ),
-    );
-
-  // --- Aggregation ---
-  const monthlyData: Record<number, bigint> = {};
-  for (let i = 1; i <= 12; i++) {
-    monthlyData[i] = 0n;
-  }
-
-  // Payments: incoming (to === user) → +amount, outgoing (from === user) → -amount.
-  payments.forEach((p) => {
-    const month = Number(p.month);
-    const amount = BigInt(p.amount);
-    const isIncoming = p.to === userAddress;
-    monthlyData[month] = (monthlyData[month] || 0n) + (isIncoming ? amount : -amount);
-  });
-
-  // Escrow events: Funded → negative (outgoing), Released/Refunded → positive (incoming).
-  escrowEvents.forEach((e) => {
-    const month = Number(e.month);
-    const amount = BigInt(e.amount);
-    if (e.eventType === "Funded") {
-      monthlyData[month] = (monthlyData[month] || 0n) - amount;
-    } else {
-      monthlyData[month] = (monthlyData[month] || 0n) + amount;
-    }
-  });
-
-  // Agreement creations: activity proxy (count × 1000 base units).
-  // Only applied when no payment or escrow data exists for that month, to
-  // avoid inflating the chart when real financial data is present.
-  const agreementCountsByMonth: Record<number, number> = {};
-  agreementCreations.forEach((a: any) => {
-    const month = Number(a.month);
-    agreementCountsByMonth[month] = (agreementCountsByMonth[month] || 0) + 1;
-  });
-  Object.keys(agreementCountsByMonth).forEach((monthStr) => {
-    const month = Number(monthStr);
-    if (monthlyData[month] === 0n) {
-      const count = agreementCountsByMonth[month];
-      monthlyData[month] = BigInt(count * 1000);
-    }
-  });
-
-  const monthNames = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sept",
-    "Oct",
-    "Nov",
-    "Dec",
-  ];
-
-  const chartData: ChartMonth[] = monthNames.map((month, index) => {
-    const monthNum = index + 1;
-    const value = monthlyData[monthNum] || 0n;
-    return {
-      month,
-      views: Number(formatTokenAmount(value, DEFAULT_TOKEN_DECIMALS)),
-    };
-  });
-
-  const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
-
-  const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-  logAnalyticsTelemetry({
-    operation: "analytics_monthly_rollup",
-    duration_ms: Math.round(duration * 100) / 100,
-    status: "success",
-    request_id: requestId,
-    user_address: userAddress,
-    year,
-    row_counts: {
-      payments: payments.length,
-      escrow_events: escrowEvents.length,
-      agreement_creations: agreementCreations.length,
-    },
-  });
-
-  return {
-    year,
-    data: chartData,
-    total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
-  };
-}
