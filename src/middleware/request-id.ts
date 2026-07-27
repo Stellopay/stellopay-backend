@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import crypto from "node:crypto";
+import { requestIdContext } from "../utils/logger.js";
 
 /** Maximum length accepted for a client-supplied X-Request-Id value. */
 const MAX_REQUEST_ID_LENGTH = 128;
@@ -46,5 +47,7 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
   res.locals.requestId = requestId;
   res.setHeader("X-Request-Id", requestId);
 
-  next();
+  requestIdContext.run(requestId, () => {
+    next();
+  });
 }
