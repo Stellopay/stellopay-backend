@@ -247,6 +247,58 @@ describe("makeLimiter", () => {
 
     delete process.env.RATE_LIMIT_ABSURD_MAX;
   });
+
+  // ---------------------------------------------------------------------------
+  // Input validation
+  // ---------------------------------------------------------------------------
+
+  it("throws TypeError for an empty name", () => {
+    expect(() =>
+      makeLimiter({ name: "", windowMs: 60_000, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a non-string name", () => {
+    expect(() =>
+      makeLimiter({ name: undefined as unknown as string, windowMs: 60_000, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a negative windowMs", () => {
+    expect(() =>
+      makeLimiter({ name: "neg-window", windowMs: -1, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a zero windowMs", () => {
+    expect(() =>
+      makeLimiter({ name: "zero-window", windowMs: 0, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a non-finite windowMs", () => {
+    expect(() =>
+      makeLimiter({ name: "nan-window", windowMs: NaN, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a negative max", () => {
+    expect(() =>
+      makeLimiter({ name: "neg-max", windowMs: 60_000, max: -5 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a zero max", () => {
+    expect(() =>
+      makeLimiter({ name: "zero-max", windowMs: 60_000, max: 0 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a non-finite max", () => {
+    expect(() =>
+      makeLimiter({ name: "nan-max", windowMs: 60_000, max: NaN }),
+    ).toThrow(TypeError);
+  });
 });
 
 // ---------------------------------------------------------------------------
