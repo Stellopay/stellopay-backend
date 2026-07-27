@@ -134,6 +134,18 @@ export interface MakeLimiterOptions {
 /** Default message used when a caller does not supply one. */
 const DEFAULT_MESSAGE = "Too many requests, please try again later.";
 
+// ---------------------------------------------------------------------------
+// Environment-variable override helpers
+// ---------------------------------------------------------------------------
+
+const ABSURD_MAX_THRESHOLD = 1000;
+
+function getEnvOverride(name: string, suffix: string): string | undefined {
+  const safeName = name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const value = process.env[`RATE_LIMIT_${safeName}_${suffix}`];
+  return value ?? undefined;
+}
+
 /**
  * Build a named, in-memory rate limiter with the app's shared key generator,
  * a `Retry-After` header on every 429 response, and a JSON 429 body consistent
@@ -176,6 +188,20 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  * `new RedisStore({ sendCommand })` from `rate-limit-redis`). The `store`
  * option is the single place to wire that up.
  *
+ * ## Environment-variable overrides
+ *
+ * Each option can be overridden at runtime via the environment:
+ *
+ * | Variable | Overrides | Example |
+ * |---|---|---|
+ * | `RATE_LIMIT_<NAME>_MAX` | `max` | `RATE_LIMIT_GLOBAL_MAX=50` |
+ * | `RATE_LIMIT_<NAME>_WINDOW_MS` | `windowMs` | `RATE_LIMIT_STRICT_WINDOW_MS=120000` |
+ * | `RATE_LIMIT_<NAME>_MESSAGE` | `message` | `RATE_LIMIT_CONTACT_MESSAGE="Slow down"` |
+ *
+ * `<NAME>` is the limiter `name` uppercased with non-alphanumeric characters
+ * replaced by `_`. Overrides apply at construction time only; they are read
+ * once when `makeLimiter()` is called.
+ *
  * @param options - {@link MakeLimiterOptions} controlling window, max, name,
  *   message, optional skip predicate, and optional backing store.
  * @returns A configured Express {@link RateLimitRequestHandler} middleware.
@@ -192,7 +218,56 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  * ```
  */
 export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandler {
-  const { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent } = options;
+  let { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent } = options;
+
+  // ---- Input validation ---------------------------------------------------
+  if (!name || typeof name !== "string") {
+    throw new TypeError(
+      `[rate-limit] "name" is required and must be a non-empty string`,
+    );
+  }
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new TypeError(
+      `[rate-limit] limiter="${name}": windowMs must be a positive number`,
+    );
+  }
+  if (!Number.isFinite(max) || max <= 0) {
+    throw new TypeError(
+      `[rate-limit] limiter="${name}": max must be a positive number`,
+    );
+  }
+
+  // ---- Environment-variable overrides -------------------------------------
+  const envWindowMs = getEnvOverride(name, "WINDOW_MS");
+  if (envWindowMs !== undefined) {
+    const parsed = parseInt(envWindowMs, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      windowMs = parsed;
+    }
+  }
+
+  const envMax = getEnvOverride(name, "MAX");
+  if (envMax !== undefined) {
+    const parsed = parseInt(envMax, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      max = parsed;
+    }
+  }
+
+  const envMessage = getEnvOverride(name, "MESSAGE");
+  if (envMessage !== undefined) {
+    message = envMessage;
+  }
+
+  // Warn if the effective max is absurdly high (likely a config mistake).
+  if (max > ABSURD_MAX_THRESHOLD) {
+    console.warn(
+      `[rate-limit] limiter="${name}" has an absurdly high max of ${max}` +
+        (envMax !== undefined
+          ? ` (set via RATE_LIMIT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_MAX)`
+          : ""),
+    );
+  }
 
   // Pre-compute the Retry-After value; it is constant for the lifetime of the
   // limiter because the window length is fixed at construction time.

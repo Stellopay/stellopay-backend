@@ -3,7 +3,7 @@
 Source: [`src/routes/indexed.ts`](../../src/routes/indexed.ts)
 
 Read-only endpoints serving data already written to Postgres by the indexer
-(agreements, payments, milestones, employees, escrow events). These routes
+(agreements, payments, milestones, employees, escrow events) and operational indexer freshness metrics. These routes
 never call the chain directly — they query the indexed copy, which is why
 responses are tagged with `source: "indexed"` where applicable.
 
@@ -11,16 +11,58 @@ responses are tagged with `source: "indexed"` where applicable.
 
 ## Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/indexed/agreements/:contract_address/user/:user_address` | Agreements where the user is employer, contributor, or a payroll employee |
-| GET | `/indexed/agreement/:contract_address/:agreement_id` | Full detail for one agreement (events, payments, milestones, employees, escrow events) |
-| GET | `/indexed/payments/user/:user_address` | Payments where the user is sender or recipient |
-| GET | `/indexed/escrow/:contract_address/balance/:agreement_id` | Escrow balance, computed by folding `Funded`/`Released`/`Refunded` events |
+| Method | Path | Authorization | Description |
+|---|---|---|---|
+| GET | `/indexed/freshness` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer sync checkpoint block number and freshness state |
+| GET | `/indexed/checkpoint` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer high-water mark sync checkpoint |
+| GET | `/indexed/agreements/:contract_address/user/:user_address` | Public / Standard Read | Agreements where the user is employer, contributor, or a payroll employee |
+| GET | `/indexed/agreement/:contract_address/:agreement_id` | Public / Standard Read | Full detail for one agreement (events, payments, milestones, employees, escrow events) |
+| GET | `/indexed/payments/user/:user_address` | Public / Standard Read | Payments where the user is sender or recipient |
+| GET | `/indexed/escrow/:contract_address/balance/:agreement_id` | Public / Standard Read | Escrow balance, computed by folding `Funded`/`Released`/`Refunded` events |
 
 All `:contract_address`/`:user_address` params are validated with
 `StarknetAddress`; `:agreement_id` with `AgreementId`. Pagination (`limit`,
 `offset`) goes through the shared `parsePagination` helper.
+
+---
+
+## Authorization Contract & Security Boundary
+
+`src/routes/indexed.ts` enforces a centralized authorization boundary around indexer freshness and sync checkpoint operations:
+
+### 1. Authorization Requirements
+- **Freshness & Sync Checkpoints (`/indexed/freshness`, `/indexed/checkpoint`)**:
+  - Requires session authentication (`requireAuth`) via `x-user-address` and `Authorization: Bearer <token>` headers.
+  - Requires admin role authorization (`requireAdmin`).
+  - Access control is centralized using `authorizeIndexedFreshness` (`[requireAuth, requireAdmin]`).
+  - Permission checks are evaluated **strictly before** any database query, state lookup, or sensitive processing occurs.
+
+### 2. Expected Success Responses
+- `GET /indexed/freshness`:
+  ```json
+  {
+    "source": "indexed",
+    "checkpointBlock": 12345,
+    "freshness": "synced"
+  }
+  ```
+- `GET /indexed/checkpoint`:
+  ```json
+  {
+    "source": "indexed",
+    "checkpointBlock": 12345
+  }
+  ```
+
+### 3. Expected Authorization Failure Responses
+- **401 Unauthorized**:
+  - Returned when `x-user-address` or `Authorization` headers are missing or invalid.
+  - Payload: `{ "error": "Unauthorized" }`
+- **403 Forbidden**:
+  - Returned when the caller is authenticated but lacks admin privileges.
+  - Payload: `{ "error": "Forbidden" }`
+- **Security & Privacy Guarantee**:
+  - Failed requests receive no database state, high-water mark metrics, or internal execution details, preventing state inference or probing by unauthorized callers.
 
 ---
 
@@ -88,11 +130,13 @@ as a decimal string to avoid precision loss over the wire.
 
 ---
 
-## Backward Compatibility Guarantees
+## Backward Compatibility & Callers
 
-- **Top-level JSON response keys remain unchanged** across all endpoints.
+- **Top-level JSON response keys remain unchanged** across all read endpoints.
 - **`source: "indexed"`** is preserved in `/indexed/agreements/:contract_address/user/:user_address`.
 - **Error formats and status codes** (`400` validation/contract mismatch, `404` agreement not found, `500` server error) remain identical for existing callers.
+- **Assumptions About Existing Callers**:
+  - Callers accessing indexer operational status/freshness must supply valid admin authentication headers (`x-user-address` + Bearer token).
 
 ---
 
