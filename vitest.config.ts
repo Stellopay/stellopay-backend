@@ -10,6 +10,7 @@ export default defineConfig({
     // no test performs real network calls.
     env: {
       NODE_ENV: "test",
+      CORS_ORIGIN: "https://app.stellopay.com",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
       POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
     },
