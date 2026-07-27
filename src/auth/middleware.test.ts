@@ -1,16 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Request, Response, NextFunction } from "express";
 import {
+  AUTH_METRICS,
   AUTHORIZATION_HEADER,
   BEARER_PREFIX,
   FORBIDDEN_BODY,
   FORBIDDEN_STATUS,
+  getAuthMetricsSnapshot,
   getPrincipal,
   isAdminPrincipal,
+  logAuthMiddlewareEvent,
   PRINCIPAL_HEADER,
   requireAdmin,
   requireAuth,
   requirePrincipal,
+  resetAuthMetrics,
   UNAUTHORIZED_BODY,
   UNAUTHORIZED_STATUS,
 } from "./middleware.js";
@@ -29,6 +33,7 @@ describe("Auth Middleware", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAuthMetrics();
 
     mockReq = {
       headers: {},
@@ -645,6 +650,194 @@ describe("Auth Middleware", () => {
       expect(mockNext).toHaveBeenCalledTimes(1);
       expect(mockNext).toHaveBeenCalledWith();
       expect(mockRes.status).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Telemetry & Observability
+  // -------------------------------------------------------------------------
+
+  describe("Telemetry & Observability", () => {
+    it("tracks metrics and logs on requireAuth success", async () => {
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(true);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_RESOLVED]).toBe(1);
+
+      expect(infoSpy).toHaveBeenCalled();
+      infoSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth cached idempotency hit", async () => {
+      const origLevel = env.LOG_LEVEL;
+      env.LOG_LEVEL = "debug";
+      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+
+      mockReq.auth = { address: "0xuser", token: "valid_token" };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_IDEMPOTENT_HITS]).toBe(1);
+
+      expect(debugSpy).toHaveBeenCalled();
+      debugSpy.mockRestore();
+      env.LOG_LEVEL = origLevel;
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to missing headers", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_MISSING_HEADER]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to non-Bearer format", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Basic token",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_INVALID_BEARER]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to empty credentials", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "   ",
+        authorization: "Bearer valid_token",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_EMPTY_CREDENTIALS]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to invalid session", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer invalid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(false);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_INVALID_SESSION]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAdmin authorization success", () => {
+      const originalAdminAddresses = env.ADMIN_ADDRESSES;
+      env.ADMIN_ADDRESSES = ["0xabc1"];
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+      mockReq.auth = { address: "0xabc1", token: "testtoken" };
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_AUTHORIZED]).toBe(1);
+
+      expect(infoSpy).toHaveBeenCalled();
+      infoSpy.mockRestore();
+      env.ADMIN_ADDRESSES = originalAdminAddresses;
+    });
+
+    it("tracks metrics and logs on requireAdmin 401 unauthorized (no principal)", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_UNAUTHORIZED]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAdmin 403 forbidden (non-admin)", () => {
+      const originalAdminAddresses = env.ADMIN_ADDRESSES;
+      env.ADMIN_ADDRESSES = ["0xabc1"];
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.auth = { address: "0xdef1", token: "testtoken" };
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_FORBIDDEN]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+      env.ADMIN_ADDRESSES = originalAdminAddresses;
+    });
+
+    it("tracks metrics and logs on requireAdmin cached idempotency hit", () => {
+      const origLevel = env.LOG_LEVEL;
+      env.LOG_LEVEL = "debug";
+      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+
+      mockRes.locals = { adminAuthorized: true };
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_IDEMPOTENT_HITS]).toBe(1);
+
+      expect(debugSpy).toHaveBeenCalled();
+      debugSpy.mockRestore();
+      env.LOG_LEVEL = origLevel;
+    });
+
+    it("tracks metrics and logs error when requirePrincipal is called without a principal", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      expect(() => requirePrincipal(mockReq as Request)).toThrow();
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.REQUIRE_PRINCIPAL_MISSING]).toBe(1);
+
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
   });
 });

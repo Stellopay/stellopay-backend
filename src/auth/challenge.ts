@@ -325,18 +325,7 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
   };
 }
 
-/**
- * Decodes an encoded chain-ID felt into its human-readable label
- * ("SN_SEPOLIA", "SN_MAIN"), memoising the result — see {@link chainIdCache}.
- */
-function getChainIdLabel(chainId: string): string {
-  const cached = chainIdCache.get(chainId);
-  if (cached !== undefined) return cached;
 
-  const label = shortString.decodeShortString(chainId);
-  chainIdCache.set(chainId, label);
-  return label;
-}
 
 /**
  * Returns the canonical Starknet address (lowercase, `0x` + 64 hex) for use

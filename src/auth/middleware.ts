@@ -2,6 +2,25 @@ import { Request, Response, NextFunction } from "express";
 import { requireSession } from "./session.js";
 import { env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
+import {
+  AUTH_METRICS,
+  incAuthMetric,
+  logAuthMiddlewareEvent,
+} from "./middleware-metrics.js";
+
+export {
+  getAuthMetricsSnapshot,
+  resetAuthMetrics,
+  incAuthMetric,
+  setAuthGauge,
+  logAuthMiddlewareEvent,
+  AUTH_METRICS,
+} from "./middleware-metrics.js";
+export type {
+  AuthMiddlewareLogLevel,
+  AuthMiddlewareEventName,
+  AuthMiddlewareDenialReason,
+} from "./middleware-metrics.js";
 
 /**
  * The authenticated principal bound to `req.auth` by {@link requireAuth}.
@@ -124,6 +143,8 @@ export function getPrincipal(req: Request): AuthPrincipal | null {
 export function requirePrincipal(req: Request): AuthPrincipal {
   const principal = getPrincipal(req);
   if (principal === null) {
+    incAuthMetric(AUTH_METRICS.REQUIRE_PRINCIPAL_MISSING);
+    logAuthMiddlewareEvent("error", "auth.principal.missing_error", {});
     throw new Error("requirePrincipal: no authenticated principal — is requireAuth mounted?");
   }
   return principal;
@@ -188,7 +209,13 @@ export const requireAuth = async (
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
+  incAuthMetric(AUTH_METRICS.AUTH_REQUESTS);
+
   if (req.auth?.address && req.auth?.token) {
+    incAuthMetric(AUTH_METRICS.AUTH_IDEMPOTENT_HITS);
+    logAuthMiddlewareEvent("debug", "auth.principal.cached", {
+      address: req.auth.address,
+    });
     next();
     return;
   }
@@ -201,11 +228,21 @@ export const requireAuth = async (
     // deliver multi-value headers as an array; calling .startsWith on an
     // array throws). Same response for every shape so we cannot be used to
     // probe header types.
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED);
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED_MISSING_HEADER);
+    logAuthMiddlewareEvent("warn", "auth.principal.denied", {
+      reason: "missing_header",
+    });
     deny(res, "unauthorized");
     return;
   }
 
   if (!authHeader.startsWith(BEARER_PREFIX)) {
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED);
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED_INVALID_BEARER);
+    logAuthMiddlewareEvent("warn", "auth.principal.denied", {
+      reason: "invalid_bearer",
+    });
     deny(res, "unauthorized");
     return;
   }
@@ -217,6 +254,11 @@ export const requireAuth = async (
   // so a missing value is indistinguishable from an empty one and gets the
   // same response.
   if (!token || !address) {
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED);
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED_EMPTY_CREDENTIALS);
+    logAuthMiddlewareEvent("warn", "auth.principal.denied", {
+      reason: "empty_credentials",
+    });
     deny(res, "unauthorized");
     return;
   }
@@ -231,11 +273,21 @@ export const requireAuth = async (
     isValid = false;
   }
   if (!isValid) {
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED);
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED_INVALID_SESSION);
+    logAuthMiddlewareEvent("warn", "auth.principal.denied", {
+      reason: "invalid_session",
+      address: address.toLowerCase(),
+    });
     deny(res, "unauthorized");
     return;
   }
 
   req.auth = { address: address.toLowerCase(), token };
+  incAuthMetric(AUTH_METRICS.AUTH_RESOLVED);
+  logAuthMiddlewareEvent("info", "auth.principal.resolved", {
+    address: address.toLowerCase(),
+  });
   // next() intentionally outside the try/catch so a synchronous throw from
   // a downstream route handler surfaces as a 5xx instead of being
   // silently relabeled as a 401.
@@ -262,17 +314,40 @@ export const requireAuth = async (
  * fires if the principal was mutated by a downstream middleware.
  */
 export const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
+  incAuthMetric(AUTH_METRICS.ADMIN_REQUESTS);
+
+  if (res.locals?.adminAuthorized) {
+    incAuthMetric(AUTH_METRICS.ADMIN_IDEMPOTENT_HITS);
+    logAuthMiddlewareEvent("debug", "auth.admin.cached", {
+      address: req.auth?.address,
+    });
+    next();
+    return;
+  }
+
   const principal = getPrincipal(req);
   if (principal === null) {
+    incAuthMetric(AUTH_METRICS.ADMIN_UNAUTHORIZED);
+    logAuthMiddlewareEvent("warn", "auth.admin.unauthorized", {
+      reason: "no_principal",
+    });
     deny(res, "unauthorized");
     return;
   }
 
   if (!isAdminPrincipal(principal.address)) {
+    incAuthMetric(AUTH_METRICS.ADMIN_FORBIDDEN);
+    logAuthMiddlewareEvent("warn", "auth.admin.forbidden", {
+      address: principal.address,
+    });
     deny(res, "forbidden");
     return;
   }
 
   res.locals.adminAuthorized = true;
+  incAuthMetric(AUTH_METRICS.ADMIN_AUTHORIZED);
+  logAuthMiddlewareEvent("info", "auth.admin.authorized", {
+    address: principal.address,
+  });
   next();
 };
