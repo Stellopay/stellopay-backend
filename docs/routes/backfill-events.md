@@ -47,6 +47,15 @@ Every backfill call is checkpointed to a `backfill_progress` table, one row per 
 
 **Omitting `before` now auto-resumes from the last checkpoint.** On each call, the effective cursor is the explicit `before` query parameter if provided, otherwise the job's persisted `lastCursor`. This means an operator can simply keep calling the endpoint (e.g. from a cron job or a retry loop) with no query parameters at all, and it will always pick up where the last successful batch left off — including after a crash or restart — instead of rescanning from scratch. Passing `before` explicitly still works exactly as before, for manual paging or reprocessing an older window.
 
+**Accumulating totals on resume:** When a job resumes from a persisted checkpoint (without an explicit `before`), the running `totalScanned` and `totalCreated` counters start from the values persisted in the last checkpoint rather than from zero. This ensures that the final `totalScanned`/`totalCreated` values reported at job completion reflect the cumulative work across all invocations — including batches committed in previous runs.
+
+**Transaction structure per request:**
+1. Mark job as `running` (one transaction)
+2. For each batch of `BACKFILL_CHECKPOINT_BATCH_SIZE` rows:
+   - Insert synthetic events via `ON CONFLICT DO NOTHING`
+   - Atomically update the progress checkpoint (totalScanned, totalCreated, lastCursor)
+3. Mark job as `completed` (if no more pages) or `idle` (if `hasMore`), one transaction
+
 **Known limitation:** the checkpoint is tracked per job name, not per `agreementId` filter. Running a scoped (`agreementId=...`) backfill still checkpoints and resumes against the same job-level cursor as an unscoped run — see "Known Limitations" below.
 
 ### Checking Progress: `GET /backfill/status`
@@ -192,13 +201,23 @@ Unknown query parameters are silently ignored.
 
 Both routes delegate to a shared `performBackfill` helper that:
 
-1. **LEFT JOINs** the source table (`employees` or `milestones`) with
+1. **Loads persisted checkpoint** (when `before` is omitted) to auto-resume from the last committed cursor and accumulate totals from prior runs.
+2. **LEFT JOINs** the source table (`employees` or `milestones`) with
    `agreement_events` on `transaction_hash` + `event_type` to find rows
    without a matching backfill event.
-2. Applies the optional `agreementId` and `before` filters.
-3. Orders results by `created_at DESC` so the cursor correctly pages
+3. Applies the optional `agreementId` and `before` filters.
+4. Orders results by `created_at DESC` so the cursor correctly pages
    backward through newest-first order.
-4. Inserts synthetic events inside a single transaction using
-   `ON CONFLICT DO NOTHING` for idempotency.
-5. Returns a `BackfillResponse` with `nextCursor` (the oldest `created_at`
+5. **Batches inserts** in groups of `BACKFILL_CHECKPOINT_BATCH_SIZE` (100),
+   with each batch running in its own transaction that atomically commits
+   both the synthetic events and the progress checkpoint.
+6. Marks the job as `completed` when no more pages remain, or `idle` when
+   `hasMore` is true.
+7. Returns a `BackfillResponse` with `nextCursor` (the oldest `created_at`
    in the page) and `hasMore` (page-full indicator).
+
+Helper functions:
+- `upsertBackfillProgress(tx, jobName, fields)` — creates or updates a row
+  in `backfill_progress` within the given transaction.
+- `getBackfillProgress(jobName)` — reads the current checkpoint for a job,
+  used for auto-resume and status checks.
