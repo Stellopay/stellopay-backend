@@ -41,7 +41,8 @@ export const RETRY_BUDGET = (() => {
 export const QUARANTINE_PATH = process.env.QUARANTINE_PATH
   ? path.resolve(process.env.QUARANTINE_PATH)
   : path.resolve(process.cwd(), "quarantine");
-/** In‑memory map tracking retry attempts per normalized transaction hash. */
+
+/** In‑memory map tracking retry attempts per normalized transaction hash (batch/tx routes). */
 const retryCounts = new Map<string, number>();
 
 /**
@@ -66,6 +67,8 @@ export function __resetStatusChangeState() {
  */
 export function __resetRetryCounts() {
   retryCounts.clear();
+  statusChangeRetryCounts.clear();
+  statusChangeQuarantine.clear();
 }
 
 /**
@@ -142,6 +145,29 @@ function handleRetry(txHash: string, error: any) {
     return { status: "quarantined" as const, attempts, error: error?.message ?? String(error) };
   }
   return { status: "error" as const, attempts, error: error?.message ?? String(error) };
+}
+
+/**
+ * Structured log helper for the reprocess routes.
+ * Emits a JSON line to stdout (info) or stderr (error).
+ */
+function logReprocess(
+  level: "info" | "warn" | "error",
+  operation: string,
+  meta: Record<string, unknown>,
+): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    operation: `reprocess.${operation}`,
+    ...meta,
+  };
+  const line = JSON.stringify(entry);
+  if (level === "error") {
+    console.error(line);
+  } else {
+    console.info(line);
+  }
 }
 
 /** Zod schema for the status‑changes query parameters. */
@@ -250,7 +276,7 @@ reprocessEventsRouter.post(
   "/reprocess-events/tx/:tx_hash",
   requireAuth,
   requireAdmin,
-  async (req, res, next) => {
+  async (req, res, _next) => {
     if (!acquireReprocessLock()) {
       res.status(409).json({ error: "Reprocessing operation already in progress" });
       return;
@@ -331,9 +357,15 @@ reprocessEventsRouter.post(
           if (retry.status === "quarantined") {
             result = { txHash, status: "quarantined", attempts: retry.attempts, error: retry.error };
           } else {
-            result = { txHash, status: "error", attempts: retry.attempts, eventsProcessed: 0, eventLabels: [], error: retry.error };
+            result = {
+              txHash,
+              status: "error",
+              attempts: retry.attempts,
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: retry.error,
+            };
           }
-          
           resultByNormalizedHash.set(normalizedHash, result);
           results.push(result);
           continue;
@@ -381,13 +413,15 @@ reprocessEventsRouter.post(
     try {
       const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
 
-      const workAgreementAbi = await getWorkAgreementAbi();
-      const payrollEscrowAbi = await getPayrollEscrowAbi();
+      const workAgreementAbiResolved = await getWorkAgreementAbi();
+      const payrollEscrowAbiResolved = await getPayrollEscrowAbi();
       const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
       const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-      const workAgreementContract = new Contract(workAgreementAbi, workAgreementAddress, provider);
-      const payrollEscrowContract = new Contract(payrollEscrowAbi, payrollEscrowAddress, provider);
+      const workAgreementContract = new Contract(workAgreementAbiResolved, workAgreementAddress, provider);
+      const payrollEscrowContract = new Contract(payrollEscrowAbiResolved, payrollEscrowAddress, provider);
+      void workAgreementContract; // used for ABI loading side-effect; per-event contracts created below
+      void payrollEscrowContract;
 
       const conditions = [eq(schema.agreementEvents.eventType, "AgreementStatusChange")];
       if (fromBlock !== undefined) conditions.push(gte(schema.agreementEvents.blockNumber, fromBlock));
@@ -443,18 +477,18 @@ reprocessEventsRouter.post(
           let decodedEvent: any = null;
           let eventType = "AgreementStatusChange";
           try {
-            const workContract = new Contract(workAgreementAbi, eventContractAddress, provider);
+            const workContract = new Contract(workAgreementAbiResolved, eventContractAddress, provider);
             try {
               decodedEvent = workContract.parseEvent(receiptEvent);
               eventType = decodedEvent.name;
             } catch {
-              const escrowContract = new Contract(payrollEscrowAbi, eventContractAddress, provider);
+              const escrowContract = new Contract(payrollEscrowAbiResolved, eventContractAddress, provider);
               try {
                 decodedEvent = escrowContract.parseEvent(receiptEvent);
                 eventType = decodedEvent.name;
               } catch {
                 const selector = receiptEvent.keys?.[0] || "";
-                const map: Record<string, string> = {
+                const selectorMap: Record<string, string> = {
                   "0x39935559db9e6f265020b5e7f9e32f707ec95bc7744e4313651be569076f335": "AgreementActivated",
                   "0x2fd23973c113c5a29f0779620b5bee73d19782f53a0d36ab5fb34fee90d61f3": "AgreementPaused",
                   "0xd8daf85c1fa0887e802a145d9f3c7db99b61aa78d5beb5c98ffd0fc8df3d45": "AgreementResumed",
@@ -469,7 +503,7 @@ reprocessEventsRouter.post(
                   "0x27eac42673c7b6ad77b281f32dfd605fc2994c6e2ba3bcb526bb46f4eaa636c": "DisputeResolved",
                 };
                 const normSel = selector.toLowerCase();
-                if (map[normSel]) eventType = map[normSel];
+                if (selectorMap[normSel]) eventType = selectorMap[normSel];
               }
             }
           } catch {
@@ -479,6 +513,12 @@ reprocessEventsRouter.post(
             await db.update(schema.agreementEvents).set({ eventType }).where(eq(schema.agreementEvents.id, event.id));
             statusChangeRetryCounts.delete(event.id);
             updated++;
+            logReprocess("info", "status_changes", {
+              eventId: event.id,
+              outcome: "updated",
+              newType: eventType,
+              elapsed_ms: Date.now() - evtStart,
+            });
             results.push({ eventId: event.id, status: "updated", oldType: "AgreementStatusChange", newType: eventType });
           } else {
             const failure = handleFailure(event.id, "no_change");
@@ -492,7 +532,12 @@ reprocessEventsRouter.post(
       }
 
       const hasMore = statusChangeEvents.length === limit;
-      res.json({ message: `Reprocessed ${results.length} events, updated ${updated}`, updated, results, hasMore });
+      res.json({
+        message: `Reprocessed ${results.length} events, updated ${updated}`,
+        updated,
+        results,
+        hasMore,
+      });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });

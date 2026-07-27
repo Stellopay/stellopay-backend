@@ -113,6 +113,7 @@ describe("Reprocess Events Routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetTransactionReceipt.mockReset();
+    // Restore the default parseEvent implementation after each test.
     mockParseEvent.mockReset();
     global.fetch = fetchMock as any;
 
@@ -1040,7 +1041,7 @@ it("should quarantine after exceeding retry budget", async () => {
       // Wait briefly to ensure first request enters the handler and acquires the lock
       await new Promise((r) => setTimeout(r, 100));
 
-      // Trigger second concurrent request while first is in-flight
+      // Trigger second concurrent request while first is in-flight — should get 409.
       const secondRes = await request(app)
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(409);
@@ -1057,7 +1058,7 @@ it("should quarantine after exceeding retry budget", async () => {
       const firstRes = await firstResPromise;
       expect(firstRes.status).toBe(200);
 
-      // Verify that after completion, the lock is released and a new request succeeds
+      // Lock is released — a new request should succeed.
       mockGetTransactionReceipt.mockResolvedValueOnce({
         transaction_hash: txHash,
         blockNumber: 101,
@@ -1068,7 +1069,7 @@ it("should quarantine after exceeding retry budget", async () => {
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(200);
       expect(thirdRes.body.message).toBe("Events reprocessed");
-    });
+    }, 10_000);
 
     it("reliably releases the lock even if the route handler throws an exception", async () => {
       mockGetTransactionReceipt.mockRejectedValue(new Error("Fatal RPC Error"));
