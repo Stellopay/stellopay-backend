@@ -79,6 +79,7 @@ All `:contract_address`/`:user_address` params are validated with
 - The indexer sync progress across indexed tables (`agreements`, `agreement_events`, `payments`, `escrow_events`, `milestones`, `employees`) is marked by the `block_number` stored with each event or entity.
 - The `deriveSyncCheckpoint(records)` helper calculates the highest block number (high-water mark) across a set of retrieved records.
 - If a query returns an empty result set or records without block numbers, `deriveSyncCheckpoint` returns `0`.
+- **`x-indexer-sync-checkpoint` Header**: Every successful response from the read endpoints (`GET /indexed/...`) includes the `x-indexer-sync-checkpoint` HTTP header, which exposes the derived high-water mark block number (sync checkpoint) to the client. This allows the client to inspect the freshness of the returned dataset directly.
 
 ---
 
