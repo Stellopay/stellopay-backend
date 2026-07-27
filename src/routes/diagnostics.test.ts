@@ -1,10 +1,19 @@
 /**
- * @file diagnostics.test.ts
- * Tests for the operator-only GET /diagnostics/events route.
+ * diagnostics.test.ts
+ *
+ * Contract tests for src/routes/diagnostics.ts (issue #279).
  *
  * The real requireAuth + requireAdmin middleware run here (only their
  * dependencies, the session check and the admin list, are mocked) so the
  * gating itself is exercised. db.execute is mocked to return canned rows.
+ *
+ * Coverage:
+ *   - Auth gating: 401 for unauthenticated and non-admin; no DB hit
+ *   - Success path: correct shape, counts, poolStats
+ *   - Redaction invariant: transaction_hash / agreement_id never leak
+ *   - Empty DB boundary: all summary fields default to 0, latestEvents is []
+ *   - Error handling: db failure propagates as 500 via error handler
+ *   - Response shape: all top-level keys present on every 200
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
