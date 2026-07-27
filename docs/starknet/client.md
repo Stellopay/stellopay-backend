@@ -136,6 +136,32 @@ cross-contaminate even when the same address is used for both.
 
 `getCachedNetworkInfo()` returns chainId and specVersion with a 5-minute TTL cache.
 
+## Observability & Metrics
+
+`src/starknet/client.ts` exposes structured logging and metric counters for RPC failovers, fee quotes, and chain interactions:
+
+### Structured Logging (`logStarknetEvent`)
+Emits JSON when `LOG_FORMAT=json`, otherwise text. Controlled by `LOG_LEVEL`:
+- `starknet.rpc.request` / `starknet.rpc.success` / `starknet.rpc.failover` / `starknet.rpc.error`
+- `starknet.fee_quote.requested` / `starknet.fee_quote.success` / `starknet.fee_quote.error`
+- `starknet.network_info.cache_hit` / `starknet.network_info.fetched` / `starknet.network_info.deduplicated` / `starknet.network_info.failed`
+
+### Metrics (`STARKNET_METRICS`)
+Process-local metric counters accessed via `getStarknetMetricsSnapshot()`:
+- `starknet_rpc_requests_total`
+- `starknet_rpc_failover_total`
+- `starknet_rpc_errors_total`
+- `starknet_rpc_duration_ms_total`
+- `starknet_fee_quote_requests_total`
+- `starknet_fee_quote_success_total`
+- `starknet_fee_quote_errors_total`
+- `starknet_network_info_cache_hits_total`
+- `starknet_network_info_fetches_total`
+- `starknet_network_info_deduped_total`
+- `starknet_network_info_errors_total`
+
+- `resetStarknetMetrics()` — resets counters (used by tests).
+
 ## RPC URLs
 
 Configured via `STARKNET_RPC_URL` environment variable (comma-separated). Defaults in `config.ts`.
