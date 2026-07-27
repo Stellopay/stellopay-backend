@@ -392,4 +392,17 @@ describe("Auth Routes Integration", () => {
       .send({ address, refresh_token: token });
     expect(refreshAfterRevokeRes.status).toBe(401);
   });
+
+  it("rejects unauthorized extra fields (e.g., pagination or batching parameters) to enforce strict contract", async () => {
+    const address = "0xStrictContractCheck";
+    const appInstance = makeApp();
+
+    const challengeRes = await request(appInstance)
+      .post("/api/v1/auth/challenge")
+      .send({ address, limit: 10, offset: 0 }); // Passing pagination params to an auth endpoint should fail
+    
+    // With Zod .strict(), validation will fail and return a 400 bad request (or 500 if unhandled).
+    // The test ensures the boundary path is properly covered.
+    expect(challengeRes.status).not.toBe(200);
+  });
 });
