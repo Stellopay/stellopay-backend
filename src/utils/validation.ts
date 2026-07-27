@@ -54,13 +54,15 @@ function logValidationError(metric: ValidationErrorMetric): void {
 export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
+    const inputPreview =
+      typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40);
     logValidationError({
       validator: validatorName,
-      input: typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40),
+      input: inputPreview,
       error: result.error.issues.map((i) => i.message).join("; "),
       timestamp: new Date().toISOString(),
     });
-    throw result.error;
+    throw ValidationError.fromZodError(result.error, validatorName, inputPreview);
   }
   return result.data;
 }
@@ -149,10 +151,8 @@ export const AgreementId = z
   .trim()
   .regex(/^\d+$/, "agreement_id must be a numeric string");
 
-/** Largest page a list endpoint will return in a single response. */
 export const MAX_PAGE_LIMIT = 100;
 
-/** Page size used when the caller does not supply a usable limit. */
 export const DEFAULT_PAGE_LIMIT = 50;
 
 /**
