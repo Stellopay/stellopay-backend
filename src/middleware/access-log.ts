@@ -1,165 +1,200 @@
 import { Request, Response, NextFunction } from "express";
+import crypto from "node:crypto";
 import { env } from "../config.js";
 
-/**
- * Maximum length accepted for a logged URL / path value.
- * Prevents unbounded log entries from extremely long paths.
- */
-const MAX_PATH_LENGTH = 2048;
+// ---------------------------------------------------------------------------
+// PII / sensitive query-param redaction
+// ---------------------------------------------------------------------------
 
-/**
- * Maximum length accepted for a logged method value.
- */
-const MAX_METHOD_LENGTH = 16;
-
-/**
- * Header names whose values MUST never appear in log output.
- * Comparison is case-insensitive.
- */
-const SENSITIVE_HEADERS = new Set([
+const REDACTED_PARAM_NAMES = new Set([
+  "token",
+  "access_token",
+  "auth",
   "authorization",
-  "cookie",
-  "set-cookie",
-  "x-api-key",
-  "proxy-authorization",
-  "x-auth-token",
-  "x-csrf-token",
+  "secret",
+  "password",
+  "api_key",
+  "apikey",
+  "key",
+  "signature",
+  "sig",
+  "private_key",
+  "wallet",
+  "address",
+  "account",
 ]);
 
+const REDACTED = "[redacted]";
+
 /**
- * Sanitise a string value so it is safe for log output.
+ * Redact sensitive query-parameter values from a URL string before it is
+ * written to the log.
  *
- * - Strips ASCII control characters (0x00–0x1F) except TAB (0x09), and DEL
- *   (0x7F) to prevent log injection via newlines, carriage returns, etc.
- * - Truncates to {@link MAX_PATH_LENGTH} characters.
- * - Replaces remaining non-printable sequences with a safe placeholder.
- *
- * @param value - The raw value to sanitise.
- * @param maxLen - Optional maximum length; defaults to {@link MAX_PATH_LENGTH}.
- * @returns The sanitised, truncated value.
+ * - Any param whose name matches {@link REDACTED_PARAM_NAMES}
+ *   (case-insensitive) has its value replaced with `"[redacted]"`.
+ * - Non-matching params pass through unchanged.
+ * - URLs with no query string are returned as-is (fast path).
+ * - Malformed URLs that cannot be parsed return the path portion only
+ *   (everything before `?`) so the function never throws and never leaks data.
  */
-function sanitiseForLog(value: string, maxLen: number = MAX_PATH_LENGTH): string {
-  // First, decode percent-encoded sequences so that URL-encoded control
-  // characters (e.g. %0a, %0d, %00) are handled as actual control characters
-  // and then stripped or replaced.
-  let sanitised = value;
+export function redactSensitiveParams(rawUrl: string): string {
+  const qIndex = rawUrl.indexOf("?");
+  if (qIndex === -1) return rawUrl;
+
+  let parsed: URL;
   try {
-    sanitised = decodeURIComponent(sanitised);
+    parsed = new URL(rawUrl, "http://localhost");
   } catch {
-    // If the value contains malformed percent-encoding (e.g. %ZZ), leave it
-    // as-is — decodeURIComponent throws URIError on invalid sequences.
+    return rawUrl.slice(0, qIndex);
   }
 
-  sanitised = sanitised
-    // Strip ASCII control characters except TAB (\t = 0x09).
-    // This explicitly includes newline (0x0A) and carriage return (0x0D) to
-    // prevent log injection via crafted URLs.
-    .replace(/[\x00-\x08\x0A\x0B\x0C\x0D\x0E-\x1F\x7F]/g, "")
-    // Replace any remaining non-printable Unicode with a placeholder,
-    // but preserve actual TAB characters.
-    .replace(/(?!\t)\p{C}/gu, "<\\x??>");
-
-  if (sanitised.length > maxLen) {
-    sanitised = sanitised.slice(0, maxLen) + "...";
+  let modified = false;
+  for (const [key] of parsed.searchParams) {
+    if (REDACTED_PARAM_NAMES.has(key.toLowerCase())) {
+      parsed.searchParams.set(key, REDACTED);
+      modified = true;
+    }
   }
 
-  return sanitised;
+  if (!modified) return rawUrl;
+
+  return parsed.pathname + "?" + parsed.searchParams.toString();
 }
 
-/**
- * Redact sensitive header values from a headers object for safe logging.
- *
- * Returns a new plain object where every value whose key matches a known
- * sensitive header is replaced with `"[REDACTED]"`. All other values pass
- * through unchanged. The returned object is flat — repeated headers are
- * represented as a single comma-joined string, which is the Express
- * convention for `req.headers`.
- *
- * @param headers - The raw `req.headers` object (or a partial copy).
- * @returns A new object safe for inclusion in log output.
- */
-function redactSensitiveHeaders(
-  headers: Record<string, string | string[] | undefined>,
-): Record<string, string> {
-  const redacted: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers)) {
-    if (!value) continue;
-    const headerValue = Array.isArray(value) ? value.join(", ") : value;
-    redacted[key] = SENSITIVE_HEADERS.has(key.toLowerCase())
-      ? "[REDACTED]"
-      : headerValue;
-  }
-  return redacted;
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+export interface AccessLogMetrics {
+  totalRequests: number;
+  requestsByStatus: Record<number, number>;
+  requestsByPath: Record<string, number>;
+  totalDurationMs: number;
 }
 
-// Exported for testing only — not part of the public API.
-export { sanitiseForLog, redactSensitiveHeaders };
+let metrics: AccessLogMetrics = {
+  totalRequests: 0,
+  requestsByStatus: {},
+  requestsByPath: {},
+  totalDurationMs: 0,
+};
+
+/** Return a snapshot of the current metrics counters. */
+export function getMetrics(): Readonly<AccessLogMetrics> {
+  return { ...metrics, requestsByStatus: { ...metrics.requestsByStatus }, requestsByPath: { ...metrics.requestsByPath } };
+}
+
+/** Reset all metrics counters (for use in tests). */
+export function resetMetrics(): void {
+  metrics = { totalRequests: 0, requestsByStatus: {}, requestsByPath: {}, totalDurationMs: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Log-entry shape
+// ---------------------------------------------------------------------------
+
+/** The structured object written to stdout for every logged request. */
+export interface AccessLogEntry {
+  timestamp: string;
+  level: "info";
+  method: string;
+  /** URL with sensitive query-parameter values replaced by `[redacted]`. */
+  path: string;
+  status: number;
+  duration_ms: number;
+  request_id: string;
+  /** Content-Length of the response body, if set. */
+  content_length?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
 
 /**
- * Structured access log middleware.
+ * Structured access-log middleware.
  *
- * Records method, sanitised path, status code, and duration of every request.
- * Sensitive headers are NEVER written to log output. URLs and paths are
- * sanitised to strip control characters (preventing log injection) and
- * truncated to a maximum length.
+ * Behaviour
+ * ---------
+ * - Skips `/health` to avoid log noise from liveness probes.
+ * - Reads the correlation ID from `res.locals.requestId` (set by
+ *   {@link requestIdMiddleware}). Falls back to a `crypto.randomUUID()` when
+ *   that middleware is not mounted, so every log line always carries a valid ID.
+ * - Redacts sensitive query-parameter values via {@link redactSensitiveParams}
+ *   before writing to the log — wallet addresses, tokens, passwords, etc.
+ * - Emits one log line per request on the `res.finish` event, after the status
+ *   code and duration are both known.
+ * - Never logs request/response bodies, `Authorization` headers, or any other
+ *   header — only the fields in {@link AccessLogEntry}.
+ * - All logic inside the `finish` handler is wrapped in `try/catch`. A logging
+ *   failure is reported via `console.error` and never re-thrown, so it cannot
+ *   crash the process or affect the HTTP response.
  *
- * Reads `res.locals.requestId` set by {@link requestIdMiddleware}, which must
- * be mounted before this middleware.
- *
- * ## Security guarantees
- *
- * - **No PII in default fields** — the log entry never contains request bodies,
- *   query strings, or raw headers by default. The `redacted_headers` field is
- *   only present for diagnostic use and has all sensitive values replaced with
- *   `"[REDACTED]"`.
- * - **Log-injection prevention** — every string field (method, path, URL) is
- *   passed through {@link sanitiseForLog} which strips ASCII control
- *   characters (newlines, carriage returns, etc.) so an attacker cannot forge
- *   fake log lines via a crafted URL.
- * - **Length limits** — all logged string values are capped to prevent
- *   unbounded log entries from extremely long input.
- * - **Health-check exemption** — `/health` and `/ready` requests are skipped
- *   immediately and never produce a log line.
+ * Log formats
+ * -----------
+ * Controlled by `LOG_FORMAT` (default `"json"`):
+ * - `"json"` — `JSON.stringify(entry)` on one line; machine-parseable.
+ * - anything else — human-readable:
+ *   `[<timestamp>] INFO <method> <path> <status> <duration>ms [<request_id>]`
  */
-export function accessLogMiddleware(req: Request, res: Response, next: NextFunction) {
-  // Skip noisy /health and /ready requests
-  if (req.path === "/health" || req.path === "/ready") {
+export function accessLogMiddleware(req: Request, res: Response, next: NextFunction): void {
+  if (req.path === "/health") {
     return next();
   }
+
+  const snapshotId: string =
+    typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
+      ? res.locals.requestId
+      : crypto.randomUUID();
 
   const startHrTime = process.hrtime.bigint();
 
   res.on("finish", () => {
-    const endHrTime = process.hrtime.bigint();
-    const durationMs = Number(endHrTime - startHrTime) / 1_000_000;
+    try {
+      const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
 
-    // Sanitise every string field to prevent log injection.
-    const logEntry: Record<string, unknown> = {
-      timestamp: new Date().toISOString(),
-      level: "info",
-      method: sanitiseForLog(req.method, MAX_METHOD_LENGTH),
-      path: sanitiseForLog(req.originalUrl || req.path),
-      status: res.statusCode,
-      duration_ms: Math.round(durationMs * 100) / 100,
-      // ID is set by requestIdMiddleware; fall back gracefully when used standalone
-      request_id: res.locals.requestId ?? "unknown",
-    };
+      const requestId: string =
+        typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
+          ? res.locals.requestId
+          : snapshotId;
 
-    // Include sanitised response headers only when LOG_LEVEL is debug/trace so
-    // operators can inspect redacted header values for debugging without
-    // leaking PII in default-level logs.
-    if (env.LOG_LEVEL === "debug" || env.LOG_LEVEL === "trace") {
-      logEntry.redacted_headers = redactSensitiveHeaders(req.headers as Record<string, string | string[] | undefined>);
-    }
+      metrics.totalRequests += 1;
+      metrics.requestsByStatus[res.statusCode] = (metrics.requestsByStatus[res.statusCode] ?? 0) + 1;
+      const pathKey = req.route?.path ?? req.path;
+      metrics.requestsByPath[pathKey] = (metrics.requestsByPath[pathKey] ?? 0) + 1;
+      metrics.totalDurationMs += durationMs;
 
-    if (env.LOG_FORMAT === "json") {
+      const contentLength =
+        typeof res.getHeader === "function"
+          ? res.getHeader("content-length")
+          : undefined;
+
+      const entry: AccessLogEntry = {
+        timestamp: new Date().toISOString(),
+        level: "info",
+        method: req.method,
+        path: redactSensitiveParams(req.originalUrl || req.path),
+        status: res.statusCode,
+        duration_ms: Math.round(durationMs * 100) / 100,
+        request_id: requestId,
+      };
+
+      if (contentLength !== undefined) {
+        entry.content_length = Number(contentLength);
+      }
+
+      if (env.LOG_FORMAT === "json") {
+        // eslint-disable-next-line no-console
+        console.info(JSON.stringify(entry));
+      } else {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[${entry.timestamp}] INFO ${entry.method} ${entry.path} ${entry.status} ${entry.duration_ms}ms [${entry.request_id}]`,
+        );
+      }
+    } catch (err) {
       // eslint-disable-next-line no-console
-      console.info(JSON.stringify(logEntry));
-    } else {
-      // eslint-disable-next-line no-console
-      console.info(
-        `[${logEntry.timestamp}] INFO ${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms [${logEntry.request_id}]`,
-      );
+      console.error("[access-log] failed to emit log entry", err);
     }
   });
 

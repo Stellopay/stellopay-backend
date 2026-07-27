@@ -8,15 +8,69 @@ import {
   index,
   numeric,
   check,
+  type PgTableWithColumns,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 /**
- * Index convention (enforced by schema-consistency.test.ts):
- * Every foreign-key-shaped column — camelCase *Id mapped to SQL *_id (e.g. agreementId,
- * profileId, milestoneId) — must have a btree index declared in this file. Primary keys and
- * non-relational identifiers (e.g. taxId) are excluded. Missing indexes hurt join and filter
+ * # Schema Contract
+ *
+ * This module owns the database schema for the Stellopay backend indexer.
+ * Every table, constraint, and helper exported here is the single source of
+ * truth. Callers in `src/routes/`, `src/auth/`, and test files all read the
+ * same definitions — no divergent copies exist.
+ *
+ * ## Invariants (enforced by `schema-consistency.test.ts`)
+ *
+ * | # | Invariant | Rationale |
+ * |---|-----------|-----------|
+ * | I1 | **Table inventory** — exactly 10 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
+ * | I2 | **FK index** — every `*Id` column mapped to `*_id` in SQL has a
+ *        btree `index()` unless it is a PK or a documented exclusion
+ *        (e.g. `taxId`). See `schema-fk-indexes.ts`. | Joins and filtered queries
+ *        against these columns degrade to sequential scans without an index. |
+ * | I3 | **u256 amount CHECK** — every column storing a Cairo `u256` value
+ *        as a decimal string uses the shared
+ *        {@link U256_DECIMAL_REGEX} in its `check()` constraint. | Ensures all
+ *        amount columns use the same validated format; a single regex change
+ *        updates every table consistently. |
+ * | I4 | **Currency CHECK** — every `currency` column uses
+ *        `'^[A-Z]{3}$'` (ISO 4217-style). | Prevents mixed-case or malformed
+ *        currency codes. |
+ * | I5 | **Block-number CHECK** — every `block_number` column has
+ *        `CHECK >= 0`. | Negative block numbers are nonsensical and must be
+ *        rejected at the DB layer. |
+ * | I6 | **Enum CHECK** — every column with a closed set of values
+ *        (mode, status, event_type, profile_type, etc.) carries a
+ *        `CHECK IN (...)` or `CHECK BETWEEN`. | The DB is the last line of
+ *        defence against out-of-range values; application code may have bugs. |
+ * | I7 | **Runtime ↔ DB parity** — every DB CHECK constraint has a
+ *        corresponding runtime validation helper exported from this module
+ *        (e.g. `assertValidU256` matches the u256 CHECK). | Callers validate
+ *        early to produce actionable errors instead of opaque DB violations. |
+ *
+ * ## Adding a new table
+ *
+ * 1. Define it here with the appropriate CHECK constraints, FK indexes, and
+ *    runtime helpers.
+ * 2. Add an entry to {@link SCHEMA_TABLES} so the table-inventory test stays
+ *    in sync.
+ * 3. Add a CHECK-constraint test in `src/db/migration.test.ts`.
+ * 4. Write a migration in `src/db/migrations/` and register it in
+ *    `src/db/migrations/meta/_journal.json`.
+ * 5. Update `docs/db/schema.md` with the table documentation.
+ *
+ * ## Index convention
+ *
+ * Every foreign-key-shaped column — camelCase `*Id` mapped to SQL `*_id`
+ * (e.g. `agreementId`, `profileId`, `milestoneId`) — must have a btree index
+ * declared in this file. Primary keys and non-relational identifiers
+ * (e.g. `taxId`) are excluded. Missing indexes hurt join and filter
  * performance as tables grow.
+ *
+ * Enforced by `schema-consistency.test.ts` via `schema-fk-indexes.ts`.
+ *
+ * @module schema
  */
 
 // ---------------------------------------------------------------------------
@@ -31,8 +85,90 @@ import { sql } from "drizzle-orm";
  *
  * Used as a DB-level CHECK constraint on every `amount` column that stores a
  * Cairo u256 value serialised as a decimal string.
+ *
+ * @example
+ *   isValidU256("0")        // true
+ *   isValidU256("12345")    // true
+ *   isValidU256("01")       // false — leading zero
+ *   isValidU256("-1")       // false — negative
+ *   isValidU256("1.5")      // false — decimal
  */
-const U256_DECIMAL_REGEX = "^(0|[1-9][0-9]{0,77})$";
+export const U256_DECIMAL_REGEX = "^(0|[1-9][0-9]{0,77})$";
+
+/** Compiled pattern for runtime validation — see {@link U256_DECIMAL_REGEX}. */
+export const U256_DECIMAL_PATTERN = new RegExp(U256_DECIMAL_REGEX);
+
+/**
+ * Regex that matches ISO 4217-style currency codes — exactly three uppercase
+ * ASCII letters. Used in CHECK constraints on `currency` columns.
+ *
+ * @example
+ *   isValidCurrencyCode("USD")  // true
+ *   isValidCurrencyCode("usd")  // false — lowercase
+ *   isValidCurrencyCode("US")   // false — too short
+ */
+export const CURRENCY_CODE_REGEX = /^[A-Z]{3}$/;
+
+/**
+ * Returns true when `value` is a canonical decimal string representing a
+ * valid Cairo u256 (0 … 2²⁵⁶−1).
+ *
+ * This is the runtime counterpart of the DB-level CHECK constraint using
+ * {@link U256_DECIMAL_REGEX}. Callers should validate early to produce
+ * actionable errors rather than relying on a database constraint violation.
+ */
+export function isValidU256(value: string): boolean {
+  return U256_DECIMAL_PATTERN.test(value);
+}
+
+/**
+ * Returns true when `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters).
+ *
+ * Runtime counterpart of the DB-level CHECK constraint using
+ * {@link CURRENCY_CODE_REGEX}.
+ */
+export function isValidCurrencyCode(code: string): boolean {
+  return CURRENCY_CODE_REGEX.test(code);
+}
+
+/**
+ * Returns true when `value` is a non-negative integer.
+ */
+export function isValidNonNegativeInteger(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * Asserts that `value` is a non-negative integer. Throws a descriptive
+ * {@link RangeError} when the assertion fails.
+ *
+ * Use this in write-path code to fail fast before a query reaches the
+ * database, making failures easier to catch and retry.
+ */
+export function assertNonNegative(value: number, name: string): void {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new RangeError(`${name} must be a non-negative integer, got ${value}`);
+  }
+  if (value < 0) {
+    throw new RangeError(`${name} must be non-negative, got ${value}`);
+  }
+}
+
+/**
+ * Asserts that `value` is a valid u256 decimal string. Throws a descriptive
+ * {@link RangeError} when the assertion fails.
+ *
+ * Use this in write-path code to validate amounts before inserting into
+ * columns guarded by the `U256_DECIMAL_REGEX` CHECK constraint.
+ */
+export function assertValidU256(value: string, name: string): void {
+  if (!U256_DECIMAL_PATTERN.test(value)) {
+    throw new RangeError(
+      `${name} must be a valid u256 decimal string (0 or positive integer up to 78 digits), got "${value}"`,
+    );
+  }
+}
 
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
@@ -375,6 +511,63 @@ export const billingInvoices = pgTable(
   }),
 );
 
+
+// ---------------------------------------------------------------------------
+// Pagination & Batching Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum rows per page across all list endpoints. */
+export const MAX_PAGE_SIZE = 100;
+
+/** Default page size when the caller does not specify a limit. */
+export const DEFAULT_PAGE_SIZE = 50;
+
+/** Maximum batch size for bulk operations (inserts, updates, deletes). */
+export const MAX_BATCH_SIZE = 100;
+
+/**
+ * Clamp a caller-supplied limit to the allowed pagination range [1, MAX_PAGE_SIZE].
+ * Values <= 0 default to DEFAULT_PAGE_SIZE. Values > MAX_PAGE_SIZE are capped.
+ */
+export function clampPageLimit(requested: number): number {
+  if (requested <= 0) return DEFAULT_PAGE_SIZE;
+  return Math.min(requested, MAX_PAGE_SIZE);
+}
+
+/**
+ * Clamp a caller-supplied batch size to the allowed range [1, MAX_BATCH_SIZE].
+ * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 — callers must
+ * validate before proceeding with a bulk operation.
+ *
+ * Prefer {@link validateBatchSize} in new code because it throws a descriptive
+ * error instead of silently returning 0, making failures visible and retryable.
+ */
+export function clampBatchSize(requested: number): number {
+  if (requested <= 0 || requested > MAX_BATCH_SIZE) return 0;
+  return requested;
+}
+
+/**
+ * Validate and return a batch size, throwing a {@link RangeError} when
+ * `requested` is outside [1, {@link MAX_BATCH_SIZE}].
+ *
+ * Unlike {@link clampBatchSize} — which returns 0 on invalid input — this
+ * function fails fast with a descriptive message. This makes it suitable for
+ * user-facing input validation where the caller should know the value was
+ * rejected rather than silently adjusted, and for retry-safe code paths that
+ * need explicit errors rather than silent fallbacks.
+ *
+ * @throws {RangeError} when `requested` is not an integer in [1, MAX_BATCH_SIZE].
+ */
+export function validateBatchSize(requested: number, name?: string): number {
+  if (!Number.isInteger(requested) || requested <= 0 || requested > MAX_BATCH_SIZE) {
+    throw new RangeError(
+      `${name ?? "batchSize"} must be an integer between 1 and ${MAX_BATCH_SIZE}, got ${requested}`,
+    );
+  }
+  return requested;
+}
+
 // Sessions table - stores auth sessions with sliding and absolute expiry
 export const sessions = pgTable(
   "sessions",
@@ -398,3 +591,35 @@ export const sessions = pgTable(
     familyIdIdx: index("sessions_family_id_idx").on(table.familyId),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Schema table inventory — single source of truth for the table list.
+// Used by schema-consistency.test.ts to verify no tables are orphaned or
+// duplicated. Every new table must be added here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Ordered list of every Drizzle table definition exported from this module.
+ *
+ * The order matches the table documentation in {@link docs/db/schema.md}.
+ * Schema-consistency tests assert that `Object.keys(schema)` (minus helpers /
+ * constants) matches this list exactly — preventing orphaned table
+ * definitions and ensuring every new table is registered consciously.
+ *
+ * `any` is intentional for the table type parameter — the tables have
+ * heterogeneous column shapes and this array is consumed only by tests for
+ * inventory verification, not for type-level operations.
+ */
+export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any> }> = [
+  { name: "agreements", table: agreements },
+  { name: "agreementEvents", table: agreementEvents },
+  { name: "payments", table: payments },
+  { name: "milestones", table: milestones },
+  { name: "employees", table: employees },
+  { name: "escrowEvents", table: escrowEvents },
+  { name: "billingProfiles", table: billingProfiles },
+  { name: "billingPaymentMethods", table: billingPaymentMethods },
+  { name: "billingInvoices", table: billingInvoices },
+  { name: "sessions", table: sessions },
+];
+

@@ -21,6 +21,49 @@ import { z } from "zod";
 
 const parseEventMock = vi.hoisted(() => vi.fn());
 
+const { dbSelectMock, queryState } = vi.hoisted(() => {
+  const state = {
+    eventsRows: [] as any[],
+    lastWhere: null as any,
+    lastLimit: 50,
+    lastOffset: 0,
+  };
+
+  const select = vi.fn(() => ({
+    from: vi.fn(() => ({
+      where: vi.fn((cond) => {
+        state.lastWhere = cond;
+        return {
+          orderBy: vi.fn(() => ({
+            limit: vi.fn((limit) => {
+              state.lastLimit = limit;
+              return {
+                offset: vi.fn((offset) => {
+                  state.lastOffset = offset;
+                  return Promise.resolve(state.eventsRows);
+                }),
+              };
+            }),
+          })),
+        };
+      }),
+      orderBy: vi.fn(() => ({
+        limit: vi.fn((limit) => {
+          state.lastLimit = limit;
+          return {
+            offset: vi.fn((offset) => {
+              state.lastOffset = offset;
+              return Promise.resolve(state.eventsRows);
+            }),
+          };
+        }),
+      })),
+    })),
+  }));
+
+  return { dbSelectMock: select, queryState: state };
+});
+
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
@@ -36,7 +79,7 @@ vi.mock("../db/index.js", () => {
   const update = vi.fn().mockReturnValue({ set });
 
   return {
-    db: { insert, update },
+    db: { insert, update, select: dbSelectMock },
     schema: {
       agreements: "agreements",
       agreementEvents: "agreementEvents",
@@ -45,6 +88,15 @@ vi.mock("../db/index.js", () => {
     },
   };
 });
+
+vi.mock("drizzle-orm", () => ({
+  eq: (col: any, val: any) => ({ type: "eq", col, val }),
+  and: (...conds: any[]) => ({ type: "and", conds }),
+  gte: (col: any, val: any) => ({ type: "gte", col, val }),
+  lte: (col: any, val: any) => ({ type: "lte", col, val }),
+  inArray: (col: any, val: any) => ({ type: "inArray", col, val }),
+  desc: (col: any) => ({ type: "desc", col }),
+}));
 
 vi.mock("../starknet/client.js", () => ({
   provider: { getTransactionReceipt: vi.fn() },
@@ -81,7 +133,7 @@ vi.mock("../config.js", () => ({
     payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
   },
   abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
-  env: { NODE_ENV: "test" },
+  env: { NODE_ENV: "test", LOG_FORMAT: "json" },
 }));
 
 vi.mock("../utils/codec.js", () => ({
@@ -95,9 +147,16 @@ vi.mock("../utils/codec.js", () => ({
 
 import express from "express";
 import request from "supertest";
-import { processTxReceipt, eventsRouter } from "./events.js";
+import {
+  processTxReceipt,
+  eventsRouter,
+  parseEventTypeQuery,
+  parseTimestampQuery,
+  validateTimeRange,
+} from "./events.js";
 import { db } from "../db/index.js";
 import { provider, agreementContract } from "../starknet/client.js";
+import { env } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -194,14 +253,45 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
+// Named via vi.hoisted so individual tests can override behavior (e.g.
+// simulate requireAdmin rejecting a non-admin caller) with mockImplementationOnce.
+// vi.clearAllMocks() (used throughout this file) clears call history but not
+// the base implementation set here, so the default "always call next()"
+// behavior persists across tests unless explicitly overridden.
+const { mockRequireAuth, mockRequireAdmin } = vi.hoisted(() => ({
+  mockRequireAuth: vi.fn((_req: any, _res: any, next: any) => next()),
+  mockRequireAdmin: vi.fn((_req: any, _res: any, next: any) => next()),
+}));
+
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: mockRequireAuth,
+  requireAdmin: mockRequireAdmin,
 }));
 describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     rewireDbInsert();
+  });
+
+  it("emits structured ingestion telemetry for a successful receipt", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    await processTxReceipt(TX_A);
+
+    const entry = infoSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_ingestion");
+    expect(entry).toMatchObject({
+      status: "success",
+      tx_hash: TX_A,
+      result_status: "processed",
+      events_processed: 1,
+    });
+    expect(entry.duration_ms).toEqual(expect.any(Number));
+    infoSpy.mockRestore();
   });
 
   it("returns not_found when provider returns null", async () => {
@@ -523,6 +613,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
 
     expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ success: false });
     expect(res.body.error).toMatch(/not found/i);
   });
 
@@ -537,5 +628,234 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.summary.total).toBe(1);
     expect(res.body.results).toHaveLength(1);
+  });
+
+  it("process_batch returns 400 with a clean error for malformed hashes", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, "not-a-tx-hash"] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 2 });
+    errorSpy.mockRestore();
+  });
+
+  it("process_tx returns 400 with a clean error for a malformed hash", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+    const res = await request(makeApp()).post("/events/process_tx/not-a-tx-hash").send();
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    // Never should have reached the provider with garbage input.
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 1 });
+    errorSpy.mockRestore();
+  });
+
+  it("process_tx still works for valid TX_A/TX_B-style hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp()).post(`/events/process_tx/${TX_B}`).send();
+
+    expect(res.status).toBe(200);
+    expect(res.body.transactionHash).toBe(TX_B);
+  });
+
+  it("process_batch dedupes an exact duplicate hash within the same batch", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_A] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.results[0]).toEqual(res.body.results[1]);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch dedupes hashes that differ only by leading-zero padding", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const unpadded = "0xaaaa";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, unpadded] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch reports zero duplicates for all-unique hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(2);
+    expect(res.body.summary.duplicates).toBe(0);
+    expect(res.body.summary.total).toBe(2);
+  });
+});
+
+describe("GET /events event-type and time-range filters", () => {
+  function makeApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(eventsRouter);
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryState.eventsRows = [
+      {
+        id: "tx1_0",
+        agreementId: "100",
+        contractAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+        eventType: "AgreementCreated",
+        createdAt: new Date("2026-03-01T12:00:00Z"),
+      },
+      {
+        id: "tx2_0",
+        agreementId: "100",
+        contractAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+        eventType: "PaymentSent",
+        createdAt: new Date("2026-03-02T12:00:00Z"),
+      },
+    ];
+  });
+
+  describe("Helper Functions", () => {
+    it("parseEventTypeQuery handles strings, comma-separated values, arrays, and deduplication", () => {
+      expect(parseEventTypeQuery(undefined)).toEqual([]);
+      expect(parseEventTypeQuery("AgreementCreated")).toEqual(["AgreementCreated"]);
+      expect(parseEventTypeQuery("AgreementCreated, PaymentSent")).toEqual(["AgreementCreated", "PaymentSent"]);
+      expect(parseEventTypeQuery(["AgreementCreated, PaymentSent", "AgreementActivated", "AgreementCreated"])).toEqual([
+        "AgreementCreated",
+        "PaymentSent",
+        "AgreementActivated",
+      ]);
+    });
+
+    it("parseTimestampQuery correctly parses ISO strings and numeric timestamps", () => {
+      expect(parseTimestampQuery(undefined, "from")).toBeUndefined();
+      expect(parseTimestampQuery("", "from")).toBeUndefined();
+
+      const iso = "2026-01-01T00:00:00.000Z";
+      expect(parseTimestampQuery(iso, "from")?.toISOString()).toBe(iso);
+
+      const ms = 1700000000000;
+      expect(parseTimestampQuery(ms, "from")?.getTime()).toBe(ms);
+
+      const sec = 1700000000;
+      expect(parseTimestampQuery(sec, "from")?.getTime()).toBe(sec * 1000);
+    });
+
+    it("parseTimestampQuery throws ZodError on malformed timestamp string", () => {
+      expect(() => parseTimestampQuery("not-a-date", "from")).toThrow();
+      expect(() => parseTimestampQuery({} as any, "from")).toThrow();
+    });
+
+    it("validateTimeRange passes valid ranges and throws on inverted bounds", () => {
+      const earlier = new Date("2026-01-01");
+      const later = new Date("2026-02-01");
+
+      expect(() => validateTimeRange(earlier, later)).not.toThrow();
+      expect(() => validateTimeRange(earlier, earlier)).not.toThrow();
+      expect(() => validateTimeRange(earlier, undefined)).not.toThrow();
+      expect(() => validateTimeRange(undefined, later)).not.toThrow();
+
+      expect(() => validateTimeRange(later, earlier)).toThrow();
+    });
+  });
+
+  describe("HTTP GET /events filtering integration", () => {
+    it("returns events list with default pagination when no filters are supplied", async () => {
+      const res = await request(makeApp()).get("/events");
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(2);
+      expect(res.body.count).toBe(2);
+      expect(res.body.limit).toBe(50);
+      expect(res.body.offset).toBe(0);
+    });
+
+    it("filters by eventType (single or comma-separated)", async () => {
+      const res = await request(makeApp()).get("/events?eventType=AgreementCreated,PaymentSent");
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(2);
+      expect(queryState.lastWhere).toBeDefined();
+    });
+
+    it("filters by time range (from and to parameters)", async () => {
+      const from = "2026-03-01T00:00:00Z";
+      const to = "2026-03-05T00:00:00Z";
+      const res = await request(makeApp()).get(`/events?from=${from}&to=${to}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(2);
+      expect(queryState.lastWhere).toBeDefined();
+    });
+
+    it("intersects eventType, time-range, agreement_id, and pagination params cleanly", async () => {
+      const from = "2026-03-01T00:00:00Z";
+      const to = "2026-03-05T00:00:00Z";
+      const res = await request(makeApp()).get(
+        `/events?eventType=AgreementCreated&from=${from}&to=${to}&agreement_id=100&limit=10&offset=5`
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.limit).toBe(10);
+      expect(res.body.offset).toBe(5);
+      expect(queryState.lastLimit).toBe(10);
+      expect(queryState.lastOffset).toBe(5);
+      expect(queryState.lastWhere).toBeDefined();
+    });
+
+    it("returns 400 Bad Request when from or to timestamp is malformed", async () => {
+      const res = await request(makeApp()).get("/events?from=invalid-date");
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Validation failed");
+      expect(res.body.details).toBeDefined();
+    });
+
+    it("returns 400 Bad Request when from timestamp is strictly greater than to timestamp", async () => {
+      const res = await request(makeApp()).get(
+        "/events?from=2026-12-31T00:00:00Z&to=2026-01-01T00:00:00Z"
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Validation failed");
+      expect(res.body.details[0].message).toMatch(/from timestamp must be less than or equal to to timestamp/);
+    });
   });
 });

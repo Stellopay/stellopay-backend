@@ -4,200 +4,160 @@ Source: [`src/middleware/access-log.ts`](../../src/middleware/access-log.ts)
 
 ## Overview
 
-Every HTTP request (except `/health` and `/ready`) produces a single structured
-log line with the method, sanitised path, response status, duration, and a
-correlation ID. The middleware is mounted early in the Express pipeline so all
-downstream handlers and errors are covered.
+`accessLogMiddleware` emits one structured log line per request after the
+response is sent. It records the HTTP method, sanitised path, status code,
+duration, correlation ID, and optional `content-length`. Bodies, headers,
+and auth material are never logged.
+
+The middleware also maintains in-memory request metrics that can be consumed
+for health/observability endpoints.
 
 ---
 
 ## Public API
 
-### `accessLogMiddleware(req, res, next)`
+### `accessLogMiddleware`
 
-Express middleware function. No configuration is needed — the middleware reads
-`env.LOG_FORMAT` and `env.LOG_LEVEL` from the application config at runtime.
+Standard Express middleware. Mount it after `requestIdMiddleware`:
 
 ```ts
+import { requestIdMiddleware } from "./middleware/request-id.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
 
+app.use(requestIdMiddleware);  // must come first
 app.use(accessLogMiddleware);
 ```
 
-**Prerequisite:** `requestIdMiddleware` should be mounted first so
-`res.locals.requestId` is available. When mounted standalone (without the
-request-ID middleware), the `request_id` field falls back to `"unknown"`.
+Works without `requestIdMiddleware` too — falls back to `crypto.randomUUID()`
+so every log line always carries a valid correlation ID.
 
 ---
 
-## Log entry contract
+### `redactSensitiveParams(rawUrl)`
 
-Every log entry has the following shape:
-
-```json
-{
-  "timestamp": "2026-07-27T12:34:56.789Z",
-  "level": "info",
-  "method": "GET",
-  "path": "/api/v1/transactions",
-  "status": 200,
-  "duration_ms": 12.34,
-  "request_id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-### Default fields
-
-| Field | Type | Always present | Description |
-|---|---|---|---|
-| `timestamp` | `string` | yes | ISO 8601 UTC timestamp of the response |
-| `level` | `string` | yes | Always `"info"` |
-| `method` | `string` | yes | HTTP method, sanitised and truncated to 16 chars |
-| `path` | `string` | yes | `req.originalUrl` or `req.path`, sanitised and truncated to 2048 chars |
-| `status` | `number` | yes | HTTP response status code |
-| `duration_ms` | `number` | yes | Response time in milliseconds, rounded to 2 decimal places |
-| `request_id` | `string` | yes | Correlation ID from `res.locals.requestId`, or `"unknown"` |
-
-### Debug-only field: `redacted_headers`
-
-When `LOG_LEVEL` is set to `debug` or `trace`, a `redacted_headers` object is
-included in the log entry. This mirrors the request headers with all sensitive
-values replaced by `"[REDACTED]"`.
-
-**Sensitive headers** (always redacted):
-
-- `authorization`
-- `cookie`
-- `set-cookie`
-- `x-api-key`
-- `proxy-authorization`
-- `x-auth-token`
-- `x-csrf-token`
-
-All other header values pass through unchanged.
-
-```json
-{
-  "redacted_headers": {
-    "authorization": "[REDACTED]",
-    "x-api-key": "[REDACTED]",
-    "accept": "application/json",
-    "user-agent": "curl/8.0"
-  }
-}
-```
-
-At the default `LOG_LEVEL` (`info`) the `redacted_headers` field is **absent**
-from the log entry.
-
----
-
-## Security guarantees
-
-### No PII in default fields
-
-The log entry never contains request bodies, query strings, or raw headers by
-default. The `redacted_headers` field is only present at `debug`/`trace` log
-level, and every known sensitive header is replaced with `"[REDACTED]"`.
-
-### Log-injection prevention
-
-Every string field (method, path, URL) is passed through `sanitiseForLog`
-which:
-
-- Strips all ASCII control characters (0x00–0x1F) except TAB (0x09), plus DEL
-  (0x7F). This removes injected newlines (`\n`), carriage returns (`\r`), and
-  other control characters that could forge fake log lines.
-- Replaces any remaining Unicode control characters with a safe `<\x??>`
-  placeholder.
-
-### Length limits
-
-| Field | Maximum length | Behaviour when exceeded |
-|---|---|---|
-| `method` | 16 characters | Truncated with no suffix |
-| `path` / URL | 2048 characters | Truncated and appended with `"..."` |
-
-These limits prevent unbounded log entries from extremely long or pathological
-input.
-
-### Health-check exemption
-
-Requests to `/health` and `/ready` are skipped immediately and never produce a
-log line. This keeps health-monitoring noise out of the access logs.
-
----
-
-## Output format
-
-Controlled by `env.LOG_FORMAT`:
-
-| Value | Output |
-|---|---|
-| `"json"` (default) | `console.info(JSON.stringify(logEntry))` — one JSON object per line |
-| any other value | Human-readable format: `[timestamp] INFO method path status duration_msms [request_id]` |
-
----
-
-## Caller expectations
-
-- The middleware must be mounted **before** any route handlers so it can
-  observe every response via the `res.on("finish")` event.
-- `requestIdMiddleware` must be mounted **before** `accessLogMiddleware` for
-  correlation IDs to work. When mounted standalone, `request_id` falls back to
-  `"unknown"`.
-- The middleware does **not** catch errors; it delegates to `next()` and lets
-  Express error handlers process them.
-
-### Example: Correct mounting order in `src/index.ts`
+Exported helper that strips sensitive query-parameter values before the URL
+is written to the log.
 
 ```ts
-app.use(requestIdMiddleware);       // 1. Set up correlation IDs
-app.use(accessLogMiddleware);        // 2. Log every request
-app.use(helmet());                   // 3. Security headers
-app.use(cors());                     // 4. CORS
-app.use("/api/", globalLimiter);     // 5. Rate limiting
-app.use("/api/v1", routes);          // 6. Route handlers
+import { redactSensitiveParams } from "./middleware/access-log.js";
+
+redactSensitiveParams("/api/v1/balance?address=0xDEAD&page=1");
+// → "/api/v1/balance?address=%5Bredacted%5D&page=1"
+```
+
+Parameters whose names match the redaction list (case-insensitive) have their
+values replaced with `[redacted]` (URL-encoded as `%5Bredacted%5D`). All other
+parameters pass through unchanged. Malformed URLs that cannot be parsed return
+the path portion only — the function never throws and never leaks data.
+
+---
+
+### `getMetrics()`
+
+Return a snapshot of the in-memory metrics counters:
+
+```ts
+import { getMetrics } from "./middleware/access-log.js";
+
+const metrics = getMetrics();
+console.log(metrics.totalRequests);       // total non-/health requests
+console.log(metrics.requestsByStatus);    // { 200: 5, 404: 1, … }
+console.log(metrics.requestsByPath);      // { "/api/v1/users": 3, … }
+console.log(metrics.totalDurationMs);     // cumulative wall-clock ms
+```
+
+### `resetMetrics()`
+
+Reset all counters to zero. Intended for use in tests.
+
+```ts
+import { resetMetrics } from "./middleware/access-log.js";
+resetMetrics();
 ```
 
 ---
 
-## Edge cases
+## Redacted query-parameter names
 
-### Request-ID middleware not mounted
+| Name |
+|---|
+| `token`, `access_token` |
+| `auth`, `authorization` |
+| `secret`, `password` |
+| `api_key`, `apikey`, `key` |
+| `signature`, `sig` |
+| `private_key` |
+| `wallet`, `address`, `account` |
 
-When `accessLogMiddleware` is used standalone, `res.locals.requestId` is
-`undefined` and the `request_id` field in the log entry is `"unknown"`.
+To add a name: extend `REDACTED_PARAM_NAMES` in `access-log.ts` and add a
+test case in `access-log.test.ts`.
 
-### Extremely long path / URL
+---
 
-The path is truncated to 2048 characters. The suffix `"..."` is appended when
-truncation occurs so operators can distinguish a truncated value from a
-naturally bounded one.
+## Log-entry shape
 
-### Path with control characters
+```ts
+interface AccessLogEntry {
+  timestamp: string;       // ISO-8601
+  level: "info";
+  method: string;          // "GET", "POST", …
+  path: string;            // req.originalUrl with sensitive params redacted
+  status: number;          // HTTP status code
+  duration_ms: number;     // wall-clock ms from middleware mount to finish (2 dp)
+  request_id: string;      // correlation ID or a fresh UUID fallback
+  content_length?: number; // response Content-Length header if set
+}
+```
 
-Control characters (newlines, carriage returns, etc.) are silently stripped
-from the logged path. The remaining printable characters are logged as a
-single line, preventing an attacker from forging fake log entries via a
-crafted URL.
+---
 
-### Query strings in the path
+## Log formats
 
-`req.originalUrl` preserves the query string, so `/path?foo=bar` is logged as
-`/path?foo=bar`. The query string is **not** redacted (it is not PII by
-default), but it is sanitised — all control characters are stripped.
+Controlled by `LOG_FORMAT` env var (default `"json"`).
+
+**json**
+```
+{"timestamp":"…","level":"info","method":"GET","path":"/api/v1/users","status":200,"duration_ms":4.72,"request_id":"…","content_length":42}
+```
+
+**text** (any value other than `"json"`)
+```
+[2025-06-01T12:00:00.000Z] INFO GET /api/v1/users 200 4.72ms [<request_id>]
+```
+
+---
+
+## Reliability contract
+
+| Concern | Behaviour |
+|---|---|
+| Missing `requestIdMiddleware` | Falls back to `crypto.randomUUID()` — never emits `"unknown"` |
+| Error inside `finish` handler | Caught, written to `console.error("[access-log] failed to emit log entry …")`, never re-thrown |
+| Malformed request URL | `redactSensitiveParams` returns the path portion — never throws |
+| `/health` requests | Always skipped — no log noise from liveness probes |
+
+---
+
+## Metrics contract
+
+| Field | Description |
+|---|---|
+| `totalRequests` | Count of all non-/health requests processed |
+| `requestsByStatus` | Map of HTTP status code → count |
+| `requestsByPath` | Map of route path → count |
+| `totalDurationMs` | Cumulative wall-clock duration of all requests |
+
+Metrics are updated atomically inside the `finish` handler. `/health` requests
+are excluded from all counters.
 
 ---
 
 ## Out of scope
 
-- **Request body logging** — bodies are never logged by this middleware.
-  Downstream handlers may log their own payloads as needed.
-- **Per-route log level overrides** — the log level is global (`env.LOG_LEVEL`).
-  Per-route tuning is not implemented.
-- **Custom redaction patterns** — the sensitive-header list is hardcoded.
-  For custom patterns, extend `SENSITIVE_HEADERS` in the source file.
-- **Log shipping / transport** — this middleware only writes to `console.info`.
-  Log shipping (file, stdout forwarding, external aggregator) is handled by the
-  runtime environment.
+- **Response / request body logging** — never included; increases memory
+  pressure and PII risk.
+- **Header logging** — headers can carry credentials; none are ever written.
+- **Per-route suppression** beyond `/health` — treat as a separate concern.
+- **Log sampling / rate-limiting** — out of scope for this middleware layer.
+- **Persistent metrics export** (e.g. Prometheus) — `getMetrics()` provides an
+  in-memory snapshot; a separate adapter can scrape it for external systems.
