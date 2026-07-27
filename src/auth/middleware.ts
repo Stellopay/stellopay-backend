@@ -262,6 +262,11 @@ export const requireAuth = async (
  * fires if the principal was mutated by a downstream middleware.
  */
 export const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
+  if (res.locals.adminAuthorized) {
+    next();
+    return;
+  }
+
   const principal = getPrincipal(req);
   if (principal === null) {
     deny(res, "unauthorized");

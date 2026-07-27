@@ -139,6 +139,12 @@ not signed in" apart from "you are signed in but not allowed". Collapsing
 them into a single 401 (the previous behaviour) made clients retry
 credentials forever on the second case.
 
+**Idempotency.** `requireAdmin` is idempotent: once the principal is
+authorized, the result is cached in `res.locals.adminAuthorized` and
+subsequent calls short-circuit to `next()` without re-checking the
+allowlist. This means allowlist changes during a request's lifecycle do
+not affect an already-authorized principal.
+
 **Success path** — calls `next()` and lets the route handle the request.
 
 ## How callers consume `req.auth`
@@ -215,6 +221,9 @@ breaking, and needs a coordinated change in `routes/auth.ts`,
   stored, next called).
 - `requireAuth` idempotency paths (second call skips re-validation,
   original principal preserved when headers change between calls).
+- `requireAdmin` idempotency paths (short-circuit when
+  `res.locals.adminAuthorized` is pre-set, second call skips re-check,
+  allowlist changes ignored after first authorization).
 - `requireAdmin` 401 path (missing `req.auth`, empty address).
 - `requireAdmin` 403 path (non-admin authenticated, malformed
   principal, allowlist has malformed entries).

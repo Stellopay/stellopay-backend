@@ -320,6 +320,15 @@ describe("Auth Middleware", () => {
       expect(mockNext).toHaveBeenCalled();
     });
 
+    it("is idempotent: skips re-authorization when res.locals.adminAuthorized is already set", () => {
+      mockRes.locals!.adminAuthorized = true;
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockNext).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
     it("is idempotent: second call skips re-authorization and does not re-check allowlist", () => {
       mockReq.auth = { address: "0xabc1", token: "testtoken" };
 
