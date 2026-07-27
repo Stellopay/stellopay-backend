@@ -6,9 +6,20 @@ import { Server } from "http";
  * waits for in-flight requests to complete with a bounded timeout,
  * and then closes the database pool.
  *
+ * Also registers `unhandledRejection` and `uncaughtException` handlers that
+ * log structured context and route through the same graceful shutdown sequence
+ * rather than calling `process.exit` directly. This ensures in-flight HTTP
+ * requests are drained and the database pool is closed cleanly even when an
+ * unhandled async error occurs. The existing force-exit timeout guard still
+ * applies so a hung shutdown never blocks the process indefinitely.
+ *
+ * Logged error context deliberately excludes request bodies and auth tokens
+ * to prevent accidental secret exposure in logs.
+ *
  * @param server - The active HTTP server instance
  * @param closePool - A function to close the database connection pool
- * @param drainTimeoutMs - The bounded timeout in milliseconds to wait for connections to drain
+ * @param drainTimeoutMs - The bounded timeout in milliseconds to wait for
+ *   connections to drain before force-exiting
  */
 type ShutdownPhase = "starting" | "server_close" | "pool_close";
 
@@ -65,13 +76,37 @@ export function setupGracefulShutdown(
   process.on("SIGTERM", () => shutdownHandler("SIGTERM"));
   process.on("SIGINT", () => shutdownHandler("SIGINT"));
 
-  process.on("unhandledRejection", (reason, promise) => {
-    console.error("[shutdown] Unhandled Rejection at:", promise, "reason:", reason);
-    process.exit(1);
+  /**
+   * Unhandled promise rejections route through the graceful shutdown sequence
+   * rather than calling process.exit directly. Structured context (error
+   * message and stack) is logged before shutdown begins. The promise and
+   * `reason` are used only for logging — request body contents and auth
+   * tokens are never reachable from here so there is no secret-exposure risk.
+   */
+  process.on("unhandledRejection", (reason: unknown, promise: Promise<unknown>) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    console.error("[shutdown] Unhandled promise rejection — initiating graceful shutdown", {
+      event: "unhandledRejection",
+      message,
+      stack,
+      promise: String(promise),
+    });
+    void shutdownHandler("unhandledRejection");
   });
 
-  process.on("uncaughtException", (error) => {
-    console.error("[shutdown] Uncaught Exception:", error);
-    process.exit(1);
+  /**
+   * Uncaught synchronous exceptions route through the graceful shutdown
+   * sequence rather than calling process.exit directly. Full error context
+   * (message, stack, error name) is logged before shutdown begins.
+   */
+  process.on("uncaughtException", (error: Error) => {
+    console.error("[shutdown] Uncaught exception — initiating graceful shutdown", {
+      event: "uncaughtException",
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    });
+    void shutdownHandler("uncaughtException");
   });
 }

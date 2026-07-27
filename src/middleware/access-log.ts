@@ -7,9 +7,32 @@ import { env } from "../config.js";
 // ---------------------------------------------------------------------------
 
 /**
- * Query-parameter names whose values are redacted before logging.
- * Matching is case-insensitive. Extend this set when a new endpoint
- * introduces a param that carries PII or secret material.
+ * Redact sensitive query parameters from a URL string or path.
+ */
+function redactQueryParams(originalPath: string): string {
+  try {
+    // URL requires a base, dummy one is fine for parsing relative paths
+    const url = new URL(originalPath, "http://localhost");
+    let redacted = false;
+    for (const [key, value] of url.searchParams.entries()) {
+      if (env.LOG_REDACT_QUERY_PARAMS.includes(key.toLowerCase()) && value) {
+        url.searchParams.set(key, "[REDACTED]");
+        redacted = true;
+      }
+    }
+    return redacted ? url.pathname + url.search : originalPath;
+  } catch {
+    return originalPath;
+  }
+}
+
+/**
+ * Structured access log middleware.
+ * Records method, path, status code, and duration of requests.
+ * Explicitly skips bodies and auth tokens for security.
+ *
+ * Reads `res.locals.requestId` set by {@link requestIdMiddleware}, which must
+ * be mounted before this middleware.
  */
 const REDACTED_PARAM_NAMES = new Set([
   "token",
@@ -170,7 +193,7 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
       timestamp: new Date().toISOString(),
       level: "info",
       method: req.method,
-      path: req.originalUrl || req.path,
+      path: redactQueryParams(req.originalUrl || req.path),
       status: res.statusCode,
       duration_ms: Math.round(durationMs * 100) / 100,
       request_id: res.locals.requestId ?? requestId,

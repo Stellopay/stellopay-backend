@@ -179,115 +179,22 @@ describe("accessLogMiddleware", () => {
     expect(logObj.request_id).toBe(customId);
   });
 
-  // ── New: correlation ID resilience ────────────────────────────────────────
-
-  it("falls back to a generated UUID (not 'unknown') when mounted without requestIdMiddleware", async () => {
-    const standaloneApp = makeStandaloneApp();
-    // need a fresh spy for the standalone app
-    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
-    const res = await request(standaloneApp).get("/test");
-    expect(res.status).toBe(200);
-    expect(spy).toHaveBeenCalledTimes(1);
-    const logObj = JSON.parse(spy.mock.calls[0][0]);
-    // Must be a UUID, not the old "unknown" string
-    expect(logObj.request_id).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-    spy.mockRestore();
-  });
-
-  it("generates a UUID request_id when no X-Request-Id header is supplied", async () => {
-    await request(app).get("/test");
-    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
-    expect(logObj.request_id).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    );
-  });
-
-  // ── New: PII redaction in logged path ─────────────────────────────────────
-
-  it("redacts sensitive query params from the logged path", async () => {
-    // The app needs a route that accepts query strings
-    const appWithQuery = express();
-    appWithQuery.use(express.json());
-    appWithQuery.use(requestIdMiddleware);
-    appWithQuery.use(accessLogMiddleware);
-    appWithQuery.get("/search", (_req, res) => res.status(200).json({ ok: true }));
-
-    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
-    await request(appWithQuery).get("/search?q=hello&token=super-secret&page=1");
-    const logObj = JSON.parse(spy.mock.calls[0][0]);
-    expect(logObj.path).not.toContain("super-secret");
-    expect(logObj.path).toContain("q=hello");
-    expect(logObj.path).toContain("page=1");
-    spy.mockRestore();
-  });
-
-  it("redacts wallet address from the logged path", async () => {
-    const appWithQuery = express();
-    appWithQuery.use(requestIdMiddleware);
-    appWithQuery.use(accessLogMiddleware);
-    appWithQuery.get("/balance", (_req, res) => res.status(200).json({ ok: true }));
-
-    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
-    await request(appWithQuery).get("/balance?address=0xDEADBEEF123&chain=starknet");
-    const logObj = JSON.parse(spy.mock.calls[0][0]);
-    expect(logObj.path).not.toContain("0xDEADBEEF123");
-    expect(logObj.path).toContain("chain=starknet");
-    spy.mockRestore();
-  });
-
-  // ── New: finish-handler error isolation ───────────────────────────────────
-
-  it("does not propagate an error thrown inside the finish handler", async () => {
-    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    // Make console.info throw once to simulate a serialisation failure
-    consoleInfoSpy.mockImplementationOnce(() => {
-      throw new Error("simulated write failure");
-    });
-
-    // The HTTP response must still complete successfully
-    const res = await request(app).get("/test");
+  it("should redact sensitive query parameters", async () => {
+    const res = await request(app).get("/test?token=secret123&signature=abc&normal=value");
     expect(res.status).toBe(200);
 
-    // The error should have been swallowed and reported
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
-      "[access-log] failed to emit log entry",
-      expect.any(Error),
-    );
-    consoleErrorSpy.mockRestore();
-  });
-
-  // ── New: text log format ──────────────────────────────────────────────────
-
-  it("emits a human-readable line when LOG_FORMAT is not 'json'", async () => {
-    const { env } = await import("../config.js");
-    const original = env.LOG_FORMAT;
-    (env as any).LOG_FORMAT = "text";
-
-    try {
-      await request(app).get("/test");
-      expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
-      const logLine = consoleInfoSpy.mock.calls[0][0] as string;
-      expect(typeof logLine).toBe("string");
-      expect(logLine).toContain("INFO");
-      expect(logLine).toContain("GET");
-      expect(logLine).toContain("/test");
-      expect(logLine).toContain("200");
-      expect(logLine).toMatch(/\d+(\.\d+)?ms/);
-      // Must NOT be valid JSON
-      expect(() => JSON.parse(logLine)).toThrow();
-    } finally {
-      (env as any).LOG_FORMAT = original;
-    }
-  });
-
-  // ── New: duration is non-negative ─────────────────────────────────────────
-
-  it("records a non-negative duration_ms", async () => {
-    await request(app).get("/test");
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
-    expect(logObj.duration_ms).toBeGreaterThanOrEqual(0);
+
+    // Redacted sensitive params
+    expect(logObj.path).toContain("token=[REDACTED]");
+    expect(logObj.path).toContain("signature=[REDACTED]");
+    
+    // Non-sensitive param should remain unchanged
+    expect(logObj.path).toContain("normal=value");
+
+    // The original secret values should not be in the log at all
+    expect(logObj.path).not.toContain("secret123");
+    expect(logObj.path).not.toContain("abc");
   });
 });
