@@ -115,6 +115,14 @@ const contactLimiter = makeLimiter({
   message: "Too many contact form submissions. Please try again later.",
 });
 
+// Analytics limiter - specific limit for analytics endpoints
+const analyticsLimiter = makeLimiter({
+  name: "analytics",
+  windowMs: env.RATE_LIMIT_ANALYTICS_WINDOW_MS,
+  max: env.RATE_LIMIT_ANALYTICS_MAX,
+  message: "Too many analytics requests, please try again later.",
+});
+
 // Apply global rate limiter to all API routes
 app.use("/api/", globalLimiter);
 
@@ -135,6 +143,7 @@ app.use("/api/v1", indexedRouter);
 app.use("/api/v1", tokenRouter);
 app.use("/api/v1", transactionsRouter);
 app.use("/api/v1", notificationsRouter);
+app.use("/api/v1/analytics", analyticsLimiter);
 app.use("/api/v1", analyticsRouter);
 app.use("/api/v1", eventsRouter);
 app.use("/api/v1", indexerStatusRouter);

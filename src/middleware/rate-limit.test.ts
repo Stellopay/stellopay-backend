@@ -215,6 +215,38 @@ describe("makeLimiter", () => {
     );
     expect(limitWarnings).toHaveLength(0);
   });
+
+  // ---------------------------------------------------------------------------
+  // Environment overrides
+  // ---------------------------------------------------------------------------
+
+  it("allows environment variable overrides per limiter name", async () => {
+    process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_MAX = "2";
+    process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_WINDOW_MS = "60000";
+
+    const app = makeApp(makeLimiter({ name: "test_env_override", windowMs: 1000, max: 10 }));
+
+    // Should only allow 2 requests, not 10 (which is the default passed in)
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(429);
+
+    delete process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_MAX;
+    delete process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_WINDOW_MS;
+  });
+
+  it("warns on startup if an env override max is absurdly high", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.RATE_LIMIT_ABSURD_MAX = "5000";
+
+    makeLimiter({ name: "absurd", windowMs: 60000, max: 10 });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('absurdly high max of 5000')
+    );
+
+    delete process.env.RATE_LIMIT_ABSURD_MAX;
+  });
 });
 
 // ---------------------------------------------------------------------------
