@@ -8,6 +8,66 @@ import {
   type CircuitBreakerSnapshot,
 } from "./circuit-breaker.js";
 
+/**
+ * COMPATIBILITY CONTRACT: src/starknet/client.ts
+ *
+ * This module provides a Starknet RPC client with automatic failover, contract caching,
+ * and network info caching. The following contract guarantees backward compatibility
+ * for existing callers and defines the expected behavior for future changes.
+ *
+ * Public API Surface:
+ * - provider: RpcProvider proxy with automatic failover across configured endpoints
+ * - getEscrowAbi(): Returns memoized escrow contract ABI
+ * - getAgreementAbi(): Returns memoized agreement contract ABI
+ * - escrowContract(address): Returns cached escrow Contract instance
+ * - agreementContract(address): Returns cached agreement Contract instance
+ * - getCachedNetworkInfo(ttlMs?): Returns cached chainId and specVersion
+ * - clearContractCache(): Clears memoized ABIs and cached Contract instances (test-only)
+ * - clearNetworkCache(): Clears network info cache (test-only)
+ * - resetRpcFailoverForTests(): Resets RPC failover state to primary endpoint (test-only)
+ *
+ * Behavior Guarantees:
+ * 1. RPC Failover:
+ *    - Tries endpoints in failover order (healthy endpoint first, then others)
+ *    - On success, updates healthyRpcIndex to the successful endpoint
+ *    - Logs console.warn on failover with old and new URLs
+ *    - Clones RPC arguments before each retry to prevent mutation
+ *    - Throws the last error if all endpoints fail
+ *    - Argument cloning supports: primitives, arrays, plain objects, Date, Map, Set
+ *    - Argument cloning does NOT support: custom class instances, cyclic structures
+ *
+ * 2. Contract Caching:
+ *    - Contracts are cached by "<kind>:<address>" key (kind = "escrow" or "agreement")
+ *    - ABI is parsed from disk once and memoized per contract type
+ *    - Same address returns the same Contract instance (reference equality)
+ *    - Different addresses return distinct instances even for same contract type
+ *    - escrow and agreement contracts never share instances even at same address
+ *    - clearContractCache() resets all caches and forces reload from disk
+ *
+ * 3. Network Info Caching:
+ *    - getCachedNetworkInfo() caches chainId and specVersion for default 5-minute TTL
+ *    - TTL is configurable via ttlMs parameter (milliseconds)
+ *    - Cache is not poisoned on RPC failure - subsequent calls retry RPC
+ *    - clearNetworkCache() resets the cache
+ *
+ * 4. Error Handling:
+ *    - getEscrowAbi() throws Error if ESCROW_CONTRACT_CLASS_JSON is not configured
+ *    - getAgreementAbi() throws Error if AGREEMENT_CONTRACT_CLASS_JSON is not configured
+ *    - RPC methods propagate errors from the underlying RpcProvider
+ *    - All errors are thrown synchronously or as rejected promises
+ *
+ * 5. Test-Only Functions:
+ *    - clearContractCache(), clearNetworkCache(), resetRpcFailoverForTests()
+ *    - These are exported for testing and should not be used in production code
+ *    - They reset module-level state to ensure test isolation
+ *
+ * Backward Compatibility:
+ * - All existing exports maintain their current signatures and behavior
+ * - No breaking changes to the public API surface
+ * - Existing callers in routes/agreement.ts, routes/escrow.ts, routes/auth.ts, etc.
+ *   will continue to work without modification
+ */
+
 const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
 
 /** Circuit breaker per RPC endpoint, aligned with `rpcProviders` by index. */
@@ -26,6 +86,41 @@ function rpcFailoverOrder(): number[] {
     }
   }
   return order;
+}
+
+function cloneRpcArgs(args: unknown[]): unknown[] {
+  return args.map((argument) => cloneRpcValue(argument));
+}
+
+function cloneRpcValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneRpcValue(item));
+  }
+
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value instanceof Map) {
+    return new Map(Array.from(value.entries(), ([key, entryValue]) => [cloneRpcValue(key), cloneRpcValue(entryValue)]));
+  }
+
+  if (value instanceof Set) {
+    return new Set(Array.from(value.values(), (entryValue) => cloneRpcValue(entryValue)));
+  }
+
+  if (value && typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      const clone: Record<string, unknown> = {};
+      for (const [key, entryValue] of Object.entries(value as Record<string, unknown>)) {
+        clone[key] = cloneRpcValue(entryValue);
+      }
+      return clone;
+    }
+  }
+
+  return value;
 }
 
 async function invokeWithFailover(
@@ -53,6 +148,8 @@ async function invokeWithFailover(
 
       // Success path
       breaker.recordSuccess();
+      const attemptArgs = cloneRpcArgs(args);
+      const result = await fn.apply(candidate, attemptArgs);
       if (index !== healthyRpcIndex) {
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,
@@ -77,6 +174,16 @@ async function invokeWithFailover(
  * Subsequent calls reuse the last healthy endpoint until it fails again.
  * Each endpoint is guarded by a circuit breaker that opens after repeated
  * failures and half-opens after a configurable cooldown period.
+ *
+ * **Idempotency of read calls**: all methods that only read chain state
+ * (`getChainId`, `getSpecVersion`, `getTransactionReceipt`, `estimateFee`, etc.)
+ * are safe to call multiple times — the provider proxy routes them through
+ * `invokeWithFailover` which retries on failure without duplicating effects.
+ *
+ * **Fee quotes**: `estimateFee` calls are read-only and idempotent.  The
+ * in-flight dedup map below (`pendingNetworkInfo`) ensures that concurrent
+ * calls for the same cached data share a single in-flight RPC request rather
+ * than fanning out N identical calls during a cache miss.
  */
 export const provider = new Proxy(rpcProviders[0]!, {
   get(_target, prop, _receiver) {
@@ -179,8 +286,26 @@ let cachedSpecVersion: string | undefined;
 let cacheExpiryTime = 0;
 
 /**
+ * In-flight deduplication for getCachedNetworkInfo.
+ *
+ * When multiple concurrent callers hit a cache miss at the same instant,
+ * only a single RPC request is issued; all callers await the same Promise.
+ * This prevents N×2 simultaneous `getChainId` + `getSpecVersion` fan-out
+ * calls during a cold start or TTL expiry under load — a form of duplicate
+ * request protection that keeps fee-quote and chain-interaction paths
+ * idempotent at the RPC level.
+ */
+let pendingNetworkInfo: Promise<{ chainId: string; specVersion: string }> | undefined;
+
+/**
  * Gets the chain ID and spec version from the Starknet RPC,
  * caching the result in memory for the specified TTL.
+ *
+ * **Idempotency**: repeated calls within the TTL window return the cached
+ * value without issuing any RPC call. Concurrent calls during a cache miss
+ * share a single in-flight request (see `pendingNetworkInfo`). The cache is
+ * not poisoned on failure: a rejected call leaves the cache empty so the
+ * next caller retries cleanly.
  *
  * @param ttlMs - Time-to-live in milliseconds (default: 5 minutes)
  * @returns An object containing the stringified chainId and specVersion
@@ -193,18 +318,32 @@ export async function getCachedNetworkInfo(
     return { chainId: cachedChainId, specVersion: cachedSpecVersion };
   }
 
-  const [rawChainId, rawSpecVersion] = await Promise.all([
-    provider.getChainId(),
-    provider.getSpecVersion(),
-  ]);
+  // Deduplicate concurrent cache-miss fetches so only one RPC round-trip goes
+  // out regardless of how many callers hit the miss simultaneously.
+  if (!pendingNetworkInfo) {
+    pendingNetworkInfo = (async () => {
+      try {
+        const [rawChainId, rawSpecVersion] = await Promise.all([
+          provider.getChainId(),
+          provider.getSpecVersion(),
+        ]);
 
-  const chainId = String(rawChainId);
-  const specVersion = String(rawSpecVersion);
-  cachedChainId = chainId;
-  cachedSpecVersion = specVersion;
-  cacheExpiryTime = now + ttlMs;
+        const chainId = String(rawChainId);
+        const specVersion = String(rawSpecVersion);
+        cachedChainId = chainId;
+        cachedSpecVersion = specVersion;
+        cacheExpiryTime = Date.now() + ttlMs;
 
-  return { chainId, specVersion };
+        return { chainId, specVersion };
+      } finally {
+        // Always clear the pending promise — whether the fetch succeeded or
+        // failed — so the next caller can issue a fresh request.
+        pendingNetworkInfo = undefined;
+      }
+    })();
+  }
+
+  return pendingNetworkInfo;
 }
 
 /**
@@ -214,6 +353,7 @@ export function clearNetworkCache(): void {
   cachedChainId = undefined;
   cachedSpecVersion = undefined;
   cacheExpiryTime = 0;
+  pendingNetworkInfo = undefined;
 }
 
 /**

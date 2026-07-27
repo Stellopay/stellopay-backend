@@ -1,10 +1,19 @@
 /**
- * @file diagnostics.test.ts
- * Tests for the operator-only GET /diagnostics/events route.
+ * diagnostics.test.ts
+ *
+ * Contract tests for src/routes/diagnostics.ts (issue #279).
  *
  * The real requireAuth + requireAdmin middleware run here (only their
  * dependencies, the session check and the admin list, are mocked) so the
  * gating itself is exercised. db.execute is mocked to return canned rows.
+ *
+ * Coverage:
+ *   - Auth gating: 401 for unauthenticated and non-admin; no DB hit
+ *   - Success path: correct shape, counts, poolStats
+ *   - Redaction invariant: transaction_hash / agreement_id never leak
+ *   - Empty DB boundary: all summary fields default to 0, latestEvents is []
+ *   - Error handling: db failure propagates as 500 via error handler
+ *   - Response shape: all top-level keys present on every 200
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -16,7 +25,7 @@ vi.mock("../auth/session.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  env: { ADMIN_ADDRESSES: ["0xadmin"] },
+  env: { ADMIN_ADDRESSES: ["0xabc1"] },
 }));
 
 vi.mock("../db/index.js", () => ({
@@ -36,9 +45,11 @@ import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
 import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
-
-const ADMIN = "0xadmin";
-const NON_ADMIN = "0xnotadmin";
+// Use valid-hex addresses: the auth middleware now compares the
+// principal against the admin allowlist through normalizeStarknetAddress,
+// which rejects anything outside [0-9a-f] (e.g. `m`, `n`, `o`, `t`).
+const ADMIN = "0xabc1";
+const NON_ADMIN = "0xdef2";
 
 function makeApp() {
   const app = express();
@@ -107,6 +118,36 @@ describe("redactRecentEvent helper", () => {
     expect(redacted).not.toHaveProperty("agreement_id");
     expect(redacted).not.toHaveProperty("employer");
   });
+
+  it("provides safe fallbacks for malformed inputs without crashing", () => {
+    // Missing fields
+    expect(redactRecentEvent({})).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Invalid types
+    expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Null or undefined
+    expect(redactRecentEvent(null)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+    expect(redactRecentEvent(undefined)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    // Primitive values
+    expect(redactRecentEvent("just a string")).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+  });
 });
 
 describe("fetchDiagnosticsData helper", () => {
@@ -156,7 +197,6 @@ describe("fetchDiagnosticsData helper", () => {
   });
 });
 
-
 describe("GET /diagnostics/events – admin gating and redaction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -171,21 +211,24 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(db.execute).not.toHaveBeenCalled();
   });
 
-  it("rejects an authenticated non-admin with 401 and runs no queries", async () => {
+  it("rejects an authenticated non-admin with 403 and runs no queries", async () => {
+    // requireAuth was satisfied by the session mock, but requireAdmin
+    // denies because NON_ADMIN is not in the admin allowlist. The 401/403
+    // split in src/auth/middleware.ts intentionally distinguishes "no
+    // session" from "wrong role".
     const res = await request(makeApp())
       .get("/api/v1/diagnostics/events")
       .set(authHeaders(NON_ADMIN));
 
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Forbidden" });
     expect(db.execute).not.toHaveBeenCalled();
   });
 
   it("rejects requests when requireSession invalidates session", async () => {
     vi.mocked(requireSession).mockResolvedValueOnce(false);
 
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
+    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
 
     expect(res.status).toBe(401);
     expect(db.execute).not.toHaveBeenCalled();
@@ -273,3 +316,88 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 });
 
+
+describe("GET /diagnostics/events – backward-compatibility contract (Issue #284)", () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+            vi.mocked(db.execute).mockReset();
+                vi.mocked(requireSession).mockResolvedValue(true);
+                  });
+
+                    it("response always includes the full set of documented top-level keys", async () => {
+                        wireDbRows();
+
+                            const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                expect(res.status).toBe(200);
+                                    // Locks the public response contract: existing consumers may rely on
+                                        // any of these keys being present. Adding new keys is fine (additive);
+                                            // renaming or removing one of these is a breaking change and must fail
+                                                // this test, forcing a deliberate version discussion instead of a
+                                                    // silent drift.
+                                                        expect(Object.keys(res.body).sort()).toEqual(
+                                                              [
+                                                                      "eventTypeCounts",
+                                                                              "escrowEventCounts",
+                                                                                      "paymentEventCounts",
+                                                                                              "tableCounts",
+                                                                                                      "latestEvents",
+                                                                                                              "poolStats",
+                                                                                                                      "summary",
+                                                                                                                            ].sort(),
+                                                                                                                                );
+                                                                                                                                  });
+
+                                                                                                                                    it("summary always includes the documented six fields, even when tables are empty", async () => {
+                                                                                                                                        vi.mocked(db.execute)
+                                                                                                                                              .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                    .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                          .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                                .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                                      .mockResolvedValueOnce({ rows: [] } as any);
+
+                                                                                                                                                                          const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                              expect(res.status).toBe(200);
+                                                                                                                                                                                  expect(Object.keys(res.body.summary).sort()).toEqual(
+                                                                                                                                                                                        [
+                                                                                                                                                                                                "totalAgreementEvents",
+                                                                                                                                                                                                        "totalEscrowEvents",
+                                                                                                                                                                                                                "totalPayments",
+                                                                                                                                                                                                                        "totalEmployees",
+                                                                                                                                                                                                                                "totalMilestones",
+                                                                                                                                                                                                                                        "latestBlock",
+                                                                                                                                                                                                                                              ].sort(),
+                                                                                                                                                                                                                                                  );
+                                                                                                                                                                                                                                                    });
+
+                                                                                                                                                                                                                                                      it("latestEvents entries never grow beyond the documented redacted shape", async () => {
+                                                                                                                                                                                                                                                          wireDbRows();
+
+                                                                                                                                                                                                                                                              const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                  expect(res.status).toBe(200);
+                                                                                                                                                                                                                                                                      for (const entry of res.body.latestEvents) {
+                                                                                                                                                                                                                                                                            // Exactly two keys — event_type and created_at. If a future change to
+                                                                                                                                                                                                                                                                                  // fetchDiagnosticsData or redactRecentEvent starts leaking a third
+                                                                                                                                                                                                                                                                                        // field, this fails instead of silently widening the redaction surface.
+                                                                                                                                                                                                                                                                                              expect(Object.keys(entry).sort()).toEqual(["created_at", "event_type"]);
+                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                    });
+
+                                                                                                                                                                                                                                                                                                      it("only GET is exposed on /diagnostics/events; other methods are not silently handled", async () => {
+                                                                                                                                                                                                                                                                                                          const app = makeApp();
+
+                                                                                                                                                                                                                                                                                                              const postRes = await request(app).post("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+                                                                                                                                                                                                                                                                                                                  const deleteRes = await request(app).delete("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                                                                      // Express's default for an unregistered method on a known path is 404.
+                                                                                                                                                                                                                                                                                                                          // This test locks that in as the documented contract, so a future route
+                                                                                                                                                                                                                                                                                                                              // addition (e.g. a POST handler) is a deliberate, reviewed decision
+                                                                                                                                                                                                                                                                                                                                  // rather than an accidental side effect of an unrelated change.
+                                                                                                                                                                                                                                                                                                                                      expect(postRes.status).toBe(404);
+                                                                                                                                                                                                                                                                                                                                          expect(deleteRes.status).toBe(404);
+                                                                                                                                                                                                                                                                                                                                              expect(db.execute).not.toHaveBeenCalled();
+                                                                                                                                                                                                                                                                                                                                                });
+                                                                                                                                                                                                                                                                                                                                                });
+})
