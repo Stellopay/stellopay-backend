@@ -7,7 +7,7 @@ import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
 import { shortString, Contract } from "starknet";
-import { defaults, abiPaths } from "../config.js";
+import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
@@ -30,6 +30,40 @@ export const TxHashSchema = z
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
 
 export const eventsRouter = Router();
+
+interface EventTelemetryEntry {
+  operation: "event_ingestion" | "event_envelope_validation" | "event_fanout_delivery";
+  duration_ms: number;
+  status: "success" | "error";
+  tx_hash?: string;
+  batch_size?: number;
+  unique_transactions?: number;
+  duplicates?: number;
+  events_processed?: number;
+  result_status?: TxProcessResult["status"];
+  error?: string;
+}
+
+/** Emits one structured, low-cardinality telemetry event for the ingestion path. */
+function logEventTelemetry(entry: EventTelemetryEntry): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
+  if (env.LOG_FORMAT === "json") {
+    // eslint-disable-next-line no-console
+    (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
+    return;
+  }
+  const message =
+    `[events-telemetry] ${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+    `${logEntry.tx_hash ? ` tx=${logEntry.tx_hash}` : ""}` +
+    `${logEntry.batch_size !== undefined ? ` batch=${logEntry.batch_size}` : ""}` +
+    `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+  // eslint-disable-next-line no-console
+  (logEntry.level === "error" ? console.error : console.info)(message);
+}
 
 /**
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.
@@ -161,6 +195,32 @@ async function verifyAndUpdateToken(
  * @returns A {@link TxProcessResult} describing what was stored.
  */
 export async function processTxReceipt(txHash: string): Promise<TxProcessResult> {
+  const start = process.hrtime.bigint();
+  const normalizedTxHash = normalizeTransactionHash(txHash);
+  try {
+    const result = await processTxReceiptUnchecked(txHash);
+    logEventTelemetry({
+      operation: "event_ingestion",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: result.txHash,
+      result_status: result.status,
+      events_processed: result.eventsProcessed,
+    });
+    return result;
+  } catch (error: any) {
+    logEventTelemetry({
+      operation: "event_ingestion",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "error",
+      tx_hash: normalizedTxHash,
+      error: error?.message ?? String(error),
+    });
+    throw error;
+  }
+}
+
+async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResult> {
   const normalizedTxHash = normalizeTransactionHash(txHash);
 
   // ------------------------------------------------------------------
@@ -745,10 +805,28 @@ eventsRouter.get("/events/list", async (req, res, next) => {
  * `backfill-events.ts` and `reprocess-events.ts`.
  */
 eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
+  const start = process.hrtime.bigint();
   try {
     const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
+    logEventTelemetry({
+      operation: "event_envelope_validation",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: normalizeTransactionHash(tx_hash),
+      batch_size: 1,
+    });
 
-      const result = await processTxReceipt(tx_hash);
+    const result = await processTxReceipt(tx_hash);
+    logEventTelemetry({
+      operation: "event_fanout_delivery",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: result.txHash,
+      batch_size: 1,
+      unique_transactions: 1,
+      events_processed: result.eventsProcessed,
+      result_status: result.status,
+    });
 
     if (result.status === "not_found") {
       notFoundResponse(res, "Transaction not found");
@@ -766,12 +844,19 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
       transactionHash: result.txHash,
       tokenVerified: result.tokenVerified,
     });
-  } catch (e) {
-    if (e instanceof z.ZodError) {
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "error",
+        batch_size: 1,
+        error: error.message,
+      });
       res.status(400).json({ error: "Invalid Starknet transaction hash format" });
       return;
     }
-    next(e);
+    next(error);
   }
 });
 
@@ -812,6 +897,7 @@ eventsRouter.post(
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    const start = process.hrtime.bigint();
     try {
       const { tx_hashes } = z
         .object({
@@ -1014,6 +1100,16 @@ eventsRouter.get("/events", async (req, res, next) => {
       .orderBy(desc(schema.agreementEvents.createdAt))
       .limit(limit)
       .offset(offset);
+
+    logEventTelemetry({
+      operation: "event_fanout_delivery",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      batch_size: tx_hashes.length,
+      unique_transactions: uniqueResults.length,
+      duplicates,
+      events_processed: totalProcessed,
+    });
 
     res.json({
       events,
