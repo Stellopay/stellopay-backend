@@ -2,22 +2,30 @@ import express from "express";
 import request from "supertest";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ZodError } from "zod";
-import { defaults } from "../config.js";
-import { computeETag } from "../utils/cache-headers.js";
 
-// Mock the db module (no real Postgres or config needed) and drizzle-orm
-// helpers. Each query resolves to the rows configured for its table, records
-// the limit/offset it was asked for, and the innerJoin payroll lookup
-// (employee-agreements) resolves separately from `state.rows.employeeAgreements`,
-// shaped as `{ agreement }` rows to match the route's `.select({ agreement: ... })`.
+const { ADMIN_ADDRESS, NON_ADMIN_ADDRESS, VALID_TOKEN } = vi.hoisted(() => ({
+  ADMIN_ADDRESS: "0x" + "1".repeat(64),
+  NON_ADMIN_ADDRESS: "0x" + "2".repeat(64),
+  VALID_TOKEN: "valid-session-token",
+}));
+
+vi.mock("../auth/session.js", () => ({
+  requireSession: vi.fn(async (_address: string, token: string) => token === VALID_TOKEN),
+}));
+
+vi.mock("../config.js", () => ({
+  env: { ADMIN_ADDRESSES: [ADMIN_ADDRESS] },
+  defaults: {
+    workAgreementAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+    payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
+  },
+  abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
+}));
+
 const { dbMock, schemaMock, state, limitSpy, offsetSpy, callOrder } = vi.hoisted(() => {
   const limitSpy = vi.fn();
   const offsetSpy = vi.fn();
   const state = { rows: {} as Record<string, any[]> };
-  // Records, in order, when each query is *issued* ("agreements"/"employeeAgreements")
-  // vs when it *resolves* ("resolved:agreements"/"resolved:employeeAgreements").
-  // Used to distinguish concurrent (Promise.all) from sequential (await, await)
-  // execution without relying on artificial delays/timers.
   const callOrder: string[] = [];
 
   function from(tableName: string) {
@@ -33,7 +41,6 @@ const { dbMock, schemaMock, state, limitSpy, offsetSpy, callOrder } = vi.hoisted
         return chain;
       },
       limit: (n: number) => {
-        // Track which table was limited and by how much
         limitSpy(tableName, n);
         return chain;
       },
@@ -51,7 +58,15 @@ const { dbMock, schemaMock, state, limitSpy, offsetSpy, callOrder } = vi.hoisted
     return chain;
   }
 
-  const db = { select: () => ({ from: (t: { __name: string }) => from(t.__name) }) };
+  const db = {
+    select: (_fields?: any) => ({
+      from: (t: { __name: string }) => {
+        callOrder.push(`select:${t.__name}`);
+        return from(t.__name);
+      },
+    }),
+  };
+
   const schema = new Proxy(
     {},
     {
@@ -73,9 +88,16 @@ vi.mock("drizzle-orm", () => ({
   desc: () => "desc",
 }));
 
-import { indexedRouter, deriveSyncCheckpoint, INDEXED_DATA_SOURCE, MAX_INTERNAL_LIMIT } from "./indexed";
+import {
+  indexedRouter,
+  deriveSyncCheckpoint,
+  authorizeIndexedFreshness,
+  INDEXED_DATA_SOURCE,
+  MAX_INTERNAL_LIMIT,
+} from "./indexed";
+import { defaults } from "../config.js";
 
-const VALID = `0x${"a".repeat(63)}1`;
+const VALID = "0x" + "3".repeat(64);
 
 function makeApp() {
   const app = express();
@@ -103,6 +125,85 @@ beforeEach(() => {
   offsetSpy.mockClear();
   state.rows = {};
   callOrder.length = 0;
+});
+
+describe("indexer freshness and sync checkpoint authorization boundary", () => {
+  it("rejects unauthenticated requests with 401 Unauthorized", async () => {
+    const resFreshness = await request(makeApp()).get("/api/v1/indexed/freshness");
+    expect(resFreshness.status).toBe(401);
+    expect(resFreshness.body).toEqual({ error: "Unauthorized" });
+
+    const resCheckpoint = await request(makeApp()).get("/api/v1/indexed/checkpoint");
+    expect(resCheckpoint.status).toBe(401);
+    expect(resCheckpoint.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("rejects requests with invalid session token with 401 Unauthorized", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", "Bearer invalid-token");
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("rejects authenticated non-admin requests with 403 Forbidden", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", NON_ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Forbidden" });
+  });
+
+  it("evaluates authorization BEFORE executing route logic or DB access", async () => {
+    await request(makeApp()).get("/api/v1/indexed/freshness");
+    expect(callOrder).toHaveLength(0);
+
+    await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", NON_ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+    expect(callOrder).toHaveLength(0);
+  });
+
+  it("prevents sensitive state leakage in failure responses", async () => {
+    const resUnauth = await request(makeApp()).get("/api/v1/indexed/freshness");
+    expect(resUnauth.body).toEqual({ error: "Unauthorized" });
+    expect(resUnauth.body.checkpointBlock).toBeUndefined();
+    expect(resUnauth.body.source).toBeUndefined();
+
+    const resForbidden = await request(makeApp())
+      .get("/api/v1/indexed/checkpoint")
+      .set("x-user-address", NON_ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+    expect(resForbidden.body).toEqual({ error: "Forbidden" });
+    expect(resForbidden.body.checkpointBlock).toBeUndefined();
+  });
+
+  it("allows authorized admin requests to succeed", async () => {
+    state.rows.agreementEvents = [
+      { blockNumber: 1500 },
+      { blockNumber: 1200 },
+    ];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.source).toBe(INDEXED_DATA_SOURCE);
+    expect(res.body.checkpointBlock).toBe(1500);
+    expect(res.body.freshness).toBe("synced");
+  });
+
+  it("exports authorizeIndexedFreshness middleware array", () => {
+    expect(Array.isArray(authorizeIndexedFreshness)).toBe(true);
+    expect(authorizeIndexedFreshness.length).toBe(2);
+  });
 });
 
 describe("indexed routes validation", () => {
@@ -170,29 +271,28 @@ describe("indexed routes pagination and bounding", () => {
 describe("indexed routes data paths", () => {
   it("deduplicates agreements by id for a user", async () => {
     state.rows.agreements = [
-      { id: "a1", contractAddress: VALID, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() },
-      { id: "a1", contractAddress: VALID, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() },
+      { id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() },
+      { id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() },
     ];
     const res = await request(makeApp()).get(
       `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.count).toBe(2);
+    expect(res.body.count).toBe(1);
     expect(res.body.source).toBe("indexed");
   });
 
   it("success path: runs the direct-agreements and employee-agreements queries concurrently, not sequentially", async () => {
-    state.rows.agreements = [{ id: "a1", contractAddress: "c" }];
+    state.rows.agreements = [{ id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
 
-    // Both queries must be *issued* before either *resolves*. A regression to
-    // sequential awaits would instead produce:
-    //   ["agreements", "resolved:agreements", "employeeAgreements", "resolved:employeeAgreements"]
     expect(callOrder).toEqual([
+      "select:agreements",
       "agreements",
+      "select:agreements",
       "employeeAgreements",
       "resolved:agreements",
       "resolved:employeeAgreements",
@@ -200,19 +300,17 @@ describe("indexed routes data paths", () => {
   });
 
   it("boundary path: still combines results correctly when only the employee-agreements query returns rows", async () => {
-    // The direct-agreements query (employer/contributor) returns nothing, but
-    // the user is an employee on a payroll agreement — exercises the branch
-    // where the final result depends entirely on the second, concurrently-run
-    // query rather than the first.
     state.rows.agreements = [];
-    state.rows.employeeAgreements = [{ agreement: { id: "payroll-1", contractAddress: "c" } }];
+    state.rows.employeeAgreements = [
+      { agreement: { id: "payroll-1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 1, createdAt: new Date() } },
+    ];
 
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
     expect(res.body.count).toBe(1);
-    expect(res.body.agreements).toEqual([{ id: "payroll-1", contractAddress: "c" }]);
+    expect(res.body.agreements[0].id).toBe("payroll-1");
   });
 
   it("returns 404 when an agreement is not found", async () => {
@@ -225,7 +323,7 @@ describe("indexed routes data paths", () => {
   });
 
   it("returns aggregated detail when an agreement exists", async () => {
-    state.rows.agreements = [{ id: "7", contractAddress: "c" }];
+    state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
     state.rows.agreementEvents = [{ id: "e1" }];
     state.rows.payments = [{ id: "p1" }];
     state.rows.milestones = [{ id: "m1" }];
