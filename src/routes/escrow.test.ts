@@ -48,9 +48,12 @@ function makeApp() {
   const app = express();
   app.use(express.json());
   app.use("/api/v1", escrowRouter);
-  // Add a generic error handler to prevent 500s from blowing up the test output
-  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    res.status(500).json({ error: err.message });
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const isZodError = err instanceof ZodError;
+    res.status(isZodError ? 400 : 500).json({
+      error: isZodError ? "Validation failed" : (err?.message ?? "Internal error"),
+      details: isZodError ? err.issues : undefined,
+    });
   });
   return app;
 }
@@ -199,6 +202,24 @@ describe("escrow routes", () => {
         nonce: "0x1",
         chain_id: "0x534e5f4d41494e",
       });
+    });
+
+    it("rejects malformed release amounts with 400", async () => {
+      const res = await request(makeApp())
+        .post("/api/v1/prepare/escrow/0x123/release")
+        .send({
+          wallet_address: "0xabc",
+          session_token: "token123456",
+          agreement_id: 1,
+          to: "0xdef",
+          amount: "not-a-number",
+        })
+        .expect(400);
+
+      expect(res.body).toMatchObject({
+        error: "Validation failed",
+      });
+      expect(res.body.details).toEqual(expect.any(Array));
     });
 
     it("returns 401 when session is invalid", async () => {

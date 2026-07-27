@@ -20,25 +20,31 @@ const AddressParam = z.string().min(3).transform((val, ctx) => {
 const AgreementIdParam = z.coerce.bigint().positive();
 
 const WalletSession = z.object({
-  wallet_address: z.string().min(3),
-  session_token: z.string().min(10),
+  wallet_address: EscrowAddress,
+  session_token: z.string().trim().min(10),
 });
+const AgreementIdBody = z
+  .union([z.string().trim().regex(/^\d+$/), z.number().int().positive()])
+  .transform((value) => BigInt(value));
+const AmountBody = z
+  .union([z.string().trim().regex(/^\d+$/), z.number().int().nonnegative()])
+  .transform((value) => String(value));
 const FundAgreementBody = WalletSession.extend({
-  agreement_id: z.coerce.bigint().positive(),
-  employer: z.string().min(3),
-  amount: z.string().min(1),
+  agreement_id: AgreementIdBody,
+  employer: EscrowAddress,
+  amount: AmountBody,
 });
 const ReleaseBody = WalletSession.extend({
-  agreement_id: z.coerce.bigint().positive(),
-  to: z.string().min(3),
-  amount: z.string().min(1),
+  agreement_id: AgreementIdBody,
+  to: EscrowAddress,
+  amount: AmountBody,
 });
 const InitBody = WalletSession.extend({
-  token: z.string().min(3),
-  manager: z.string().min(3),
+  token: EscrowAddress,
+  manager: EscrowAddress,
 });
 const RefundBody = WalletSession.extend({
-  agreement_id: z.coerce.bigint().positive(),
+  agreement_id: AgreementIdBody,
 });
 
 // -------- Idempotency Store & Helpers --------
