@@ -516,9 +516,6 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
       kind: "all",
       address: normalizedAddress,
     });
-    // Already revoked — skip the retry/update loop AND the ALL_REVOKED
-    // bump so that `session_all_revoked_total` reflects distinct address
-    // revocations only.
     return;
   }
 
@@ -583,10 +580,48 @@ export async function revokeSessionByHash(tokenHash: string): Promise<void> {
   if (!tokenHash) return;
   const tokenHashShort = tokenHash.slice(0, 8);
 
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+    });
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.tokenHash, tokenHash)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "single",
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          token_hash_prefix: tokenHashShort,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.REVOKED);
   logSessionEvent("info", "session.revoked", {

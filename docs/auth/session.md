@@ -403,6 +403,7 @@ Wrapped in `withBoundedRetry` (3 attempts, 50ms backoff, see
 | `revokeSession` (UPDATE)                        | `SET revokedAt = now()` applied to the same row twice produces the same final state. |
 | `revokeFamily` (UPDATE)                         | Same as above; per-family write is idempotent.                             |
 | `revokeAllSessionsForAddress` (UPDATE)          | Same as above; per-address write is idempotent.                            |
+| `revokeSessionByHash` (UPDATE)                  | Same as above; per-token-hash write is idempotent.                         |
 | `sweepExpiredSessions` (DELETE)                 | Predicate is on `expiresAt` / `revokedAt`; the second attempt simply deletes fewer rows. |
 
 Deliberately **NOT** wrapped (throws on first DB error):
@@ -430,6 +431,7 @@ so, an **additional** `session.revoke_already` info log is emitted and an
 | `revokeSession`                  | `session_revoke_already_total`                  |
 | `revokeFamily`                   | `session_family_revoke_already_total`           |
 | `revokeAllSessionsForAddress`    | `session_all_revoke_already_total`              |
+| `revokeSessionByHash`            | `session_revoke_already_total`                  |
 
 The pre-existing `session_revoked_total` / `session_family_revoked_total`
 / `session_all_revoked_total` counters are **NOT** double-bumped on a
@@ -443,10 +445,10 @@ many were idempotent re-plays".
 
 | Event name               | Level | Bumped counter                    | Emitted by                                  |
 | ------------------------ | ----- | --------------------------------- | ------------------------------------------- |
-| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all`) |
-| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` |
+| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all` / `single-hash`) |
+| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` / `revokeSessionByHash` |
 | `session.sweep_retry`    | warn  | `session_sweep_retry_total`       | `withBoundedRetry` between attempts in `sweepExpiredSessions` |
-| `session.revoke_already` | info  | `session_revoke_already_total` (family / all variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
+| `session.revoke_already` | info  | `session_revoke_already_total` (family / all / single-hash variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
 
 `session.revoke_failed` always rethrows the original error so the route
 handler can return a 5xx. The pre-existing `session.sweep_failed` path
