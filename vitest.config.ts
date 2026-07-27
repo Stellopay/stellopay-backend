@@ -27,10 +27,12 @@ export default defineConfig({
         "src/middleware/rate-limit.ts",
         "src/routes/token.ts",
         "src/routes/not-found.ts",
+        "src/routes/read.ts",
         "src/utils/token-formatting.ts",
         "src/utils/validation.ts",
         "src/shutdown.ts",
         "scripts/check-env-sync.ts",
+        "scripts/lint-migrations.ts",
       ],
       thresholds: {
         lines: 95,

@@ -1,28 +1,55 @@
 # Events
 
 **Overview:**
-These endpoints ingest Starknet transaction receipts, decode `WorkAgreement` and `PayrollEscrow` contract events using the loaded ABIs, and persist the results (agreements, agreement events, payments, escrow events) to the database. Both routes delegate to the same internal `processTxReceipt(txHash)` function, so decoding/persistence behavior is identical whether a transaction is processed individually or as part of a batch.
+These endpoints handle indexed event querying as well as Starknet transaction receipt ingestion.
+
+Event ingestion endpoints decode `WorkAgreement` and `PayrollEscrow` contract events using the loaded ABIs, and persist the results (agreements, agreement events, payments, escrow events) to the database. Both POST routes delegate to the same internal `processTxReceipt(txHash)` function.
+
+The read endpoint (`GET /api/v1/events`) allows consumers to query indexed events with database-level filtering by event type, time range, agreement ID, contract address, and pagination parameters.
+
+---
 
 ## Endpoints
 
-## Observability contract
-
-The route emits one telemetry record for each completed stage when `LOG_FORMAT=json` (and an equivalent concise text record otherwise). These records never change either endpoint's response body:
-
-| `operation` | Emitted for | Key fields |
-| --- | --- | --- |
-| `event_envelope_validation` | Transaction-hash envelope accepted or rejected | `status`, `duration_ms`, `batch_size`, `error` on rejection |
-| `event_ingestion` | Each receipt fetch/decode/persist attempt | `status`, `duration_ms`, normalized `tx_hash`, `result_status`, `events_processed`, `error` on failure |
-| `event_fanout_delivery` | Result prepared for the single or batch caller | `status`, `duration_ms`, `batch_size`, `unique_transactions`, `duplicates`, `events_processed` |
-
-All telemetry records include an ISO `timestamp` and log `level`. Batch fan-out metrics count unique normalized transaction hashes, while the HTTP `results` array retains its existing one-entry-per-input contract.
-
+- `GET /api/v1/events`
 - `POST /api/v1/events/process_tx/:tx_hash`
 - `POST /api/v1/events/process_batch`
 
+---
+
+## `GET /api/v1/events`
+
+Fetch indexed events with event-type and time-range filtering pushed directly down into the database query.
+
+### Query Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `eventType` | `string` or `string[]` | Single event type (`AgreementCreated`), comma-separated types (`AgreementCreated,PaymentSent`), or repeated query params (`?eventType=A&eventType=B`). |
+| `from` | `string` or `number` | Bounds start of time range (inclusive: `createdAt >= from`). Accepts ISO 8601 strings or numeric epoch timestamps (seconds or milliseconds). |
+| `to` | `string` or `number` | Bounds end of time range (inclusive: `createdAt <= to`). Accepts ISO 8601 strings or numeric epoch timestamps (seconds or milliseconds). |
+| `agreement_id` / `agreementId` | `string` | Optional filter by numeric agreement ID. |
+| `contract_address` / `contractAddress` | `string` | Optional filter by contract address. |
+| `limit` | `number` | Page limit (default 50, maximum 100). |
+| `offset` | `number` | Pagination offset (default 0). |
+
+### Validation & Bounds Guarantees
+
+1. **Inclusive Bounds**: Time range bounds are inclusive (`from <= createdAt <= to`).
+2. **Strict Range Order Validation**: `from` must be less than or equal to `to` (`from <= to`). If `from > to`, the API rejects the request with HTTP `400 Bad Request` and `details: [{ message: "from timestamp must be less than or equal to to timestamp" }]`.
+3. **Malformed Timestamp Rejection**: Malformed or unparseable timestamps return HTTP `400 Bad Request` before hitting the database.
+
+### Query Pushdown Semantics
+
+Filtering by `eventType` and time range (`from`/`to`) is pushed down into the PostgreSQL query using Drizzle SQL operators (`inArray`, `gte`, `lte`), avoiding wasteful in-memory filtering and keeping database scans strictly bounded.
+
+---
+
+## Ingestion Endpoints
+
 ### Authentication
 
-Both routes require an authenticated session (`requireAuth`).
+Ingestion routes require an authenticated session (`requireAuth`).
 
 ---
 
@@ -106,7 +133,7 @@ A per-tx error is captured into that tx's result entry (`status: "error"`) and n
 
 ## Envelope validation contract
 
-Both endpoints validate transaction hash format identically via the shared `TxHashSchema` (`0x`-prefixed hex, 3–66 characters). This was previously inconsistent: `process_tx/:tx_hash` accepted any string and let malformed input fall through to the RPC layer, producing a murky downstream error instead of a clean validation failure. Both endpoints now return the same `400` shape on malformed input:
+Both endpoints validate transaction hash format identically via the shared `TxHashSchema` (`0x`-prefixed hex, 3–66 characters). Both endpoints return the same `400` shape on malformed input:
 
 ```json
 { "error": "Invalid Starknet transaction hash format" }
@@ -114,6 +141,4 @@ Both endpoints validate transaction hash format identically via the shared `TxHa
 
 ## Known limitations / out of scope
 
-- **No cross-request idempotency-key / response-replay caching.** There is no persistent idempotency-key store (e.g. Redis, a dedup table) in this service. If a caller (or an upstream retry/fan-out mechanism) sends the *same* transaction hash as two **separate** HTTP requests — rather than twice within one `process_batch` array — each request still performs its own RPC fetch and its own call to `processTxReceipt`. This remains safe at the DB layer (no duplicate rows, thanks to `onConflictDoNothing`), but it is not free: each request pays its own RPC cost, and the two HTTP responses are computed independently rather than one replaying the other's exact response body.
-- Adding true cross-request idempotency (an `Idempotency-Key` header with response replay, backed by a persistent store) would require new infrastructure and is intentionally out of scope for this change. The within-request dedup and envelope validation fixes above address the ambiguity that was actually reported without requiring that infrastructure.
-- **No external metrics exporter.** The route emits structured metric fields through the existing logging sink; wiring them to a metrics backend or tracing system is intentionally out of scope.
+- **No cross-request idempotency-key / response-replay caching.** There is no persistent idempotency-key store (e.g. Redis, a dedup table) in this service. If a caller sends the *same* transaction hash as two **separate** HTTP requests each request still performs its own RPC fetch and call to `processTxReceipt`.

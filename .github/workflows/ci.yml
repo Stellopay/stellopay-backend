@@ -65,6 +65,9 @@ jobs:
       - name: Check env sync
         run: pnpm check:env
 
+      - name: Check migrations naming
+        run: pnpm check:migrations
+
       - name: Build
         run: pnpm build
 
