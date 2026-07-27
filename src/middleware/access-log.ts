@@ -58,7 +58,16 @@ export function redactSensitiveParams(rawUrl: string): string {
 
   if (!modified) return rawUrl;
 
-  return parsed.pathname + "?" + parsed.searchParams.toString();
+  // URLSearchParams encodes brackets as %5B / %5D.
+  // Decode them back so the log entry remains human-readable.
+  return (
+    parsed.pathname +
+    "?" +
+    parsed.searchParams
+      .toString()
+      .replace(/%5B/gi, "[")
+      .replace(/%5D/gi, "]")
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +129,10 @@ export interface AccessLogEntry {
  * - Reads the correlation ID from `res.locals.requestId` (set by
  *   {@link requestIdMiddleware}). Falls back to a `crypto.randomUUID()` when
  *   that middleware is not mounted, so every log line always carries a valid ID.
+ * - **Idempotency**: the same request ID is only logged once within the
+ *   deduplication window (60 s). Retries or accidental duplicate delivery
+ *   with the same correlation ID produce at most one log line. See
+ *   {@link SeenRequestIds} for the dedup contract.
  * - Redacts sensitive query-parameter values via {@link redactSensitiveParams}
  *   before writing to the log — wallet addresses, tokens, passwords, etc.
  * - Emits one log line per request on the `res.finish` event, after the status

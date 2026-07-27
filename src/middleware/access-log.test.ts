@@ -126,6 +126,7 @@ describe("accessLogMiddleware", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    seenRequestIds.reset();
   });
 
   it("should emit exactly one access log line for a standard request", async () => {
