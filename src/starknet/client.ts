@@ -2,6 +2,66 @@ import { Contract, RpcProvider } from "starknet";
 import { abiPaths, starknetRpcUrls } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "./abi.js";
 
+/**
+ * COMPATIBILITY CONTRACT: src/starknet/client.ts
+ *
+ * This module provides a Starknet RPC client with automatic failover, contract caching,
+ * and network info caching. The following contract guarantees backward compatibility
+ * for existing callers and defines the expected behavior for future changes.
+ *
+ * Public API Surface:
+ * - provider: RpcProvider proxy with automatic failover across configured endpoints
+ * - getEscrowAbi(): Returns memoized escrow contract ABI
+ * - getAgreementAbi(): Returns memoized agreement contract ABI
+ * - escrowContract(address): Returns cached escrow Contract instance
+ * - agreementContract(address): Returns cached agreement Contract instance
+ * - getCachedNetworkInfo(ttlMs?): Returns cached chainId and specVersion
+ * - clearContractCache(): Clears memoized ABIs and cached Contract instances (test-only)
+ * - clearNetworkCache(): Clears network info cache (test-only)
+ * - resetRpcFailoverForTests(): Resets RPC failover state to primary endpoint (test-only)
+ *
+ * Behavior Guarantees:
+ * 1. RPC Failover:
+ *    - Tries endpoints in failover order (healthy endpoint first, then others)
+ *    - On success, updates healthyRpcIndex to the successful endpoint
+ *    - Logs console.warn on failover with old and new URLs
+ *    - Clones RPC arguments before each retry to prevent mutation
+ *    - Throws the last error if all endpoints fail
+ *    - Argument cloning supports: primitives, arrays, plain objects, Date, Map, Set
+ *    - Argument cloning does NOT support: custom class instances, cyclic structures
+ *
+ * 2. Contract Caching:
+ *    - Contracts are cached by "<kind>:<address>" key (kind = "escrow" or "agreement")
+ *    - ABI is parsed from disk once and memoized per contract type
+ *    - Same address returns the same Contract instance (reference equality)
+ *    - Different addresses return distinct instances even for same contract type
+ *    - escrow and agreement contracts never share instances even at same address
+ *    - clearContractCache() resets all caches and forces reload from disk
+ *
+ * 3. Network Info Caching:
+ *    - getCachedNetworkInfo() caches chainId and specVersion for default 5-minute TTL
+ *    - TTL is configurable via ttlMs parameter (milliseconds)
+ *    - Cache is not poisoned on RPC failure - subsequent calls retry RPC
+ *    - clearNetworkCache() resets the cache
+ *
+ * 4. Error Handling:
+ *    - getEscrowAbi() throws Error if ESCROW_CONTRACT_CLASS_JSON is not configured
+ *    - getAgreementAbi() throws Error if AGREEMENT_CONTRACT_CLASS_JSON is not configured
+ *    - RPC methods propagate errors from the underlying RpcProvider
+ *    - All errors are thrown synchronously or as rejected promises
+ *
+ * 5. Test-Only Functions:
+ *    - clearContractCache(), clearNetworkCache(), resetRpcFailoverForTests()
+ *    - These are exported for testing and should not be used in production code
+ *    - They reset module-level state to ensure test isolation
+ *
+ * Backward Compatibility:
+ * - All existing exports maintain their current signatures and behavior
+ * - No breaking changes to the public API surface
+ * - Existing callers in routes/agreement.ts, routes/escrow.ts, routes/auth.ts, etc.
+ *   will continue to work without modification
+ */
+
 const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
 
 /** Index into rpcProviders for the last known healthy endpoint. */

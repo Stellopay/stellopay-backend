@@ -271,6 +271,51 @@ by the Cairo contract.
 
 ---
 
+## Runtime validation helpers
+
+`schema.ts` exports runtime counterparts of every DB-level CHECK constraint. Callers
+should validate early to produce actionable errors rather than relying on a database
+constraint violation — this makes failures easier to catch, log, and retry.
+
+| Helper | Input | Returns | Description |
+|---|---|---|---|
+| `isValidU256(value)` | `string` | `boolean` | True when `value` matches the u256 decimal CHECK constraint |
+| `isValidCurrencyCode(code)` | `string` | `boolean` | True when `code` matches `^[A-Z]{3}$` |
+| `isValidNonNegativeInteger(value)` | `number` | `boolean` | True when `value` is an integer ≥ 0 |
+| `assertValidU256(value, name)` | `string` | throws on failure | Same as `isValidU256` but throws a `RangeError` |
+| `assertNonNegative(value, name)` | `number` | throws on failure | Same as `isValidNonNegativeInteger` but throws a `RangeError` |
+
+### Exported constraint constants
+
+| Constant | Type | Value | Description |
+|---|---|---|---|
+| `U256_DECIMAL_REGEX` | `string` | `^(0\|[1-9][0-9]{0,77})$` | Raw regex string used in the DB CHECK constraint |
+| `U256_DECIMAL_PATTERN` | `RegExp` | compiled `RegExp` | Pre-compiled pattern for runtime `test()` calls |
+| `CURRENCY_CODE_REGEX` | `RegExp` | `/^[A-Z]{3}$/` | Compiled pattern for ISO 4217-style currency codes |
+
+### Pagination & batching helpers
+
+| Helper | Input | Returns | Description |
+|---|---|---|---|
+| `clampPageLimit(n)` | `number` | `number` | Clamps to [1, `MAX_PAGE_SIZE`]; values ≤ 0 default to `DEFAULT_PAGE_SIZE` |
+| `clampBatchSize(n)` | `number` | `number` | Returns `0` when `n` is outside [1, `MAX_BATCH_SIZE`]; prefer `validateBatchSize` in new code |
+| `validateBatchSize(n, name?)` | `number` | `number` or throws | Returns `n` if valid; throws `RangeError` with a descriptive message otherwise |
+
+| Constant | Value | Description |
+|---|---|---|
+| `MAX_PAGE_SIZE` | `100` | Maximum rows per page across all list endpoints |
+| `DEFAULT_PAGE_SIZE` | `50` | Default page size when the caller does not specify a limit |
+| `MAX_BATCH_SIZE` | `100` | Maximum batch size for bulk operations |
+
+**Design note — `clampBatchSize` vs `validateBatchSize`:**
+`clampBatchSize` silently returns 0 on invalid input, which can make failures
+invisible and hard to retry. New code should prefer `validateBatchSize`, which
+throws a descriptive `RangeError` so the caller knows the input was rejected.
+The error message includes the field name and the invalid value, making it safe
+to propagate to user-facing validation responses.
+
+---
+
 ## Migration safety
 
 Migrations are run with a PostgreSQL advisory lock (`pg_advisory_lock`) so that only one
@@ -284,6 +329,21 @@ pnpm db:migrate -- --dry-run
 
 Each new migration file must be registered in
 [`src/db/migrations/meta/_journal.json`](../../src/db/migrations/meta/_journal.json).
+
+### Retry and replay semantics
+
+- **Advisory lock** (`pg_advisory_lock`) serialises concurrent migration attempts.
+  Only one process holds the lock at a time; others queue and wait.
+- **Lock release is guaranteed** via a `try`/`finally` block — even when the
+  migration itself fails, the lock is released so waiting processes can proceed.
+- **CHECK constraints are additive** — adding a new CHECK constraint to an
+  existing column via a migration is safe to replay if the data already
+  satisfies it. The migration runner does not wrap each migration in a
+  transaction, so each `.sql` file should be idempotent (use `IF NOT EXISTS`
+  where appropriate).
+- **Runtime validation** (`assertNonNegative`, `assertValidU256`, etc.) catches
+  constraint violations early so write-path code can be retried without
+  incurring a round-trip to the database.
 
 ### Out-of-scope notes
 

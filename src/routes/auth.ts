@@ -35,20 +35,55 @@ const RevokeSessionBody = z.object({
   token_hash: z.string().length(64),
 });
 
+/**
+ * Lowercased admin address set, built once at module load from
+ * `env.ADMIN_ADDRESSES`. Using a Set gives O(1) membership checks and
+ * avoids re-allocating and re-lowercasing the array on every request to
+ * `/auth/session/revoke`.
+ *
+ * If `env.ADMIN_ADDRESSES` is mutated at runtime (e.g. in tests) use
+ * {@link isAdminAddress} which reads the live set after any rebuild, or
+ * call {@link rebuildAdminSet} to refresh the set from the current env value.
+ */
+let adminAddressSet: Set<string> = buildAdminSet();
+
+function buildAdminSet(): Set<string> {
+  return new Set(env.ADMIN_ADDRESSES.map((a) => a.toLowerCase()));
+}
+
+/**
+ * Rebuilds the admin address set from the current value of
+ * `env.ADMIN_ADDRESSES`. Call this in tests that mutate `env.ADMIN_ADDRESSES`
+ * after module load so the set stays in sync.
+ */
+export function rebuildAdminSet(): void {
+  adminAddressSet = buildAdminSet();
+}
+
+/**
+ * Returns `true` when `address` (case-insensitive) is listed in
+ * `env.ADMIN_ADDRESSES`. The check is O(1) against the pre-built Set.
+ */
+function isAdminAddress(address: string): boolean {
+  return adminAddressSet.has(address.toLowerCase());
+}
+
 export const authRouter = Router();
 
-// Debug logger for auth routes (helps track nonce/signature/RPC issues)
+// Debug logger for auth routes (helps track nonce/signature/RPC issues).
+// The body is only cloned when it is a non-null object to avoid an
+// unconditional spread on every request.
 authRouter.use((req, _res, next) => {
-  const bodyLog: Record<string, unknown> =
-    req.body && typeof req.body === "object" ? { ...req.body } : {};
-  if (bodyLog.session_token) {
-    bodyLog.session_token = "***";
+  if (req.body && typeof req.body === "object") {
+    const bodyLog: Record<string, unknown> = { ...req.body };
+    if (bodyLog.session_token) bodyLog.session_token = "***";
+    if (bodyLog.signature) bodyLog.signature = "***";
+    // eslint-disable-next-line no-console
+    console.log(`[auth] ${req.method} ${req.originalUrl}`, { body: bodyLog });
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(`[auth] ${req.method} ${req.originalUrl}`);
   }
-  if (bodyLog.signature) {
-    bodyLog.signature = "***";
-  }
-  // eslint-disable-next-line no-console
-  console.log(`[auth] ${req.method} ${req.originalUrl}`, { body: bodyLog });
   next();
 });
 
@@ -78,7 +113,7 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
 authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
-    
+
     if (isLockedOut(address)) {
       res.status(401).json({ error: "Invalid signature or account locked" });
       return;
@@ -104,7 +139,7 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       res.status(401).json({ error: "Invalid signature or account locked" });
       return;
     }
-    
+
     clearFailures(address);
     const session = await createSession(address);
     res.json({
@@ -153,7 +188,6 @@ authRouter.post("/auth/logout", requireAuth, async (req, res, next) => {
     next(e);
   }
 });
-
 
 // Step 3.5: rotate a refresh token on every use. Detects reuse of an
 // already-rotated (stale) token and revokes the whole token family — a
@@ -217,9 +251,9 @@ authRouter.post("/auth/session/revoke", requireAuth, async (req, res, next) => {
     }
 
     const isOwner = session.address.toLowerCase() === callerAddress.toLowerCase();
-    const isAdmin = env.ADMIN_ADDRESSES.map((a) => a.toLowerCase()).includes(callerAddress.toLowerCase());
 
-    if (!isOwner && !isAdmin) {
+    // isAdminAddress checks the pre-built Set — O(1), no per-request array allocation.
+    if (!isOwner && !isAdminAddress(callerAddress)) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }

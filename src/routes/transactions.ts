@@ -81,27 +81,31 @@ interface TransactionFilters {
 
 export const transactionsRouter = Router();
 
-export interface TransactionRecord {
-  id: string;
-  type: string;
-  address: string;
-  date: string;
-  time: string;
-  token: string;
-  amount: string;
-  status: "Completed";
-  tokenIcon: string;
-  txHash: string;
-  createdAt: Date;
-}
+export const TransactionRecordSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  address: z.string(),
+  date: z.string(),
+  time: z.string(),
+  token: z.string(),
+  amount: z.string(),
+  status: z.literal("Completed"),
+  tokenIcon: z.string(),
+  txHash: z.string(),
+  createdAt: z.date(),
+});
 
-export interface TransactionExport {
-  transactions: TransactionRecord[];
-  total: number;
-  hasMore: boolean;
-  limit: number;
-  offset: number;
-}
+export type TransactionRecord = z.infer<typeof TransactionRecordSchema>;
+
+export const TransactionExportSchema = z.object({
+  transactions: z.array(TransactionRecordSchema),
+  total: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+});
+
+export type TransactionExport = z.infer<typeof TransactionExportSchema>;
 /**
  * Explicit allowlist of every event-type value that may appear in the
  * `eventTypes` query parameter. Values outside this set are rejected before
@@ -225,6 +229,7 @@ function formatAmount(amount: string | bigint, tokenInfo: TokenInfo): string {
 
 const tokenCache = new Map<string, { token: string; timestamp: number }>();
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
+const TOKEN_FETCH_BATCH_SIZE = 10;
 
 /** Fetches the token address for a single agreement from its on-chain contract. */
 async function getTokenFromAgreementContract(
@@ -263,7 +268,7 @@ async function getTokenFromAgreementContract(
 
 /**
  * Batches token fetches from agreement contracts, checking the cache first
- * and limiting RPC concurrency to BATCH_SIZE.
+ * and limiting RPC concurrency to TOKEN_FETCH_BATCH_SIZE.
  */
 async function batchGetTokensFromAgreementContracts(
   agreements: Array<{ agreementContractAddress: string; agreementId: string }>,
@@ -292,9 +297,9 @@ async function batchGetTokensFromAgreementContracts(
     `[transactions] Need to fetch ${uncachedAgreements.length} tokens from contracts (${agreements.length - uncachedAgreements.length} from cache)`,
   );
 
-  const BATCH_SIZE = 10;
-  for (let i = 0; i < uncachedAgreements.length; i += BATCH_SIZE) {
-    const batch = uncachedAgreements.slice(i, i + BATCH_SIZE);
+
+  for (let i = 0; i < uncachedAgreements.length; i += TOKEN_FETCH_BATCH_SIZE) {
+    const batch = uncachedAgreements.slice(i, i + TOKEN_FETCH_BATCH_SIZE);
     const fetchPromises = batch.map(async (agreement) => {
       try {
         const token = await getTokenFromAgreementContract(
@@ -389,15 +394,91 @@ function formatEventType(eventType: string): string {
  * - Missing or invalid `offset` defaults to 0.
  * - Requested values > 100 are silently clamped to 100.
  */
-function parsePagination(req: {
-  query: Record<string, unknown>;
-}): { limit: number; offset: number } {
-  const requestedLimit =
-    z.coerce.number().int().positive().optional().parse(req.query.limit) || 50;
-  const limit = Math.min(requestedLimit, 100);
-  const offset =
-    z.coerce.number().int().nonnegative().optional().parse(req.query.offset) || 0;
+/** Maximum allowed limit per page (configurable via env). */
+const MAX_LIMIT = env.TRANSACTIONS_MAX_LIMIT ? Number(env.TRANSACTIONS_MAX_LIMIT) : 100;
+const DEFAULT_LIMIT = 50;
+/**
+ * Parses `limit` and `offset` from request query, applying the pagination contract.
+ *
+ * - `limit` defaults to 50 and is clamped to the range [1, MAX_LIMIT].
+ * - `offset` defaults to 0 and must be non‑negative.
+ * - Values exceeding `MAX_LIMIT` are silently reduced to `MAX_LIMIT`.
+ */
+function parsePagination(req: { query: Record<string, unknown> }): { limit: number; offset: number } {
+  const rawLimit = z.coerce.number().int().positive().optional().parse(req.query.limit);
+  const rawOffset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset);
+
+  const limit = typeof rawLimit === "number" ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
+  const offset = typeof rawOffset === "number" ? rawOffset : 0;
+
+  if (limit < 1) {
+    const err = new Error("`limit` must be a positive integer");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
+  if (offset < 0) {
+    const err = new Error("`offset` must be a non‑negative integer");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
   return { limit, offset };
+}
+
+/**
+ * Explicit allowlist of sort columns clients may request.
+ *
+ * Only these values are permitted for `sortBy`; anything else is rejected with
+ * a 400 before it can reach any SQL construction, preventing column-injection.
+ *
+ * - `"date"` maps to the `createdAt` timestamp on every merged `TransactionItem`.
+ * - `"amount"` maps to the numeric value encoded in the human-readable `amount`
+ *   string (raw amounts are not stored in `TransactionItem`, so we parse the
+ *   numeric prefix from the formatted string for comparison).
+ */
+const ALLOWED_SORT_COLUMNS = new Set(["date", "amount"] as const);
+export type SortColumn = "date" | "amount";
+export type SortDir = "asc" | "desc";
+
+/**
+ * Parses `sortBy` and `sortDir` query parameters.
+ *
+ * - `sortBy` must be one of the values in `ALLOWED_SORT_COLUMNS`; any other
+ *   value causes this function to return `{ error: "..." }` so the caller can
+ *   respond with 400 immediately — the value is **never** interpolated into SQL.
+ * - `sortDir` must be `"asc"` or `"desc"` (case-insensitive). Invalid values
+ *   default to `"desc"` rather than returning an error, which matches common
+ *   API conventions.
+ * - Omitting `sortBy` returns `{ sortBy: null, sortDir: "desc" }` so callers
+ *   can preserve the existing default ordering.
+ *
+ * @returns `{ sortBy, sortDir }` on success, or `{ error }` when `sortBy` is
+ *   present but not in the allowlist.
+ */
+function parseSortParams(req: { query: Record<string, unknown> }):
+  | { sortBy: SortColumn | null; sortDir: SortDir; error?: never }
+  | { error: string; sortBy?: never; sortDir?: never } {
+  const rawSortBy = req.query.sortBy as string | undefined;
+  const rawSortDir = (req.query.sortDir as string | undefined)
+    ?.toLowerCase();
+
+  const sortDir: SortDir =
+    rawSortDir === "asc" || rawSortDir === "desc" ? rawSortDir : "desc";
+
+  if (!rawSortBy) {
+    return { sortBy: null, sortDir };
+  }
+
+  if (!ALLOWED_SORT_COLUMNS.has(rawSortBy as SortColumn)) {
+    return {
+      error: `Invalid sortBy value "${rawSortBy}". Allowed values: ${
+        [...ALLOWED_SORT_COLUMNS].join(", ")
+      }.`,
+    };
+  }
+
+  return { sortBy: rawSortBy as SortColumn, sortDir };
 }
 
 /**
@@ -834,44 +915,18 @@ async function fetchAndBuildTransactions(
       const isReceived = p.eventType === "PaymentReceived";
       const sign = isReceived ? "+" : "-";
       const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-
-    const allTransactions: TransactionRecord[] = [
-      ...uniqueAgreementEvents.map((a) => {
-        const dateTime = formatDate(a.createdAt);
-        return {
-          id: a.transactionHash.slice(0, 10), type: formatEventType(a.eventType),
-          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
-          date: dateTime.date, time: dateTime.time, token: "-", amount: "-",
-          status: "Completed" as const, tokenIcon: "", txHash: a.transactionHash, createdAt: a.createdAt,
-        };
-      }),
-      ...payments.map((p) => {
-        const dateTime = formatDate(p.createdAt);
-        const tokenInfo = getTokenInfo(p.token);
-        const amountStr = formatAmount(p.amount, tokenInfo);
-        const isReceived = p.eventType === "PaymentReceived";
-        const sign = isReceived ? "+" : "-";
-        const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
-
       return {
-        id: e.transactionHash.slice(0, 10),
-        type:
-          e.eventType === "Funded"
-            ? "Agreement Funded"
-            : e.eventType === "Released"
-              ? "Payment Released"
-              : "Refund Received",
-        address: formatAddress(
-          e.eventType === "Funded" ? e.employer : e.to || "",
-        ),
+        id: p.transactionHash.slice(0, 10),
+        type: formatEventType(p.eventType),
+        address: formatAddress(p.to || p.from || "N/A"),
         date: dateTime.date,
         time: dateTime.time,
         token: tokenInfo.name,
         amount: finalAmount,
         status: "Completed" as const,
         tokenIcon: tokenInfo.icon,
-        txHash: e.transactionHash,
-        createdAt: e.createdAt,
+        txHash: p.transactionHash,
+        createdAt: p.createdAt,
       };
     }),
     ...employeeEvents.map((e) => {
@@ -924,10 +979,69 @@ async function fetchAndBuildTransactions(
   return { allTransactions, total };
 }
 
+// ── Sort helper ──────────────────────────────────────────────────────────
+
+/**
+ * Extracts a raw numeric value from a formatted amount string for sorting.
+ *
+ * Handles the following formatted patterns produced by `formatAmount`:
+ * - STRK amounts: `"+1.234567 STRK"`, `"-0.500000 STRK"`
+ * - USD amounts:  `"+$1.23"`, `"-$0.00"`
+ * - Placeholder:  `"-"` → returns `0`
+ *
+ * The sign (`+`/`-`) prefix and non-numeric characters (`$`, ` STRK`) are
+ * stripped before parsing so that the raw magnitude is used for ordering;
+ * the sign is preserved so that negative amounts sort below positives.
+ */
+function parseAmountForSort(amount: string): number {
+  if (!amount || amount === "-") return 0;
+  // Remove currency symbols, token names, and whitespace; keep sign, digits, dot.
+  const stripped = amount.replace(/[^\d.+\-]/g, "").replace(/\s+/g, "");
+  const parsed = parseFloat(stripped);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Applies client-requested sort to the merged transaction array.
+ *
+ * - `sortBy === "date"` sorts by `createdAt` (newest first for `desc`,
+ *   oldest first for `asc`).
+ * - `sortBy === "amount"` sorts by the numeric value parsed from the
+ *   formatted `amount` field.
+ * - `sortBy === null` preserves the existing default sort (date desc +
+ *   txHash tiebreak) which is already applied inside
+ *   `fetchAndBuildTransactions`.
+ *
+ * A secondary `txHash` tiebreak is always applied for stable ordering.
+ */
+function applySort(
+  transactions: TransactionItem[],
+  sortBy: SortColumn | null,
+  sortDir: SortDir,
+): TransactionItem[] {
+  if (!sortBy) return transactions; // preserve default sort
+
+  const dir = sortDir === "asc" ? 1 : -1;
+
+  return [...transactions].sort((a, b) => {
+    let cmp = 0;
+    if (sortBy === "date") {
+      const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      cmp = tA - tB;
+    } else if (sortBy === "amount") {
+      cmp = parseAmountForSort(a.amount) - parseAmountForSort(b.amount);
+    }
+    if (cmp !== 0) return cmp * dir;
+    // Stable tiebreak by txHash (always ascending)
+    return a.txHash.localeCompare(b.txHash);
+  });
+}
+
 // ── Response helper ──────────────────────────────────────────────────────
 
 /**
- * Slices, paginates, and sends the unified transaction list.
+ * Sorts (if requested), slices, paginates, and sends the unified transaction list.
  *
  * The response body always contains:
  * - `transactions`: the page of items (`array`, may be empty)
@@ -941,8 +1055,11 @@ function respondPaginated(
   total: number,
   limit: number,
   offset: number,
+  sortBy: SortColumn | null = null,
+  sortDir: SortDir = "desc",
 ): void {
-  const paginated = allTransactions.slice(offset, offset + limit);
+  const sorted = applySort(allTransactions, sortBy, sortDir);
+  const paginated = sorted.slice(offset, offset + limit);
   const hasMore = total > offset + limit;
   const body: TransactionResponse = {
     transactions: paginated,
@@ -958,6 +1075,7 @@ function respondPaginated(
 //
 // Contract:
 // - Accepts `eventTypes` query filter (comma-separated).
+// - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
 // - Deduplicates agreement events by id.
 // - Employee condition mode: "employer-or-employee".
 // - Does NOT support date-range filtering.
@@ -970,6 +1088,14 @@ transactionsRouter.get(
       const { limit, offset } = parsePagination(req);
       const eventTypes = parseEventTypes(req);
 
+      // Validate and parse sort parameters against the allowlist.
+      const sortResult = parseSortParams(req);
+      if (sortResult.error) {
+        res.status(400).json({ error: sortResult.error });
+        return;
+      }
+      const { sortBy, sortDir } = sortResult;
+
       const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined });
       const { allTransactions, total } = await fetchAndBuildTransactions(
         userAddress,
@@ -978,7 +1104,7 @@ transactionsRouter.get(
         { deduplicateAgreementEvents: true },
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset);
+      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
     } catch (e) {
       next(e);
     }
@@ -989,6 +1115,7 @@ transactionsRouter.get(
 //
 // Contract:
 // - Accepts `startDate` / `endDate` query filters.
+// - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
 // - Employee condition mode: "employee-only".
 // - Does NOT deduplicate agreement events.
 // - Does NOT support `eventTypes` filter.
@@ -1001,6 +1128,14 @@ transactionsRouter.get(
       const { limit, offset } = parsePagination(req);
       const { startDate, endDate } = parseDateFilters(req);
 
+      // Validate and parse sort parameters against the allowlist.
+      const sortResult = parseSortParams(req);
+      if (sortResult.error) {
+        res.status(400).json({ error: sortResult.error });
+        return;
+      }
+      const { sortBy, sortDir } = sortResult;
+
       const conds = buildConditions(
         userAddress,
         { startDate, endDate },
@@ -1012,180 +1147,10 @@ transactionsRouter.get(
         offset + limit,
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset);
+      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
     } catch (e) {
       next(e);
     }
 
-    const employeeConditions = [eq(schema.employees.employeeAddress, userAddress)];
-    const milestoneConditions = [or(eq(schema.agreements.employer, userAddress), eq(schema.agreements.contributor, userAddress))];
-    if (startDate) { employeeConditions.push(gte(schema.employees.createdAt, startDate)); milestoneConditions.push(gte(schema.milestones.createdAt, startDate)); }
-    if (endDate) { employeeConditions.push(lte(schema.employees.createdAt, endDate)); milestoneConditions.push(lte(schema.milestones.createdAt, endDate)); }
-
-    const [paymentsCount, escrowCount, agreementEventsCount, employeesCount, milestonesCount] = await Promise.all([
-      db.select({ count: count() }).from(schema.payments).where(and(...paymentConditions)),
-      db.select({ count: count() }).from(schema.escrowEvents).where(and(...escrowConditions)),
-      db.select({ count: count() }).from(schema.agreementEvents)
-        .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-        .where(and(...agreementEventConditions)),
-      db.select({ count: count() }).from(schema.employees)
-        .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
-        .where(and(...employeeConditions)),
-      db.select({ count: count() }).from(schema.milestones)
-        .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
-        .where(and(...milestoneConditions)),
-    ]);
-
-    const total = Number(paymentsCount[0].count) + Number(escrowCount[0].count) +
-      Number(agreementEventsCount[0].count) + Number(employeesCount[0].count) + Number(milestonesCount[0].count);
-
-    const [payments, escrowEvents, employeeEventsData, milestoneEventsData] = await Promise.all([
-      db.select().from(schema.payments).where(and(...paymentConditions))
-        .orderBy(desc(schema.payments.createdAt), desc(schema.payments.id)).limit(queryLimit),
-      db.select().from(schema.escrowEvents).where(and(...escrowConditions))
-        .orderBy(desc(schema.escrowEvents.createdAt), desc(schema.escrowEvents.id)).limit(queryLimit),
-      db.select({
-        id: schema.employees.id, agreementId: schema.employees.agreementId,
-        contractAddress: schema.employees.contractAddress, blockNumber: schema.employees.blockNumber,
-        transactionHash: schema.employees.transactionHash, createdAt: schema.employees.createdAt,
-        employer: schema.agreements.employer, contributor: schema.agreements.contributor,
-        token: schema.agreements.token, employeeAddress: schema.employees.employeeAddress,
-        amount: schema.employees.salaryPerPeriod,
-      }).from(schema.employees)
-        .leftJoin(schema.agreements, eq(schema.employees.agreementId, schema.agreements.id))
-        .where(and(...employeeConditions))
-        .orderBy(desc(schema.employees.createdAt), desc(schema.employees.id)).limit(queryLimit),
-      db.select({
-        id: schema.milestones.id, agreementId: schema.milestones.agreementId,
-        contractAddress: schema.milestones.contractAddress, blockNumber: schema.milestones.blockNumber,
-        transactionHash: schema.milestones.transactionHash, createdAt: schema.milestones.createdAt,
-        employer: schema.agreements.employer, contributor: schema.agreements.contributor,
-        token: schema.agreements.token, amount: schema.milestones.amount,
-      }).from(schema.milestones)
-        .leftJoin(schema.agreements, eq(schema.milestones.agreementId, schema.agreements.id))
-        .where(and(...milestoneConditions))
-        .orderBy(desc(schema.milestones.createdAt), desc(schema.milestones.id)).limit(queryLimit),
-    ]);
-
-    const employeeEvents = employeeEventsData.map((e) => ({ ...e, eventType: "EmployeeAdded" as const }));
-    const milestoneEvents = milestoneEventsData.map((m) => ({ ...m, eventType: "MilestoneAdded" as const }));
-
-    const escrowAgreementIds = [...new Set(escrowEvents.map((e) => e.agreementId))];
-    const escrowAgreements = escrowAgreementIds.length > 0
-      ? await db.select({ id: schema.agreements.id, token: schema.agreements.token, contractAddress: schema.agreements.contractAddress })
-          .from(schema.agreements).where(inArray(schema.agreements.id, escrowAgreementIds))
-      : [];
-
-    const tokenFetchStart = Date.now();
-    const contractTokenMap = await batchGetTokensFromAgreementContracts(
-      escrowAgreements.filter((a) => a.contractAddress).map((a) => ({ agreementContractAddress: a.contractAddress!, agreementId: a.id }))
-    );
-    tokenFetchDurationMs = Date.now() - tokenFetchStart;
-
-    const escrowTokenMap = new Map<string, string>();
-    for (const agreement of escrowAgreements) {
-      escrowTokenMap.set(agreement.id, contractTokenMap.get(agreement.id) || agreement.token);
-    }
-
-    const agreementEvents = await db.select({
-      id: schema.agreementEvents.id, agreementId: schema.agreementEvents.agreementId,
-      contractAddress: schema.agreementEvents.contractAddress, eventType: schema.agreementEvents.eventType,
-      blockNumber: schema.agreementEvents.blockNumber, transactionHash: schema.agreementEvents.transactionHash,
-      createdAt: schema.agreementEvents.createdAt, employer: schema.agreements.employer,
-      contributor: schema.agreements.contributor, token: schema.agreements.token,
-    }).from(schema.agreementEvents)
-      .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-      .where(and(...agreementEventConditions))
-      .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id)).limit(queryLimit);
-
-    const allTransactions: TransactionRecord[] = [
-      ...agreementEvents.map((a) => {
-        const dateTime = formatDate(a.createdAt);
-        return {
-          id: a.transactionHash.slice(0, 10), type: formatEventType(a.eventType),
-          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
-          date: dateTime.date, time: dateTime.time, token: "-", amount: "-",
-          status: "Completed" as const, tokenIcon: "", txHash: a.transactionHash, createdAt: a.createdAt,
-        };
-      }),
-      ...payments.map((p) => {
-        const dateTime = formatDate(p.createdAt);
-        const tokenInfo = getTokenInfo(p.token);
-        const amountStr = formatAmount(p.amount, tokenInfo);
-        const isReceived = p.eventType === "PaymentReceived";
-        const sign = isReceived ? "+" : "-";
-        return {
-          id: p.transactionHash.slice(0, 10),
-          type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
-          address: formatAddress(isReceived ? p.from : p.to),
-          date: dateTime.date, time: dateTime.time, token: tokenInfo.name,
-          amount: amountStr !== "-" ? `${sign}${amountStr}` : amountStr,
-          status: "Completed" as const, tokenIcon: tokenInfo.icon, txHash: p.transactionHash, createdAt: p.createdAt,
-        };
-      }),
-      ...escrowEvents.map((e) => {
-        const dateTime = formatDate(e.createdAt);
-        const tokenAddress = escrowTokenMap.get(e.agreementId) || null;
-        const tokenInfo = getTokenInfo(tokenAddress);
-        const amountStr = formatAmount(e.amount, tokenInfo);
-        const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
-        const sign = isIncoming ? "+" : "-";
-        return {
-          id: e.transactionHash.slice(0, 10),
-          type: e.eventType === "Funded" ? "Agreement Funded" : e.eventType === "Released" ? "Payment Released" : "Refund Received",
-          address: formatAddress(e.eventType === "Funded" ? e.employer : e.to || ""),
-          date: dateTime.date, time: dateTime.time, token: tokenInfo.name,
-          amount: amountStr !== "-" ? `${sign}${amountStr}` : amountStr,
-          status: "Completed" as const, tokenIcon: tokenInfo.icon, txHash: e.transactionHash, createdAt: e.createdAt,
-        };
-      }),
-      ...employeeEvents.map((e) => {
-        const dateTime = formatDate(e.createdAt);
-        const addressToFormat = e.employer === userAddress ? e.employeeAddress : e.employer;
-        return {
-          id: e.transactionHash.slice(0, 10), type: "Employee Added", address: formatAddress(addressToFormat || ""),
-          date: dateTime.date, time: dateTime.time, token: "-", amount: "-",
-          status: "Completed" as const, tokenIcon: "", txHash: e.transactionHash, createdAt: e.createdAt,
-        };
-      }),
-      ...milestoneEvents.map((m) => {
-        const dateTime = formatDate(m.createdAt);
-        const addressToFormat = m.employer === userAddress ? m.contributor || "N/A" : m.employer;
-        return {
-          id: m.transactionHash.slice(0, 10), type: "Milestone Added", address: formatAddress(addressToFormat || ""),
-          date: dateTime.date, time: dateTime.time, token: "-", amount: "-",
-          status: "Completed" as const, tokenIcon: "", txHash: m.transactionHash, createdAt: m.createdAt,
-        };
-      }),
-    ].sort((a, b) => {
-      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-      if (timeB !== timeA) return timeB - timeA;
-      return a.txHash.localeCompare(b.txHash);
-    });
-
-    const paginatedTransactions = allTransactions.slice(offset, offset + limit);
-    const hasMore = total > offset + limit;
-
-    const durationMs = Date.now() - startTime;
-    logTxMetrics({
-      route: req.path, userAddress: userAddress.slice(0, 12) + "...", durationMs,
-      totalResults: total, paymentsCount: Number(paymentsCount[0].count),
-      escrowCount: Number(escrowCount[0].count), agreementEventsCount: Number(agreementEventsCount[0].count),
-      employeeCount: Number(employeesCount[0].count), milestoneCount: Number(milestonesCount[0].count),
-      tokenFetchDurationMs, correlationId,
-    });
-
-    res.json({ transactions: paginatedTransactions, total, hasMore, limit, offset });
-  } catch (e) {
-    const durationMs = Date.now() - startTime;
-    logTxMetrics({
-      route: req.path, userAddress: req.params?.user_address?.slice(0, 12) + "..." || "unknown",
-      durationMs, totalResults: 0, paymentsCount: 0, escrowCount: 0,
-      agreementEventsCount: 0, employeeCount: 0, milestoneCount: 0,
-      tokenFetchDurationMs, correlationId,
-      error: (e as Error).message,
-    });
-    next(e);
-  }
-});
+  },
+);
