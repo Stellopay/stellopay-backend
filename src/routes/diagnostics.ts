@@ -3,6 +3,7 @@ import { z } from "zod";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats } from "../db/index.js";
 import { sql } from "drizzle-orm";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
 export const diagnosticsRouter = Router();
 
@@ -211,6 +212,7 @@ export async function fetchDiagnosticsData(
     tableCounts: summaryRow,
     latestEvents: recentEvents,
     poolStats: getPoolStats(),
+    circuitBreakers: getCircuitBreakerSnapshots(),
     summary: {
       totalAgreementEvents: summaryRow.agreement_events_count ?? 0,
       totalEscrowEvents: summaryRow.escrow_events_count ?? 0,
@@ -236,9 +238,9 @@ export async function fetchDiagnosticsData(
 // clean up. Do not remove without updating the docs' compatibility notes.
 diagnosticsRouter.get(
   "/diagnostics/events",
-  requireAuth,
-  requireAdmin,
-  withDiagnosticsIdempotency(async (req: Request, res: Response, next: NextFunction) => {
+    requireAuth,
+      requireAdmin,
+        async (req, res, next) => {
     try {
       const rawLimit = Number(req.query.limit);
       const rawOffset = Number(req.query.offset);
@@ -253,5 +255,5 @@ diagnosticsRouter.get(
     } catch (e) {
       next(e);
     }
-  }),
+  }
 );

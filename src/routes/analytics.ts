@@ -6,6 +6,7 @@ import { asc, eq, and, gt, gte, lte, or, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
+import { AnalyticsCache, buildAnalyticsCacheKey } from "../utils/analytics-cache.js";
 
 export const analyticsRouter = Router();
 
@@ -115,6 +116,7 @@ interface AnalyticsTelemetryEntry {
   year?: number;
   row_counts?: Record<string, number>;
   error?: string;
+  cache_hit?: boolean;
 }
 
 /**
@@ -430,40 +432,26 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
       const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
-      const responsePayload = {
-        year,
-        data: chartData,
-        total: toDisplayNumber(totalRaw),
-      };
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logAnalyticsTelemetry({
+      operation: "analytics_monthly_rollup",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "success",
+      request_id: requestId,
+      user_address: userAddress,
+      year,
+      row_counts: {
+        payments: payments.length,
+        escrow_events: escrowEvents.length,
+        agreement_creations: agreementCreations.length,
+      },
+    });
 
-      const etag = computeETag(responsePayload);
-      res.setHeader("ETag", etag);
-      res.setHeader("Cache-Control", "private, max-age=60");
-
-      if (req.headers["if-none-match"] === etag) {
-        res.status(304).end();
-        return;
-      }
-
-      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-      logAnalyticsTelemetry({
-        operation: "analytics_monthly_rollup",
-        duration_ms: Math.round(duration * 100) / 100,
-        status: "success",
-        request_id: requestId,
-        user_address: userAddress,
-        year,
-        row_counts: {
-          payments: payments.length,
-          escrow_events: escrowEvents.length,
-          agreement_creations: agreementCreations.length,
-        },
-      });
-
-      res.json(responsePayload);
-    } finally {
-      inflightRollups.delete(rollupKey);
-    }
+    const responseBody = {
+      year,
+      data: chartData,
+      total: toDisplayNumber(totalRaw),
+    });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     if (!(e instanceof z.ZodError)) {
