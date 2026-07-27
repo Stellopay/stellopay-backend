@@ -354,6 +354,42 @@ canonicalising `req.auth.address`, or renaming a header constant — is
 breaking, and needs a coordinated change in `routes/auth.ts`,
 `routes/billing.ts`, and every admin-gated router.
 
+## Telemetry & Observability
+
+`src/auth/middleware.ts` exposes process-local metric counters and structured event logs for principal resolution and route authorization via `src/auth/middleware-metrics.ts`:
+
+### Metric Counters (`AUTH_METRICS`)
+
+- `auth_middleware_auth_requests_total` — Total principal resolution requests received.
+- `auth_middleware_auth_resolved_total` — Total successful principal resolutions.
+- `auth_middleware_auth_denied_total` — Total principal resolution denials (401).
+- `auth_middleware_auth_denied_missing_header_total` — Denials due to missing `x-user-address` or `authorization` header.
+- `auth_middleware_auth_denied_invalid_bearer_total` — Denials due to non-Bearer format.
+- `auth_middleware_auth_denied_empty_credentials_total` — Denials due to empty address or token.
+- `auth_middleware_auth_denied_invalid_session_total` — Denials due to invalid or expired session lookup.
+- `auth_middleware_auth_idempotent_hits_total` — `requireAuth` calls that hit cached `req.auth`.
+- `auth_middleware_admin_requests_total` — Total admin route authorization checks.
+- `auth_middleware_admin_authorized_total` — Total successful admin authorizations.
+- `auth_middleware_admin_unauthorized_total` — Total admin checks denied due to missing principal (401).
+- `auth_middleware_admin_forbidden_total` — Total admin checks denied due to non-admin principal (403).
+- `auth_middleware_admin_idempotent_hits_total` — `requireAdmin` calls that hit cached `res.locals.adminAuthorized`.
+- `auth_middleware_require_principal_missing_total` — `requirePrincipal` calls invoked without a principal (5xx wiring error).
+
+### Structured Event Logs
+
+Structured event logs are emitted via `logAuthMiddlewareEvent` (JSON when `LOG_FORMAT=json`, filtered by `LOG_LEVEL`):
+- `"auth.principal.resolved"` (`info`) — Emitted on successful principal resolution with lowercased address.
+- `"auth.principal.denied"` (`warn`) — Emitted on principal resolution denial with bounded `reason` code (`missing_header`, `invalid_bearer`, `empty_credentials`, `invalid_session`).
+- `"auth.principal.cached"` (`debug`) — Emitted when `requireAuth` hits cached `req.auth`.
+- `"auth.admin.authorized"` (`info`) — Emitted on successful admin authorization.
+- `"auth.admin.unauthorized"` (`warn`) — Emitted when `requireAdmin` rejects an unauthenticated caller (401).
+- `"auth.admin.forbidden"` (`warn`) — Emitted when `requireAdmin` rejects a non-admin principal (403).
+- `"auth.admin.cached"` (`debug`) — Emitted when `requireAdmin` hits cached `res.locals.adminAuthorized`.
+- `"auth.principal.missing_error"` (`error`) — Emitted when `requirePrincipal` is called on an unauthenticated request.
+
+*SECURITY NOTE*: Telemetry functions NEVER log raw bearer tokens or authorization header contents.
+
+
 ## Tests
 
 `src/auth/middleware.test.ts` covers the full contract:
