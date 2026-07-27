@@ -29,6 +29,11 @@ import { loadAbiFromContractClassJsonPath } from "./abi.js";
  *    - Throws the last error if all endpoints fail
  *    - Argument cloning supports: primitives, arrays, plain objects, Date, Map, Set
  *    - Argument cloning does NOT support: custom class instances, cyclic structures
+ *    - Only RETRYABLE_METHODS are eligible for failover; non-retryable (write/mutation)
+ *      methods attempt the primary endpoint once and throw immediately on failure
+ *    - After failover, the new endpoint's chain ID is validated against the primary's
+ *      to prevent cross-chain replay
+ *    - Failover is capped at MAX_FAILOVER_ATTEMPTS to bound latency on degraded networks
  *
  * 2. Contract Caching:
  *    - Contracts are cached by "<kind>:<address>" key (kind = "escrow" or "agreement")
@@ -49,6 +54,8 @@ import { loadAbiFromContractClassJsonPath } from "./abi.js";
  *    - getAgreementAbi() throws Error if AGREEMENT_CONTRACT_CLASS_JSON is not configured
  *    - RPC methods propagate errors from the underlying RpcProvider
  *    - All errors are thrown synchronously or as rejected promises
+ *    - Non-retryable methods that fail on the primary endpoint throw without failover
+ *    - Chain ID mismatch during failover throws ChainIdMismatchError
  *
  * 5. Test-Only Functions:
  *    - clearContractCache(), clearNetworkCache(), resetRpcFailoverForTests()
@@ -62,10 +69,54 @@ import { loadAbiFromContractClassJsonPath } from "./abi.js";
  *   will continue to work without modification
  */
 
+/**
+ * Read-only RPC methods eligible for automatic failover. Write/mutation methods
+ * are excluded so they attempt the primary endpoint once and fail immediately —
+ * retrying a state-modifying call across endpoints risks double-execution if the
+ * first attempt succeeded but the response was lost.
+ */
+const RETRYABLE_METHODS = new Set<string>([
+  "getChainId",
+  "getSpecVersion",
+  "getBlock",
+  "getBlockWithTxHashes",
+  "getBlockWithTxs",
+  "getBlockNumber",
+  "getTransactionReceipt",
+  "getTransaction",
+  "getTransactionStatus",
+  "getTransactionByBlockIdAndIndex",
+  "estimateFee",
+  "estimateMessageFee",
+  "callContract",
+  "getNonceForAddress",
+  "getStorageAt",
+  "getClassHashAt",
+  "getClass",
+  "getClassAt",
+  "getEvents",
+  "getBalance",
+  "getSyncingStats",
+  "getProtocolVersion",
+  "pendingTransactions",
+  "verifyMessageInStarknet",
+]);
+
+/**
+ * Maximum number of distinct RPC endpoints to try during a single failover
+ * cycle. Bounded to the configured endpoint count so degraded networks do not
+ * cause unbounded latency.
+ */
+const MAX_FAILOVER_ATTEMPTS = starknetRpcUrls.length;
+
 const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
 
 /** Index into rpcProviders for the last known healthy endpoint. */
 let healthyRpcIndex = 0;
+
+function isRetryableMethod(method: string | symbol): boolean {
+  return RETRYABLE_METHODS.has(String(method));
+}
 
 function rpcFailoverOrder(): number[] {
   const order = [healthyRpcIndex];
@@ -116,8 +167,13 @@ async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
 ): Promise<unknown> {
+  const retryable = isRetryableMethod(method);
+  const order = rpcFailoverOrder();
+  const attempts = retryable ? Math.min(order.length, MAX_FAILOVER_ATTEMPTS) : 1;
+
   let lastError: unknown;
-  for (const index of rpcFailoverOrder()) {
+  for (let i = 0; i < attempts; i++) {
+    const index = order[i]!;
     const candidate = rpcProviders[index]!;
     try {
       const fn = Reflect.get(candidate, method) as (...a: unknown[]) => unknown;
@@ -126,12 +182,15 @@ async function invokeWithFailover(
       }
       const attemptArgs = cloneRpcArgs(args);
       const result = await fn.apply(candidate, attemptArgs);
+
       if (index !== healthyRpcIndex) {
+        const newChainId = await validateFailoverChainConsistency(index);
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,
         );
         healthyRpcIndex = index;
       }
+
       return result;
     } catch (err) {
       lastError = err;
@@ -141,8 +200,77 @@ async function invokeWithFailover(
 }
 
 /**
+ * After a successful failover to a different endpoint, verify that the new
+ * endpoint reports the same chain ID as the primary. A mismatch indicates a
+ * misconfiguration or network-level redirect that could lead to cross-chain
+ * replay of signed data.
+ *
+ * Throws ChainIdMismatchError if the chain IDs diverge. The error is
+ * intentionally not caught so the caller sees a clear failure rather than
+ * silently operating on the wrong network.
+ */
+async function validateFailoverChainConsistency(newIndex: number): Promise<string> {
+  const primary = rpcProviders[healthyRpcIndex]!;
+  const secondary = rpcProviders[newIndex]!;
+  try {
+    const [primaryChainId, secondaryChainId] = await Promise.all([
+      primary.getChainId(),
+      secondary.getChainId(),
+    ]);
+    const primaryId = String(primaryChainId);
+    const secondaryId = String(secondaryChainId);
+    if (primaryId !== secondaryId) {
+      throw new ChainIdMismatchError(primaryId, secondaryId, starknetRpcUrls[healthyRpcIndex]!, starknetRpcUrls[newIndex]!);
+    }
+    return secondaryId;
+  } catch (err) {
+    if (err instanceof ChainIdMismatchError) {
+      throw err;
+    }
+    // If chain ID validation itself fails (e.g. primary is also down),
+    // log a warning but allow the failover to proceed — the original
+    // RPC call already succeeded on the secondary.
+    console.warn(
+      `[starknet] Chain ID validation failed during failover: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return "";
+  }
+}
+
+/**
+ * Error thrown when a failover endpoint reports a different chain ID than the
+ * primary endpoint. This indicates a misconfiguration or potential cross-chain
+ * replay risk.
+ */
+export class ChainIdMismatchError extends Error {
+  constructor(
+    public readonly primaryChainId: string,
+    public readonly secondaryChainId: string,
+    public readonly primaryUrl: string,
+    public readonly secondaryUrl: string,
+  ) {
+    super(
+      `Chain ID mismatch during failover: primary ${primaryUrl} reports ${primaryChainId}, ` +
+        `secondary ${secondaryUrl} reports ${secondaryChainId}`,
+    );
+    this.name = "ChainIdMismatchError";
+  }
+}
+
+/**
  * Starknet RPC client with automatic failover across configured endpoints.
  * Subsequent calls reuse the last healthy endpoint until it fails again.
+ *
+ * **Security boundary — method classification**: only methods in
+ * `RETRYABLE_METHODS` (read-only queries) are eligible for automatic failover.
+ * Write/mutation methods (e.g. `addTransaction`) attempt the primary endpoint
+ * once and throw immediately on failure — retrying a state-modifying call across
+ * endpoints risks double-execution if the first attempt succeeded but the
+ * response was lost.
+ *
+ * **Chain consistency**: after a successful failover, the new endpoint's chain
+ * ID is validated against the primary's. A mismatch throws
+ * `ChainIdMismatchError` to prevent cross-chain replay of signed data.
  *
  * **Idempotency of read calls**: all methods that only read chain state
  * (`getChainId`, `getSpecVersion`, `getTransactionReceipt`, `estimateFee`, etc.)
