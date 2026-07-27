@@ -2,6 +2,8 @@ import { execSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { getTableConfig } from "drizzle-orm/pg-core";
+import { getTableName } from "drizzle-orm";
 import pg from "pg";
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import {
@@ -12,6 +14,9 @@ import {
   main,
   withMigrationLock,
 } from "./migrate.js";
+import { validateSchema } from "./schema-fk-indexes.js";
+import { pgTable, text } from "drizzle-orm/pg-core";
+import * as schema from "./schema.js";
 
 vi.mock("drizzle-orm/node-postgres/migrator", () => ({
   migrate: vi.fn(),
@@ -54,6 +59,23 @@ describe("migration dry-run helpers", () => {
     } as unknown as pg.Client;
 
     await expect(getLastAppliedMigrationTimestamp(client)).rejects.toBe(permissionError);
+  });
+});
+
+describe("schema contract validation", () => {
+  it("validateSchema succeeds on the production schema", () => {
+    expect(() => validateSchema(schema as Record<string, unknown>)).not.toThrow();
+  });
+
+  it("validateSchema throws with FK-level detail when an indexed column is missing", () => {
+    const gapTable = pgTable("schema_consistency_gap_fixture", {
+      id: text("id").primaryKey(),
+      agreementId: text("agreement_id").notNull(),
+    });
+
+    expect(() => validateSchema({ gapTable } as Record<string, unknown>)).toThrow(
+      /schema_consistency_gap_fixture\.agreement_id \(agreementId\)/,
+    );
   });
 });
 
@@ -249,6 +271,53 @@ describe("migration CLI", () => {
   });
 });
 
+describe("schema foreign key constraints", () => {
+  it("defines agreementId references for agreement child tables", () => {
+    const childTables = [
+      schema.agreementEvents,
+      schema.payments,
+      schema.milestones,
+      schema.employees,
+      schema.escrowEvents,
+    ];
+
+    for (const table of childTables) {
+      const fks = getTableConfig(table).foreignKeys;
+      expect(fks).toHaveLength(1);
+      const ref = fks[0].reference();
+      expect(getTableName(ref.foreignTable)).toBe("agreements");
+      expect(ref.columns.map((c: any) => c.name)).toEqual(["agreement_id"]);
+      expect(ref.foreignColumns.map((c: any) => c.name)).toEqual(["id"]);
+      expect(fks[0].onDelete).toBe("no action");
+      expect(fks[0].onUpdate).toBe("no action");
+    }
+  });
+
+  it("defines profileId cascade references for billing child tables", () => {
+    const childTables = [
+      schema.billingPaymentMethods,
+      schema.billingInvoices,
+    ];
+
+    for (const table of childTables) {
+      const fks = getTableConfig(table).foreignKeys;
+      expect(fks).toHaveLength(1);
+      const ref = fks[0].reference();
+      expect(getTableName(ref.foreignTable)).toBe("billing_profiles");
+      expect(ref.columns.map((c: any) => c.name)).toEqual(["profile_id"]);
+      expect(ref.foreignColumns.map((c: any) => c.name)).toEqual(["id"]);
+      expect(fks[0].onDelete).toBe("cascade");
+      expect(fks[0].onUpdate).toBe("no action");
+    }
+  });
+
+  it("does not define foreign keys for standalone tables", () => {
+    expect(getTableConfig(schema.agreements).foreignKeys).toEqual([]);
+    expect(getTableConfig(schema.billingProfiles).foreignKeys).toEqual([]);
+    expect(getTableConfig(schema.sessions).foreignKeys).toEqual([]);
+  });
+});
+
 describeDbMigration("Database migration integration test", () => {
   let containerId: string;
   const connectionString = "postgresql://postgres:postgres@localhost:54321/stellopay_test";
@@ -369,6 +438,70 @@ describeDbMigration("Database migration integration test", () => {
     }
 
     await client.end();
+  });
+
+  it("verifies foreign key constraints exist after migration", async () => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+
+    const res = await client.query(`
+      SELECT tc.table_name, tc.constraint_name
+      FROM information_schema.table_constraints tc
+      WHERE tc.table_schema = 'public'
+        AND tc.constraint_type = 'FOREIGN KEY'
+      ORDER BY tc.table_name, tc.constraint_name
+    `);
+
+    const fkTables = new Set(res.rows.map((row) => row.table_name));
+    expect(fkTables.has("agreement_events")).toBe(true);
+    expect(fkTables.has("payments")).toBe(true);
+    expect(fkTables.has("milestones")).toBe(true);
+    expect(fkTables.has("employees")).toBe(true);
+    expect(fkTables.has("escrow_events")).toBe(true);
+    expect(fkTables.has("billing_payment_methods")).toBe(true);
+    expect(fkTables.has("billing_invoices")).toBe(true);
+
+    await client.end();
+  });
+
+  it("rejects inserts that violate foreign key constraints", async () => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+
+    try {
+      await client.query(
+        `INSERT INTO agreement_events (id, agreement_id, contract_address, event_type, block_number, transaction_hash, event_index, created_at)
+         VALUES ('fk-test-event', 'non-existent-id', '0x0', 'AgreementCreated', 1, '0x0', 0, NOW())`,
+      );
+      expect(true).toBe(false);
+    } catch (error: any) {
+      expect(error.code).toBe("23503");
+    } finally {
+      await client.end();
+    }
+  });
+
+  it("cascades delete from billing_profiles to billing_payment_methods", async () => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+
+    try {
+      await client.query(
+        `INSERT INTO billing_profiles (id, owner_address) VALUES ('fk-cascade-test', '0xOwner')`,
+      );
+      await client.query(
+        `INSERT INTO billing_payment_methods (id, profile_id, type) VALUES ('fk-cascade-pm', 'fk-cascade-test', 'bank_account')`,
+      );
+
+      await client.query(`DELETE FROM billing_profiles WHERE id = 'fk-cascade-test'`);
+
+      const res = await client.query(
+        `SELECT COUNT(*) FROM billing_payment_methods WHERE id = 'fk-cascade-pm'`,
+      );
+      expect(res.rows[0].count).toBe("0");
+    } finally {
+      await client.end();
+    }
   });
 
   it("exits non-zero when the migrations table cannot be read", async () => {
