@@ -187,6 +187,25 @@ describe("Auth Middleware", () => {
       expect(mockNext).not.toHaveBeenCalled();
     });
 
+    it("logs a warning when requireSession throws (resilience: observability)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token",
+      };
+      const dbError = new Error("connection pool exhausted");
+      vi.mocked(requireSession).mockRejectedValue(dbError);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[auth] requireSession threw — treating as failed auth",
+        dbError,
+      );
+      expect(mockRes.status).toHaveBeenCalledWith(401);
+      warnSpy.mockRestore();
+    });
+
     it("attaches the lowercased address and raw token to req.auth and calls next on success", async () => {
       mockReq.headers = {
         "x-user-address": "0xUSER", // Test case-insensitivity normalization
@@ -255,6 +274,29 @@ describe("Auth Middleware", () => {
       requireAdmin(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
+      expect(mockRes.status).not.toHaveBeenCalledWith(403);
+    });
+
+    it("is idempotent: skips re-authorization when res.locals.adminAuthorized is already set", () => {
+      mockRes.locals!.adminAuthorized = true;
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockNext).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
+    it("is idempotent: second call skips re-authorization even if allowlist changes", () => {
+      mockReq.auth = { address: "0xabc1", token: "testtoken" };
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+      expect(mockNext).toHaveBeenCalledTimes(1);
+
+      mockNext = vi.fn();
+      env.ADMIN_ADDRESSES = ["0xdef1"];
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockNext).toHaveBeenCalledTimes(1);
       expect(mockRes.status).not.toHaveBeenCalledWith(403);
     });
 
