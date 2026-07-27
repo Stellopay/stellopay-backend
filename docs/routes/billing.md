@@ -102,29 +102,51 @@ present in the API.
 
 ### `GET /billing/profiles/:profileId/invoices`
 
-Returns the invoice history for the profile.
+Returns the invoice history for the profile. Supports optional pagination via
+`limit` and `offset` query parameters.
 
-**Response (`200`):**
+**Query parameters:**
+
+| Parameter | Type    | Default | Max | Description                                              |
+| --------- | ------- | ------- | --- | -------------------------------------------------------- |
+| `limit`   | integer | —       | 200 | Maximum rows to return. When omitted, returns all rows.  |
+| `offset`  | integer | 0       | —   | Number of rows to skip before returning results.         |
+
+When neither `limit` nor `offset` is supplied, the response envelope omits the
+`pagination` block (backward-compatible with earlier callers).
+
+**Paginated response (`200`):**
 
 ```json
 {
   "success": true,
   "data": {
     "profileId": "profile-001",
-    "invoices": [
-      {
-        "id": "inv-1",
-        "invoiceNumber": "INV-2025-001",
-        "amount": "500.000000",
-        "currency": "USD",
-        "status": "pending",
-        "description": "Monthly retainer",
-        "issuedAt": "2025-06-01T00:00:00.000Z",
-        "paidAt": null,
-        "createdAt": "2025-06-01T00:00:00.000Z",
-        "updatedAt": "2025-06-01T00:00:00.000Z"
-      }
-    ]
+    "invoices": [ … ],
+    "pagination": {
+      "limit": 50,
+      "offset": 0,
+      "hasMore": true
+    }
+  }
+}
+```
+
+`hasMore` is computed by fetching `limit + 1` rows and discarding the probe
+row — no separate `COUNT` query.
+
+**Ordering:** Invoices are returned in descending order by `createdAt` with
+`id` as a tiebreaker, ensuring deterministic pagination even when rows share
+the same timestamp.
+
+**Unpaginated response (`200` — backward-compatible):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "profileId": "profile-001",
+    "invoices": [ … ]
   }
 }
 ```
@@ -236,7 +258,8 @@ The two `*_duration_ms_total` counters are cumulative sums: divide by the matchi
 
 `summarizeInvoices(rows)` is exported so the arithmetic can be unit-tested directly. It is
 a **read-side aggregate for telemetry only** — nothing is written back to the database and
-no response body changes.
+no response body changes. When pagination is active the aggregate covers only the returned
+page, not the full dataset.
 
 - An invoice counts toward `paidAmount` when its status is exactly `paid`
   (case-insensitive). Everything else — `pending`, `overdue`, `void`, an unrecognised
@@ -251,7 +274,7 @@ no response body changes.
 
 | Status | Condition                                                       |
 | ------ | --------------------------------------------------------------- |
-| `400`  | Invalid `profileId` (empty, illegal characters, or > 128 chars) |
+| `400`  | Invalid `profileId`, or invalid pagination parameters           |
 | `401`  | Missing or invalid session credentials                          |
 | `404`  | Profile does not exist, **or** the caller does not own it       |
 | `409`  | Idempotency key reused with a different request body            |
@@ -351,6 +374,11 @@ These functions are tested as pure functions in
 - **Counter durability** — counters reset on process restart and are per-instance, so a
   horizontally scaled deployment sees N independent sets. This matches the existing
   in-process idempotency store's caveat.
+- **Cursor-based pagination** — the invoices endpoint uses offset-based pagination.
+  Cursor-based pagination (e.g., `createdAt` + `id`-anchored) would be more robust
+  against insertions shifting page boundaries, but would require database-level
+  `WHERE` filtering the mock infrastructure cannot currently simulate. This is a
+  candidate improvement if offset drift becomes measurable in production.
 
 ## Testing
 
@@ -369,6 +397,9 @@ The test suite covers:
   per-column coercion warnings, over-limit flagging, and the zero-limit boundary
 - Invoice route: response shape unchanged, aggregate event contents, empty-list boundary,
   and the single per-request coercion warning with its reason breakdown
+- Invoice pagination: paginated response with hasMore, boundary cases (limit equals total,
+  limit exceeds total, offset skip), validation rejection for out-of-range values, and
+  backward-compatible envelope when no pagination params are supplied
 - Ownership denial: `not_found` vs `not_owner` logged distinctly behind an identical
   `404` body
 - Failure paths: handler and ownership-lookup rejections produce one `*.failed` event and

@@ -51,6 +51,7 @@ vi.mock("../db/index.js", () => ({
 
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn((left: unknown, right: unknown) => ({ left, right })),
+  desc: vi.fn((col: unknown) => ({ type: "desc", col })),
 }));
 
 import {
@@ -59,6 +60,8 @@ import {
   parseBillingAmount,
   summarizeInvoices,
   withBillingIdempotency,
+  DEFAULT_INVOICE_PAGE_LIMIT,
+  MAX_INVOICE_PAGE_LIMIT,
 } from "./billing.js";
 import {
   BILLING_METRICS,
@@ -100,6 +103,8 @@ function makeQueryBuilder(): any {
     from: () => builder,
     where: () => builder,
     limit: () => builder,
+    offset: () => builder,
+    orderBy: () => builder,
     then: (resolve: (value: unknown[]) => unknown, reject: (reason: unknown) => unknown) =>
       shouldFail
         ? Promise.resolve().then(() => reject(shouldFail))
@@ -510,6 +515,112 @@ describe("billing routes telemetry", () => {
         reasons: { malformed: 1, missing: 1 },
       });
       expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
+    });
+
+    it("pagination success path: returns a page with hasMore=true when more rows exist", async () => {
+      const invoices = Array.from({ length: 5 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=2`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.invoices).toHaveLength(2);
+      expect(res.body.data.pagination).toEqual({ limit: 2, offset: 0, hasMore: true });
+    });
+
+    it("pagination boundary: hasMore=false when limit matches total rows", async () => {
+      const invoices = Array.from({ length: 2 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=2`)
+        .set(authHeaders());
+
+      expect(res.body.data.invoices).toHaveLength(2);
+      expect(res.body.data.pagination).toEqual({ limit: 2, offset: 0, hasMore: false });
+    });
+
+    it("pagination boundary: offset skips rows correctly", async () => {
+      const invoices = Array.from({ length: 5 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=2&offset=2`)
+        .set(authHeaders());
+
+      expect(res.body.data.invoices).toHaveLength(2);
+      expect(res.body.data.pagination).toEqual({ limit: 2, offset: 2, hasMore: true });
+    });
+
+    it("pagination boundary: limit larger than result set returns all without hasMore", async () => {
+      const invoices = Array.from({ length: 3 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=10`)
+        .set(authHeaders());
+
+      expect(res.body.data.invoices).toHaveLength(3);
+      expect(res.body.data.pagination).toEqual({ limit: 10, offset: 0, hasMore: false });
+    });
+
+    it("pagination failure: rejects limit above MAX_INVOICE_PAGE_LIMIT", async () => {
+      queueRows([profileRow()]);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=201`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain("Invalid pagination parameters");
+    });
+
+    it("pagination failure: rejects a negative offset", async () => {
+      queueRows([profileRow()]);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?offset=-1`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain("Invalid pagination parameters");
+    });
+
+    it("pagination contract: no pagination params preserves the original envelope shape", async () => {
+      const invoices = [
+        { id: "inv-1", amount: "100.000000", status: "paid" },
+        { id: "inv-2", amount: "250.000000", status: "pending" },
+      ];
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      // No pagination block — original shape preserved.
+      expect(res.body.data.pagination).toBeUndefined();
+      expect(res.body.data.invoices).toEqual(invoices);
     });
   });
 
