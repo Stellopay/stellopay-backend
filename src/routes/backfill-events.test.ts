@@ -182,18 +182,18 @@ describe("Backfill Events Routes", () => {
   });
 
   describe("Input Validation & Resume Tokens", () => {
-    it("rejects a malformed resumeToken (not an ISO date)", async () => {
+    it("rejects a malformed `before` value (not an ISO date)", async () => {
       const res = await request(app)
-        .post("/api/v1/backfill/employee-events?resumeToken=invalid-date")
+        .post("/api/v1/backfill/employee-events?before=invalid-date")
         .expect(400);
 
       expect(res.body.error).toBeDefined();
     });
 
-    it("accepts a valid resumeToken and passes it to the query", async () => {
+    it("accepts a valid ISO `before` value and passes it to the query", async () => {
       const validToken = "2026-07-25T10:00:00.000Z";
       await request(app)
-        .post(`/api/v1/backfill/employee-events?resumeToken=${validToken}`)
+        .post(`/api/v1/backfill/employee-events?before=${validToken}`)
         .expect(200);
 
       expect(mockDb.execute).toHaveBeenCalled();
@@ -284,6 +284,7 @@ describe("Backfill Events Routes", () => {
   });
 
   describe("POST /backfill/employee-events", () => {
+    const mockDate = new Date("2024-01-01T00:00:00.000Z");
     const mockEmployeeRow = {
       id: "emp_1",
       agreement_id: "agr_123",

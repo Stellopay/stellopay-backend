@@ -94,13 +94,11 @@ export const BackfillQuerySchema = z.object({
 // Response shape
 // ---------------------------------------------------------------------------
 
-/** A single entry inside the response `results` array. */
 export interface BackfillResultEntry {
   employeeId?: string;
   milestoneId?: string;
   agreementId: string;
   status: string;
-  error?: string;
 }
 
 /** Shape returned by both backfill endpoints on success. */

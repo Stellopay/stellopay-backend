@@ -124,3 +124,31 @@ The `results` array contains a preview sample limited to a maximum of 10 items (
 - **No concurrent/parallel worker partitioning**: These endpoints support single-caller sequential resumption only. There is no row-locking, worker-id sharding, or other mechanism to let multiple callers safely split a backlog and process it in parallel. Running two callers against the same backlog concurrently may cause both to scan overlapping rows (harmless, since inserts are idempotent, but wasteful). This is an intentional, documented trade-off — parallel backfill workers are out of scope.
 - **Automatic scaling / pagination**: The caller must issue repeated requests, following the resume-token contract above, if the number of missing rows is extremely large.
 - **Handling of events missing transaction hashes**: Records inserted through out-of-band means that completely lack an original `transaction_hash` cannot be safely backfilled using these routes, as the synthetic ID heavily relies on the source transaction hash.
+
+## Input Validation
+
+All query parameters are validated by `BackfillQuerySchema` before any database
+operation begins:
+
+| Parameter     | Type              | Default | Max    | Validation                                    |
+| ------------- | ----------------- | ------- | ------ | --------------------------------------------- |
+| `limit`       | number (coerced)  | `1000`  | `5000` | Must be a positive integer ≤ `MAX_BACKFILL_LIMIT`. Non-numeric or floating-point values are rejected. |
+| `agreementId` | string            | —       | —      | Passed through as-is when present.            |
+| `before`      | ISO-8601 datetime | —       | —      | Must be a parseable date. Invalid values produce the same `400 { "error" }` shape as other validation failures. |
+
+Unknown query parameters are silently ignored.
+
+## Implementation Notes
+
+Both routes delegate to a shared `performBackfill` helper that:
+
+1. **LEFT JOINs** the source table (`employees` or `milestones`) with
+   `agreement_events` on `transaction_hash` + `event_type` to find rows
+   without a matching backfill event.
+2. Applies the optional `agreementId` and `before` filters.
+3. Orders results by `created_at DESC` so the cursor correctly pages
+   backward through newest-first order.
+4. Inserts synthetic events inside a single transaction using
+   `ON CONFLICT DO NOTHING` for idempotency.
+5. Returns a `BackfillResponse` with `nextCursor` (the oldest `created_at`
+   in the page) and `hasMore` (page-full indicator).
