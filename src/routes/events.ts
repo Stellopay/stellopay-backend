@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
+import { eq, and, gte, lte, inArray, desc, SQL, or, gt, sql } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
@@ -11,9 +11,12 @@ import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
-import { parsePagination } from "../utils/validation.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
+
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 100;
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
@@ -898,6 +901,8 @@ eventsRouter.post(
   requireAdmin,
   async (req, res, next) => {
     const start = process.hrtime.bigint();
+    const batchSize = Array.isArray(req.body?.tx_hashes) ? req.body.tx_hashes.length : 0;
+
     try {
       const { tx_hashes } = z
         .object({
@@ -910,6 +915,13 @@ eventsRouter.post(
             ),
         })
         .parse(req.body);
+
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+      });
 
       const results: TxProcessResult[] = [];
       const resultsByNormalizedHash = new Map<string, TxProcessResult>();
@@ -945,6 +957,16 @@ eventsRouter.post(
       const uniqueResults = Array.from(resultsByNormalizedHash.values());
       const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
+      logEventTelemetry({
+        operation: "event_fanout_delivery",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+        unique_transactions: uniqueResults.length,
+        duplicates,
+        events_processed: totalProcessed,
+      });
+
       res.json({
         summary: {
           total: results.length,
@@ -958,6 +980,17 @@ eventsRouter.post(
         results,
       });
     } catch (e) {
+      if (e instanceof z.ZodError) {
+        logEventTelemetry({
+          operation: "event_envelope_validation",
+          duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+          status: "error",
+          batch_size: batchSize,
+          error: e.message,
+        });
+        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+        return;
+      }
       next(e);
     }
   },
@@ -992,7 +1025,18 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 
   let date: Date;
   if (typeof raw === "number") {
-    date = new Date(raw);
+    if (!Number.isFinite(raw)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [paramName],
+          message: `Invalid timestamp format for parameter '${paramName}'`,
+        },
+      ]);
+    }
+    // Treat numeric values the same as numeric strings: 10-digit values are
+    // assumed to be seconds, while 13-digit values are treated as milliseconds.
+    date = new Date(raw < 10000000000 ? raw * 1000 : raw);
   } else if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (!trimmed) return undefined;
@@ -1000,7 +1044,8 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
     if (/^\d+$/.test(trimmed)) {
       const num = parseInt(trimmed, 10);
       // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
-      date = new Date(num < 10000000000 ? num * 1000 : num);
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
     } else {
       date = new Date(trimmed);
     }
@@ -1074,21 +1119,31 @@ eventsRouter.get("/events", async (req, res, next) => {
     const contractAddress = rawContractAddr ? String(rawContractAddr).trim().toLowerCase() : undefined;
 
     const conditions: SQL[] = [];
+    const agreementEventsTable = schema.agreementEvents as unknown as {
+      eventType?: unknown;
+      createdAt?: unknown;
+      agreementId?: unknown;
+      contractAddress?: unknown;
+    };
+    const eventTypeColumn = agreementEventsTable.eventType ?? "eventType";
+    const createdAtColumn = agreementEventsTable.createdAt ?? "createdAt";
+    const agreementIdColumn = agreementEventsTable.agreementId ?? "agreementId";
+    const contractAddressColumn = agreementEventsTable.contractAddress ?? "contractAddress";
 
     if (eventTypes.length > 0) {
-      conditions.push(inArray(schema.agreementEvents.eventType, eventTypes));
+      conditions.push(inArray(eventTypeColumn as any, eventTypes));
     }
     if (fromDate) {
-      conditions.push(gte(schema.agreementEvents.createdAt, fromDate));
+      conditions.push(gte(createdAtColumn as any, fromDate));
     }
     if (toDate) {
-      conditions.push(lte(schema.agreementEvents.createdAt, toDate));
+      conditions.push(lte(createdAtColumn as any, toDate));
     }
     if (agreementId) {
-      conditions.push(eq(schema.agreementEvents.agreementId, agreementId));
+      conditions.push(eq(agreementIdColumn as any, agreementId));
     }
     if (contractAddress) {
-      conditions.push(eq(schema.agreementEvents.contractAddress, contractAddress));
+      conditions.push(eq(contractAddressColumn as any, contractAddress));
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -1101,16 +1156,6 @@ eventsRouter.get("/events", async (req, res, next) => {
       .limit(limit)
       .offset(offset);
 
-    logEventTelemetry({
-      operation: "event_fanout_delivery",
-      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
-      status: "success",
-      batch_size: tx_hashes.length,
-      unique_transactions: uniqueResults.length,
-      duplicates,
-      events_processed: totalProcessed,
-    });
-
     res.json({
       events,
       count: events.length,
@@ -1118,6 +1163,7 @@ eventsRouter.get("/events", async (req, res, next) => {
       offset,
     });
   } catch (e) {
+    console.error("[events] GET /events failed", e);
     if (e instanceof z.ZodError) {
       res.status(400).json({
         error: "Validation failed",

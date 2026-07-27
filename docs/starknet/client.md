@@ -198,6 +198,41 @@ cross-contaminate even when the same address is used for both.
 
 `getCachedNetworkInfo()` returns chainId and specVersion with a 5-minute TTL cache.
 
+## Observability & Metrics
+
+`src/starknet/client.ts` exposes structured logging and metric counters for RPC failovers, fee quotes, and chain interactions:
+
+### Structured Logging (`logStarknetEvent`)
+Emits JSON when `LOG_FORMAT=json`, otherwise text. Controlled by `LOG_LEVEL`:
+- `starknet.rpc.request` / `starknet.rpc.success` / `starknet.rpc.failover` / `starknet.rpc.error`
+- `starknet.fee_quote.requested` / `starknet.fee_quote.success` / `starknet.fee_quote.error`
+- `starknet.network_info.cache_hit` / `starknet.network_info.fetched` / `starknet.network_info.deduplicated` / `starknet.network_info.failed`
+
+### Metrics (`STARKNET_METRICS`)
+Process-local metric counters accessed via `getStarknetMetricsSnapshot()`:
+- `starknet_rpc_requests_total`
+- `starknet_rpc_failover_total`
+- `starknet_rpc_errors_total`
+- `starknet_rpc_duration_ms_total`
+- `starknet_fee_quote_requests_total`
+- `starknet_fee_quote_success_total`
+- `starknet_fee_quote_errors_total`
+- `starknet_network_info_cache_hits_total`
+- `starknet_network_info_fetches_total`
+- `starknet_network_info_deduped_total`
+- `starknet_network_info_errors_total`
+
+- `resetStarknetMetrics()` — resets counters (used by tests).
+
+## Performance Optimizations
+
+To reduce redundant computation and allocation during high-frequency RPC retries, fee quotes, and chain interactions:
+
+- **Fast-Path Argument Cloning**: Empty argument arrays (`[]`) and primitive value arguments (`string`, `number`, `boolean`, `bigint`, `symbol`, `null`, `undefined`) bypass recursive deep tree traversal, returning immediate shallow copies without garbage collection overhead.
+- **Failover Order Array Caching**: Prevents allocating new index arrays on every RPC invocation when a single provider is configured or when the healthy endpoint index has not changed.
+- **Proxy Method Binding Cache**: Caches method wrappers on the `provider` proxy to avoid creating new function closures on repeated method accesses.
+- **Contract Address Normalization**: Normalizes hex casing and surrounding whitespace in contract addresses before building cache keys, preventing duplicate `Contract` instance creation for equivalent addresses.
+
 ## RPC URLs
 
 Configured via `STARKNET_RPC_URL` environment variable (comma-separated). Defaults in `config.ts`.
