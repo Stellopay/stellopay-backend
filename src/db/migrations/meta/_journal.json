@@ -6,28 +6,28 @@
       "idx": 0,
       "version": "7",
       "when": 1782074550149,
-      "tag": "0000_faulty_mole_man",
+      "tag": "20240101000000_faulty_mole_man",
       "breakpoints": true
     },
     {
       "idx": 1,
       "version": "7",
       "when": 1783240693251,
-      "tag": "0001_faulty_blue_blade",
+      "tag": "20240102000000_faulty_blue_blade",
       "breakpoints": true
     },
     {
       "idx": 2,
       "version": "7",
       "when": 1785084169250,
-      "tag": "0002_hard_onslaught",
+      "tag": "20240103000000_hard_onslaught",
       "breakpoints": true
     },
     {
       "idx": 3,
       "version": "7",
       "when": 1753574400000,
-      "tag": "0003_schema_check_constraints",
+      "tag": "20240104000000_schema_check_constraints",
       "breakpoints": true
     }
   ]

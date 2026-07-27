@@ -6,6 +6,7 @@ import { parseU256, toHexString } from "../utils/codec.js";
 import { requireSession } from "../auth/session.js";
 import { env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
+import { StarknetAddress } from "../utils/validation.js";
 
 
 
@@ -200,11 +201,15 @@ tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
     const tokenAddress = normalizeStarknetAddress(req.params.address);
     const body = ApproveBody.parse(req.body);
 
+    // Validate session
     if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
-    const spender = normalizeStarknetAddress(body.spender);
+
+    // Validate spender address format (no normalization to preserve raw input)
+    StarknetAddress.parse(body.spender);
+    const spender = body.spender;
 
     const tokenContract = new (await import("starknet")).Contract(
       ERC20_ABI,
@@ -215,11 +220,5 @@ tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
     res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
-  } catch (e: any) {
-    if (e.message && e.message.startsWith("Starknet address")) {
-      res.status(400).json({ error: e.message });
-      return;
-    }
-    next(e);
-  }
+  } catch (e) { next(e); }
 });

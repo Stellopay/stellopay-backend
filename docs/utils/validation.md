@@ -1,66 +1,131 @@
-# Validation Utilities
+# Validation — Schema Definitions & Error Mapping
 
-Source: [`src/utils/validation.ts`](../../src/utils/validation.ts)
-
-Shared Zod schemas and helpers for validating request parameters consistently
-across all routes. Every route handler in `src/routes/` that needs to parse a
-Starknet address, an agreement id, or pagination query params passes them
-through this module so validation rules live in one place.
-
-## Exports
-
-| Export | Kind | Description |
-|---|---|---|
-| `StarknetAddress` | Zod schema | Hex string (with or without `0x` prefix), 1–64 hex chars, normalised to canonical 0x-padded-64-lowercase form. Rejects whitespace, non-hex, oversized, empty, and null/undefined inputs. Validates SNIP-23 checksum on mixed-case inputs. |
-| `AgreementId` | Zod schema | Numeric-only string (digits `0-9`), trimmed. Rejects non-digit, hex-prefixed, negative, float, and empty strings. |
-| `parsePagination` | Function | Extracts and clamps `limit` (1–100) and `offset` (≥0) from a query object. Falls back to defaults on missing, null, empty, or non-numeric input without throwing. |
-| `loggedParse` | Function | Wraps any Zod schema with structured error logging before re-throwing the error. |
-| `MAX_PAGE_LIMIT` | Constant | Hard upper bound for pagination limit (100). |
-| `DEFAULT_PAGE_LIMIT` | Constant | Default page size when caller does not supply a limit (50). |
+Source of truth: [`src/utils/validation.ts`](../../src/utils/validation.ts)
 
 ## Contract
 
+This module provides the shared schemas and error-mapping helpers used by every
+route handler that validates request parameters.  All of the following are
+exported:
+
+| Export | Kind | Purpose |
+|---|---|---|
+| `StarknetAddress` | `z.ZodString` → transform | Parse + normalize a Starknet hex address |
+| `AgreementId` | `z.ZodString` | Parse a numeric-string agreement identifier |
+| `parsePagination` | function | Clamp `limit`/`offset` query params to safe defaults |
+| `loggedParse` | function | Parse + log structured diagnostics on failure |
+| `formatValidationError` | function | Map a caught error to the standard API JSON shape |
+| `ValidationErrorResponse` | interface | Return type of `formatValidationError` |
+| `MAX_PAGE_LIMIT` | `number` (= 100) | Upper bound for pagination limit |
+| `DEFAULT_PAGE_LIMIT` | `number` (= 50) | Fallback pagination limit |
+
+## Schemas
+
 ### `StarknetAddress`
 
-- Input is trimmed before validation.
-- Regex `/^(0x)?[0-9a-fA-F]{1,64}$/` rejects non-hex, mixed-unicode, empty,
-  whitespace-only, and >64-char hex strings.
-- Transform calls `normalizeStarknetAddress`, which strips leading zeros, pads
-  to 64 hex characters, and validates SNIP-23 checksums on mixed-case inputs.
-- Errors from the transform surface as `ZodError` with the underlying message.
+- Accepts a hex string with or without `0x` prefix
+- Up to 64 hex characters (Starknet felt width)
+- Trims surrounding whitespace before validation
+- On success, returns the canonical lowercase `0x`-padded 64-char form
+- Mixed-case inputs are validated against SNIP-23/EIP-55 checksum
+- **Rejects**: non-hex, oversized, empty, whitespace-only, null, undefined,
+  non-string types, invalid checksum
+
+```typescript
+StarknetAddress.parse("0x4718F5a...") // "0x0..." (canonical)
+StarknetAddress.parse("abc")           // "0x0...0abc" (padded)
+StarknetAddress.parse("")              // throws ZodError
+```
 
 ### `AgreementId`
 
-- Input is trimmed before validation.
-- Regex `/^\d+$/` accepts only ASCII digits. Leading zeros, long strings, and
-  single-digit values are valid. Hex (`0x...`), negative (`-`), float (`.`),
-  scientific (`e`), unicode digits, and empty strings are rejected.
+- Accepts a string containing only ASCII digits (`0`–`9`)
+- Leading zeros are preserved
+- Trims surrounding whitespace
+- **Rejects**: negative signs, floats, hex (`0x...`), unicode digits, empty
+  string, whitespace-only, null, undefined, non-string types
 
-### `parsePagination`
+```typescript
+AgreementId.parse("42")     // "42"
+AgreementId.parse("00042")  // "00042"
+AgreementId.parse("12ab")   // throws ZodError
+```
 
-- Coerces `null` and `""` to `undefined` before Zod coercion so `.catch()`
-  fallbacks engage instead of coercing to `0`.
-- `limit` is clamped to `[1, MAX_PAGE_LIMIT]` after parsing.
-- `offset` is floored to `≥ 0` after parsing.
-- Never throws: every input shape returns a `{ limit: number, offset: number }`
-  with finite values within bounds.
+## Pagination
 
-### `loggedParse`
+### `parsePagination(query)` → `{ limit, offset }`
 
-- Calls `schema.safeParse(value)`. On success, returns parsed data.
-- On failure, logs a JSON diagnostic via `console.warn` with keys
-  `validator`, `input`, `error`, `timestamp` and re-throws the `ZodError`.
-- Input is truncated to 40 characters in the log payload. Non-string inputs
-  are stringified via `String()`.
-- Multiple Zod issues are joined with `"; "`.
+This function **never throws**.  Every input is gracefully degraded:
 
-## Out of scope
+| Input | Behaviour |
+|---|---|
+| Missing / `undefined` / `null` query | Defaults: `{ limit: 50, offset: 0 }` |
+| `limit` or `offset` is `null` / `""` | Treated as `undefined` → falls back to default |
+| `limit` > `MAX_PAGE_LIMIT` | Clamped down to `MAX_PAGE_LIMIT` (100) |
+| `limit` < 1 | Clamped up to `1` |
+| `offset` < 0 | Clamped up to `0` |
+| Non-numeric strings (`"abc"`, `"1.5"`) | Fall back to default via `.catch()` |
+| Array values | Single-element arrays coerce; multi-element fall back to default |
+| Object / boolean values | Fall back to default |
 
-- **Cursor-based pagination** — this module only supports offset/limit
-  pagination. See `docs/routes/read.md` for the cursor pattern.
-- **Body/payload validation** — this module is focused on path, query, and
-  param validation. Request body schemas live in route files or dedicated
-  contract files under `contracts/`.
-- **Starknet address checksum verification** — delegated to
-  `normalizeStarknetAddress` in `src/utils/address.ts`. This module only
-  ensures the input is a valid hex string before passing it to the normalizer.
+```typescript
+parsePagination({ limit: "5000" })   // { limit: 100, offset: 0 }
+parsePagination({ offset: "-3" })    // { limit: 50, offset: 0 }
+parsePagination(null)                // { limit: 50, offset: 0 }
+```
+
+## Logged Parse
+
+### `loggedParse(schema, value, validatorName)` → `T`
+
+Wraps any Zod schema with structured error logging.  On failure:
+1. Logs a JSON entry via `console.warn` with `[validation:error]` prefix
+2. Log payload includes: `validator`, `input` (truncated to 40 chars),
+   `error` (semi-colon joined issues), `timestamp`
+3. Re-throws the original `ZodError`
+
+```typescript
+const address = loggedParse(StarknetAddress, raw, "createAgreement");
+```
+
+## Error Mapping
+
+### `formatValidationError(error)` → `ValidationErrorResponse`
+
+Maps a caught value to the standard API error shape used across all routes.
+When the error is a `ZodError`, the response includes the full issue list:
+
+```typescript
+try {
+  StarknetAddress.parse(raw);
+} catch (e) {
+  const { error, details } = formatValidationError(e);
+  res.status(400).json({ error, details });
+}
+```
+
+**Response shapes:**
+
+```json
+// ZodError
+{ "error": "Validation failed", "details": [{ "code": "invalid_type", ... }] }
+
+// Non-ZodError
+{ "error": "Invalid request" }
+```
+
+## Error Handling Architecture
+
+1. **Zod schemas throw `ZodError`** on invalid input
+2. **Route handlers** either:
+   - Catch `ZodError` inline and return 400 (e.g. `backfill-events.ts`)
+   - Let the error propagate to the global error handler
+3. **Global error handler** (`src/index.ts`) detects `instanceof ZodError`,
+   responds with HTTP 400, and attaches `err.issues` as the `details` field
+
+## Edge Cases (Intentionally Out of Scope)
+
+- Custom `ZodIssue` formatting for specific API versions
+- Automatic i18n of error messages
+- Async validation schemas
+- Integration testing of the global error handler with every schema
