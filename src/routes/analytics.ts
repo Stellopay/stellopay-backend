@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, or, gte, lte, sql } from "drizzle-orm";
+import { asc, eq, and, gt, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
@@ -178,6 +178,25 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
           lte(schema.payments.createdAt, endDate),
         ),
       );
+      const cursorFilter = cursor
+        ? or(
+            gt(schema.payments.createdAt, cursor.createdAt),
+            and(eq(schema.payments.createdAt, cursor.createdAt), gt(schema.payments.id, cursor.id)),
+          )
+        : undefined;
+
+      return db
+        .select({
+          id: schema.payments.id,
+          createdAt: schema.payments.createdAt,
+          month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
+          amount: schema.payments.amount,
+        })
+        .from(schema.payments)
+        .where(cursorFilter ? and(filters, cursorFilter) : filters)
+        .orderBy(asc(schema.payments.createdAt), asc(schema.payments.id))
+        .limit(ANALYTICS_ROLLUP_BATCH_SIZE);
+    });
 
     // Get escrow events (funding, releases, refunds)
     const escrowEvents = await db

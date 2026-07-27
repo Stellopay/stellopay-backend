@@ -49,6 +49,12 @@ The `MONTH_NAMES` constant is hoisted to module scope to avoid re-allocation on 
 - **Agreement creation proxy**: unchanged — adds `count * 1000` base units to months with no payment or escrow data.
 - **`views` field name**: preserved for backward compatibility; represents a net monetary amount.
 
+## Rollup batching contract
+
+The endpoint retains its existing response shape and does not expose client pagination. Internally, each of its three event sources is read in batches of at most `ANALYTICS_ROLLUP_BATCH_SIZE` (500 rows). Pages use the ascending `(created_at, id)` keyset, with both fields forming the cursor. This makes a timestamp tie deterministic and prevents offset drift from skipping or repeating pre-existing rows as the tables grow.
+
+The route continues until a short page is received. If a full page fails to advance the cursor, it fails the request rather than looping indefinitely or returning a silently incomplete rollup. This contract intentionally does not provide a cross-query database snapshot: events committed while a rollup is in progress may be included if they sort after the current cursor.
+
 ---
 
 ## Contract
