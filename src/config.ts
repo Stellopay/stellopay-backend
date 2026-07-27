@@ -121,6 +121,20 @@ const EnvSchema = z.object({
         .map((a) => a.trim().toLowerCase())
         .filter((a) => a.length > 0),
     ),
+
+  // ABI verification configuration
+  // Skip ABI verification at startup (useful for environments without RPC access)
+  SKIP_ABI_VERIFICATION: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((v) => v === "true"),
+
+  // ABI verification mode: "fail" (exit on mismatch) or "warn" (log warning and continue)
+  ABI_VERIFICATION_MODE: z
+    .enum(["fail", "warn"])
+    .optional()
+    .default("fail"),
 });
 
 export const env = EnvSchema.parse(process.env);
