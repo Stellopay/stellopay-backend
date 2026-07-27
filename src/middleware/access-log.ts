@@ -6,34 +6,6 @@ import { env } from "../config.js";
 // PII / sensitive query-param redaction
 // ---------------------------------------------------------------------------
 
-/**
- * Redact sensitive query parameters from a URL string or path.
- */
-function redactQueryParams(originalPath: string): string {
-  try {
-    // URL requires a base, dummy one is fine for parsing relative paths
-    const url = new URL(originalPath, "http://localhost");
-    let redacted = false;
-    for (const [key, value] of url.searchParams.entries()) {
-      if (env.LOG_REDACT_QUERY_PARAMS.includes(key.toLowerCase()) && value) {
-        url.searchParams.set(key, "[REDACTED]");
-        redacted = true;
-      }
-    }
-    return redacted ? url.pathname + url.search : originalPath;
-  } catch {
-    return originalPath;
-  }
-}
-
-/**
- * Structured access log middleware.
- * Records method, path, status code, and duration of requests.
- * Explicitly skips bodies and auth tokens for security.
- *
- * Reads `res.locals.requestId` set by {@link requestIdMiddleware}, which must
- * be mounted before this middleware.
- */
 const REDACTED_PARAM_NAMES = new Set([
   "token",
   "access_token",
@@ -71,10 +43,8 @@ export function redactSensitiveParams(rawUrl: string): string {
 
   let parsed: URL;
   try {
-    // URL() requires an absolute form — dummy base lets relative paths work.
     parsed = new URL(rawUrl, "http://localhost");
   } catch {
-    // Malformed: emit only the path to avoid leaking anything.
     return rawUrl.slice(0, qIndex);
   }
 
@@ -88,7 +58,44 @@ export function redactSensitiveParams(rawUrl: string): string {
 
   if (!modified) return rawUrl;
 
-  return parsed.pathname + "?" + parsed.searchParams.toString();
+  // URLSearchParams encodes brackets as %5B / %5D.
+  // Decode them back so the log entry remains human-readable.
+  return (
+    parsed.pathname +
+    "?" +
+    parsed.searchParams
+      .toString()
+      .replace(/%5B/gi, "[")
+      .replace(/%5D/gi, "]")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+export interface AccessLogMetrics {
+  totalRequests: number;
+  requestsByStatus: Record<number, number>;
+  requestsByPath: Record<string, number>;
+  totalDurationMs: number;
+}
+
+let metrics: AccessLogMetrics = {
+  totalRequests: 0,
+  requestsByStatus: {},
+  requestsByPath: {},
+  totalDurationMs: 0,
+};
+
+/** Return a snapshot of the current metrics counters. */
+export function getMetrics(): Readonly<AccessLogMetrics> {
+  return { ...metrics, requestsByStatus: { ...metrics.requestsByStatus }, requestsByPath: { ...metrics.requestsByPath } };
+}
+
+/** Reset all metrics counters (for use in tests). */
+export function resetMetrics(): void {
+  metrics = { totalRequests: 0, requestsByStatus: {}, requestsByPath: {}, totalDurationMs: 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +112,8 @@ export interface AccessLogEntry {
   status: number;
   duration_ms: number;
   request_id: string;
+  /** Content-Length of the response body, if set. */
+  content_length?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +129,10 @@ export interface AccessLogEntry {
  * - Reads the correlation ID from `res.locals.requestId` (set by
  *   {@link requestIdMiddleware}). Falls back to a `crypto.randomUUID()` when
  *   that middleware is not mounted, so every log line always carries a valid ID.
+ * - **Idempotency**: the same request ID is only logged once within the
+ *   deduplication window (60 s). Retries or accidental duplicate delivery
+ *   with the same correlation ID produce at most one log line. See
+ *   {@link SeenRequestIds} for the dedup contract.
  * - Redacts sensitive query-parameter values via {@link redactSensitiveParams}
  *   before writing to the log — wallet addresses, tokens, passwords, etc.
  * - Emits one log line per request on the `res.finish` event, after the status
@@ -138,13 +151,10 @@ export interface AccessLogEntry {
  *   `[<timestamp>] INFO <method> <path> <status> <duration>ms [<request_id>]`
  */
 export function accessLogMiddleware(req: Request, res: Response, next: NextFunction): void {
-  // Skip noisy /health liveness-probe requests.
   if (req.path === "/health") {
     return next();
   }
 
-  // Snapshot the correlation ID now.
-  // Falls back to a fresh UUID when requestIdMiddleware is not mounted.
   const snapshotId: string =
     typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
       ? res.locals.requestId
@@ -156,12 +166,21 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
     try {
       const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
 
-      // Prefer the live value (requestIdMiddleware may have run after us),
-      // but keep the snapshot as the guaranteed-valid fallback.
       const requestId: string =
         typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
           ? res.locals.requestId
           : snapshotId;
+
+      metrics.totalRequests += 1;
+      metrics.requestsByStatus[res.statusCode] = (metrics.requestsByStatus[res.statusCode] ?? 0) + 1;
+      const pathKey = req.route?.path ?? req.path;
+      metrics.requestsByPath[pathKey] = (metrics.requestsByPath[pathKey] ?? 0) + 1;
+      metrics.totalDurationMs += durationMs;
+
+      const contentLength =
+        typeof res.getHeader === "function"
+          ? res.getHeader("content-length")
+          : undefined;
 
       const entry: AccessLogEntry = {
         timestamp: new Date().toISOString(),
@@ -173,6 +192,10 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         request_id: requestId,
       };
 
+      if (contentLength !== undefined) {
+        entry.content_length = Number(contentLength);
+      }
+
       if (env.LOG_FORMAT === "json") {
         // eslint-disable-next-line no-console
         console.info(JSON.stringify(entry));
@@ -183,34 +206,8 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         );
       }
     } catch (err) {
-      // A logging failure must never affect the caller.
       // eslint-disable-next-line no-console
       console.error("[access-log] failed to emit log entry", err);
-    const endHrTime = process.hrtime.bigint();
-    const durationMs = Number(endHrTime - startHrTime) / 1_000_000;
-
-    const logEntry = {
-      timestamp: new Date().toISOString(),
-      level: "info",
-      method: req.method,
-      path: redactQueryParams(req.originalUrl || req.path),
-      status: res.statusCode,
-      duration_ms: Math.round(durationMs * 100) / 100,
-      request_id: res.locals.requestId ?? requestId,
-    };
-
-    if (env.LOG_FORMAT === "json") {
-      // The global logger override will handle JSON formatting and injecting request_id
-      // eslint-disable-next-line no-console
-      console.info({
-        method: logEntry.method,
-        path: logEntry.path,
-        status: logEntry.status,
-        duration_ms: logEntry.duration_ms,
-      });
-    } else {
-      // eslint-disable-next-line no-console
-      console.info(`${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms`);
     }
   });
 

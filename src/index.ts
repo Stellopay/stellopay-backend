@@ -4,7 +4,7 @@ import cors from "cors";
 import { resolveCorsConfig } from "./utils/cors.js";
 import helmet from "helmet";
 import { ZodError } from "zod";
-import { env } from "./config.js";
+import { env, defaults } from "./config.js";
 import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
 import { agreementRouter } from "./routes/agreement.js";
@@ -29,6 +29,8 @@ import { dbReadinessMiddleware, setApplicationReady } from "./middleware/db-read
 import { setupGracefulShutdown } from "./shutdown.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
+import { verifyAbiCompatibility } from "./starknet/abi.js";
+import { provider, getEscrowAbi, getAgreementAbi } from "./starknet/client.js";
 
 export const app = express();
 initLogger();
@@ -202,8 +204,69 @@ if (process.env.NODE_ENV !== "test") {
 
   void (async () => {
     await waitForDbReadiness();
+    // eslint-disable-next-line no-console
+    console.log("[startup] Database ready");
+
+    // Verify ABI compatibility at startup unless explicitly skipped
+    if (!env.SKIP_ABI_VERIFICATION) {
+      try {
+        // eslint-disable-next-line no-console
+        console.log("[startup] Verifying ABI compatibility with deployed contracts...");
+
+        const [escrowResult, agreementResult] = await Promise.all([
+          verifyAbiCompatibility({
+            provider,
+            label: "PayrollEscrow",
+            contractAddress: defaults.payrollEscrowAddress,
+            bundledAbi: getEscrowAbi(),
+            mode: env.ABI_VERIFICATION_MODE,
+          }),
+          verifyAbiCompatibility({
+            provider,
+            label: "WorkAgreement",
+            contractAddress: defaults.workAgreementAddress,
+            bundledAbi: getAgreementAbi(),
+            mode: env.ABI_VERIFICATION_MODE,
+          }),
+        ]);
+
+        // eslint-disable-next-line no-console
+        console.log(escrowResult.message);
+        // eslint-disable-next-line no-console
+        console.log(agreementResult.message);
+
+        if (!escrowResult.match || !agreementResult.match) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[startup] ⚠  ABI verification detected mismatches — event decoding may be unreliable",
+          );
+        }
+      } catch (err) {
+        const message = (err as Error).message;
+        // eslint-disable-next-line no-console
+        console.error(`[startup] ABI verification failed: ${message}`);
+
+        // When mode is "fail" (default), verifyAbiCompatibility throws on mismatch.
+        // Re-throw to abort startup.
+        if (env.ABI_VERIFICATION_MODE === "fail") {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[startup] FATAL: ABI verification failed in fail-fast mode. " +
+              "Set SKIP_ABI_VERIFICATION=true or ABI_VERIFICATION_MODE=warn to bypass.",
+          );
+          process.exit(1);
+        }
+      }
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[startup] ⚠  ABI verification SKIPPED (SKIP_ABI_VERIFICATION=true). " +
+          "Bundled ABIs may not match deployed contracts.",
+      );
+    }
+
     setApplicationReady(true);
     // eslint-disable-next-line no-console
-    console.log("[startup] Database ready — serving traffic");
+    console.log("[startup] Application ready — serving traffic");
   })();
 }

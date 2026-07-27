@@ -4,9 +4,38 @@ Source of truth: [`src/db/schema.ts`](../../src/db/schema.ts)
 
 ## Overview
 
-All tables are defined with [Drizzle ORM](https://orm.drizzle.team/) and targeting PostgreSQL.
+All tables are defined with [Drizzle ORM](https://orm.drizzle.team/) targeting PostgreSQL.
 Migrations live in [`src/db/migrations/`](../../src/db/migrations/) and are applied via
 `pnpm db:migrate` (or `pnpm db:migrate -- --dry-run` for a preview).
+
+---
+
+## Schema Contract
+
+`schema.ts` is the single source of truth for the database shape. Every table,
+constraint, and runtime helper is defined there — no divergent copies exist in
+routes or auth modules. The following invariants are enforced by
+[`schema-consistency.test.ts`](../../src/db/schema-consistency.test.ts):
+
+| # | Invariant | Enforcement |
+|---|-----------|-------------|
+| I1 | **Table inventory** — exactly 10 tables, all listed in `SCHEMA_TABLES`. | Test asserts `Object.keys(schema)` matches `SCHEMA_TABLES`. |
+| I2 | **FK index** — every `*Id` → `*_id` column has a btree `index()` (PKs and documented exclusions like `taxId` excepted). | `schema-fk-indexes.ts` walks every table and asserts. |
+| I3 | **u256 amount CHECK** — every amount column uses the shared `U256_DECIMAL_REGEX`. | Test verifies each named amount CHECK references the regex. |
+| I4 | **Currency CHECK** — every `currency` column uses `'^[A-Z]{3}$'`. | Test verifies `currency_check` constraints. |
+| I5 | **Block-number CHECK** — every `block_number` column has `CHECK >= 0`. | Test verifies each named block-number CHECK. |
+| I6 | **Enum CHECK** — every column with a closed value set has a `CHECK IN` / `CHECK BETWEEN`. | Test asserts each enum-bearing table has at least one non-numeric CHECK. |
+| I7 | **Runtime ↔ DB parity** — every DB CHECK has a runtime helper (e.g. `assertValidU256`). | Test asserts all helpers and regex constants are exported. |
+
+### Adding a new table
+
+1. Define the table in `src/db/schema.ts` with CHECK constraints, FK indexes,
+   and runtime helpers.
+2. Add the table to the `SCHEMA_TABLES` array.
+3. Add a CHECK-constraint test in `src/db/migration.test.ts`.
+4. Write a migration in `src/db/migrations/` and register it in
+   `src/db/migrations/meta/_journal.json`.
+5. Document the table below.
 
 ---
 
