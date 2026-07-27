@@ -154,6 +154,13 @@ describe("accessLogMiddleware", () => {
     expect(consoleInfoSpy).not.toHaveBeenCalled();
   });
 
+  it("should not log /ready requests", async () => {
+    const res = await request(app).get("/ready");
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).not.toHaveBeenCalled();
+  });
+
   it("should log the correct status code for errors", async () => {
     const res = await request(app).get("/error");
     expect(res.status).toBe(500);
