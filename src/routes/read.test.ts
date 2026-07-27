@@ -25,6 +25,8 @@ const { callContract, envMock, mockEscrow, mockAgreement } = vi.hoisted(() => {
   };
 });
 
+const providerCallContract = vi.fn();
+
 vi.mock("../starknet/client.js", () => ({
   provider: { callContract },
   escrowContract: vi.fn(() => mockEscrow),
@@ -53,6 +55,7 @@ import { readRouter, CursorPaginationSchema, BatchReadSchema } from "./read.js";
 function makeApp() {
   const app = express();
   app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
   app.use("/api/v1", readRouter);
   app.use(
     (error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -81,6 +84,17 @@ describe("GET /token/:token/balance/:owner", () => {
       entrypoint: "balance_of",
       calldata: ["0xdef"],
     });
+    const onRetry = vi.fn();
+
+    const result = await withReadRetry(op, { baseDelayMs: 1, maxDelayMs: 5 }, onRetry);
+
+    expect(result).toBe("ok");
+    expect(op).toHaveBeenCalledTimes(2);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    const info = onRetry.mock.calls[0][0] as ReadRetryAttemptInfo;
+    expect(info.attempt).toBe(1);
+    expect(info.maxAttempts).toBe(3);
+    expect(info.retriesSoFar).toBe(1);
   });
 
   it("returns 500 when RPC result is not an array", async () => {
