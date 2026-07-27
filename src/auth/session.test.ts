@@ -1273,4 +1273,93 @@ describe("sessions", () => {
       dbMock.update = originalUpdate;
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Session Authorization & Lifecycle Contract Boundary Tests
+  // ---------------------------------------------------------------------------
+
+  describe("Session Authorization and Lifecycle Contract Boundary", () => {
+    it("authorized session creation succeeds and persists SHA-256 hash", async () => {
+      const result = await createSession("0xContractAuthUser");
+      expect(result.token).toBeDefined();
+      expect(typeof result.token).toBe("string");
+      expect(result.token.length).toBe(48); // 24 bytes in hex
+      expect(result.expires_in_ms).toBe(env.SESSION_TTL_MS);
+
+      const stored = mockState.sessions[0];
+      expect(stored.address).toBe("0xcontractauthuser");
+      expect(stored.tokenHash).not.toBe(result.token);
+      const expectedHash = crypto.createHash("sha256").update(result.token).digest("hex");
+      expect(stored.tokenHash).toBe(expectedHash);
+    });
+
+    it("authorized session validation succeeds for valid address and token", async () => {
+      const { token } = await createSession("0xValidUserContract");
+      const isValid = await requireSession("0xValidUserContract", token);
+      expect(isValid).toBe(true);
+    });
+
+    it("expired sessions cannot be used for authentication or rotation", async () => {
+      const { token, expires_in_ms } = await createSession("0xExpiredContract");
+      vi.advanceTimersByTime(expires_in_ms + 1000);
+
+      // requireSession returns false
+      expect(await requireSession("0xExpiredContract", token)).toBe(false);
+
+      // rotateSession returns ok: false, reason: "invalid"
+      const rotateRes = await rotateSession("0xExpiredContract", token);
+      expect(rotateRes.ok).toBe(false);
+      if (!rotateRes.ok) {
+        expect(rotateRes.reason).toBe("invalid");
+      }
+    });
+
+    it("invalidated sessions cannot be reused for authentication or rotation", async () => {
+      const { token } = await createSession("0xRevokedContract");
+      await revokeSession(token);
+
+      // requireSession rejects
+      expect(await requireSession("0xRevokedContract", token)).toBe(false);
+
+      // rotateSession detects compromise / revocation, revokes family, and returns reason "reused"
+      const rotateRes = await rotateSession("0xRevokedContract", token);
+      expect(rotateRes.ok).toBe(false);
+      if (!rotateRes.ok) {
+        expect(rotateRes.reason).toBe("reused");
+      }
+    });
+
+    it("unauthorized session operations (empty/invalid inputs) are rejected fail-closed", async () => {
+      await expect(createSession("")).rejects.toThrow(TypeError);
+      await expect(createSession("   ")).rejects.toThrow(TypeError);
+
+      expect(await requireSession("", "some-token")).toBe(false);
+      expect(await requireSession("0xuser", "")).toBe(false);
+
+      const rotateRes = await rotateSession("0xuser", "");
+      expect(rotateRes.ok).toBe(false);
+
+      expect(await getSessionByHash("")).toBeNull();
+      expect(await getSessionByHash("   ")).toBeNull();
+    });
+
+    it("failure responses do not expose sensitive session tokens or raw hashes", async () => {
+      const secretToken = "super-secret-raw-token-12345";
+      await requireSession("0xaddress", secretToken);
+      await rotateSession("0xaddress", secretToken);
+
+      const logs = [
+        ...consoleInfoSpy.mock.calls,
+        ...consoleWarnSpy.mock.calls,
+        ...consoleErrorSpy.mock.calls,
+      ];
+
+      for (const [line] of logs) {
+        if (typeof line === "string") {
+          expect(line).not.toContain(secretToken);
+        }
+      }
+    });
+  });
 });
+
