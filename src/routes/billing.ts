@@ -363,13 +363,14 @@ export function withBillingIdempotency(
 }
 
 /** Zod schema for the :profileId path param – non-empty string, max 128 chars */
-const profileIdSchema = z.object({
-  profileId: z
-    .string()
-    .min(1)
-    .max(128)
-    .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash"),
-});
+const profileIdParamSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash");
+
+/** Convenience object schema for optional programmatic reuse. */
+const profileIdSchema = z.object({ profileId: profileIdParamSchema });
 
 /** Middleware: parse + validate :profileId, attach to res.locals */
 function validateProfileId(req: Request, res: Response, next: NextFunction): void {
@@ -456,67 +457,6 @@ function stripSensitive(profile: ProfileRow) {
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
-
-/**
- * GET /api/v1/billing/profiles/:profileId/summary
- * Hardened math to prevent NaN and division by zero.
- */
-billingRouter.get(
-  "/billing/profiles/:profileId/summary",
-  validateProfileId,
-  requireBillingOwner,
-  async (req: Request, res: Response) => {
-    const profileId: string = res.locals.profileId;
-
-    try {
-      const [profile] = await db
-        .select({
-          id: schema.billingProfiles.id,
-          profileType: schema.billingProfiles.profileType,
-          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
-          usedAmount: schema.billingProfiles.usedAmount,
-          currency: schema.billingProfiles.currency,
-        })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
-
-      // Ownership already verified by requireBillingOwner; this is a
-      // safety net for a very unlikely TOCTOU race (profile deleted
-      // between middleware and handler).
-      if (!profile) {
-        fail(res, 404, `Billing profile '${profileId}' not found`);
-        return;
-      }
-
-      // Bounded Math: Ensure values are finite and non-negative
-      const limit = numericString.parse(profile.annualRewardLimit ?? "0");
-      const used = numericString.parse(profile.usedAmount ?? "0");
-      
-      const remaining = Math.max(0, limit - used);
-      
-      // Prevent division by zero and cap progress at 100%
-      const rawPct = limit > 0 ? (used / limit) * 100 : 0;
-      const progressPct = Math.min(100, Math.max(0, Math.round(rawPct * 100) / 100));
-
-      incBillingMetric(BILLING_METRICS.PROFILE_FETCHED);
-      logBillingEvent("info", "billing.profile.fetched", {
-        profileId,
-        paymentMethodCount: paymentMethods.length,
-        invoiceCount: invoices.length,
-      });
-
-      ok(res, {
-        profile: stripSensitive(profile),
-        paymentMethods,
-        invoices,
-      });
-    } catch (err: any) {
-      logBillingFailure("billing.profile.failed", err, { profileId });
-      fail(res, 500, "Failed to fetch billing profile");
-    }
-  },
-);
 
 /**
  * GET /api/v1/billing/profiles/:profileId/general-information

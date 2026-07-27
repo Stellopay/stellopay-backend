@@ -285,8 +285,8 @@ describe("billing routes telemetry", () => {
 
   describe("GET /billing/profiles/:profileId/summary", () => {
     it("success path: returns the computed summary and logs the math that produced it", async () => {
-      // Ownership lookup, then the summary select.
-      queueRows([{ ownerAddress: OWNER }], [profileRow()]);
+      // Ownership check returns the full profile; handler uses res.locals.profile.
+      queueRows([profileRow()]);
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
@@ -325,10 +325,7 @@ describe("billing routes telemetry", () => {
     });
 
     it("boundary path: warns per coerced column when a stored amount is unusable", async () => {
-      queueRows(
-        [{ ownerAddress: OWNER }],
-        [profileRow({ annualRewardLimit: "not-a-number", usedAmount: null })],
-      );
+      queueRows([profileRow({ annualRewardLimit: "not-a-number", usedAmount: null })]);
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
@@ -356,10 +353,7 @@ describe("billing routes telemetry", () => {
     });
 
     it("boundary path: flags an over-limit profile that the response clamps to zero", async () => {
-      queueRows(
-        [{ ownerAddress: OWNER }],
-        [profileRow({ annualRewardLimit: "100.000000", usedAmount: "150.250000" })],
-      );
+      queueRows([profileRow({ annualRewardLimit: "100.000000", usedAmount: "150.250000" })]);
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
@@ -397,18 +391,17 @@ describe("billing routes telemetry", () => {
     });
 
     it("failure path: logs one error event and bumps the shared error counter on a DB failure", async () => {
-      // Ownership check succeeds, then the summary select itself rejects.
-      queueRows([{ ownerAddress: OWNER }]);
-      failSelectOnCall(2, new Error("connection reset"));
+      // The ownership check (the single select) rejects.
+      failSelectOnCall(1, new Error("connection reset"));
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
         .set(authHeaders());
 
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing summary" });
+      expect(res.body).toEqual({ success: false, error: "Failed to verify billing profile ownership" });
 
-      expect(loggedEvents(spies).find((e) => e.event === "billing.summary.failed")).toMatchObject({
+      expect(loggedEvents(spies).find((e) => e.event === "billing.ownership.failed")).toMatchObject({
         level: "error",
         profileId: PROFILE_ID,
         message: "connection reset",
@@ -672,5 +665,86 @@ describe("billing idempotency middleware", () => {
       .join(" ");
     expect(serialized).toContain("billing.idempotency.replayed");
     expect(serialized).not.toContain("secret-key");
+  });
+
+  it("accepts the lowercase idempotency-key header as an alternative", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    await request(app)
+      .post("/billing/test")
+      .set("idempotency-key", "lower-key")
+      .send({ amount: 10 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("idempotency-key", "lower-key")
+      .send({ amount: 10 });
+
+    expect(second.status).toBe(201);
+    expect(getExecutionCount()).toBe(1);
+    expect(counters()[BILLING_METRICS.IDEMPOTENCY_REPLAYED]).toBe(1);
+  });
+
+  it("treats request bodies with different key orderings as the same fingerprint", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "order-key")
+      .send({ b: 2, a: 1 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "order-key")
+      .send({ a: 1, b: 2 });
+
+    expect(second.status).toBe(201);
+    expect(second.body).toEqual({ executionCount: 1, body: { b: 2, a: 1 } });
+    expect(getExecutionCount()).toBe(1);
+    expect(counters()[BILLING_METRICS.IDEMPOTENCY_REPLAYED]).toBe(1);
+  });
+
+  it("expires the cached entry after the TTL and allows re-execution", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "ttl-key")
+      .send({ amount: 10 });
+
+    expect(getExecutionCount()).toBe(1);
+
+    // Travel past the 24-hour TTL.
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "ttl-key")
+      .send({ amount: 10 });
+
+    expect(second.status).toBe(201);
+    // The handler ran again because the cached entry expired.
+    expect(getExecutionCount()).toBe(2);
+  });
+
+  it("isolates cache keys by x-user-address scope", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    const first = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "scope-key")
+      .set("x-user-address", "0xalice")
+      .send({ amount: 10 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "scope-key")
+      .set("x-user-address", "0xbob")
+      .send({ amount: 10 });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    // Both executed because the scopes differ.
+    expect(getExecutionCount()).toBe(2);
   });
 });
