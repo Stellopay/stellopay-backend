@@ -6,34 +6,6 @@ import { env } from "../config.js";
 // PII / sensitive query-param redaction
 // ---------------------------------------------------------------------------
 
-/**
- * Redact sensitive query parameters from a URL string or path.
- */
-function redactQueryParams(originalPath: string): string {
-  try {
-    // URL requires a base, dummy one is fine for parsing relative paths
-    const url = new URL(originalPath, "http://localhost");
-    let redacted = false;
-    for (const [key, value] of url.searchParams.entries()) {
-      if (env.LOG_REDACT_QUERY_PARAMS.includes(key.toLowerCase()) && value) {
-        url.searchParams.set(key, "[REDACTED]");
-        redacted = true;
-      }
-    }
-    return redacted ? url.pathname + url.search : originalPath;
-  } catch {
-    return originalPath;
-  }
-}
-
-/**
- * Structured access log middleware.
- * Records method, path, status code, and duration of requests.
- * Explicitly skips bodies and auth tokens for security.
- *
- * Reads `res.locals.requestId` set by {@link requestIdMiddleware}, which must
- * be mounted before this middleware.
- */
 const REDACTED_PARAM_NAMES = new Set([
   "token",
   "access_token",
@@ -88,8 +60,115 @@ export function redactSensitiveParams(rawUrl: string): string {
 
   if (!modified) return rawUrl;
 
-  return parsed.pathname + "?" + parsed.searchParams.toString();
+  // URLSearchParams encodes brackets as %5B / %5D.
+  // Decode them back so the log entry remains human-readable.
+  return (
+    parsed.pathname +
+    "?" +
+    parsed.searchParams
+      .toString()
+      .replace(/%5B/gi, "[")
+      .replace(/%5D/gi, "]")
+  );
 }
+
+// ---------------------------------------------------------------------------
+// Idempotency — duplicate-request tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum number of recently-seen request IDs to retain in the deduplication
+ * set. When the set exceeds this size the oldest half is evicted to bound
+ * memory usage regardless of TTL.
+ */
+const MAX_SEEN_IDS = 10_000;
+
+/**
+ * Time-to-live (ms) for a deduplication entry. Request IDs older than this
+ * are considered expired and eligible for garbage collection.
+ *
+ * Default 60 s — longer than a typical HTTP timeout + retry window, short
+ * enough that the set does not grow unbounded under steady traffic.
+ */
+const SEEN_ID_TTL_MS = 60_000;
+
+/**
+ * In-process set of recently-seen request IDs for idempotency.
+ *
+ * Retries or duplicate delivery of the same request (same correlation ID)
+ * must not produce duplicate log lines. This bounded, TTL-based set records
+ * every request ID the first time it is observed and silently skips the
+ * access-log emission when the same ID is seen again within the TTL window.
+ *
+ * Design constraints
+ * ------------------
+ * - **Bounded memory**: the set is capped at {@link MAX_SEEN_IDS} entries.
+ *   When the cap is exceeded the oldest half of entries is evicted before
+ *   inserting the new one.
+ * - **TTL-aware lookup**: stale entries are detected on lookup via the
+ *   per-entry timestamp — no timer, no background sweeps. Expired entries
+ *   are treated as "new" and re-recorded.
+ * - **Process-local**: deduplication does not survive a restart. This is
+ *   intentional — the set is a best-effort guard, not a durability guarantee.
+ *   A process restart creates a fresh log stream where duplicates are
+ *   harmless (the old process's logs are distinct).
+ * - **Not shared across instances**: each process maintains its own set.
+ *   Horizon-scaling deployments should handle cross-instance dedup at the
+ *   log-aggregation layer.
+ */
+class SeenRequestIds {
+  /** Map of request ID → insertion time (Date.now() ms). Insertion order is preserved. */
+  private _ids = new Map<string, number>();
+
+  /**
+   * Test whether `id` is new and should be logged.
+   *
+   * Returns `true` when the ID has never been seen or has expired.
+   * Returns `false` when the ID is still fresh — the caller should skip
+   * emitting a log line for this request.
+   *
+   * Side effect: records `id` with the current timestamp on first sighting.
+   * When the map hits its size cap the oldest half is evicted — a single
+   * O(n) compaction that keeps the hot path O(1) under normal load.
+   */
+  isNew(id: string): boolean {
+    const now = Date.now();
+    const existing = this._ids.get(id);
+
+    if (existing !== undefined && now - existing < SEEN_ID_TTL_MS) {
+      // Still fresh — duplicate.
+      return false;
+    }
+
+    // Bounded-memory safety: evict the oldest half when the map is full.
+    // This is the only eviction path — no per-insert full scan.
+    if (this._ids.size >= MAX_SEEN_IDS) {
+      let count = 0;
+      const toRemove = Math.ceil(this._ids.size / 2);
+      for (const key of this._ids.keys()) {
+        if (count >= toRemove) break;
+        this._ids.delete(key);
+        count++;
+      }
+    }
+
+    this._ids.set(id, now);
+    return true;
+  }
+
+  /** Number of entries in the dedup set. Visible for tests. */
+  get size(): number {
+    return this._ids.size;
+  }
+
+  /** Remove all tracked IDs. Visible for tests. */
+  reset(): void {
+    this._ids.clear();
+  }
+}
+
+/** Singleton deduplication store. Exported for test visibility. */
+export const seenRequestIds = new SeenRequestIds();
 
 // ---------------------------------------------------------------------------
 // Log-entry shape
@@ -120,6 +199,10 @@ export interface AccessLogEntry {
  * - Reads the correlation ID from `res.locals.requestId` (set by
  *   {@link requestIdMiddleware}). Falls back to a `crypto.randomUUID()` when
  *   that middleware is not mounted, so every log line always carries a valid ID.
+ * - **Idempotency**: the same request ID is only logged once within the
+ *   deduplication window (60 s). Retries or accidental duplicate delivery
+ *   with the same correlation ID produce at most one log line. See
+ *   {@link SeenRequestIds} for the dedup contract.
  * - Redacts sensitive query-parameter values via {@link redactSensitiveParams}
  *   before writing to the log — wallet addresses, tokens, passwords, etc.
  * - Emits one log line per request on the `res.finish` event, after the status
@@ -154,14 +237,19 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
 
   res.on("finish", () => {
     try {
-      const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
-
       // Prefer the live value (requestIdMiddleware may have run after us),
       // but keep the snapshot as the guaranteed-valid fallback.
       const requestId: string =
         typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
           ? res.locals.requestId
           : snapshotId;
+
+      // Idempotency guard: skip when the same request ID was recently logged.
+      if (!seenRequestIds.isNew(requestId)) {
+        return;
+      }
+
+      const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
 
       const entry: AccessLogEntry = {
         timestamp: new Date().toISOString(),
@@ -186,31 +274,6 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
       // A logging failure must never affect the caller.
       // eslint-disable-next-line no-console
       console.error("[access-log] failed to emit log entry", err);
-    const endHrTime = process.hrtime.bigint();
-    const durationMs = Number(endHrTime - startHrTime) / 1_000_000;
-
-    const logEntry = {
-      timestamp: new Date().toISOString(),
-      level: "info",
-      method: req.method,
-      path: redactQueryParams(req.originalUrl || req.path),
-      status: res.statusCode,
-      duration_ms: Math.round(durationMs * 100) / 100,
-      request_id: res.locals.requestId ?? requestId,
-    };
-
-    if (env.LOG_FORMAT === "json") {
-      // The global logger override will handle JSON formatting and injecting request_id
-      // eslint-disable-next-line no-console
-      console.info({
-        method: logEntry.method,
-        path: logEntry.path,
-        status: logEntry.status,
-        duration_ms: logEntry.duration_ms,
-      });
-    } else {
-      // eslint-disable-next-line no-console
-      console.info(`${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms`);
     }
   });
 

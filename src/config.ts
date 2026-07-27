@@ -153,7 +153,7 @@ export const EnvSchema = z
     ),
   })
   .superRefine((data, ctx) => {
-    const isDev = !data.NODE_ENV || data.NODE_ENV === "development";
+    const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
     const origin = data.CORS_ORIGIN;
 
     if (isDev) {

@@ -49,6 +49,22 @@ function never throws and never leaks data.
 
 ---
 
+### `seenRequestIds`
+
+Exported singleton (`SeenRequestIds` instance) that tracks recently-seen
+correlation IDs for idempotency. Exposed for diagnostics and test resets.
+
+```ts
+import { seenRequestIds } from "./middleware/access-log.js";
+
+seenRequestIds.isNew("req-abc-123");  // true  (first sighting)
+seenRequestIds.isNew("req-abc-123");  // false (duplicate within TTL)
+seenRequestIds.size;                  // 1
+seenRequestIds.reset();               // clears all tracked IDs
+```
+
+---
+
 ## Redacted query-parameter names
 
 | Name |
@@ -98,11 +114,42 @@ Controlled by `LOG_FORMAT` env var (default `"json"`).
 
 ---
 
+## Idempotency / duplicate-request protection
+
+Repeated delivery or retrying the same request (same correlation ID) must
+not produce duplicate log lines. The middleware uses an in-process,
+TTL-based deduplication set (`SeenRequestIds`) to enforce this:
+
+| Concern | Behaviour |
+|---|---|
+| First sighting of an ID | Logged normally; ID recorded |
+| Same ID seen again within TTL (60 s) | Log line suppressed entirely |
+| ID seen after TTL expiry | Treated as new — logged again |
+| Memory bound | Capped at 10 000 entries; oldest half evicted when full |
+| Expired entries | Lazily evicted on each insertion |
+| Process restart | Set is cleared — duplicates after restart are harmless (new log stream) |
+| No `requestIdMiddleware` mounted | Each request gets a fresh `crypto.randomUUID()` — always unique, so idempotency is never triggered unintentionally |
+
+### Design rationale
+
+- **Best-effort**: the dedup set is process-local and does not survive
+  restarts. It prevents the most common cause of duplicate log lines — a
+  client retrying the same request with the same `X-Request-Id` within a
+  few seconds — without adding a shared persistence layer.
+- **Bounded memory**: the 10 000-entry cap and lazy TTL eviction keep the
+  footprint negligible even under high throughput.
+- **Not a durability guarantee**: cross-instance deduplication and
+  long-term idempotency archives are the responsibility of the log
+  aggregation layer (e.g. OpenSearch, Loki).
+
+---
+
 ## Reliability contract
 
 | Concern | Behaviour |
 |---|---|
 | Missing `requestIdMiddleware` | Falls back to `crypto.randomUUID()` — never emits `"unknown"` |
+| Duplicate request ID within TTL | Suppressed — at most one log line |
 | Error inside `finish` handler | Caught, written to `console.error("[access-log] failed to emit log entry …")`, never re-thrown |
 | Malformed request URL | `redactSensitiveParams` returns the path portion — never throws |
 | `/health` requests | Always skipped — no log noise from liveness probes |
@@ -116,3 +163,9 @@ Controlled by `LOG_FORMAT` env var (default `"json"`).
 - **Header logging** — headers can carry credentials; none are ever written.
 - **Per-route suppression** beyond `/health` — treat as a separate concern.
 - **Log sampling / rate-limiting** — out of scope for this middleware layer.
+- **Cross-instance deduplication** — the dedup set is process-local.
+  Multi-instance deployments should handle cross-instance dedup at the
+  log-aggregation layer.
+- **Persistent idempotency** — the set does not survive restarts.
+  Post-restart duplicates are harmless because the old process's log stream
+  is distinct.

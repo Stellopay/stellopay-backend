@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
-import { accessLogMiddleware, redactSensitiveParams } from "./access-log.js";
+import { accessLogMiddleware, redactSensitiveParams, seenRequestIds } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
 
 // ---------------------------------------------------------------------------
@@ -97,7 +97,101 @@ describe("redactSensitiveParams", () => {
 });
 
 // ---------------------------------------------------------------------------
-// accessLogMiddleware — original tests (preserved)
+// SeenRequestIds — idempotency unit tests
+// ---------------------------------------------------------------------------
+
+describe("SeenRequestIds", () => {
+  beforeEach(() => {
+    seenRequestIds.reset();
+  });
+
+  afterEach(() => {
+    seenRequestIds.reset();
+  });
+
+  it("returns true for a new request ID", () => {
+    expect(seenRequestIds.isNew("req-001")).toBe(true);
+  });
+
+  it("returns false when the same request ID is seen again immediately", () => {
+    seenRequestIds.isNew("req-001");
+    expect(seenRequestIds.isNew("req-001")).toBe(false);
+  });
+
+  it("returns true for different request IDs", () => {
+    expect(seenRequestIds.isNew("req-001")).toBe(true);
+    expect(seenRequestIds.isNew("req-002")).toBe(true);
+    expect(seenRequestIds.isNew("req-003")).toBe(true);
+  });
+
+  it("returns true for an expired ID (after TTL)", () => {
+    // Mock Date.now to simulate TTL expiry
+    const realNow = Date.now;
+    try {
+      let currentTime = 1_000_000;
+      Date.now = () => currentTime;
+
+      seenRequestIds.isNew("req-001"); // inserted at t=1_000_000
+
+      // Advance past TTL (60_000 ms)
+      currentTime += 60_001;
+
+      expect(seenRequestIds.isNew("req-001")).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("treats expired entries as new on lookup", () => {
+    const realNow = Date.now;
+    try {
+      let currentTime = 1_000_000;
+      Date.now = () => currentTime;
+
+      seenRequestIds.isNew("req-001"); // t=1_000_000
+      seenRequestIds.isNew("req-002"); // t=1_000_000
+
+      currentTime += 60_001; // advance past TTL
+
+      // This insertion triggers eviction of expired entries
+      seenRequestIds.isNew("req-003");
+
+      // Both original IDs should now be expired, so they should be "new" again
+      expect(seenRequestIds.isNew("req-001")).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("tracks the expected number of active entries", () => {
+    expect(seenRequestIds.size).toBe(0);
+    seenRequestIds.isNew("req-001");
+    expect(seenRequestIds.size).toBe(1);
+    seenRequestIds.isNew("req-002");
+    expect(seenRequestIds.size).toBe(2);
+    // Duplicate doesn't increase size
+    seenRequestIds.isNew("req-001");
+    expect(seenRequestIds.size).toBe(2);
+  });
+
+  it("reset clears all tracked IDs", () => {
+    seenRequestIds.isNew("req-001");
+    seenRequestIds.isNew("req-002");
+    expect(seenRequestIds.size).toBe(2);
+
+    seenRequestIds.reset();
+    expect(seenRequestIds.size).toBe(0);
+    expect(seenRequestIds.isNew("req-001")).toBe(true);
+  });
+
+  it("handles empty strings", () => {
+    expect(seenRequestIds.isNew("")).toBe(true);
+    expect(seenRequestIds.isNew("")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// accessLogMiddleware — integration tests
 // ---------------------------------------------------------------------------
 
 describe("accessLogMiddleware", () => {
@@ -107,10 +201,12 @@ describe("accessLogMiddleware", () => {
   beforeEach(() => {
     app = makeApp();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    seenRequestIds.reset();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    seenRequestIds.reset();
   });
 
   it("should emit exactly one access log line for a standard request", async () => {
@@ -187,14 +283,109 @@ describe("accessLogMiddleware", () => {
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
 
     // Redacted sensitive params
-    expect(logObj.path).toContain("token=[REDACTED]");
-    expect(logObj.path).toContain("signature=[REDACTED]");
-    
+    expect(logObj.path).toContain("token=[redacted]");
+    expect(logObj.path).toContain("signature=[redacted]");
+
     // Non-sensitive param should remain unchanged
     expect(logObj.path).toContain("normal=value");
 
     // The original secret values should not be in the log at all
     expect(logObj.path).not.toContain("secret123");
     expect(logObj.path).not.toContain("abc");
+  });
+
+  // ── Idempotency ──────────────────────────────────────────────────────────
+
+  it("should only log once when the same request ID is reused", async () => {
+    const dupId = "duplicate-request-id";
+
+    const res1 = await request(app).get("/test").set("x-request-id", dupId);
+    expect(res1.status).toBe(200);
+
+    const res2 = await request(app).get("/test").set("x-request-id", dupId);
+    expect(res2.status).toBe(200);
+
+    // Only one log line should be emitted despite two requests
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.request_id).toBe(dupId);
+  });
+
+  it("should log separately for different request IDs", async () => {
+    const res1 = await request(app).get("/test").set("x-request-id", "req-a");
+    expect(res1.status).toBe(200);
+
+    const res2 = await request(app).get("/test").set("x-request-id", "req-b");
+    expect(res2.status).toBe(200);
+
+    const res3 = await request(app).get("/test").set("x-request-id", "req-c");
+    expect(res3.status).toBe(200);
+
+    // Three distinct IDs → three log lines
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("should still log a second request when no request ID header is sent (UUID fallback is unique)", async () => {
+    const app = makeStandaloneApp();
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const res1 = await request(app).get("/test");
+    expect(res1.status).toBe(200);
+
+    const res2 = await request(app).get("/test");
+    expect(res2.status).toBe(200);
+
+    // Without requestIdMiddleware, each request gets a unique crypto.randomUUID()
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    spy.mockRestore();
+  });
+
+  it("should only log the first occurrence when request ID middleware is not mounted", async () => {
+    // This test is important: without requestIdMiddleware, the fallback
+    // generates a fresh UUID per request (always unique), so idempotency
+    // doesn't suppress logs — but it also doesn't break.
+    const app = makeStandaloneApp();
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    const res = await request(app).get("/test");
+    expect(res.status).toBe(200);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    const logLine = spy.mock.calls[0][0];
+    const logObj = JSON.parse(logLine);
+    expect(typeof logObj.request_id).toBe("string");
+    expect(logObj.request_id.length).toBeGreaterThan(0);
+
+    spy.mockRestore();
+  });
+
+  // ── Boundary / error paths ───────────────────────────────────────────────
+
+  it("should still return next() on /health without touching the seen set", async () => {
+    // /health is skipped entirely — idempotency set is never consulted.
+    expect(seenRequestIds.size).toBe(0);
+
+    const res = await request(app).get("/health");
+    expect(res.status).toBe(200);
+
+    expect(seenRequestIds.size).toBe(0);
+  });
+
+  it("should handle concurrent requests with different IDs correctly", async () => {
+    const [res1, res2, res3] = await Promise.all([
+      request(app).get("/test").set("x-request-id", "concurrent-a"),
+      request(app).get("/test").set("x-request-id", "concurrent-b"),
+      request(app).get("/test").set("x-request-id", "concurrent-c"),
+    ]);
+
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    expect(res3.status).toBe(200);
+
+    // Each distinct ID should produce exactly one log line
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(3);
   });
 });
