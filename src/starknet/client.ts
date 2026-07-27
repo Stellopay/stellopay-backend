@@ -1,5 +1,5 @@
 import { Contract, RpcProvider } from "starknet";
-import { abiPaths, starknetRpcUrls } from "../config.js";
+import { abiPaths, circuitBreakerConfig, starknetRpcUrls } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "./abi.js";
 import {
   incStarknetMetric,
@@ -125,6 +125,11 @@ const RETRYABLE_METHODS = new Set<string>([
 const MAX_FAILOVER_ATTEMPTS = starknetRpcUrls.length;
 
 const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
+
+/** Circuit breaker per RPC endpoint, aligned with `rpcProviders` by index. */
+const circuitBreakers = starknetRpcUrls.map(
+  (url) => new EndpointCircuitBreaker(url, circuitBreakerConfig),
+);
 
 /** Index into rpcProviders for the last known healthy endpoint. */
 let healthyRpcIndex = 0;
@@ -280,6 +285,10 @@ async function invokeWithFailover(
 
       return result;
     } catch (err) {
+      // Don't count CircuitOpenError as a new failure against the breaker
+      if (!(err instanceof CircuitOpenError)) {
+        breaker.recordFailure();
+      }
       lastError = err;
       incStarknetMetric(STARKNET_METRICS.RPC_ERRORS);
       logStarknetEvent("warn", "starknet.rpc.error", {
@@ -362,6 +371,8 @@ export class ChainIdMismatchError extends Error {
 /**
  * Starknet RPC client with automatic failover across configured endpoints.
  * Subsequent calls reuse the last healthy endpoint until it fails again.
+ * Each endpoint is guarded by a circuit breaker that opens after repeated
+ * failures and half-opens after a configurable cooldown period.
  *
  * **Security boundary — method classification**: only methods in
  * `RETRYABLE_METHODS` (read-only queries) are eligible for automatic failover.
@@ -597,4 +608,21 @@ export function resetRpcFailoverForTests(): void {
   healthyRpcIndex = 0;
   cachedHealthyIndex = -1;
   cachedFailoverOrder = undefined;
+}
+
+/**
+ * Resets all circuit breakers to their initial CLOSED state. For tests only.
+ */
+export function resetCircuitBreakersForTests(): void {
+  for (const breaker of circuitBreakers) {
+    breaker.reset();
+  }
+}
+
+/**
+ * Returns a read-only diagnostic snapshot of all circuit breakers.
+ * Safe to include in health-check and diagnostics responses.
+ */
+export function getCircuitBreakerSnapshots(): CircuitBreakerSnapshot[] {
+  return circuitBreakers.map(snapshotCircuitBreaker);
 }

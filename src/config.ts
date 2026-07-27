@@ -163,6 +163,39 @@ export const EnvSchema = z
         .map((a) => a.trim().toLowerCase())
         .filter((a) => a.length > 0),
     ),
+
+  // Circuit breaker configuration for Starknet RPC calls
+  // Failure threshold: number of failures before circuit opens - default 5
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(5),
+  // Success threshold: number of successes needed to close circuit from half-open - default 2
+  CIRCUIT_BREAKER_SUCCESS_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(2),
+  // Cooldown period before attempting to half-open circuit (milliseconds) - default 30 seconds
+  CIRCUIT_BREAKER_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(30_000),
+  // Time window for counting failures (milliseconds) - default 60 seconds
+  CIRCUIT_BREAKER_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(60_000),
+});
+
+export const env = EnvSchema.parse(process.env);
   })
   .superRefine((data, ctx) => {
     const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
@@ -233,6 +266,14 @@ if (process.env.NODE_ENV === "production") {
     );
   }
 }
+
+/** Circuit breaker configuration for Starknet RPC calls. */
+export const circuitBreakerConfig = {
+  failureThreshold: env.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+  successThreshold: env.CIRCUIT_BREAKER_SUCCESS_THRESHOLD,
+  cooldownMs: env.CIRCUIT_BREAKER_COOLDOWN_MS,
+  windowMs: env.CIRCUIT_BREAKER_WINDOW_MS,
+};
 
 export const defaults = {
   payrollEscrowAddress:

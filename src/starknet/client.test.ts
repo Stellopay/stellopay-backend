@@ -56,6 +56,7 @@ import {
   incStarknetMetric,
   STARKNET_METRICS,
 } from "./client.js";
+import { CircuitOpenError } from "./circuit-breaker.js";
 
 const VITEST_POSTGRES =
   process.env.POSTGRES_CONNECTION_STRING ??
@@ -75,6 +76,7 @@ describe("Starknet Client Cache", () => {
 
   beforeEach(() => {
     resetRpcFailoverForTests();
+    resetCircuitBreakersForTests();
     clearNetworkCache();
 
     getChainIdSpy = vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");

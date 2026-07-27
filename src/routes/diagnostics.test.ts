@@ -43,6 +43,7 @@ import {
 } from "./diagnostics.js";
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
 // Use valid-hex addresses: the auth middleware now compares the
 // principal against the admin allowlist through normalizeStarknetAddress,
@@ -577,7 +578,10 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.summary.latestBlock).toBe("100");
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
+    expect(res.body.circuitBreakers).toHaveLength(1);
+    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
     expect(getPoolStats).toHaveBeenCalledOnce();
+    expect(getCircuitBreakerSnapshots).toHaveBeenCalledOnce();
   });
 
   it("handles case-insensitive admin address matching", async () => {

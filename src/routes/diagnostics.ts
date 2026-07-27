@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats } from "../db/index.js";
 import { sql } from "drizzle-orm";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
 export const diagnosticsRouter = Router();
 
@@ -210,6 +211,7 @@ export async function fetchDiagnosticsData(
     tableCounts: summaryRow,
     latestEvents: recentEvents,
     poolStats: getPoolStats(),
+    circuitBreakers: getCircuitBreakerSnapshots(),
     summary: {
       totalAgreementEvents: summaryRow.agreement_events_count ?? 0,
       totalEscrowEvents: summaryRow.escrow_events_count ?? 0,

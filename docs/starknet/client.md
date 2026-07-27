@@ -150,6 +150,26 @@ modifying it.
 - `invokeWithFailover()` tries endpoints in failover order
 - `healthyRpcIndex` tracks the last working endpoint
 - Failed-over events log a `console.warn` with the old and new URL
+
+## Circuit Breaker
+
+Each RPC endpoint is protected by an independent circuit breaker that composes with the failover logic. The circuit breaker prevents repeated wasted calls to a struggling-but-not-dead endpoint.
+
+- When failures cross the threshold, the circuit **opens** and calls short-circuit immediately
+- After a cooldown period, the circuit transitions to **HALF_OPEN** and allows a probe call
+- Two consecutive successes **close** the circuit and return the endpoint to normal rotation
+- A failing probe immediately **reopens** the circuit
+
+See [circuit-breaker.md](./circuit-breaker.md) for full documentation.
+
+### Configuration
+
+| Env Var | Default | Description |
+|---|---|---|
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Failures in window before opening |
+| `CIRCUIT_BREAKER_SUCCESS_THRESHOLD` | `2` | Consecutive successes to close from HALF_OPEN |
+| `CIRCUIT_BREAKER_COOLDOWN_MS` | `30000` | Cooldown before attempting recovery |
+| `CIRCUIT_BREAKER_WINDOW_MS` | `60000` | Rolling window for failure counting |
 - Each retry receives a fresh copy of the RPC arguments so pagination and batching payloads are not mutated by an earlier failed attempt
 - The helper is intentionally scoped to plain JSON-like payloads used by current callers; custom class instances and cyclic structures are out of scope
 
