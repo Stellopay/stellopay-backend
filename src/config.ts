@@ -193,10 +193,7 @@ export const EnvSchema = z
     .positive()
     .optional()
     .default(60_000),
-});
-
-export const env = EnvSchema.parse(process.env);
-  })
+})
   .superRefine((data, ctx) => {
     const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
     const origin = data.CORS_ORIGIN;
@@ -215,22 +212,31 @@ export const env = EnvSchema.parse(process.env);
           `CORS_ORIGIN must be set to an explicit comma-separated allowlist of origins ` +
           `in non-development environments (NODE_ENV=${data.NODE_ENV}). ` +
           `A wildcard ('*') is not permitted outside of development because it ` +
-          `cannot be combined with credentials and exposes authenticated endpoints ` +
-          `to cross-origin requests from any domain.`,
+          `cannot be combined with credentials and exposes authenticated endpoints.`,
       });
     }
-  });
+});
 
-/** Resolve the effective CORS_ORIGIN value, applying the development wildcard default. */
-const _rawEnv = EnvSchema.parse(process.env);
+// Parse and validate environment variables using the Zod schema.
+const _parseResult = EnvSchema.safeParse(process.env);
+if (!_parseResult.success) {
+  const issues = _parseResult.error.issues
+    .map((i) => `${i.path.join('.')}: ${i.message}`)
+    .join('; ');
+  // Throw without leaking raw values.
+  throw new Error(`Configuration validation error: ${issues}`);
+}
+export const env = _parseResult.data;
 
-export const env = {
-  ..._rawEnv,
-  // Apply development default: when CORS_ORIGIN is unset in development, fall back to "*".
-  CORS_ORIGIN:
-    _rawEnv.CORS_ORIGIN ??
-    (_rawEnv.NODE_ENV === "development" || !_rawEnv.NODE_ENV ? "*" : ""),
-};
+/** Configuration object with sensitive values redacted for logging. */
+export const redactedConfig = Object.fromEntries(
+  Object.entries(env).map(([key, value]) => [
+    key,
+    key.toLowerCase().includes("password") || key.toLowerCase().includes("secret")
+      ? "[REDACTED]"
+      : value,
+  ])
+);
 
 /** Ordered Starknet JSON-RPC endpoints (primary first) from STARKNET_RPC_URL. */
 export const starknetRpcUrls = parseStarknetRpcUrls(env.STARKNET_RPC_URL);
