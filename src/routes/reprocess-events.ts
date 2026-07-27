@@ -171,7 +171,7 @@ reprocessEventsRouter.post(
     } finally {
       releaseReprocessLock();
     }
-  },
+  }),
 );
 
 /** POST /reprocess-events/batch */
@@ -251,7 +251,7 @@ reprocessEventsRouter.post(
     } finally {
       releaseReprocessLock();
     }
-  },
+  }),
 );
 
 /** POST /reprocess-events/status-changes */
@@ -368,7 +368,7 @@ reprocessEventsRouter.post(
     } finally {
       releaseReprocessLock();
     }
-  },
+  }),
 );
 
 export default reprocessEventsRouter;

@@ -395,7 +395,7 @@ async function requireBillingOwner(req: Request, res: Response, next: NextFuncti
 
   try {
     const [row] = await db
-      .select({ ownerAddress: schema.billingProfiles.ownerAddress })
+      .select()
       .from(schema.billingProfiles)
       .where(eq(schema.billingProfiles.id, profileId))
       .limit(1);
@@ -421,6 +421,7 @@ async function requireBillingOwner(req: Request, res: Response, next: NextFuncti
       return;
     }
 
+    res.locals.profile = row;
     next();
   } catch (err: any) {
     logBillingFailure("billing.ownership.failed", err, { profileId, callerAddress });
@@ -531,11 +532,7 @@ billingRouter.get(
     const profileId: string = res.locals.profileId;
 
     try {
-      const [profile] = await db
-        .select()
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
+      const profile = res.locals.profile;
 
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);
@@ -671,17 +668,7 @@ billingRouter.get(
     const startedAt = Date.now();
 
     try {
-      const [profile] = await db
-        .select({
-          id: schema.billingProfiles.id,
-          profileType: schema.billingProfiles.profileType,
-          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
-          usedAmount: schema.billingProfiles.usedAmount,
-          currency: schema.billingProfiles.currency,
-        })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
+      const profile = res.locals.profile;
 
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);

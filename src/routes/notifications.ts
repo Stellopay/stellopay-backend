@@ -40,8 +40,22 @@ export function getDefaultNotificationPreferences(): NotificationPreferences {
  * payload so the unread counter stays in lockstep with the helper's
  * semantics.
  */
-export function calculateUnreadCount(notifications: Array<{ read: boolean }>): number {
-  return notifications.filter((n) => !n.read).length;
+export function calculateUnreadCount(notifications: Array<{ id?: string | number, read: boolean }>): number {
+  const uniqueIds = new Set<string | number>();
+  let count = 0;
+  for (const n of notifications) {
+    if (!n.read) {
+      if (n.id !== undefined) {
+        if (!uniqueIds.has(n.id)) {
+          uniqueIds.add(n.id);
+          count++;
+        }
+      } else {
+        count++;
+      }
+    }
+  }
+  return count;
 }
 
 /**

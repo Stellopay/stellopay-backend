@@ -1,95 +1,40 @@
 # Billing Routes
 
-> **Module:** `src/routes/billing.ts`  
-> **Base path:** `/api/v1/billing`  
-> **Feature flag:** `BILLING_ENABLED`
+## Overview
 
-## Security model
+The billing routes are located under `/api/v1/billing/profiles/:profileId`. They are responsible for retrieving billing profile information, payment methods, invoice history, and reward-limit summaries.
 
-Every billing route enforces three independent gates in order:
+All endpoints require:
+1. `BILLING_ENABLED=true` in the environment.
+2. A valid authentication session (see `src/auth/middleware.ts`).
+3. The authenticated user's wallet address must match the billing profile's `ownerAddress`.
 
-1. **Feature flag (`BILLING_ENABLED`)** — Must be `true`. Returns `501 Not Implemented` with
-   a descriptive message when disabled.
+## Contract and Performance
 
-2. **Authentication (`requireAuth`)** — Requires a valid session. The caller must supply
-   `x-user-address` and `Authorization: Bearer <session-token>` headers. Missing or invalid
-   credentials return `401 Unauthorized`.
+The primary resource is the `BillingProfile`, loaded during authorization by the `requireBillingOwner` middleware.
 
-3. **Authorization (ownership)** — The route verifies that the authenticated wallet address
-   matches the billing profile's `ownerAddress`. When the profile does not exist **or** the
-   caller is not the owner, the route returns `404 Not Found`. These two cases are
-   **intentionally indistinguishable** — an attacker probing profile IDs cannot tell whether
-   a profile exists or belongs to someone else.
-
-## Response envelope
-
-All responses use a uniform JSON envelope:
-
-```json
-{
-  "success": true,
-  "data": { … }
-}
-```
-
-```json
-{
-  "success": false,
-  "error": "Human-readable message"
-}
-```
-
-## Sensitive fields
-
-The columns `taxId` and `dateOfBirth` are stored in the database but **never included** in
-any API response. They must only be accessed through separately-authorised, audited internal
-processes. The `stripSensitive()` helper enforces this contract for every route.
+- The `requireBillingOwner` middleware verifies ownership by loading the entire `BillingProfile` from the database.
+- If ownership is verified, the profile is securely attached to `res.locals.profile`.
+- Route handlers MUST use `res.locals.profile` rather than querying the database again for the profile, to avoid repeated I/O and unnecessary computation.
 
 ## Endpoints
 
-### `GET /billing/profiles/:profileId`
+- **GET `/billing/profiles/:profileId`**
+  Returns the full profile, including payment methods and invoices.
 
-Returns the full billing profile together with its payment methods and invoices.
+- **GET `/billing/profiles/:profileId/general-information`**
+  Returns identity fields, with sensitive information stripped.
 
-**Path parameters:** `profileId` — alphanumeric + dash, 1–128 characters.
+- **GET `/billing/profiles/:profileId/payment-methods`**
+  Returns the list of payment methods for the profile.
 
-**Response (`200`):**
+- **GET `/billing/profiles/:profileId/invoices`**
+  Returns the invoice history.
 
-```json
-{
-  "success": true,
-  "data": {
-    "profile": {
-      "id": "profile-001",
-      "ownerAddress": "0xabc…",
-      "profileType": "Individual",
-      "firstName": "Alice",
-      "lastName": "Example",
-      "email": "alice@example.com",
-      "phone": "+1-555-0100",
-      "street": "123 Main St",
-      "city": "Metropolis",
-      "state": "NY",
-      "zipCode": "10001",
-      "country": "US",
-      "taxResidency": "US",
-      "companyName": null,
-      "vatNumber": null,
-      "businessType": null,
-      "occupation": "Engineer",
-      "website": null,
-      "notes": null,
-      "createdAt": "2025-01-01T00:00:00.000Z",
-      "updatedAt": "2025-06-01T00:00:00.000Z"
-    },
-    "paymentMethods": [ … ],
-    "invoices": [ … ]
-  }
-}
-```
+- **GET `/billing/profiles/:profileId/summary`**
+  Returns the reward-limit and spend summary, utilizing shared billing math logic for numeric fields (`parseSafeAmount`).
 
-> `taxId` and `dateOfBirth` are stripped from `profile`. There is no way to retrieve them
-> through this endpoint.
+## Billing Math and Idempotency
 
 ---
 
