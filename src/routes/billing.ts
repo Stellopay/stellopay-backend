@@ -197,12 +197,10 @@ function logBillingFailure(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/** Uniform success envelope */
 function ok<T>(res: Response, data: T, status = 200): void {
   res.status(status).json({ success: true, data });
 }
 
-/** Uniform error envelope */
 function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
 }
@@ -375,24 +373,17 @@ const profileIdSchema = z.object({
 
 /** Middleware: parse + validate :profileId, attach to res.locals */
 function validateProfileId(req: Request, res: Response, next: NextFunction): void {
-  const parsed = profileIdSchema.safeParse(req.params);
+  const parsed = profileIdParamSchema.safeParse(req.params.profileId);
   if (!parsed.success) {
-    fail(res, 400, "Invalid profileId: " + parsed.error.issues.map((i) => i.message).join(", "));
-    return;
+    return fail(res, 400, "Invalid profileId: alphanumeric and dashes only");
   }
-  res.locals.profileId = parsed.data.profileId;
+  res.locals.profileId = parsed.data;
   next();
 }
 
-/** Middleware: gate all billing routes behind the BILLING_ENABLED flag */
 function requireBillingEnabled(_req: Request, res: Response, next: NextFunction): void {
   if (!env.BILLING_ENABLED) {
-    fail(
-      res,
-      501,
-      "Billing is not yet enabled on this instance. Set BILLING_ENABLED=true to activate.",
-    );
-    return;
+    return fail(res, 501, "Billing is not yet enabled.");
   }
   next();
 }
@@ -454,15 +445,9 @@ billingRouter.use("/billing", (req, res, next) => {
   })(req, res, next);
 });
 
-// ---------------------------------------------------------------------------
-// Strip sensitive fields before returning a profile row to the client.
-// taxId and dateOfBirth are never included in API responses.
-// ---------------------------------------------------------------------------
 type ProfileRow = typeof schema.billingProfiles.$inferSelect;
-type SafeProfile = Omit<ProfileRow, "taxId" | "dateOfBirth">;
 
-function stripSensitive(profile: ProfileRow): SafeProfile {
-  // Destructure to drop the sensitive fields; the rest is safe to return.
+function stripSensitive(profile: ProfileRow) {
   const { taxId: _taxId, dateOfBirth: _dob, ...safe } = profile;
   return safe;
 }
@@ -472,13 +457,11 @@ function stripSensitive(profile: ProfileRow): SafeProfile {
 // ---------------------------------------------------------------------------
 
 /**
- * GET /api/v1/billing/profiles/:profileId
- *
- * Returns the full billing profile (general info + payment methods + invoices)
- * in a single response for clients that need everything at once.
+ * GET /api/v1/billing/profiles/:profileId/summary
+ * Hardened math to prevent NaN and division by zero.
  */
 billingRouter.get(
-  "/billing/profiles/:profileId",
+  "/billing/profiles/:profileId/summary",
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
@@ -486,7 +469,13 @@ billingRouter.get(
 
     try {
       const [profile] = await db
-        .select()
+        .select({
+          id: schema.billingProfiles.id,
+          profileType: schema.billingProfiles.profileType,
+          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
+          usedAmount: schema.billingProfiles.usedAmount,
+          currency: schema.billingProfiles.currency,
+        })
         .from(schema.billingProfiles)
         .where(eq(schema.billingProfiles.id, profileId))
         .limit(1);
@@ -499,16 +488,15 @@ billingRouter.get(
         return;
       }
 
-      const [paymentMethods, invoices] = await Promise.all([
-        db
-          .select()
-          .from(schema.billingPaymentMethods)
-          .where(eq(schema.billingPaymentMethods.profileId, profileId)),
-        db
-          .select()
-          .from(schema.billingInvoices)
-          .where(eq(schema.billingInvoices.profileId, profileId)),
-      ]);
+      // Bounded Math: Ensure values are finite and non-negative
+      const limit = numericString.parse(profile.annualRewardLimit ?? "0");
+      const used = numericString.parse(profile.usedAmount ?? "0");
+      
+      const remaining = Math.max(0, limit - used);
+      
+      // Prevent division by zero and cap progress at 100%
+      const rawPct = limit > 0 ? (used / limit) * 100 : 0;
+      const progressPct = Math.min(100, Math.max(0, Math.round(rawPct * 100) / 100));
 
       incBillingMetric(BILLING_METRICS.PROFILE_FETCHED);
       logBillingEvent("info", "billing.profile.fetched", {
@@ -613,8 +601,7 @@ billingRouter.get(
 
 /**
  * GET /api/v1/billing/profiles/:profileId/invoices
- *
- * Returns the invoice history for the profile.
+ * Hardened to validate every invoice row.
  */
 billingRouter.get(
   "/billing/profiles/:profileId/invoices",
