@@ -34,7 +34,7 @@ function makeApp() {
     next(err);
   });
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({
       error: err.message,

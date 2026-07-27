@@ -630,6 +630,24 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.body.results).toHaveLength(1);
   });
 
+  it("process_batch returns 400 with a clean error for malformed hashes", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, "not-a-tx-hash"] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 2 });
+    errorSpy.mockRestore();
+  });
+
   it("process_tx returns 400 with a clean error for a malformed hash", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     env.LOG_FORMAT = "json";

@@ -35,7 +35,7 @@
 
 import express, { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
 import { requireAuth } from "../auth/middleware.js";
@@ -192,6 +192,52 @@ function logBillingFailure(
     message: err instanceof Error ? err.message : String(err),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Pagination helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Default page size when `limit` is not provided by the caller.
+ * When omitted entirely the route returns all rows (backward-compatible).
+ */
+export const DEFAULT_INVOICE_PAGE_LIMIT = 50;
+
+/**
+ * Hard upper bound on a single page to prevent runaway queries even with a
+ * misconfigured client. Matches the column-scale contract for row counts.
+ */
+export const MAX_INVOICE_PAGE_LIMIT = 200;
+
+/**
+ * Zod schema for the optional pagination query parameters on the invoices
+ * endpoint. Both fields are optional so callers who omit them see the
+ * original unpaginated behaviour.
+ */
+const invoicePaginationSchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(MAX_INVOICE_PAGE_LIMIT).optional(),
+    offset: z.coerce.number().int().min(0).optional(),
+  })
+  .strict();
+
+type InvoicePagination = z.infer<typeof invoicePaginationSchema>;
+
+/**
+ * Checks whether the caller supplied at least one pagination parameter.
+ * When neither is present the invoices endpoint returns all rows with the
+ * original response envelope (backward compatible). When either is present
+ * the response gains a `pagination` block with `{ limit, offset, hasMore }`.
+ */
+function hasActivePagination(query: Record<string, unknown>): boolean {
+  return "limit" in query || "offset" in query;
+}
+
+export type InvoicePaginationMeta = {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -380,6 +426,9 @@ const profileIdParamSchema = z
   .min(1, "profileId is required")
   .max(128, "profileId must be at most 128 characters")
   .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash");
+
+/** Convenience object schema for optional programmatic reuse. */
+const profileIdSchema = z.object({ profileId: profileIdParamSchema });
 
 /**
  * Middleware: parse + validate the `:profileId` path param.
@@ -691,6 +740,9 @@ billingRouter.get(
  * through the safe `parseBillingAmount` helper so malformed amounts never
  * propagate NaN into the aggregate telemetry.
  *
+ * Supports optional pagination via `limit` and `offset` query parameters.
+ * When both are omitted the response envelope is unchanged (backward-compatible).
+ *
  * Contract:
  * - Queries the `billingInvoices` table filtered by `profileId`.
  * - The response body contains the raw rows unchanged — existing callers see
@@ -703,6 +755,7 @@ billingRouter.get(
  * - The aggregate normalises invoice statuses to lowercase; unrecognised or
  *   null statuses are bucketed as `"unknown"` rather than widening the log
  *   key space with arbitrary values.
+ * - Hardened to validate every invoice row.
  * - On DB failure: responds with HTTP 500.
  *
  * Response shape (200):
@@ -716,14 +769,40 @@ billingRouter.get(
     const profileId: string = res.locals.profileId;
     const startedAt = Date.now();
 
+    // Parse optional pagination params (fail-fast on malformed values).
+    const parsedQuery = invoicePaginationSchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      fail(res, 400, "Invalid pagination parameters: limit must be 1–200, offset must be 0 or greater");
+      return;
+    }
+    const { limit, offset } = parsedQuery.data;
+    const activePagination = hasActivePagination(req.query);
+
     try {
-      const invoices = await db
+      // Fetch with deterministic ordering. In the paginated case we ask for
+      // one extra row so we can compute hasMore without a second COUNT query.
+      const fetchLimit = limit !== undefined ? limit + 1 : undefined;
+      let query = db
         .select()
         .from(schema.billingInvoices)
-        .where(eq(schema.billingInvoices.profileId, profileId));
+        .where(eq(schema.billingInvoices.profileId, profileId))
+        .orderBy(desc(schema.billingInvoices.createdAt), desc(schema.billingInvoices.id));
+
+      if (fetchLimit !== undefined) {
+        query = query.limit(fetchLimit);
+      }
+      if (offset !== undefined && offset > 0) {
+        query = query.offset(offset);
+      }
+
+      const fetchedRows = await query;
+
+      // Slice the extra probe row away when paginating.
+      const hasMore = limit !== undefined && fetchedRows.length > limit;
+      const invoices = hasMore ? fetchedRows.slice(0, limit) : fetchedRows;
 
       // Read-side aggregate for telemetry only — the response body is
-      // unchanged, so existing callers see exactly the same shape.
+      // unchanged for non-paginated callers.
       const totals = summarizeInvoices(invoices);
       const durationMs = Date.now() - startedAt;
 
@@ -749,9 +828,18 @@ billingRouter.get(
         statusCounts: totals.statusCounts,
         coercedCount: totals.coercedCount,
         durationMs,
+        ...(activePagination ? { pageLimit: limit ?? DEFAULT_INVOICE_PAGE_LIMIT, pageOffset: offset ?? 0, hasMore } : {}),
       });
 
-      ok(res, { profileId, invoices });
+      const data: Record<string, unknown> = { profileId, invoices };
+      if (activePagination) {
+        data.pagination = {
+          limit: limit ?? DEFAULT_INVOICE_PAGE_LIMIT,
+          offset: offset ?? 0,
+          hasMore,
+        };
+      }
+      ok(res, data);
     } catch (err: any) {
       logBillingFailure("billing.invoices.failed", err, {
         profileId,

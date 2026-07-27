@@ -31,6 +31,10 @@ The `:profileId` path parameter must be a non-empty alphanumeric string (letters
 
 Returns the full billing profile (with sensitive fields stripped), payment methods, and invoices in a single response.
 
+### `GET /billing/profiles/:profileId/general-information`
+
+Returns identity fields, with sensitive information stripped, plus a convenience `fullAddress` field.
+
 **Contract:**
 - Uses `res.locals.profile` from the middleware — does NOT re-query the database for the profile.
 - Fetches payment methods and invoices in parallel via `Promise.all`.
@@ -39,6 +43,49 @@ Returns the full billing profile (with sensitive fields stripped), payment metho
 - Emits a `billing.amount.coerced` warning when invoice amounts are unusable (matching the behaviour of the `/invoices` route).
 - On TOCTOU race (profile deleted between middleware and handler): responds with HTTP 404 without attempting DB queries.
 - On DB failure: responds with HTTP 500.
+
+**Response (`200`):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "profile": {
+      "id": "profile-001",
+      "ownerAddress": "0xabc123...",
+      "profileType": "Individual",
+      "firstName": "Alice",
+      "lastName": "Example",
+      "email": "alice@example.com",
+      "street": "123 Main St",
+      "city": "Metropolis",
+      "state": "NY",
+      "zipCode": "10001",
+      "country": "US",
+      "annualRewardLimit": "10000.000000",
+      "usedAmount": "2500.500000",
+      "currency": "USD",
+      "createdAt": "…",
+      "updatedAt": "…"
+    },
+    "paymentMethods": [ … ],
+    "invoices": [ … ]
+  }
+}
+```
+
+- **GET `/billing/profiles/:profileId/summary`**
+  Returns the reward-limit and spend summary, utilizing shared billing math
+  logic for numeric fields (`parseBillingAmount`).
+
+Sensitive fields (`taxId`, `dateOfBirth`) are never included in the response.
+
+---
+
+### `GET /billing/profiles/:profileId`
+
+Returns the full billing profile (with sensitive fields stripped), the list of
+payment methods, and the invoice history — all in a single response.
 
 **Response (`200`):**
 
@@ -148,7 +195,7 @@ Returns the list of payment methods for the profile. Only masked/safe representa
 
 ### `GET /billing/profiles/:profileId/invoices`
 
-Returns the invoice history for the profile. Every invoice row is parsed through the safe `parseBillingAmount` helper so malformed amounts never propagate NaN into the aggregate telemetry.
+Returns the invoice history for the profile. Every invoice row is parsed through the safe `parseBillingAmount` helper so malformed amounts never propagate NaN into the aggregate telemetry. Supports optional pagination via `limit` and `offset` query parameters.
 
 **Contract:**
 - Queries the `billingInvoices` table filtered by `profileId`.
@@ -158,27 +205,48 @@ Returns the invoice history for the profile. Every invoice row is parsed through
 - The aggregate normalises invoice statuses to lowercase; unrecognised or null statuses are bucketed as `"unknown"` rather than widening the log key space with arbitrary values.
 - On DB failure: responds with HTTP 500.
 
-**Response (`200`):**
+**Query parameters:**
+
+| Parameter | Type    | Default | Max | Description                                              |
+| --------- | ------- | ------- | --- | -------------------------------------------------------- |
+| `limit`   | integer | —       | 200 | Maximum rows to return. When omitted, returns all rows.  |
+| `offset`  | integer | 0       | —   | Number of rows to skip before returning results.         |
+
+When neither `limit` nor `offset` is supplied, the response envelope omits the
+`pagination` block (backward-compatible with earlier callers).
+
+**Paginated response (`200`):**
 
 ```json
 {
   "success": true,
   "data": {
     "profileId": "profile-001",
-    "invoices": [
-      {
-        "id": "inv-1",
-        "invoiceNumber": "INV-2025-001",
-        "amount": "500.000000",
-        "currency": "USD",
-        "status": "pending",
-        "description": "Monthly retainer",
-        "issuedAt": "2025-06-01T00:00:00.000Z",
-        "paidAt": null,
-        "createdAt": "2025-06-01T00:00:00.000Z",
-        "updatedAt": "2025-06-01T00:00:00.000Z"
-      }
-    ]
+    "invoices": [ … ],
+    "pagination": {
+      "limit": 50,
+      "offset": 0,
+      "hasMore": true
+    }
+  }
+}
+```
+
+`hasMore` is computed by fetching `limit + 1` rows and discarding the probe
+row — no separate `COUNT` query.
+
+**Ordering:** Invoices are returned in descending order by `createdAt` with
+`id` as a tiebreaker, ensuring deterministic pagination even when rows share
+the same timestamp.
+
+**Unpaginated response (`200` — backward-compatible):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "profileId": "profile-001",
+    "invoices": [ … ]
   }
 }
 ```
@@ -295,20 +363,159 @@ Read them with `getBillingMetricsSnapshot()`; `resetBillingMetrics()` exists for
 
 The three `*_duration_ms_total` counters are cumulative sums: divide by the matching `*_total` counter for a mean. Percentiles need a real histogram, which is out of scope (see below).
 
+The three `*_duration_ms_total` counters are cumulative sums: divide by the matching `*_total` counter for a mean. Percentiles need a real histogram, which is out of scope (see below).
+
+### Invoice aggregation
+
+`summarizeInvoices(rows)` is exported so the arithmetic can be unit-tested directly. It is
+a **read-side aggregate for telemetry only** — nothing is written back to the database and
+no response body changes. When pagination is active the aggregate covers only the returned
+page, not the full dataset.
+
+- An invoice counts toward `paidAmount` when its status is exactly `paid`
+  (case-insensitive). Everything else — `pending`, `overdue`, `void`, an unrecognised
+  status, or a null status — counts toward `outstandingAmount`, so
+  `paidAmount + outstandingAmount === totalAmount` always holds.
+- A null, non-string, or blank status is bucketed as `unknown` rather than widening the
+  `statusCounts` key space with arbitrary values.
+- Rows whose `amount` is unusable contribute `0` and are counted in `coercedCount`, with a
+  per-reason breakdown in `coercionReasons`.
+
 ## Error codes
 
 | Status | Condition                                                       |
 | ------ | --------------------------------------------------------------- |
-| `400`  | Invalid `profileId` (empty, illegal characters, or > 128 chars) |
-| `401`  | Missing or invalid session token                                |
-| `404`  | Profile not found OR caller is not the owner (intentionally ambiguous) |
-| `500`  | Database failure or unexpected error                            |
-| `501`  | Billing is not yet enabled (`BILLING_ENABLED` is `false`)       |
+| `400`  | Invalid `profileId`, or invalid pagination parameters           |
+| `401`  | Missing or invalid session credentials                          |
+| `404`  | Profile does not exist, **or** the caller does not own it       |
+| `409`  | Idempotency key reused with a different request body            |
+| `500`  | Unexpected server error (e.g. database failure)                 |
+| `501`  | `BILLING_ENABLED` feature flag is `false`                       |
 
-## Edge cases intentionally out of scope
+## Idempotency contract
 
-- **Histogram percentiles for handler wall-time.** The `*_duration_ms_total` counters are cumulative sums only. A real histogram (e.g., Prometheus) is deferred.
-- **External metrics library.** All observability is process-local counters and structured logs. Prometheus/OpenTelemetry integration is deferred.
-- **Horizontal idempotency.** The billing idempotency store is currently an in-process TTL cache. If the service is scaled horizontally, this must be moved to a shared store (Redis or similar).
-- **Raw payment credentials.** The API never accepts or returns raw account/routing numbers. Only masked representations (`maskedAccount`, `maskedRouting`) are stored and returned.
-- **Invoice mutation.** Invoice creation, updating, and payment processing are out of scope for this module. All routes are read-only.
+Mutating billing routes (POST, PUT, PATCH, DELETE) support request replay protection
+through the `Idempotency-Key` header.
+
+### Header
+
+| Header             | Value                        | Required |
+| ------------------ | ---------------------------- | -------- |
+| `Idempotency-Key`  | A caller-chosen unique key   | No       |
+| `idempotency-key`  | Lowercase alias (same value) | No       |
+
+When the header is absent, the handler executes normally for every request — no caching
+and no replay protection. GET, HEAD, and OPTIONS requests always pass through regardless
+of the header.
+
+### Behaviour
+
+1. **First request** — the handler runs and the response `(statusCode, body)` is cached
+   keyed by `{accountScope, method, route, profileId, idempotencyKey}`. The
+   `accountScope` is resolved from `x-user-address`, `x-account-id`, or `x-user-id` (in
+   that order), falling back to the request IP.
+
+2. **Replay (same key, same body)** — the cached response is returned without running the
+   handler. The process-local counter `billing_idempotency_replayed_total` is bumped and a
+   `billing.idempotency.replayed` info event is emitted.
+
+3. **Conflict (same key, different body)** — the request is rejected with `409 Conflict`.
+   The counter `billing_idempotency_conflict_total` is bumped and a
+   `billing.idempotency.conflict` warning is emitted. Neither the key nor the body is
+   written to the log — only `route`, `method`, and `keyAgeMs` are recorded.
+
+### Cache lifetime and scope
+
+- **TTL**: 24 hours from the first successful response. After expiry, a subsequent request
+  with the same key is treated as a fresh request and re-executed.
+- **Scope**: cache keys are isolated by account scope. The same idempotency key used by
+  two different `x-user-address` values will each execute independently.
+- **Storage**: in-process `Map` — see the caveat under
+  [Intentionally out of scope](#intentionally-out-of-scope) about horizontal scaling.
+- **Pruning**: expired entries are lazily removed on the next request that carries an
+  `Idempotency-Key` header.
+
+### Security
+
+The caller-supplied `Idempotency-Key` is never written to logs, metrics, or response
+bodies. Only its age (`keyAgeMs`) and the associated route appear in structured log
+events.
+
+## Billing math determinism
+
+The two exported billing math helpers are **pure, deterministic functions** — calling them
+multiple times with the same input always produces the same output:
+
+### `parseBillingAmount(value): BillingAmount`
+
+- No internal state, no side effects (the telemetry variant
+  `parseBillingAmountWithTelemetry` is the one that emits logs).
+- `stableSerialize` ensures that JSON bodies with different key orderings produce the same
+  fingerprint, so the idempotency fingerprint is byte-for-byte reproducible.
+
+### `summarizeInvoices(rows): InvoiceTotals`
+
+- Iterates rows in the order given, applies `parseBillingAmount` per row, and
+  accumulator logic that is purely arithmetic.
+- No database writes, no external state mutations.
+- Calling `summarizeInvoices` twice on the same `rows` input yields identical
+  `InvoiceTotals`.
+
+These functions are tested as pure functions in
+`src/routes/billing.test.ts` without any HTTP or database setup.
+
+## Intentionally out of scope
+
+- **Write operations** (create/update/delete profiles, payment methods, or invoices).
+  These are not implemented in this module. Adding them would require separate
+  authorization checks for each mutation and an audit trail.
+- **Invoice generation** — the module reads existing invoice rows but does not create
+  them. Invoice creation logic and its associated billing-math decisions live in a
+  separate concern. The invoice telemetry here therefore describes the **read-side**
+  aggregate over stored rows, not an issuance pipeline.
+- **Rate limiting specific to billing** — billing routes inherit the global rate limiter
+  applied to all `/api/` paths. A per-route limiter could be added if billing endpoints
+  show heavier-than-average traffic.
+- **Metrics export** — counters are process-local and readable only through
+  `getBillingMetricsSnapshot()`. There is deliberately no Prometheus/OTel exporter and no
+  `/admin/metrics` endpoint in this change; wiring one up is a separate concern that would
+  cover every metrics module in `src/`, not just billing.
+- **Latency histograms / percentiles** — only cumulative duration sums are recorded.
+  p95/p99 need a real histogram implementation, which belongs with the exporter above.
+- **Counter durability** — counters reset on process restart and are per-instance, so a
+  horizontally scaled deployment sees N independent sets. This matches the existing
+  in-process idempotency store's caveat.
+- **Cursor-based pagination** — the invoices endpoint uses offset-based pagination.
+  Cursor-based pagination (e.g., `createdAt` + `id`-anchored) would be more robust
+  against insertions shifting page boundaries, but would require database-level
+  `WHERE` filtering the mock infrastructure cannot currently simulate. This is a
+  candidate improvement if offset drift becomes measurable in production.
+
+## Testing
+
+```bash
+pnpm test -- src/routes/billing.test.ts
+```
+
+The test suite covers:
+
+- `parseBillingAmount`: well-formed input, 6-decimal rounding, and each of the three
+  coercion reasons (`missing`, `malformed`, `negative`)
+- `summarizeInvoices`: empty list, paid/outstanding split summing to the total,
+  case-insensitive `paid` matching, `unknown` status bucketing, per-reason coercion
+  counts, and fractional precision
+- Summary route: happy path with the emitted `billing.summary.computed` payload,
+  per-column coercion warnings, over-limit flagging, and the zero-limit boundary
+- Invoice route: response shape unchanged, aggregate event contents, empty-list boundary,
+  and the single per-request coercion warning with its reason breakdown
+- Invoice pagination: paginated response with hasMore, boundary cases (limit equals total,
+  limit exceeds total, offset skip), validation rejection for out-of-range values, and
+  backward-compatible envelope when no pagination params are supplied
+- Ownership denial: `not_found` vs `not_owner` logged distinctly behind an identical
+  `404` body
+- Failure paths: handler and ownership-lookup rejections produce one `*.failed` event and
+  bump `billing_errors_total` without also bumping a success counter
+- Idempotency: pass-through without a key, replay, `409` on a body mismatch, and the
+  guarantee that the caller-supplied key never reaches the logs
+- Idempotency edge cases: TTL expiry, lowercase header acceptance, body key-ordering
+  invariance (`stableSerialize`), and per-account-scope cache isolation

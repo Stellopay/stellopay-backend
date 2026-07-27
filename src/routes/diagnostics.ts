@@ -1,7 +1,9 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { z } from "zod";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats } from "../db/index.js";
 import { sql } from "drizzle-orm";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
 export const diagnosticsRouter = Router();
 
@@ -33,7 +35,7 @@ function pruneExpiredEntries(now: number): void {
  *
  * When an Idempotency-Key header is present, the first successful response for
  * that route/key combination is cached for 24 hours. Replays with the same key
- * return the cached response, preventing ambiguous outcomes on retries.
+ * return the cached response, preventing redundant database execution.
  */
 export function withDiagnosticsIdempotency(
   handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
@@ -70,7 +72,7 @@ export function withDiagnosticsIdempotency(
     let cachedResponse: DiagnosticsIdempotencyEntry | undefined;
 
     const persistResponse = (body: unknown): void => {
-      if (cachedResponse) {
+      if (cachedResponse || res.statusCode >= 400) {
         return;
       }
       cachedResponse = {
@@ -100,12 +102,12 @@ export function withDiagnosticsIdempotency(
 // admin address.
 diagnosticsRouter.use(requireAuth, requireAdmin);
 
-import { z } from "zod";
-
-const EventRowSchema = z.object({
-  event_type: z.string().default("Unknown"),
-  created_at: z.union([z.string(), z.date()]).default(() => new Date(0)),
-}).passthrough();
+const EventRowSchema = z
+  .object({
+    event_type: z.string().default("Unknown"),
+    created_at: z.union([z.string(), z.date()]).default(() => new Date(0)),
+  })
+  .passthrough();
 
 /**
  * Redacts raw database rows from recent event queries down to safe fields
@@ -140,7 +142,7 @@ export function redactRecentEvent(row: unknown): {
  */
 export async function fetchDiagnosticsData(
   dbClient = db,
-  options: { limit?: number; offset?: number } = {}
+  options: { limit?: number; offset?: number } = {},
 ) {
   const limit = options.limit ?? 20;
   const offset = options.offset ?? 0;
@@ -210,6 +212,7 @@ export async function fetchDiagnosticsData(
     tableCounts: summaryRow,
     latestEvents: recentEvents,
     poolStats: getPoolStats(),
+    circuitBreakers: getCircuitBreakerSnapshots(),
     summary: {
       totalAgreementEvents: summaryRow.agreement_events_count ?? 0,
       totalEscrowEvents: summaryRow.escrow_events_count ?? 0,
@@ -237,20 +240,20 @@ diagnosticsRouter.get(
   "/diagnostics/events",
     requireAuth,
       requireAdmin,
-        async (_req, res, next) => {
+        async (req, res, next) => {
     try {
       const rawLimit = Number(req.query.limit);
       const rawOffset = Number(req.query.offset);
 
-      const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
-      const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+      const limit =
+        Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
+      const offset =
+        Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
 
       const data = await fetchDiagnosticsData(db, { limit, offset });
       res.json(data);
     } catch (e) {
       next(e);
     }
-  }),
+  }
 );
-
-
