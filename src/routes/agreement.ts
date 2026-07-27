@@ -7,7 +7,7 @@ import { normalizeStarknetAddress } from "../utils/address.js";
 import { requireSession } from "../auth/session.js";
 // Removed in-memory index - using database only
 import { db, schema } from "../db/index.js";
-import { eq, and, or, desc } from "drizzle-orm";
+import { eq, and, or, desc, lt } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { TxHashSchema } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
