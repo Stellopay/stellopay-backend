@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
+import { eq, and, gte, lte, inArray, desc, or, gt, sql, SQL } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
@@ -11,7 +11,7 @@ import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
-import { parsePagination } from "../utils/validation.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
 
@@ -992,7 +992,18 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 
   let date: Date;
   if (typeof raw === "number") {
-    date = new Date(raw);
+    if (!Number.isFinite(raw)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [paramName],
+          message: `Invalid timestamp format for parameter '${paramName}'`,
+        },
+      ]);
+    }
+
+    const normalizedValue = Math.abs(raw) < 10000000000 ? raw * 1000 : raw;
+    date = new Date(normalizedValue);
   } else if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (!trimmed) return undefined;
@@ -1000,7 +1011,8 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
     if (/^\d+$/.test(trimmed)) {
       const num = parseInt(trimmed, 10);
       // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
-      date = new Date(num < 10000000000 ? num * 1000 : num);
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
     } else {
       date = new Date(trimmed);
     }
@@ -1100,16 +1112,6 @@ eventsRouter.get("/events", async (req, res, next) => {
       .orderBy(desc(schema.agreementEvents.createdAt))
       .limit(limit)
       .offset(offset);
-
-    logEventTelemetry({
-      operation: "event_fanout_delivery",
-      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
-      status: "success",
-      batch_size: tx_hashes.length,
-      unique_transactions: uniqueResults.length,
-      duplicates,
-      events_processed: totalProcessed,
-    });
 
     res.json({
       events,
