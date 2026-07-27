@@ -5,14 +5,30 @@ import { parseStarknetRpcUrls } from "./starknet/rpc-urls.js";
 
 dotenv.config();
 
-export const EnvSchema = z.object({
+export const EnvSchema = z
+  .object({
   NODE_ENV: z.string().optional().default("development"),
   PORT: z.coerce.number().int().positive().optional().default(4000),
-  CORS_ORIGIN: z.string().optional().default("*"),
+  // CORS_ORIGIN — comma-separated list of allowed origins.
+  // In development, defaults to "*" (permissive) when unset.
+  // In non-development (staging/production), there is NO default: the variable
+  // must be set to an explicit allowlist. A wildcard is rejected in non-dev
+  // environments via the superRefine below.
+  CORS_ORIGIN: z.string().optional(),
 
   // Observability configuration
   LOG_LEVEL: z.string().optional().default("info"),
   LOG_FORMAT: z.string().optional().default("json"),
+  LOG_REDACT_QUERY_PARAMS: z
+    .string()
+    .optional()
+    .default("token,signature,secret")
+    .transform((s) =>
+      s
+        .split(",")
+        .map((a) => a.trim().toLowerCase())
+        .filter((a) => a.length > 0),
+    ),
 
   // Required: Starknet RPC URL(s), v0_8 — comma-separated for failover (HTTPS only)
   // Provide via environment variable (e.g. in `.env` or inline `STARKNET_RPC_URL=... pnpm dev`)
@@ -121,9 +137,41 @@ export const EnvSchema = z.object({
         .map((a) => a.trim().toLowerCase())
         .filter((a) => a.length > 0),
     ),
-});
+  })
+  .superRefine((data, ctx) => {
+    const isDev = !data.NODE_ENV || data.NODE_ENV === "development";
+    const origin = data.CORS_ORIGIN;
 
-export const env = EnvSchema.parse(process.env);
+    if (isDev) {
+      // Development: permissive wildcard default is fine — nothing to reject.
+      return;
+    }
+
+    // Non-development: require an explicit, non-wildcard allowlist.
+    if (!origin || origin.trim() === "" || origin.trim() === "*") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["CORS_ORIGIN"],
+        message:
+          `CORS_ORIGIN must be set to an explicit comma-separated allowlist of origins ` +
+          `in non-development environments (NODE_ENV=${data.NODE_ENV}). ` +
+          `A wildcard ('*') is not permitted outside of development because it ` +
+          `cannot be combined with credentials and exposes authenticated endpoints ` +
+          `to cross-origin requests from any domain.`,
+      });
+    }
+  });
+
+/** Resolve the effective CORS_ORIGIN value, applying the development wildcard default. */
+const _rawEnv = EnvSchema.parse(process.env);
+
+export const env = {
+  ..._rawEnv,
+  // Apply development default: when CORS_ORIGIN is unset in development, fall back to "*".
+  CORS_ORIGIN:
+    _rawEnv.CORS_ORIGIN ??
+    (_rawEnv.NODE_ENV === "development" || !_rawEnv.NODE_ENV ? "*" : ""),
+};
 
 /** Ordered Starknet JSON-RPC endpoints (primary first) from STARKNET_RPC_URL. */
 export const starknetRpcUrls = parseStarknetRpcUrls(env.STARKNET_RPC_URL);

@@ -673,10 +673,12 @@ describe("sessions", () => {
       await expect(createSession("0xDbCreate")).rejects.toThrow(
         "synthetic create failure",
       );
-      // createSession's db-error path is not a "validation rejection" — it
-      // never increments the global REJECTED counter. updateSession lifecycle
-      // metrics are also untouched (the session was never created).
+      // createSession's db-error path bumps REJECTED exactly once per failed
+      // call — a prior bug double-bumped it (two incSessionMetric calls in
+      // the same catch block), which would silently double-count every DB
+      // outage in the session_rejected_total dashboard.
       const counters = getSessionMetricsSnapshot().counters;
+      expect(counters[SESSION_METRICS.REJECTED]).toBe(1);
       expect(counters[SESSION_METRICS.CREATED] ?? 0).toBe(0);
       const failed = consoleErrorSpy.mock.calls.find(([line]) =>
         typeof line === "string" && line.includes("session.rejected"),
@@ -708,6 +710,8 @@ describe("sessions", () => {
     await revokeSessionByHash(tokenHash);
     const session = await getSessionByHash(tokenHash);
     expect(session!.revokedAt).toBeInstanceOf(Date);
+  });
+
   // ---------------------------------------------------------------------------
   // Input validation: hardened boundary and malformed-input paths (#307)
   // ---------------------------------------------------------------------------
@@ -824,6 +828,16 @@ describe("sessions", () => {
     const { token } = await createSession("0xTrimMe");
     // Padded address supplied by the caller — should still match
     expect(await requireSession("  0xTrimMe  ", token)).toBe(true);
+  });
+
+  it("rotateSession normalises a whitespace-padded address when validating", async () => {
+    const { token } = await createSession("0xRotateTrim");
+    // Padded address supplied by the caller must still match the cleanly
+    // stored session address, consistent with requireSession's tolerance.
+    const result = await rotateSession("  0xRotateTrim  ", token);
+    expect(result.ok).toBe(true);
+  });
+
   // Reliability: bounded retry + idempotent re-revoke detection (issue #125)
   //
   // These tests use `vi.useRealTimers()` inside the test body because the
@@ -943,6 +957,23 @@ describe("sessions", () => {
     const after = getSessionMetricsSnapshot().counters;
     expect(after[SESSION_METRICS.ALL_REVOKED]).toBe(1);
     expect(after[SESSION_METRICS.ALL_REVOKED_ALREADY]).toBe(1);
+  });
+
+  it("revokeAllSessionsForAddress is a safe no-op for an address with no sessions at all", async () => {
+    // No createSession call for this address — the idempotency SELECT finds
+    // nothing (`existing` is undefined), so the function must fall through
+    // to the retry/update path (a no-op UPDATE matching zero rows) and still
+    // bump ALL_REVOKED, rather than throwing or silently doing nothing. A
+    // prior bug ran an unconditional, unlogged UPDATE before this path even
+    // existed; this guards against that shape regressing.
+    await revokeAllSessionsForAddress("0xNeverHadASession");
+    const counters = getSessionMetricsSnapshot().counters;
+    expect(counters[SESSION_METRICS.ALL_REVOKED]).toBe(1);
+    expect(counters[SESSION_METRICS.ALL_REVOKED_ALREADY] ?? 0).toBe(0);
+    const revoked = consoleInfoSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("session.all_revoked"),
+    );
+    expect(revoked).toBeDefined();
   });
 
   it("retries revokeFamily on a transient DB error and ultimately succeeds", async () => {

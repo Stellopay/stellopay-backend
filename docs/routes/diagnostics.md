@@ -31,9 +31,11 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 | `Authorization` | String | Format: `Bearer <session_token>` | Yes |
 
 #### Request Parameters
-- **Query Parameters**: None.
+- **Query Parameters**:
+  - `limit` (Optional, Integer): The maximum number of recent events to return. Defaults to `20`. Hard-capped at `100`.
+  - `offset` (Optional, Integer): The number of recent events to skip. Defaults to `0`.
 - **Body**: None.
-- Every query is parameter-free and static, ensuring zero SQL injection exposure.
+- Every query is strictly parameterized or uses parsed integers, ensuring zero SQL injection exposure.
 
 #### Success Response (`200 OK`)
 
@@ -95,10 +97,45 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
 
 Raw row identifiers and PII (such as transaction hashes, agreement IDs, contract addresses, and wallet addresses) are excluded from recent events responses. 
 
-Row outputs are passed through the `redactRecentEvent` helper to guarantee that only non-sensitive attributes (`event_type` and `created_at`) are returned.
+Row outputs are passed through the `redactRecentEvent` helper to guarantee that only non-sensitive attributes (`event_type` and `created_at`) are returned. Malformed rows missing these fields or providing invalid types gracefully fall back to `"Unknown"` and a zero-epoch timestamp, ensuring safe evaluation by downstream code.
 
 ---
+## Backward-Compatibility Contract
 
+Existing callers (dashboards, monitoring scripts, and incident-reporting
+tooling that polls this endpoint) may depend on the current response
+shape. The following is a stability guarantee, enforced by tests in
+`diagnostics.test.ts`:
+
+- **Top-level keys are additive-only.** `eventTypeCounts`, `escrowEventCounts`,
+  `paymentEventCounts`, `tableCounts`, `latestEvents`, `poolStats`, and
+    `summary` will always be present. New keys may be added in a future
+      change; none of these seven will be renamed or removed without a
+        breaking-change notice and a version bump.
+        - **`summary` always has its six documented fields** (`totalAgreementEvents`,
+          `totalEscrowEvents`, `totalPayments`, `totalEmployees`, `totalMilestones`,
+            `latestBlock`), even when the underlying tables are empty (as `0`, not
+              `null` or a missing key).
+              - **`latestEvents` entries are locked to exactly `event_type` and
+                `created_at`.** This is a security property (redaction), not just a
+                  style choice — no future change should widen this without an explicit
+                    review, since it's the primary defense against leaking transaction
+                      hashes or agreement IDs through this endpoint.
+                      - **Only `GET` is exposed** on `/diagnostics/events`. Other HTTP methods
+                        return Express's default `404` today; this is asserted by a test so
+                          that adding a new method on this path in the future is a deliberate,
+                            reviewed change rather than an accidental side effect.
+                            - **Count values remain strings**, as returned by Postgres's `COUNT(*)`
+                              aggregate through the raw `sql` template — consumers should not assume
+                                a numeric JSON type for `count`, `*_count`, or `latest_block` fields.
+
+                                ## Out of Scope Edge Cases
+
+                                - **Granular resource permissions**: Access control is binary (operator admin vs non-admin). Per-resource role-based access control (RBAC) is out of scope.
+                                - **External Log Streaming**: Direct integration with external SIEM/log providers is handled outside this route handler.
+                                - **A dedicated incident-reporting endpoint**: this router currently exposes only `GET /diagnostics/events`, which incident-response tooling polls directly. A distinct incident-reporting API (e.g. structured alert submission) does not exist and is out of scope for this change.
+
+                                
 ## Out of Scope Edge Cases
 
 - **Granular resource permissions**: Access control is binary (operator admin vs non-admin). Per-resource role-based access control (RBAC) is out of scope.

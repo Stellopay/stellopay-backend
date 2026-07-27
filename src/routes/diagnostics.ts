@@ -10,18 +10,36 @@ export const diagnosticsRouter = Router();
 // admin address.
 diagnosticsRouter.use(requireAuth, requireAdmin);
 
+import { z } from "zod";
+
+const EventRowSchema = z.object({
+  event_type: z.string().default("Unknown"),
+  created_at: z.union([z.string(), z.date()]).default(() => new Date(0)),
+}).passthrough();
+
 /**
  * Redacts raw database rows from recent event queries down to safe fields
  * (`event_type` and `created_at`). Raw row identifiers (transaction hashes,
- * agreement IDs) and PII are stripped.
+ * agreement IDs) and PII are stripped. Malformed rows gracefully fall back
+ * to safe defaults to prevent downstream code path errors.
  */
-export function redactRecentEvent(row: Record<string, unknown>): {
-  event_type: unknown;
-  created_at: unknown;
+export function redactRecentEvent(row: unknown): {
+  event_type: string;
+  created_at: string;
 } {
+  if (!row || typeof row !== "object") {
+    return { event_type: "Unknown", created_at: new Date(0).toISOString() };
+  }
+
+  const parsed = EventRowSchema.safeParse(row);
+  if (!parsed.success) {
+    return { event_type: "Unknown", created_at: new Date(0).toISOString() };
+  }
+
+  const { event_type, created_at } = parsed.data;
   return {
-    event_type: row.event_type,
-    created_at: row.created_at,
+    event_type,
+    created_at: created_at instanceof Date ? created_at.toISOString() : created_at,
   };
 }
 
@@ -30,7 +48,13 @@ export function redactRecentEvent(row: Record<string, unknown>): {
  * Ensures read queries execute in parallel to minimize latency, eliminate sequential
  * cascade bottlenecks, and guarantee side-effect-free replay safety.
  */
-export async function fetchDiagnosticsData(dbClient = db) {
+export async function fetchDiagnosticsData(
+  dbClient = db,
+  options: { limit?: number; offset?: number } = {}
+) {
+  const limit = options.limit ?? 20;
+  const offset = options.offset ?? 0;
+
   const [
     eventTypeCountsResult,
     escrowEventCountsResult,
@@ -78,7 +102,7 @@ export async function fetchDiagnosticsData(dbClient = db) {
       SELECT event_type, created_at
       FROM agreement_events
       ORDER BY created_at DESC
-      LIMIT 20
+      LIMIT ${limit} OFFSET ${offset}
     `),
   ]);
 
@@ -115,13 +139,23 @@ export async function fetchDiagnosticsData(dbClient = db) {
  * list is redacted to event type and timestamp only. Every query is static and
  * parameter free, so no request input ever reaches the SQL.
  */
+// NOTE: requireAuth/requireAdmin are already applied router-wide above.
+// Repeating them here is intentional, redundant enforcement (see
+// docs/routes/diagnostics.md — "Dual Enforcement"), not a leftover to
+// clean up. Do not remove without updating the docs' compatibility notes.
 diagnosticsRouter.get(
   "/diagnostics/events",
-  requireAuth,
-  requireAdmin,
-  async (_req, res, next) => {
+    requireAuth,
+      requireAdmin,
+        async (_req, res, next) => {
     try {
-      const data = await fetchDiagnosticsData();
+      const rawLimit = Number(req.query.limit);
+      const rawOffset = Number(req.query.offset);
+
+      const limit = Number.isSafeInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
+      const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+
+      const data = await fetchDiagnosticsData(db, { limit, offset });
       res.json(data);
     } catch (e) {
       next(e);
