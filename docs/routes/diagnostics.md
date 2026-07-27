@@ -1,151 +1,144 @@
-# Diagnostics Routes — Backward-Compatible Contract
+# Operator Diagnostics API (`/diagnostics/*`)
 
-> Source: `src/routes/diagnostics.ts`  
-> Tests:  `src/routes/diagnostics.test.ts`  
-> Access: Admin only (`requireAuth` + `requireAdmin`)
+The diagnostics endpoint provides internal system telemetry, database metrics, event volume aggregations, and sanitized recent activity logs for system operators and incident reporting.
 
 ---
 
-## Overview
+## Security Boundary & Authorization
 
-The diagnostics surface exposes internal data shapes and table volumes for
-operator use. Every route in this router requires **both** a valid session token
-and a caller address present in the `ADMIN_ADDRESSES` config list. All requests
-that fail either check receive `401` — no database query is executed.
+### Access Control Policy
+Diagnostics data exposes high-level operational telemetry and table volumes. Access is strictly limited to authorized operators:
 
-There is currently one endpoint:
+- **Authentication (`requireAuth`)**: Every request must carry a valid Starknet wallet address in the `x-user-address` header and a valid session Bearer token in the `Authorization` header (`Authorization: Bearer <token>`).
+- **Authorization (`requireAdmin`)**: The normalized `x-user-address` must match an entry in the system's `ADMIN_ADDRESSES` configuration allowlist.
+- **Dual Enforcement**: Middleware checks are registered at both the router level (`diagnosticsRouter.use(requireAuth, requireAdmin)`) and explicitly per route handler definition (`diagnosticsRouter.get("/diagnostics/events", requireAuth, requireAdmin, ...)`) to ensure privilege boundaries cannot drift during maintenance.
 
-```
-GET /api/v1/diagnostics/events
-```
+Unauthenticated or non-admin requests receive a `401 Unauthorized` response envelope without triggering database execution.
 
 ---
 
-## Auth Contract
+## Endpoint Contract
 
-| Check | Middleware | Failure |
-|---|---|---|
-| Valid session token | `requireAuth` | `401 Unauthorized` |
-| Address in `ADMIN_ADDRESSES` | `requireAdmin` | `401 Unauthorized` |
+### `GET /api/v1/diagnostics/events`
 
-Both checks run on every request before any handler logic. No DB query is
-executed for unauthorized callers. This gating is **frozen** — loosening it is
-a security change and requires explicit review.
+Returns aggregate event counts, table counts, connection pool status, and sanitized recent activity.
 
----
+#### Request Headers
 
-## `GET /api/v1/diagnostics/events`
+| Header | Type | Description | Required |
+| :--- | :--- | :--- | :--- |
+| `x-user-address` | String | Starknet wallet address of the requesting operator | Yes |
+| `Authorization` | String | Format: `Bearer <session_token>` | Yes |
+| `Idempotency-Key` | String | Client-provided deduplication key | No |
 
-Returns aggregate event counts, table volumes, connection-pool stats, and a
-redacted recent-activity feed.
+#### Request Parameters
+- **Query Parameters**:
+  - `limit` (Optional, Integer): The maximum number of recent events to return. Defaults to `20`. Hard-capped at `100`.
+  - `offset` (Optional, Integer): The number of recent events to skip. Defaults to `0`.
+- **Body**: None.
+- Every query is strictly parameterized or uses parsed integers, ensuring zero SQL injection exposure.
 
-All five SQL queries are **static and parameter-free** — no request input ever
-reaches a query.
+#### Success Response (`200 OK`)
 
-### Success `200`
-
-```jsonc
+```json
 {
   "eventTypeCounts": [
-    { "event_type": "AgreementCreated", "count": "5" }
+    { "event_type": "AgreementCreated", "count": "15" },
+    { "event_type": "AgreementActivated", "count": "12" }
   ],
   "escrowEventCounts": [
-    { "event_type": "Funded", "count": "2" }
+    { "event_type": "Funded", "count": "8" }
   ],
   "paymentEventCounts": [
-    { "event_type": "PaymentSent", "count": "3" }
+    { "event_type": "PaymentSent", "count": "20" }
   ],
   "tableCounts": {
-    "agreement_events_count": "5",
-    "escrow_events_count":    "2",
-    "payments_count":         "3",
-    "employees_count":        "1",
-    "milestones_count":       "4",
-    "agreements_count":       "3",
-    "latest_block":           "100"
+    "agreement_events_count": "15",
+    "escrow_events_count": "8",
+    "payments_count": "20",
+    "employees_count": "5",
+    "milestones_count": "10",
+    "agreements_count": "12",
+    "latest_block": "104850"
   },
   "latestEvents": [
-    // REDACTED — see policy below
-    { "event_type": "AgreementCreated", "created_at": "2026-01-01T00:00:00Z" }
+    {
+      "event_type": "AgreementCreated",
+      "created_at": "2026-07-26T18:00:00.000Z"
+    }
   ],
-  "poolStats": { "total": 8, "idle": 3, "active": 5, "waiting": 2 },
+  "poolStats": {
+    "total": 10,
+    "idle": 8,
+    "active": 2,
+    "waiting": 0
+  },
   "summary": {
-    "totalAgreementEvents": "5",
-    "totalEscrowEvents":    "2",
-    "totalPayments":        "3",
-    "totalEmployees":       "1",
-    "totalMilestones":      "4",
-    "latestBlock":          "100"
+    "totalAgreementEvents": "15",
+    "totalEscrowEvents": "8",
+    "totalPayments": "20",
+    "totalEmployees": "5",
+    "totalMilestones": "10",
+    "latestBlock": "104850"
   }
 }
 ```
 
-This shape is **frozen**. Changing any key name or removing a field is a
-breaking change for existing operator tooling.
+---
 
-### Errors
+## Reliability & Retry Semantics
 
-| Status | Condition |
-|--------|-----------|
-| `401`  | Missing session token or non-admin address |
-| `500`  | Unexpected database error (forwarded via Express error handler) |
+- **Concurrent Execution (`Promise.all`)**: Read queries for event types, escrow events, payment events, table totals, and recent activity are executed in parallel via `fetchDiagnosticsData`. This minimizes latency and prevents cascading roundtrip bottlenecks.
+- **Idempotency & Replay Safety**: All queries are side-effect-free static `SELECT` statements. Replaying requests or polling from monitoring scripts and incident reporting tools is 100% idempotent and safe.
+  - To prevent ambiguous outcomes during retries, operators can provide an `Idempotency-Key` header. When present, the first successful response is cached for 24 hours and returned for identical subsequent requests.
+- **Null Safety**: Fallbacks (`[]` and `{}`) ensure that empty table states or partial query responses will not cause runtime `TypeError` exceptions.
 
 ---
 
-## Redaction Policy — `latestEvents`
+## Data Redaction & Reconnaissance Prevention
 
-`latestEvents` contains up to 20 of the most recent rows from `agreement_events`,
-ordered by `created_at DESC`.
+Raw row identifiers and PII (such as transaction hashes, agreement IDs, contract addresses, and wallet addresses) are excluded from recent events responses. 
 
-**Only `event_type` and `created_at` are included.** `transaction_hash` and
-`agreement_id` are **never** present in any `latestEvents` row. They are
-excluded from both the SQL `SELECT` and the application-level map.
-
-```
-// ✅ always present
-{ "event_type": "AgreementCreated", "created_at": "…" }
-
-// ❌ never present — redacted
-{ "transaction_hash": "…", "agreement_id": "…" }
-```
-
-This invariant is load-bearing and enforced by tests.
+Row outputs are passed through the `redactRecentEvent` helper to guarantee that only non-sensitive attributes (`event_type` and `created_at`) are returned. Malformed rows missing these fields or providing invalid types gracefully fall back to `"Unknown"` and a zero-epoch timestamp, ensuring safe evaluation by downstream code.
 
 ---
+## Backward-Compatibility Contract
 
-## Empty Database Behaviour
+Existing callers (dashboards, monitoring scripts, and incident-reporting
+tooling that polls this endpoint) may depend on the current response
+shape. The following is a stability guarantee, enforced by tests in
+`diagnostics.test.ts`:
 
-When any table is empty the endpoint still returns `200`. The `summary` fields
-fall back to `0` via `|| 0` guards, and `latestEvents` is an empty array `[]`.
+- **Top-level keys are additive-only.** `eventTypeCounts`, `escrowEventCounts`,
+  `paymentEventCounts`, `tableCounts`, `latestEvents`, `poolStats`, and
+    `summary` will always be present. New keys may be added in a future
+      change; none of these seven will be renamed or removed without a
+        breaking-change notice and a version bump.
+        - **`summary` always has its six documented fields** (`totalAgreementEvents`,
+          `totalEscrowEvents`, `totalPayments`, `totalEmployees`, `totalMilestones`,
+            `latestBlock`), even when the underlying tables are empty (as `0`, not
+              `null` or a missing key).
+              - **`latestEvents` entries are locked to exactly `event_type` and
+                `created_at`.** This is a security property (redaction), not just a
+                  style choice — no future change should widen this without an explicit
+                    review, since it's the primary defense against leaking transaction
+                      hashes or agreement IDs through this endpoint.
+                      - **Only `GET` is exposed** on `/diagnostics/events`. Other HTTP methods
+                        return Express's default `404` today; this is asserted by a test so
+                          that adding a new method on this path in the future is a deliberate,
+                            reviewed change rather than an accidental side effect.
+                            - **Count values remain strings**, as returned by Postgres's `COUNT(*)`
+                              aggregate through the raw `sql` template — consumers should not assume
+                                a numeric JSON type for `count`, `*_count`, or `latest_block` fields.
 
-| Field | Empty-DB value |
-|---|---|
-| `summary.*` | `0` |
-| `latestEvents` | `[]` |
-| `eventTypeCounts` | `[]` |
-| `escrowEventCounts` | `[]` |
-| `paymentEventCounts` | `[]` |
+                                ## Out of Scope Edge Cases
 
----
+                                - **Granular resource permissions**: Access control is binary (operator admin vs non-admin). Per-resource role-based access control (RBAC) is out of scope.
+                                - **External Log Streaming**: Direct integration with external SIEM/log providers is handled outside this route handler.
+                                - **A dedicated incident-reporting endpoint**: this router currently exposes only `GET /diagnostics/events`, which incident-response tooling polls directly. A distinct incident-reporting API (e.g. structured alert submission) does not exist and is out of scope for this change.
 
-## Query Inventory
+                                
+## Out of Scope Edge Cases
 
-Five static queries execute per request, in order:
-
-| # | Table | Purpose |
-|---|---|---|
-| 1 | `agreement_events` | `COUNT(*) GROUP BY event_type` |
-| 2 | `escrow_events` | `COUNT(*) GROUP BY event_type` |
-| 3 | `payments` | `COUNT(*) GROUP BY event_type` |
-| 4 | All tables | Aggregate row counts + `MAX(block_number)` |
-| 5 | `agreement_events` | Last 20 rows — `event_type, created_at` only |
-
----
-
-## Out of Scope (issue #279)
-
-- **Write operations** — read-only surface; no `POST`/`PATCH`/`DELETE`.
-- **Per-agreement or per-address drill-down** — all data is aggregate only.
-- **Pagination** — `latestEvents` is capped at 20 rows.
-- **Escrow/payment recent-activity feeds** — only `agreement_events` has a recent-activity list.
-- **Fine-grained admin roles** — all admin addresses share identical access.
+- **Granular resource permissions**: Access control is binary (operator admin vs non-admin). Per-resource role-based access control (RBAC) is out of scope.
+- **External Log Streaming**: Direct integration with external SIEM/log providers is handled outside this route handler.
