@@ -5,8 +5,24 @@ import { eq, and, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
+import { AnalyticsCache, buildAnalyticsCacheKey } from "../utils/analytics-cache.js";
 
 export const analyticsRouter = Router();
+
+/**
+ * Module-level in-process cache for analytics aggregation results.
+ *
+ * TTL is driven by `env.ANALYTICS_CACHE_TTL_MS` (default 30 s).  The cache is
+ * shared across all requests so repeated identical queries within one TTL
+ * window are served without touching the database.  The cache key includes
+ * both the user address and the year parameter so results from different
+ * identities are always kept in separate slots.
+ */
+export const analyticsAggregationCache = new AnalyticsCache<{
+  year: number;
+  data: Array<{ month: string; views: number }>;
+  total: number;
+}>(env.ANALYTICS_CACHE_TTL_MS);
 
 interface AnalyticsTelemetryEntry {
   operation: string;
@@ -17,6 +33,7 @@ interface AnalyticsTelemetryEntry {
   year?: number;
   row_counts?: Record<string, number>;
   error?: string;
+  cache_hit?: boolean;
 }
 
 /**
@@ -77,6 +94,27 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     const year =
       z.coerce.number().int().min(2020).max(2100).optional().parse(req.query.year) ||
       new Date().getFullYear();
+
+    // ── Cache look-up ──────────────────────────────────────────────────────
+    // The cache key encodes every parameter that can change the query result.
+    // Including the user address prevents cross-identity leakage.
+    const cacheKey = buildAnalyticsCacheKey(userAddress, { year });
+    const cached = analyticsAggregationCache.get(cacheKey);
+
+    if (cached !== undefined) {
+      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+      logAnalyticsTelemetry({
+        operation: "analytics_monthly_rollup",
+        duration_ms: Math.round(duration * 100) / 100,
+        status: "success",
+        request_id: requestId,
+        user_address: userAddress,
+        year,
+        cache_hit: true,
+      });
+      res.json(cached);
+      return;
+    }
 
     // Get all payments for the user in the specified year
     const startDate = new Date(year, 0, 1);
@@ -227,11 +265,17 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       },
     });
 
-    res.json({
+    const responseBody = {
       year,
       data: chartData,
       total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
-    });
+    };
+
+    // Store in cache before responding so subsequent identical requests within
+    // the TTL window skip the database entirely.
+    analyticsAggregationCache.set(cacheKey, responseBody);
+
+    res.json(responseBody);
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     // Only log telemetry for errors that are not Zod validation failures;
