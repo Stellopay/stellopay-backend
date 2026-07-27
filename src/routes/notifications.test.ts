@@ -97,6 +97,8 @@ import {
   notificationsRouter,
   getDefaultNotificationPreferences,
   calculateUnreadCount,
+  NOTIFICATIONS_DEFAULT_LIMIT,
+  NOTIFICATIONS_MAX_LIMIT,
 } from "./notifications.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
@@ -210,7 +212,11 @@ describe("notifications route", () => {
       .get("/api/v1/notifications/abc")
       .expect(200);
 
-    expect(res.body).toEqual({ notifications: [], total: 0, unreadCount: 0 });
+    expect(res.body).toMatchObject({ notifications: [], total: 0, unreadCount: 0 });
+    // Pagination envelope fields are echoed back even for empty results.
+    expect(res.body.limit).toBe(NOTIFICATIONS_DEFAULT_LIMIT);
+    expect(res.body.offset).toBe(0);
+    expect(res.body.hasMore).toBe(false);
     expect(queryState.eqValues).toContain(normalizeStarknetAddress("abc"));
   });
 
@@ -275,6 +281,7 @@ describe("notifications route", () => {
   });
 
   it("passes the requested limit through when within the documented range", async () => {
+    // With offset=0, queryLimit = limit + offset = 3; the DB queries receive 3.
     await request(makeApp()).get("/api/v1/notifications/abc?limit=3").expect(200);
     expect(queryState.limitCalls.every((limit) => limit === 3)).toBe(true);
   });
@@ -477,5 +484,128 @@ describe("notifications route", () => {
       .get("/api/v1/notifications/abc")
       .expect(200);
     expect(res.body.notifications[0].message).toBe("Agreement 999: Released of 1000000 tokens");
+  });
+});
+
+describe("notifications pagination contract", () => {
+  /**
+   * Helper: seed N payments with descending dates so [0] is newest.
+   * id is `p-<i>` with i=0 being the most recent.
+   */
+  function seedPayments(count: number): void {
+    queryState.rows.payments = Array.from({ length: count }, (_, i) =>
+      makePayment({
+        id: `p-${i}`,
+        createdAt: new Date(`2026-03-${String(count - i).padStart(2, "0")}T00:00:00Z`),
+        transactionHash: `0x${i.toString().padStart(4, "0")}`,
+      }),
+    );
+  }
+
+  it("echoes limit and offset=0 (default) in the response envelope", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=5")
+      .expect(200);
+    expect(res.body.limit).toBe(5);
+    expect(res.body.offset).toBe(0);
+  });
+
+  it("echoes the default limit when limit is omitted", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+    expect(res.body.limit).toBe(NOTIFICATIONS_DEFAULT_LIMIT);
+  });
+
+  it("sets hasMore=false when the merged pool fits within the page", async () => {
+    seedPayments(3);
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=5")
+      .expect(200);
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body.total).toBe(3);
+  });
+
+  it("sets hasMore=true when the merged pool exceeds limit+offset", async () => {
+    // 6 payments, limit=3, offset=0 → pool has 6 > 3+0 → hasMore=true
+    seedPayments(6);
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=3")
+      .expect(200);
+    expect(res.body.hasMore).toBe(true);
+    expect(res.body.total).toBe(3);
+    expect(res.body.notifications).toHaveLength(3);
+  });
+
+  it("passes queryLimit = limit+offset to each data-source query so the pool covers the requested page", async () => {
+    // limit=3, offset=2 → queryLimit=5; every DB source should receive 5.
+    seedPayments(5);
+    await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=3&offset=2")
+      .expect(200);
+    // payments + escrowEvents both receive queryLimit in their .limit() calls.
+    // agreements has no .limit() call (no orderBy); only 2 limitCalls expected.
+    expect(queryState.limitCalls.every((l) => l === 5)).toBe(true);
+  });
+
+  it("returns the correct page when offset skips items", async () => {
+    // 5 payments descending: p-0 (newest) … p-4 (oldest).
+    // offset=2, limit=2 → items p-2 and p-3.
+    seedPayments(5);
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=2&offset=2")
+      .expect(200);
+    expect(res.body.notifications.map((n: { id: string }) => n.id)).toEqual(["p-2", "p-3"]);
+    expect(res.body.offset).toBe(2);
+    expect(res.body.total).toBe(2);
+  });
+
+  it("returns an empty page (not an error) when offset is beyond the pool", async () => {
+    seedPayments(2);
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=5&offset=10")
+      .expect(200);
+    expect(res.body.notifications).toHaveLength(0);
+    expect(res.body.total).toBe(0);
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body.offset).toBe(10);
+  });
+
+  it("rejects a negative offset with 400", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?offset=-1")
+      .expect(400);
+    expect(res.body.error).toBe("Validation failed");
+  });
+
+  it("rejects a non-numeric offset with 400", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?offset=two")
+      .expect(400);
+    expect(res.body.error).toBe("Validation failed");
+  });
+
+  it("accepts offset=0 explicitly without error", async () => {
+    await request(makeApp())
+      .get("/api/v1/notifications/abc?offset=0")
+      .expect(200);
+  });
+
+  it("hasMore is false on the exact last page (pool == offset+limit)", async () => {
+    // 4 payments, limit=2, offset=2 → pool=4, offset+limit=4 → hasMore=false
+    seedPayments(4);
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=2&offset=2")
+      .expect(200);
+    expect(res.body.hasMore).toBe(false);
+    expect(res.body.total).toBe(2);
+  });
+
+  it("enforces NOTIFICATIONS_MAX_LIMIT constant matches the documented maximum of 50", () => {
+    expect(NOTIFICATIONS_MAX_LIMIT).toBe(50);
+  });
+
+  it("enforces NOTIFICATIONS_DEFAULT_LIMIT constant matches the documented default of 10", () => {
+    expect(NOTIFICATIONS_DEFAULT_LIMIT).toBe(10);
   });
 });

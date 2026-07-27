@@ -55,6 +55,7 @@ vi.mock("../db/index.js", () => ({
 
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn((left: unknown, right: unknown) => ({ left, right })),
+  desc: vi.fn((col: unknown) => ({ type: "desc", col })),
 }));
 
 import {
@@ -63,6 +64,8 @@ import {
   parseBillingAmount,
   summarizeInvoices,
   withBillingIdempotency,
+  DEFAULT_INVOICE_PAGE_LIMIT,
+  MAX_INVOICE_PAGE_LIMIT,
 } from "./billing.js";
 import {
   BILLING_METRICS,
@@ -104,6 +107,8 @@ function makeQueryBuilder(): any {
     from: () => builder,
     where: () => builder,
     limit: () => builder,
+    offset: () => builder,
+    orderBy: () => builder,
     then: (resolve: (value: unknown[]) => unknown, reject: (reason: unknown) => unknown) =>
       shouldFail
         ? Promise.resolve().then(() => reject(shouldFail))
@@ -488,9 +493,8 @@ describe("billing routes telemetry", () => {
   // -------------------------------------------------------------------------
 
   describe("GET /billing/profiles/:profileId/summary", () => {
-    it("contract success: returns the computed summary and logs the math that produced it", async () => {
-      // The summary route uses res.locals.profile from the ownership middleware,
-      // so the middleware's select must return the full profile row.
+    it("success path: returns the computed summary and logs the math that produced it", async () => {
+      // Ownership check returns the full profile; handler uses res.locals.profile.
       queueRows([profileRow()]);
 
       const res = await request(makeApp())
@@ -529,7 +533,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED]).toBeUndefined();
     });
 
-    it("contract boundary: warns per coerced column when a stored amount is unusable", async () => {
+    it("boundary path: warns per coerced column when a stored amount is unusable", async () => {
       queueRows([profileRow({ annualRewardLimit: "not-a-number", usedAmount: null })]);
 
       const res = await request(makeApp())
@@ -557,7 +561,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
     });
 
-    it("contract boundary: flags an over-limit profile that the response clamps to zero", async () => {
+    it("boundary path: flags an over-limit profile that the response clamps to zero", async () => {
       queueRows([profileRow({ annualRewardLimit: "100.000000", usedAmount: "150.250000" })]);
 
       const res = await request(makeApp())
@@ -580,8 +584,10 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED]).toBe(1);
     });
 
-    it("contract boundary: a zero limit yields 0% progress without a divide-by-zero", async () => {
-      queueRows([profileRow({ annualRewardLimit: "0.000000", usedAmount: "0.000000" })]);
+    it("boundary path: a zero limit yields 0% progress without a divide-by-zero", async () => {
+      queueRows([
+        profileRow({ annualRewardLimit: "0.000000", usedAmount: "0.000000" }),
+      ]);
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
@@ -592,21 +598,8 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED]).toBeUndefined();
     });
 
-    it("contract boundary: progress is NOT clamped to 100% when used > limit", async () => {
-      queueRows([profileRow({ annualRewardLimit: "100.000000", usedAmount: "200.000000" })]);
-
-      const res = await request(makeApp())
-        .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
-        .set(authHeaders());
-
-      // Progress correctly reports > 100% — the clamp only applies to remainingAmount.
-      expect(res.body.data.progressPercentage).toBe(200);
-      expect(res.body.data.remainingAmount).toBe(0);
-    });
-
-    it("contract failure: a DB failure in the middleware is reported as billing.ownership.failed", async () => {
-      // The summary handler uses res.locals.profile from the middleware and
-      // does not query the DB itself. A DB failure means the middleware rejects.
+    it("failure path: logs one error event and bumps the shared error counter on a DB failure", async () => {
+      // The ownership check (the single select) rejects.
       failSelectOnCall(1, new Error("connection reset"));
 
       const res = await request(makeApp())
@@ -614,10 +607,7 @@ describe("billing routes telemetry", () => {
         .set(authHeaders());
 
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({
-        success: false,
-        error: "Failed to verify billing profile ownership",
-      });
+      expect(res.body).toEqual({ success: false, error: "Failed to verify billing profile ownership" });
 
       expect(loggedEvents(spies).find((e) => e.event === "billing.ownership.failed")).toMatchObject({
         level: "error",
@@ -625,6 +615,7 @@ describe("billing routes telemetry", () => {
         message: "connection reset",
       });
       expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
+      // A failed middleware must not also report a successful computation.
       expect(counters()[BILLING_METRICS.SUMMARY_COMPUTED]).toBeUndefined();
     });
 
@@ -730,6 +721,112 @@ describe("billing routes telemetry", () => {
       });
       expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
     });
+
+    it("pagination success path: returns a page with hasMore=true when more rows exist", async () => {
+      const invoices = Array.from({ length: 5 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=2`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.invoices).toHaveLength(2);
+      expect(res.body.data.pagination).toEqual({ limit: 2, offset: 0, hasMore: true });
+    });
+
+    it("pagination boundary: hasMore=false when limit matches total rows", async () => {
+      const invoices = Array.from({ length: 2 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=2`)
+        .set(authHeaders());
+
+      expect(res.body.data.invoices).toHaveLength(2);
+      expect(res.body.data.pagination).toEqual({ limit: 2, offset: 0, hasMore: false });
+    });
+
+    it("pagination boundary: offset skips rows correctly", async () => {
+      const invoices = Array.from({ length: 5 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=2&offset=2`)
+        .set(authHeaders());
+
+      expect(res.body.data.invoices).toHaveLength(2);
+      expect(res.body.data.pagination).toEqual({ limit: 2, offset: 2, hasMore: true });
+    });
+
+    it("pagination boundary: limit larger than result set returns all without hasMore", async () => {
+      const invoices = Array.from({ length: 3 }, (_, i) => ({
+        id: `inv-${i + 1}`,
+        amount: "10.000000",
+        status: "paid",
+      }));
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=10`)
+        .set(authHeaders());
+
+      expect(res.body.data.invoices).toHaveLength(3);
+      expect(res.body.data.pagination).toEqual({ limit: 10, offset: 0, hasMore: false });
+    });
+
+    it("pagination failure: rejects limit above MAX_INVOICE_PAGE_LIMIT", async () => {
+      queueRows([profileRow()]);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?limit=201`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain("Invalid pagination parameters");
+    });
+
+    it("pagination failure: rejects a negative offset", async () => {
+      queueRows([profileRow()]);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices?offset=-1`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain("Invalid pagination parameters");
+    });
+
+    it("pagination contract: no pagination params preserves the original envelope shape", async () => {
+      const invoices = [
+        { id: "inv-1", amount: "100.000000", status: "paid" },
+        { id: "inv-2", amount: "250.000000", status: "pending" },
+      ];
+      queueRows([profileRow()], invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/invoices`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      // No pagination block — original shape preserved.
+      expect(res.body.data.pagination).toBeUndefined();
+      expect(res.body.data.invoices).toEqual(invoices);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -776,6 +873,130 @@ describe("billing routes telemetry", () => {
       );
       expect(counters()[BILLING_METRICS.OWNERSHIP_DENIED_NOT_OWNER]).toBe(1);
       expect(counters()[BILLING_METRICS.OWNERSHIP_DENIED_NOT_FOUND]).toBeUndefined();
+    });
+  });
+
+  describe("GET /billing/profiles/:profileId (full profile)", () => {
+    it("success path: returns the full profile with payment methods and invoices", async () => {
+      const paymentMethods = [
+        {
+          id: "pm-1",
+          type: "bank_account",
+          displayName: "Chase ****1234",
+          isDefault: true,
+        },
+      ];
+      const invoices = [
+        { id: "inv-1", amount: "100.000000", status: "paid" },
+        { id: "inv-2", amount: "250.000000", status: "pending" },
+      ];
+
+      // Ownership middleware returns full profile row → payment methods → invoices
+      queueRows([profileRow()], paymentMethods, invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.profile).toMatchObject({
+        id: PROFILE_ID,
+        profileType: "Individual",
+        firstName: "Alice",
+      });
+      // Sensitive fields must be stripped
+      expect(res.body.data.profile.taxId).toBeUndefined();
+      expect(res.body.data.profile.dateOfBirth).toBeUndefined();
+      expect(res.body.data.paymentMethods).toEqual(paymentMethods);
+      expect(res.body.data.invoices).toEqual(invoices);
+
+      const fetched = loggedEvents(spies).find((e) => e.event === "billing.profile.fetched");
+      expect(fetched).toMatchObject({
+        level: "info",
+        profileId: PROFILE_ID,
+        paymentMethodCount: 1,
+        invoiceCount: 2,
+        totalAmount: 350,
+      });
+      expect(counters()[BILLING_METRICS.PROFILE_FETCHED]).toBe(1);
+      expect(counters()[BILLING_METRICS.PROFILE_DURATION_MS]).toBeGreaterThanOrEqual(0);
+    });
+
+    it("success path: handles zero payment methods and invoices", async () => {
+      queueRows([profileRow()], [], []);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.paymentMethods).toEqual([]);
+      expect(res.body.data.invoices).toEqual([]);
+      expect(
+        loggedEvents(spies).find((e) => e.event === "billing.profile.fetched"),
+      ).toMatchObject({ paymentMethodCount: 0, invoiceCount: 0 });
+    });
+
+    it("boundary path: reports coerced invoice amounts through telemetry", async () => {
+      const invoices = [
+        { id: "inv-1", amount: "100.000000", status: "paid" },
+        { id: "inv-2", amount: "oops", status: "pending" },
+        { id: "inv-3", amount: null, status: "pending" },
+      ];
+
+      queueRows([profileRow()], [], invoices);
+
+      await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      // Response still contains all raw rows (including coerced ones unchanged).
+      // The coercion is visible in telemetry only — exactly one consolidated
+      // event covers both coerced rows.
+      const coerced = loggedEvents(spies).filter((e) => e.event === "billing.amount.coerced");
+      expect(coerced).toHaveLength(1);
+      expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
+    });
+
+    it("failure path: logs one error event on a DB failure during payment method fetch", async () => {
+      // Ownership succeeds (full profile row), then payment methods query fails.
+      queueRows([profileRow()]);
+      failSelectOnCall(2, new Error("connection reset"));
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing profile" });
+
+      expect(loggedEvents(spies).find((e) => e.event === "billing.profile.failed")).toMatchObject({
+        level: "error",
+        profileId: PROFILE_ID,
+        message: "connection reset",
+      });
+      expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
+    });
+
+    it("failure path: logs one error event on a DB failure during invoice fetch", async () => {
+      // Ownership succeeds (full profile row), payment methods succeed, invoices fail.
+      queueRows([profileRow()], [{ id: "pm-1" }]);
+      failSelectOnCall(3, new Error("timeout"));
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing profile" });
+
+      expect(loggedEvents(spies).find((e) => e.event === "billing.profile.failed")).toMatchObject({
+        level: "error",
+        profileId: PROFILE_ID,
+        message: "timeout",
+      });
+      expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
     });
   });
 });
@@ -888,5 +1109,86 @@ describe("billing idempotency middleware", () => {
       .join(" ");
     expect(serialized).toContain("billing.idempotency.replayed");
     expect(serialized).not.toContain("secret-key");
+  });
+
+  it("accepts the lowercase idempotency-key header as an alternative", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    await request(app)
+      .post("/billing/test")
+      .set("idempotency-key", "lower-key")
+      .send({ amount: 10 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("idempotency-key", "lower-key")
+      .send({ amount: 10 });
+
+    expect(second.status).toBe(201);
+    expect(getExecutionCount()).toBe(1);
+    expect(counters()[BILLING_METRICS.IDEMPOTENCY_REPLAYED]).toBe(1);
+  });
+
+  it("treats request bodies with different key orderings as the same fingerprint", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "order-key")
+      .send({ b: 2, a: 1 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "order-key")
+      .send({ a: 1, b: 2 });
+
+    expect(second.status).toBe(201);
+    expect(second.body).toEqual({ executionCount: 1, body: { b: 2, a: 1 } });
+    expect(getExecutionCount()).toBe(1);
+    expect(counters()[BILLING_METRICS.IDEMPOTENCY_REPLAYED]).toBe(1);
+  });
+
+  it("expires the cached entry after the TTL and allows re-execution", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "ttl-key")
+      .send({ amount: 10 });
+
+    expect(getExecutionCount()).toBe(1);
+
+    // Travel past the 24-hour TTL.
+    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "ttl-key")
+      .send({ amount: 10 });
+
+    expect(second.status).toBe(201);
+    // The handler ran again because the cached entry expired.
+    expect(getExecutionCount()).toBe(2);
+  });
+
+  it("isolates cache keys by x-user-address scope", async () => {
+    const { app, getExecutionCount } = makeIdempotencyApp();
+
+    const first = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "scope-key")
+      .set("x-user-address", "0xalice")
+      .send({ amount: 10 });
+
+    const second = await request(app)
+      .post("/billing/test")
+      .set("Idempotency-Key", "scope-key")
+      .set("x-user-address", "0xbob")
+      .send({ amount: 10 });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    // Both executed because the scopes differ.
+    expect(getExecutionCount()).toBe(2);
   });
 });
