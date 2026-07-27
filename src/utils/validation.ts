@@ -55,28 +55,78 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export interface ValidationErrorOptions {
+  validator: string;
+  message: string;
+  issues: any[];
+  input: string;
+  status?: number;
+  cause?: unknown;
+}
+
 export class ValidationError extends Error {
-  name = "ValidationError";
+  override name = "ValidationError";
   validator: string;
   input: string;
+  issues: any[];
+  status: number;
+  timestamp: string;
+  override cause?: unknown;
   metric: ValidationErrorMetric;
 
-  constructor(message: string, validator: string, input: string, metric: ValidationErrorMetric) {
-    super(message);
-    this.validator = validator;
-    this.input = input;
-    this.metric = metric;
+  constructor(opts: ValidationErrorOptions | string, validator?: string, input?: string, metric?: ValidationErrorMetric) {
+    if (typeof opts === "object" && opts !== null) {
+      super(opts.message);
+      this.validator = opts.validator;
+      this.input = opts.input;
+      this.issues = opts.issues || [];
+      this.status = opts.status ?? 400;
+      this.cause = opts.cause;
+      this.timestamp = new Date().toISOString();
+      this.metric = {
+        validator: this.validator,
+        input: this.input,
+        error: opts.message,
+        timestamp: this.timestamp,
+      };
+    } else {
+      super(opts);
+      this.validator = validator || "";
+      this.input = input || "";
+      this.issues = [];
+      this.status = 400;
+      this.timestamp = metric?.timestamp || new Date().toISOString();
+      this.metric = metric || {
+        validator: this.validator,
+        input: this.input,
+        error: opts,
+        timestamp: this.timestamp,
+      };
+    }
+  }
+
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      validator: this.validator,
+      issues: this.issues,
+      input: this.input,
+      status: this.status,
+      timestamp: this.timestamp,
+    };
   }
 
   static fromZodError(error: z.ZodError, validator: string, input: string): ValidationError {
     const message = error.issues.map((i) => i.message).join("; ");
-    const metric: ValidationErrorMetric = {
+    return new ValidationError({
       validator,
+      message,
+      issues: error.issues,
       input,
-      error: message,
-      timestamp: new Date().toISOString(),
-    };
-    return new ValidationError(message, validator, input, metric);
+      cause: error,
+      status: 400,
+    });
   }
 }
 
