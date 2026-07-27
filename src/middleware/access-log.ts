@@ -43,10 +43,8 @@ export function redactSensitiveParams(rawUrl: string): string {
 
   let parsed: URL;
   try {
-    // URL() requires an absolute form — dummy base lets relative paths work.
     parsed = new URL(rawUrl, "http://localhost");
   } catch {
-    // Malformed: emit only the path to avoid leaking anything.
     return rawUrl.slice(0, qIndex);
   }
 
@@ -73,102 +71,32 @@ export function redactSensitiveParams(rawUrl: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Idempotency — duplicate-request tracking
+// Metrics
 // ---------------------------------------------------------------------------
 
-/**
- * Maximum number of recently-seen request IDs to retain in the deduplication
- * set. When the set exceeds this size the oldest half is evicted to bound
- * memory usage regardless of TTL.
- */
-const MAX_SEEN_IDS = 10_000;
-
-/**
- * Time-to-live (ms) for a deduplication entry. Request IDs older than this
- * are considered expired and eligible for garbage collection.
- *
- * Default 60 s — longer than a typical HTTP timeout + retry window, short
- * enough that the set does not grow unbounded under steady traffic.
- */
-const SEEN_ID_TTL_MS = 60_000;
-
-/**
- * In-process set of recently-seen request IDs for idempotency.
- *
- * Retries or duplicate delivery of the same request (same correlation ID)
- * must not produce duplicate log lines. This bounded, TTL-based set records
- * every request ID the first time it is observed and silently skips the
- * access-log emission when the same ID is seen again within the TTL window.
- *
- * Design constraints
- * ------------------
- * - **Bounded memory**: the set is capped at {@link MAX_SEEN_IDS} entries.
- *   When the cap is exceeded the oldest half of entries is evicted before
- *   inserting the new one.
- * - **TTL-aware lookup**: stale entries are detected on lookup via the
- *   per-entry timestamp — no timer, no background sweeps. Expired entries
- *   are treated as "new" and re-recorded.
- * - **Process-local**: deduplication does not survive a restart. This is
- *   intentional — the set is a best-effort guard, not a durability guarantee.
- *   A process restart creates a fresh log stream where duplicates are
- *   harmless (the old process's logs are distinct).
- * - **Not shared across instances**: each process maintains its own set.
- *   Horizon-scaling deployments should handle cross-instance dedup at the
- *   log-aggregation layer.
- */
-class SeenRequestIds {
-  /** Map of request ID → insertion time (Date.now() ms). Insertion order is preserved. */
-  private _ids = new Map<string, number>();
-
-  /**
-   * Test whether `id` is new and should be logged.
-   *
-   * Returns `true` when the ID has never been seen or has expired.
-   * Returns `false` when the ID is still fresh — the caller should skip
-   * emitting a log line for this request.
-   *
-   * Side effect: records `id` with the current timestamp on first sighting.
-   * When the map hits its size cap the oldest half is evicted — a single
-   * O(n) compaction that keeps the hot path O(1) under normal load.
-   */
-  isNew(id: string): boolean {
-    const now = Date.now();
-    const existing = this._ids.get(id);
-
-    if (existing !== undefined && now - existing < SEEN_ID_TTL_MS) {
-      // Still fresh — duplicate.
-      return false;
-    }
-
-    // Bounded-memory safety: evict the oldest half when the map is full.
-    // This is the only eviction path — no per-insert full scan.
-    if (this._ids.size >= MAX_SEEN_IDS) {
-      let count = 0;
-      const toRemove = Math.ceil(this._ids.size / 2);
-      for (const key of this._ids.keys()) {
-        if (count >= toRemove) break;
-        this._ids.delete(key);
-        count++;
-      }
-    }
-
-    this._ids.set(id, now);
-    return true;
-  }
-
-  /** Number of entries in the dedup set. Visible for tests. */
-  get size(): number {
-    return this._ids.size;
-  }
-
-  /** Remove all tracked IDs. Visible for tests. */
-  reset(): void {
-    this._ids.clear();
-  }
+export interface AccessLogMetrics {
+  totalRequests: number;
+  requestsByStatus: Record<number, number>;
+  requestsByPath: Record<string, number>;
+  totalDurationMs: number;
 }
 
-/** Singleton deduplication store. Exported for test visibility. */
-export const seenRequestIds = new SeenRequestIds();
+let metrics: AccessLogMetrics = {
+  totalRequests: 0,
+  requestsByStatus: {},
+  requestsByPath: {},
+  totalDurationMs: 0,
+};
+
+/** Return a snapshot of the current metrics counters. */
+export function getMetrics(): Readonly<AccessLogMetrics> {
+  return { ...metrics, requestsByStatus: { ...metrics.requestsByStatus }, requestsByPath: { ...metrics.requestsByPath } };
+}
+
+/** Reset all metrics counters (for use in tests). */
+export function resetMetrics(): void {
+  metrics = { totalRequests: 0, requestsByStatus: {}, requestsByPath: {}, totalDurationMs: 0 };
+}
 
 // ---------------------------------------------------------------------------
 // Log-entry shape
@@ -184,6 +112,8 @@ export interface AccessLogEntry {
   status: number;
   duration_ms: number;
   request_id: string;
+  /** Content-Length of the response body, if set. */
+  content_length?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,13 +151,10 @@ export interface AccessLogEntry {
  *   `[<timestamp>] INFO <method> <path> <status> <duration>ms [<request_id>]`
  */
 export function accessLogMiddleware(req: Request, res: Response, next: NextFunction): void {
-  // Skip noisy /health liveness-probe requests.
   if (req.path === "/health") {
     return next();
   }
 
-  // Snapshot the correlation ID now.
-  // Falls back to a fresh UUID when requestIdMiddleware is not mounted.
   const snapshotId: string =
     typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
       ? res.locals.requestId
@@ -237,19 +164,23 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
 
   res.on("finish", () => {
     try {
-      // Prefer the live value (requestIdMiddleware may have run after us),
-      // but keep the snapshot as the guaranteed-valid fallback.
+      const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
+
       const requestId: string =
         typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
           ? res.locals.requestId
           : snapshotId;
 
-      // Idempotency guard: skip when the same request ID was recently logged.
-      if (!seenRequestIds.isNew(requestId)) {
-        return;
-      }
+      metrics.totalRequests += 1;
+      metrics.requestsByStatus[res.statusCode] = (metrics.requestsByStatus[res.statusCode] ?? 0) + 1;
+      const pathKey = req.route?.path ?? req.path;
+      metrics.requestsByPath[pathKey] = (metrics.requestsByPath[pathKey] ?? 0) + 1;
+      metrics.totalDurationMs += durationMs;
 
-      const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
+      const contentLength =
+        typeof res.getHeader === "function"
+          ? res.getHeader("content-length")
+          : undefined;
 
       const entry: AccessLogEntry = {
         timestamp: new Date().toISOString(),
@@ -261,6 +192,10 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         request_id: requestId,
       };
 
+      if (contentLength !== undefined) {
+        entry.content_length = Number(contentLength);
+      }
+
       if (env.LOG_FORMAT === "json") {
         // eslint-disable-next-line no-console
         console.info(JSON.stringify(entry));
@@ -271,7 +206,6 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         );
       }
     } catch (err) {
-      // A logging failure must never affect the caller.
       // eslint-disable-next-line no-console
       console.error("[access-log] failed to emit log entry", err);
     }

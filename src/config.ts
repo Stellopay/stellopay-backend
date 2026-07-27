@@ -113,6 +113,18 @@ export const EnvSchema = z
   // A Starknet block is produced roughly every 6–12 s; 12 s is a safe default.
   INDEXED_CACHE_MAX_AGE_SECONDS: z.coerce.number().int().positive().optional().default(12),
 
+  // Analytics aggregation in-process cache TTL (milliseconds).
+  // Repeated identical requests within this window hit the in-memory cache
+  // instead of re-running expensive aggregation queries.  Default is 30 s
+  // (≈ 2–5 Starknet blocks) which is conservative enough that a re-fetch after
+  // a new block will see up-to-date data within a reasonable time.
+  ANALYTICS_CACHE_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(30_000),
+
   // Session token lifetime in milliseconds (sliding expiry) - default 24 hours
   SESSION_TTL_MS: z.coerce
     .number()
@@ -151,6 +163,39 @@ export const EnvSchema = z
         .map((a) => a.trim().toLowerCase())
         .filter((a) => a.length > 0),
     ),
+
+  // Circuit breaker configuration for Starknet RPC calls
+  // Failure threshold: number of failures before circuit opens - default 5
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(5),
+  // Success threshold: number of successes needed to close circuit from half-open - default 2
+  CIRCUIT_BREAKER_SUCCESS_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(2),
+  // Cooldown period before attempting to half-open circuit (milliseconds) - default 30 seconds
+  CIRCUIT_BREAKER_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(30_000),
+  // Time window for counting failures (milliseconds) - default 60 seconds
+  CIRCUIT_BREAKER_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(60_000),
+});
+
+export const env = EnvSchema.parse(process.env);
   })
   .superRefine((data, ctx) => {
     const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
@@ -194,21 +239,23 @@ export const starknetRpcUrls = parseStarknetRpcUrls(env.STARKNET_RPC_URL);
 // In production, these should be set as absolute paths or paths relative to the deployed location
 export const abiPaths = {
   escrow:
-    env.ESCROW_CONTRACT_CLASS_JSON ||
-    (process.env.NODE_ENV === "production"
+    env.ESCROW_CONTRACT_CLASS_JSON !== undefined
+      ? env.ESCROW_CONTRACT_CLASS_JSON || null
+      : process.env.NODE_ENV === "production"
       ? null
       : path.resolve(
           process.cwd(),
           "contracts/starknet_contracts_PayrollEscrow.contract_class.json",
-        )),
+        ),
   agreement:
-    env.AGREEMENT_CONTRACT_CLASS_JSON ||
-    (process.env.NODE_ENV === "production"
+    env.AGREEMENT_CONTRACT_CLASS_JSON !== undefined
+      ? env.AGREEMENT_CONTRACT_CLASS_JSON || null
+      : process.env.NODE_ENV === "production"
       ? null
       : path.resolve(
           process.cwd(),
           "contracts/starknet_contracts_WorkAgreement.contract_class.json",
-        )),
+        ),
 };
 
 // Validate that ABI paths are set in production
@@ -219,6 +266,14 @@ if (process.env.NODE_ENV === "production") {
     );
   }
 }
+
+/** Circuit breaker configuration for Starknet RPC calls. */
+export const circuitBreakerConfig = {
+  failureThreshold: env.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+  successThreshold: env.CIRCUIT_BREAKER_SUCCESS_THRESHOLD,
+  cooldownMs: env.CIRCUIT_BREAKER_COOLDOWN_MS,
+  windowMs: env.CIRCUIT_BREAKER_WINDOW_MS,
+};
 
 export const defaults = {
   payrollEscrowAddress:

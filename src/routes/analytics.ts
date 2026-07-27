@@ -6,6 +6,7 @@ import { asc, eq, and, gt, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
+import { AnalyticsCache, buildAnalyticsCacheKey } from "../utils/analytics-cache.js";
 
 export const analyticsRouter = Router();
 
@@ -57,6 +58,7 @@ interface AnalyticsTelemetryEntry {
   year?: number;
   row_counts?: Record<string, number>;
   error?: string;
+  cache_hit?: boolean;
 }
 
 /**
@@ -349,7 +351,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       },
     });
 
-    res.json({
+    const responseBody = {
       year,
       data: chartData,
       total: toDisplayNumber(totalRaw),
