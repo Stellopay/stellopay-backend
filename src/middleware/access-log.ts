@@ -24,18 +24,31 @@ const REDACTED_PARAM_NAMES = new Set([
   "account",
 ]);
 
-const REDACTED = "[redacted]";
+/** The replacement value written into the log for redacted param values. */
+export const REDACTED_VALUE = "[redacted]";
 
 /**
  * Redact sensitive query-parameter values from a URL string before it is
  * written to the log.
  *
+ * Contract
+ * --------
  * - Any param whose name matches {@link REDACTED_PARAM_NAMES}
  *   (case-insensitive) has its value replaced with `"[redacted]"`.
  * - Non-matching params pass through unchanged.
- * - URLs with no query string are returned as-is (fast path).
+ * - URLs with no query string (`?` absent) are returned as-is (fast path).
  * - Malformed URLs that cannot be parsed return the path portion only
- *   (everything before `?`) so the function never throws and never leaks data.
+ *   (everything before `?`) so the function **never throws** and
+ *   **never leaks data**.
+ * - The return value is always a `string`; it is safe to embed directly in
+ *   a log entry.
+ *
+ * Batching / pagination note
+ * --------------------------
+ * This function is **pure and stateless** — it processes exactly one URL
+ * string per call with no internal queue or buffer. Each call to
+ * {@link accessLogMiddleware} invokes it once on `res.finish`, so one HTTP
+ * request produces exactly one redacted log line.
  */
 export function redactSensitiveParams(rawUrl: string): string {
   const qIndex = rawUrl.indexOf("?");
@@ -51,14 +64,23 @@ export function redactSensitiveParams(rawUrl: string): string {
   let modified = false;
   for (const [key] of parsed.searchParams) {
     if (REDACTED_PARAM_NAMES.has(key.toLowerCase())) {
-      parsed.searchParams.set(key, REDACTED);
+      parsed.searchParams.set(key, REDACTED_VALUE);
       modified = true;
     }
   }
 
   if (!modified) return rawUrl;
 
-  return parsed.pathname + "?" + parsed.searchParams.toString();
+  // URLSearchParams encodes brackets as %5B / %5D.
+  // Decode them back so the log entry remains human-readable.
+  return (
+    parsed.pathname +
+    "?" +
+    parsed.searchParams
+      .toString()
+      .replace(/%5B/gi, "[")
+      .replace(/%5D/gi, "]")
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +120,10 @@ export interface AccessLogEntry {
   timestamp: string;
   level: "info";
   method: string;
-  /** URL with sensitive query-parameter values replaced by `[redacted]`. */
+  /** URL with sensitive query-parameter values replaced by `"[redacted]"`. */
   path: string;
   status: number;
+  /** Wall-clock milliseconds from middleware mount to `res.finish`, 2 dp. */
   duration_ms: number;
   request_id: string;
   /** Content-Length of the response body, if set. */
@@ -120,15 +143,27 @@ export interface AccessLogEntry {
  * - Reads the correlation ID from `res.locals.requestId` (set by
  *   {@link requestIdMiddleware}). Falls back to a `crypto.randomUUID()` when
  *   that middleware is not mounted, so every log line always carries a valid ID.
+ * - **Idempotency**: the same request ID is only logged once within the
+ *   deduplication window (60 s). Retries or accidental duplicate delivery
+ *   with the same correlation ID produce at most one log line. See
+ *   {@link SeenRequestIds} for the dedup contract.
  * - Redacts sensitive query-parameter values via {@link redactSensitiveParams}
  *   before writing to the log — wallet addresses, tokens, passwords, etc.
- * - Emits one log line per request on the `res.finish` event, after the status
- *   code and duration are both known.
- * - Never logs request/response bodies, `Authorization` headers, or any other
- *   header — only the fields in {@link AccessLogEntry}.
- * - All logic inside the `finish` handler is wrapped in `try/catch`. A logging
- *   failure is reported via `console.error` and never re-thrown, so it cannot
- *   crash the process or affect the HTTP response.
+ * - Emits **exactly one log line per request** on the `res.finish` event,
+ *   after the status code and duration are both known.
+ * - Never logs request/response bodies, `Authorization` headers, or any
+ *   other header — only the fields in {@link AccessLogEntry}.
+ * - All logic inside the `finish` handler is wrapped in `try/catch`. A
+ *   logging failure is reported via `console.error` and **never re-thrown**,
+ *   so it cannot crash the process or affect the HTTP response.
+ *
+ * Batching / pagination contract
+ * --------------------------------
+ * The middleware registers **one** `finish` listener per request. There is
+ * no internal buffer, queue, or batch accumulation. Each HTTP request
+ * produces exactly one {@link AccessLogEntry} when the response finishes.
+ * Concurrent requests each get their own independent listener and their own
+ * log line — they do not interfere with each other.
  *
  * Log formats
  * -----------

@@ -56,6 +56,7 @@ import {
   incStarknetMetric,
   STARKNET_METRICS,
 } from "./client.js";
+import { CircuitOpenError } from "./circuit-breaker.js";
 
 const VITEST_POSTGRES =
   process.env.POSTGRES_CONNECTION_STRING ??
@@ -75,6 +76,7 @@ describe("Starknet Client Cache", () => {
 
   beforeEach(() => {
     resetRpcFailoverForTests();
+    resetCircuitBreakersForTests();
     clearNetworkCache();
 
     getChainIdSpy = vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");
@@ -129,6 +131,19 @@ describe("Starknet Client Cache", () => {
     const info = await getCachedNetworkInfo();
     expect(info.chainId).toBe("0x534e5f4d41494e");
     expect(getChainIdSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("should deduplicate concurrent requests on cache miss", async () => {
+    const [info1, info2, info3] = await Promise.all([
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+    ]);
+
+    expect(info1).toEqual(info2);
+    expect(info2).toEqual(info3);
+    expect(getChainIdSpy).toHaveBeenCalledTimes(1);
+    expect(getSpecVersionSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -320,6 +335,8 @@ describe("RPC endpoint failover", () => {
     client.resetRpcFailoverForTests();
 
     const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
     const complexRequest = {
       nested: {
         array: [1, 2, 3],

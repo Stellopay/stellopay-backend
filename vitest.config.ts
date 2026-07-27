@@ -12,6 +12,7 @@ export default defineConfig({
       NODE_ENV: "test",
       CORS_ORIGIN: "http://localhost:3000",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
+      CORS_ORIGIN: "http://localhost:3000",
       POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
     },
     coverage: {

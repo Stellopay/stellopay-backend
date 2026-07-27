@@ -97,24 +97,38 @@ Entries leave the store in three ways:
 
 ### Bounding memory growth
 
-Two independent bounds guard the in-memory store.
+Three independent bounds guard the in-memory store.
 
-**Opportunistic sweep.** `getChallenge` and `consumeChallenge` only evict an entry when it
-is _read_. An address that requests a challenge and never calls `/auth/verify` (an
-abandoned login, or an attacker enumerating addresses) would otherwise sit in the map
-forever. Every 50th `createChallenge` call therefore scans the map and deletes any entry
-whose TTL has already elapsed, regardless of whether it was ever read. This bounds
-unread/abandoned entries to roughly one sweep interval's worth of traffic instead of the
-lifetime of the process, without a background timer (which would complicate shutdown and
-test lifecycles).
+**Paginated opportunistic sweep.** `getChallenge` and `consumeChallenge` only evict an
+entry when it is _read_. An address that requests a challenge and never calls
+`/auth/verify` (an abandoned login, or an attacker enumerating addresses) would otherwise
+sit in the map forever. Every 50th `createChallenge` call therefore initiates a sweep
+pass that deletes entries whose TTL has already elapsed.
 
-**Hard cap.** `MAX_CHALLENGES` is 100,000 — roughly 8MB at ~80 bytes per entry. When a
-**new** entry would exceed it, `createChallenge` runs one last sweep to reclaim expired
-entries, and if the store is still full it emits `challenge_rejected` /
-`reason: "store_full"` and throws. The route layer surfaces that as a 5xx rather than
-silently dropping a security-relevant signal. Replaying an **existing** challenge is never
-blocked by the cap — a full store must not break an in-flight login for an unrelated
-address.
+The sweep is **paginated** to bound synchronous work: each invocation checks at most
+`SWEEP_BATCH_SIZE` (500) entries and advances a cursor (`sweepOffset`). The next sweep
+continues from where the previous one stopped, wrapping back to offset 0 after reaching
+the end of the store. This means a single sweep call costs O(SWEEP_BATCH_SIZE) regardless
+of store size.
+
+At `SWEEP_BATCH_SIZE = 500` and a full store of 100,000 entries, a complete pass requires
+200 sweep invocations. At the sweep interval of 50 `createChallenge` calls, a full pass
+completes every 10,000 calls, which at realistic traffic volumes is well within the
+5-minute TTL window. The page size (`SWEEP_BATCH_SIZE = 500`) and interval
+(`SWEEP_INTERVAL = 50`) are tuned to keep per-invocation latency negligible even under
+spike traffic.
+
+**Last-resort full sweep.** When a **new** entry would exceed `MAX_CHALLENGES`,
+`createChallenge` runs a full (un-paginated) sweep over the entire store to reclaim
+whatever has already expired before throwing. This guarantees all expired entries are
+reclaimed when the store is near the cap.
+
+**Hard cap.** `MAX_CHALLENGES` is 100,000 — roughly 8MB at ~80 bytes per entry. If the
+last-resort full sweep still leaves the store full, `createChallenge` emits
+`challenge_rejected` / `reason: "store_full"` and throws. The route layer surfaces that as
+a 5xx rather than silently dropping a security-relevant signal. Replaying an **existing**
+challenge is never blocked by the cap — a full store must not break an in-flight login for
+an unrelated address.
 
 ### Rationale for in-memory retention
 
@@ -185,12 +199,114 @@ caller-supplied string into logs is what would blow up cardinality.
 A successful `getChallenge` emits nothing: the metrics record state _transitions_, not
 call volume.
 
+## Compatibility guarantees
+
+These are the promises existing callers — `src/routes/auth.ts` in particular —
+already depend on. Each is pinned by a case in the "compatibility guarantees"
+block of `src/auth/challenge.test.ts`, so breaking one fails the suite rather
+than surfacing in production.
+
+**Export surface.**
+
+1. `createChallenge(address)` returns `{ nonce: string; expires_in_ms: number }`.
+   `nonce` is always `0x` + 32 hex characters (16 bytes from `crypto.randomBytes`).
+   `expires_in_ms` is the **remaining** TTL, not the fixed constant.
+   Adding or removing a key in the return value breaks `/auth/challenge`.
+2. `consumeChallenge(address)` returns `ChallengeRecord | null` — the **only**
+   safe way to read a challenge before signature verification. `/auth/verify`
+   depends on its atomic read-and-delete to close the replay race.
+3. `getChallenge(address)` is read-only and returns `ChallengeRecord | null`.
+   It never deletes the entry unless it is expired (lazy eviction).
+4. `clearChallenge(address)` returns `void` and is always a no-op when there
+   was nothing to delete.
+5. `buildTypedChallenge(address, chainId, nonce)` returns a `TypedData` (from
+   `starknet`). The wallet field inside `message` is the **canonical** Starknet
+   address, not the raw caller-supplied string.
+6. `CHALLENGE_TTL_MS` is `5 * 60 * 1000` (5 minutes), exported as a `const`.
+   Changing it changes when every issued nonce expires.
+7. `MAX_CHALLENGES` is `100_000`, exported as a `const`. Changing it changes
+   the DoS hardening bound.
+8. `challenges` (the `Map`) is exported so tests can assert on store contents
+   and drive the size cap directly. Production code outside this module must
+   go through the functions above; reading the Map directly couples the caller
+   to the internal store type and eviction strategy.
+9. `clearChallengesForTesting()` and `clearChainIdCacheForTesting()` are
+   exported for test isolation only. Calling either in production invalidates
+   every in-flight login or discards a warm cache.
+
+**Nonce behaviour.**
+
+10. A nonce is 16 cryptographic bytes, formatted as `0x` + 32 lower-case hex
+    characters. `/auth/challenge` serialises it into `typed_data.message.nonce`
+    and the wallet signs that exact string. Changing the byte count or the hex
+    encoding changes the wire format of every issued challenge.
+11. Nonce expiry is checked as `now > expiresAtMs` (**strictly greater**).
+    The exact expiry instant is still valid; the millisecond after it is not.
+    At that exact boundary `createChallenge` replays with `expires_in_ms: 0`.
+12. The TTL is never extended on retry. A replay returns the **remaining** TTL,
+    which shrinks toward zero on each call. A retry cannot push the expiry forward
+    and therefore cannot extend the replay window.
+13. A retry does **not** overwrite the nonce. A valid in-flight `/auth/verify`
+    for the same address cannot be invalidated by a concurrent or subsequent
+    `POST /auth/challenge`. The nonce stays stable until expiry or consumption.
+
+**Address keying.**
+
+14. Every entry in the challenge store is keyed by the **canonical** Starknet
+    address (lowercase, `0x` + 64 hex, from `normalizeStarknetAddress`).
+    `0x1`, `0x0001`, `0x000…001`, and mixed-case checksums for the same
+    numeric address all resolve to the same slot.
+15. `createChallenge` **throws** on a malformed address — the caller asked to
+    store something unusable, and the route layer surfaces the error.
+16. `getChallenge`, `clearChallenge`, and `consumeChallenge` **tolerate**
+    malformed addresses: they return `null` or no-op without throwing.
+    This keeps a malformed request body from turning into a 500 on the auth route.
+17. `buildTypedChallenge` **throws** on a malformed address — it must never
+    produce a typed-data payload with an unusable wallet field.
+
+**Store lifecycle.**
+
+18. Entries leave the store in exactly three ways: (a) consumed by
+    `consumeChallenge`, (b) lazily evicted on read when expired, or
+    (c) swept on the write path every 50 `createChallenge` calls.
+    No background timer participates.
+19. A full store (`MAX_CHALLENGES` entries) refuses new entries from
+    **unrecognised** addresses. An address that already holds a slot can still
+    replay its active challenge — a full store must not break an unrelated
+    in-flight login.
+20. The store is per-process and in-memory. A server restart or a different
+    instance handling `/auth/verify` sees no active challenge; the client
+    retries `/auth/challenge` to recover.
+
+**Telemetry.**
+
+21. Every state transition emits exactly one JSON line on `console.info` with
+    the shape `{ metric, …fields, timestamp }`. Silent transitions (e.g. a
+    `getChallenge` hit, or a `clearChallenge` no-op) emit nothing.
+22. The `address` field in every metric is the **canonical** key, never a raw
+    caller-supplied string. Log lines for `0xabc`, `0xABC`, and the padded form
+    all correlate to one login attempt.
+23. The seven metric names (`challenge_created`, `challenge_replayed`,
+    `challenge_rejected`, `challenge_expired`, `challenge_miss`,
+    `challenge_cleared`, `challenge_consumed`) and their field shapes are
+    part of this contract. Operators and dashboards already depend on them;
+    renaming one or changing its payload is a breaking change.
+
+**What counts as a breaking change.** Adding a new export, adding an optional
+field to the `createChallenge` return value (callers use destructuring and
+ignore unknown keys), or relaxing a throw into a return is backward compatible.
+Changing any of the 23 points above — including the nonce format, the TTL
+value, the expiry comparison operator, the idempotency contract, or a metric
+name — is breaking, and needs a coordinated change in `src/routes/auth.ts` and
+any dashboard or alert that consumes the metric.
+
 ## Test helpers
 
-`clearChallengesForTesting()` empties the store and resets the sweep counter;
-`clearChainIdCacheForTesting()` empties the chain-ID memo. Both exist for test isolation
-only — calling either in production would invalidate every in-flight login or discard a
-warm cache for no reason.
+`clearChallengesForTesting()` empties the store and resets both the sweep counter
+(`creationsSinceSweep`) and the page cursor (`sweepOffset`); `clearChainIdCacheForTesting()`
+empties the chain-ID memo. Both exist for test isolation only — calling either in production
+would invalidate every in-flight login, reset pagination mid-pass, or discard a warm cache
+for no reason.
 
 The `challenges` Map itself is exported so tests can assert on store contents and drive the
 size cap directly without minting 100,000 real nonces. Production code outside this module
@@ -211,6 +327,10 @@ must go through the functions above.
   full-but-stale store, and recovery after draining.
 - Sweep: a valid entry surviving unrelated traffic, an abandoned expired entry being
   evicted without ever being read, and not-yet-expired entries left in place.
+- Batch sweep pagination: the per-invocation page limit (`SWEEP_BATCH_SIZE`), cursor
+  advancement across multiple sweeps, cursor wrap-around after a full pass, graceful
+  handling of an empty store, cursor reset when the store shrinks below the cursor, and
+  the last-resort full sweep when the store is full.
 - `getChallenge` / `clearChallenge` / `consumeChallenge`: success, expiry boundary,
   not-found and invalid-address misses, silent no-ops, the consume-once replay race, and
   cross-format address resolution.

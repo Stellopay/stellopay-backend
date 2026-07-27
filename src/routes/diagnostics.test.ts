@@ -14,6 +14,7 @@
  *   - Empty DB boundary: all summary fields default to 0, latestEvents is []
  *   - Error handling: db failure propagates as 500 via error handler
  *   - Response shape: all top-level keys present on every 200
+ *   - Idempotency-Key replay caching
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -43,10 +44,8 @@ import {
 } from "./diagnostics.js";
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
-// Use valid-hex addresses: the auth middleware now compares the
-// principal against the admin allowlist through normalizeStarknetAddress,
-// which rejects anything outside [0-9a-f] (e.g. `m`, `n`, `o`, `t`).
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
 
@@ -60,8 +59,15 @@ function makeApp() {
   return app;
 }
 
-function authHeaders(address: string) {
-  return { "x-user-address": address, authorization: "Bearer testtoken" };
+function authHeaders(address: string, idempotencyKey?: string) {
+  const headers: Record<string, string> = {
+    "x-user-address": address,
+    authorization: "Bearer testtoken",
+  };
+  if (idempotencyKey) {
+    headers["idempotency-key"] = idempotencyKey;
+  }
+  return headers;
 }
 
 /** Queue the five db.execute results the route reads, in call order. */
@@ -83,8 +89,6 @@ function wireDbRows() {
         },
       ],
     } as any)
-    // The recent-events query returns sensitive identifiers; the route must
-    // redact them out of the response.
     .mockResolvedValueOnce({
       rows: [
         {
@@ -119,19 +123,16 @@ describe("redactRecentEvent helper", () => {
   });
 
   it("provides safe fallbacks for malformed inputs without crashing", () => {
-    // Missing fields
     expect(redactRecentEvent({})).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
 
-    // Invalid types
     expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
 
-    // Null or undefined
     expect(redactRecentEvent(null)).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
@@ -141,7 +142,6 @@ describe("redactRecentEvent helper", () => {
       created_at: new Date(0).toISOString(),
     });
 
-    // Primitive values
     expect(redactRecentEvent("just a string")).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
@@ -520,6 +520,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     vi.clearAllMocks();
     vi.mocked(db.execute).mockReset();
     vi.mocked(requireSession).mockResolvedValue(true);
+    clearDiagnosticsIdempotencyStore();
   });
 
   it("rejects an unauthenticated request with 401 and runs no queries", async () => {
@@ -530,10 +531,6 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 
   it("rejects an authenticated non-admin with 403 and runs no queries", async () => {
-    // requireAuth was satisfied by the session mock, but requireAdmin
-    // denies because NON_ADMIN is not in the admin allowlist. The 401/403
-    // split in src/auth/middleware.ts intentionally distinguishes "no
-    // session" from "wrong role".
     const res = await request(makeApp())
       .get("/api/v1/diagnostics/events")
       .set(authHeaders(NON_ADMIN));
@@ -577,7 +574,10 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.summary.latestBlock).toBe("100");
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
+    expect(res.body.circuitBreakers).toHaveLength(1);
+    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
     expect(getPoolStats).toHaveBeenCalledOnce();
+    expect(getCircuitBreakerSnapshots).toHaveBeenCalledOnce();
   });
 
   it("handles case-insensitive admin address matching", async () => {
@@ -611,7 +611,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
-      .mockResolvedValueOnce({ rows: [] } as any) // tableCounts empty: rows[0] undefined
+      .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any);
 
     const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
@@ -631,9 +631,8 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 });
 
-
 describe("GET /diagnostics/events – backward-compatibility contract (Issue #284)", () => {
-    beforeEach(() => {
+    beforeEach(() => {https://github.com/Stellopay/stellopay-backend/pull/564/conflict?name=src%252Froutes%252Fdiagnostics.test.ts&ancestor_oid=4c2037638aad218c8c1b9cac2228465f55bfc033&base_oid=f699082b599c18f0d4b617f1c6161b2253b77fe9&head_oid=15d417408f9201da0d8a9c31260caf74049f4088
         vi.clearAllMocks();
             vi.mocked(db.execute).mockReset();
                 vi.mocked(requireSession).mockResolvedValue(true);

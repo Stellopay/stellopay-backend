@@ -23,6 +23,8 @@ vi.mock("../config.js", () => ({
 }));
 
 const { dbMock, schemaMock, state, limitSpy, offsetSpy, callOrder } = vi.hoisted(() => {
+  (globalThis as any).isPlainObject = (val: unknown): val is Record<string, unknown> =>
+    !!val && typeof val === "object" && !Array.isArray(val);
   const limitSpy = vi.fn();
   const offsetSpy = vi.fn();
   const state = { rows: {} as Record<string, any[]> };
@@ -336,6 +338,8 @@ describe("indexed routes data paths", () => {
     expect(res.body.agreement.id).toBe("7");
     expect(res.body.events).toHaveLength(1);
     expect(res.body.payments).toHaveLength(1);
+    expect(res.headers["cache-control"]).toContain("public, max-age=");
+    expect(res.headers.etag).toBeDefined();
   });
 
   it("computes escrow balance from funded, released, and refunded events", async () => {
@@ -391,6 +395,52 @@ describe("indexer freshness and sync checkpoint helpers", () => {
         { blockNumber: null },
       ];
       expect(deriveSyncCheckpoint(records)).toBe(12345);
+    });
+  });
+
+  describe("indexer freshness and sync checkpoint route headers", () => {
+    it("success path: returns maximum block number in x-indexer-sync-checkpoint header", async () => {
+      state.rows.agreements = [
+        { id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 120 },
+        { id: "a2", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 350 },
+      ];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("350");
+    });
+
+    it("boundary path: returns 0 in x-indexer-sync-checkpoint header if no records exist", async () => {
+      state.rows.agreements = [];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
+    });
+
+    it("success path: agreement details endpoint derives sync checkpoint from all details records", async () => {
+      state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 100 }];
+      state.rows.agreementEvents = [{ id: "e1", blockNumber: 200 }];
+      state.rows.payments = [{ id: "p1", blockNumber: 300 }];
+      state.rows.milestones = [{ id: "m1", blockNumber: 400 }];
+      state.rows.employees = [{ id: "emp1", blockNumber: 500 }];
+      state.rows.escrowEvents = [{ id: "x1", blockNumber: 600 }];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("600");
+    });
+
+    it("boundary path: agreement details endpoint returns 0 in x-indexer-sync-checkpoint header when records lack block numbers", async () => {
+      state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
     });
   });
 });
