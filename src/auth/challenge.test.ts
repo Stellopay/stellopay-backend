@@ -657,3 +657,103 @@ describe("consumeChallenge", () => {
     expect(challenges.size).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Nonce Challenge Security and Validation Contract Boundary Tests
+// ---------------------------------------------------------------------------
+
+describe("Nonce Challenge Security and Validation Contract Boundary", () => {
+  it("rejects missing, null, undefined, and whitespace addresses fail-closed", () => {
+    const invalidInputs = [null, undefined, "", "   ", "\t\n"];
+
+    for (const input of invalidInputs) {
+      expect(() => createChallenge(input)).toThrow(/parseable Starknet address/);
+      expect(getChallenge(input)).toBeNull();
+      expect(() => clearChallenge(input)).not.toThrow();
+      expect(consumeChallenge(input)).toBeNull();
+    }
+  });
+
+  it("rejects invalid data types (number, boolean, object, array) fail-closed", () => {
+    const invalidTypes = [12345, true, false, {}, { address: "0x1" }, ["0x1"]];
+
+    for (const input of invalidTypes) {
+      expect(() => createChallenge(input as any)).toThrow(/parseable Starknet address/);
+      expect(getChallenge(input as any)).toBeNull();
+      expect(consumeChallenge(input as any)).toBeNull();
+      expect(() => buildTypedChallenge(input as any, CHAIN_ID_SEPOLIA, "0xnonce")).toThrow(
+        /parseable Starknet address/,
+      );
+    }
+  });
+
+  it("buildTypedChallenge strictly validates chainId and nonce parameter shapes", () => {
+    const invalidInputs = [null, undefined, "", "   ", 123, {}];
+
+    for (const badChainId of invalidInputs) {
+      expect(() => buildTypedChallenge(ADDR_CANONICAL, badChainId as any, "0xnonce")).toThrow(
+        /chainId must be a non-empty string/,
+      );
+    }
+
+    for (const badNonce of invalidInputs) {
+      expect(() => buildTypedChallenge(ADDR_CANONICAL, CHAIN_ID_SEPOLIA, badNonce as any)).toThrow(
+        /nonce must be a non-empty string/,
+      );
+    }
+  });
+
+  it("nonce generation produces 16-byte hex nonces with expected entropy", () => {
+    const issuedNonces = new Set<string>();
+
+    for (let i = 0; i < 20; i++) {
+      const address = canonical(i.toString(16));
+      const { nonce, expires_in_ms } = createChallenge(address);
+
+      expect(nonce).toMatch(/^0x[0-9a-f]{32}$/);
+      expect(expires_in_ms).toBe(CHALLENGE_TTL_MS);
+      expect(issuedNonces.has(nonce)).toBe(false);
+      issuedNonces.add(nonce);
+    }
+
+    expect(issuedNonces.size).toBe(20);
+  });
+
+  it("replay protection ensures consumed challenges cannot be validated or reused", () => {
+    const { nonce } = createChallenge("0x12345");
+
+    // First consume succeeds
+    const record = consumeChallenge("0x12345");
+    expect(record).not.toBeNull();
+    expect(record?.nonce).toBe(nonce);
+
+    // Immediate second consume (replay) returns null
+    expect(consumeChallenge("0x12345")).toBeNull();
+    expect(getChallenge("0x12345")).toBeNull();
+  });
+
+  it("enforces boundary conditions around expiration timing", () => {
+    const { nonce } = createChallenge("0x9999");
+
+    // Valid at exact TTL boundary
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS);
+    expect(getChallenge("0x9999")?.nonce).toBe(nonce);
+
+    // Expired 1ms past boundary
+    vi.advanceTimersByTime(1);
+    expect(getChallenge("0x9999")).toBeNull();
+    expect(consumeChallenge("0x9999")).toBeNull();
+  });
+
+  it("failure responses and telemetry omit raw malformed inputs to prevent log pollution", () => {
+    const maliciousPayload = "<script>alert('xss')</script>";
+
+    expect(getChallenge(maliciousPayload)).toBeNull();
+
+    const loggedMiss = metrics().find((m) => m.metric === "challenge_miss");
+    expect(loggedMiss).toBeDefined();
+    expect(loggedMiss?.reason).toBe("invalid_address");
+    expect(loggedMiss?.address).toBeUndefined();
+  });
+});
+

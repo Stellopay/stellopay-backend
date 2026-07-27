@@ -20,6 +20,25 @@ The wallet-login flow has three trust-bearing primitives:
 
 Each is owned by exactly one exported function below.
 
+## Input validation & security contract
+
+### Input requirements & failure behavior
+
+| Operation | Input Requirements | Failure / Validation Behavior |
+| --- | --- | --- |
+| `createChallenge` | `address`: Non-empty parseable Starknet address string | Throws `Error` ("createChallenge: address is not a parseable Starknet address") on missing, invalid type, empty, or unparseable input. |
+| `getChallenge` | `address`: Non-empty parseable Starknet address string | Returns `null` on missing, invalid type, empty, or unparseable input; emits `challenge_miss` / `reason: "invalid_address"`. |
+| `clearChallenge` | `address`: Non-empty parseable Starknet address string | Safe no-op on missing, invalid type, empty, or unparseable input. |
+| `consumeChallenge` | `address`: Non-empty parseable Starknet address string | Returns `null` on missing, invalid type, empty, or unparseable input; performs atomic read-and-delete on valid challenge. |
+| `buildTypedChallenge` | `address`, `chainId`, `nonce`: Non-empty strings | Throws `Error` if any parameter is missing, invalid type, empty/whitespace, or unparseable. |
+
+### Security guarantees & replay protection
+
+1. **Atomic Consumption**: `consumeChallenge` reads and deletes the nonce in a single step, preventing concurrent verification race conditions (replay defense).
+2. **Fail-Closed Validation**: Invalid, missing, non-string, or malformed inputs are rejected prior to Map lookups or processing.
+3. **Entropy & Uniqueness**: Nonces are generated via CSPRNG (`crypto.randomBytes(16)`), providing 128 bits of entropy (formatted as 32 hex characters prefixed with `0x`).
+4. **Log Sanitization**: Raw malformed input strings and internal error stack traces are omitted from structured telemetry logs to prevent log injection and memory bloat.
+
 ## Address keying
 
 **Every entry is keyed by the canonical Starknet address**, obtained from
