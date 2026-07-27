@@ -249,10 +249,22 @@ credentials forever on the second case.
 authorized, the result is cached in `res.locals.adminAuthorized` and
 subsequent calls short-circuit to `next()` without re-checking the
 allowlist. This means allowlist changes during a request's lifecycle do
-not affect an already-authorized principal. The `res.locals` key is set
-only on the success path and is never cleared.
+not affect an already-authorized principal, and the middleware stack can
+be safely replayed without re-evaluating the allowlist.
 
 **Success path** — calls `next()` and lets the route handle the request.
+
+### Resilience
+
+- **Session lookup failures are observable.** When `requireSession` throws
+  (e.g. database connection issue), the error is logged via `console.warn`
+  with the full error object before the request is denied with a standard
+  401 response. The client-facing response does not leak the nature of the
+  failure, but operators can detect infrastructure issues from the log.
+- **Safe replay.** Both `requireAuth` and `requireAdmin` are idempotent,
+  so applying them multiple times in a middleware stack (e.g. router-level
+  + route-level) is safe and produces the same result as a single
+  application.
 
 ## How callers consume `req.auth`
 
@@ -346,10 +358,9 @@ breaking, and needs a coordinated change in `routes/auth.ts`,
 
 `src/auth/middleware.test.ts` covers the full contract:
 
-- `requireAuth` failure paths (missing header, non-string array header —
-  each header alone and both together — non-Bearer, empty trimmed token,
-  empty trimmed address, invalid session, throwing session lookup, empty
-  `req.auth` object falls through to header validation).
+- `requireAuth` failure paths (missing header, non-string array header,
+  non-Bearer, empty trimmed token, empty trimmed address, invalid session,
+  throwing session lookup — including console.warn observability check).
 - `requireAuth` success path (lowercased address stored, raw token
   stored, next called).
 - `requireAuth` idempotency paths (second call skips re-validation,
@@ -358,6 +369,9 @@ breaking, and needs a coordinated change in `routes/auth.ts`,
   non-object `req.auth`, `req.auth.address` is null).
 - `requireAdmin` 403 path (non-admin authenticated, malformed
   principal, allowlist has malformed entries).
+- `requireAdmin` idempotency paths (short-circuit when
+  `res.locals.adminAuthorized` is pre-set, second call skips re-check,
+  allowlist changes ignored after first authorization).
 - `requireAdmin` success paths including canonical padding equivalence
   between admin and principal.
 - `requireAdmin` idempotency paths (short-circuit when

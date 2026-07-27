@@ -286,10 +286,11 @@ export const requireAuth = async (
   let isValid: boolean;
   try {
     isValid = await requireSession(address, token);
-  } catch {
+  } catch (err) {
     // `requireSession` swallows DB errors but a future change could surface
     // them; treat any throw as a failed authentication so we never hand
     // back a half-validated principal.
+    console.warn("[auth] requireSession threw — treating as failed auth", err);
     isValid = false;
   }
   if (!isValid) {

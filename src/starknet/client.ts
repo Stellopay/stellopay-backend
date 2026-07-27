@@ -1,6 +1,21 @@
 import { Contract, RpcProvider } from "starknet";
 import { abiPaths, starknetRpcUrls } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "./abi.js";
+import {
+  incStarknetMetric,
+  logStarknetEvent,
+  STARKNET_METRICS,
+} from "./client-metrics.js";
+
+export {
+  getStarknetMetricsSnapshot,
+  resetStarknetMetrics,
+  incStarknetMetric,
+  setStarknetGauge,
+  logStarknetEvent,
+  STARKNET_METRICS,
+} from "./client-metrics.js";
+export type { StarknetLogLevel, StarknetEventName } from "./client-metrics.js";
 
 /**
  * COMPATIBILITY CONTRACT: src/starknet/client.ts
@@ -66,22 +81,58 @@ const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl 
 
 /** Index into rpcProviders for the last known healthy endpoint. */
 let healthyRpcIndex = 0;
+let cachedFailoverOrder: number[] | undefined;
+let cachedHealthyIndex = -1;
 
 function rpcFailoverOrder(): number[] {
+  if (rpcProviders.length === 1) {
+    return [0];
+  }
+
+  if (healthyRpcIndex === cachedHealthyIndex && cachedFailoverOrder) {
+    return cachedFailoverOrder;
+  }
+
   const order = [healthyRpcIndex];
   for (let i = 0; i < rpcProviders.length; i++) {
     if (i !== healthyRpcIndex) {
       order.push(i);
     }
   }
+  cachedHealthyIndex = healthyRpcIndex;
+  cachedFailoverOrder = order;
   return order;
 }
 
+function isPrimitiveOrImmutable(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  const type = typeof value;
+  return type !== "object" && type !== "function";
+}
+
 function cloneRpcArgs(args: unknown[]): unknown[] {
+  if (args.length === 0) return [];
+
+  let hasMutable = false;
+  for (let i = 0; i < args.length; i++) {
+    if (!isPrimitiveOrImmutable(args[i])) {
+      hasMutable = true;
+      break;
+    }
+  }
+
+  if (!hasMutable) {
+    return [...args];
+  }
+
   return args.map((argument) => cloneRpcValue(argument));
 }
 
 function cloneRpcValue(value: unknown): unknown {
+  if (isPrimitiveOrImmutable(value)) {
+    return value;
+  }
+
   if (Array.isArray(value)) {
     return value.map((item) => cloneRpcValue(item));
   }
@@ -98,7 +149,7 @@ function cloneRpcValue(value: unknown): unknown {
     return new Set(Array.from(value.values(), (entryValue) => cloneRpcValue(entryValue)));
   }
 
-  if (value && typeof value === "object") {
+  if (typeof value === "object") {
     const prototype = Object.getPrototypeOf(value);
     if (prototype === Object.prototype || prototype === null) {
       const clone: Record<string, unknown> = {};
@@ -116,27 +167,86 @@ async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
 ): Promise<unknown> {
-  let lastError: unknown;
+  const methodName = String(method);
+  const isFeeQuote = methodName === "estimateFee";
+
+  incStarknetMetric(STARKNET_METRICS.RPC_REQUESTS);
+  if (isFeeQuote) {
+    incStarknetMetric(STARKNET_METRICS.FEE_QUOTE_REQUESTS);
+    logStarknetEvent("info", "starknet.fee_quote.requested", { method: methodName });
+  }
+
+  logStarknetEvent("debug", "starknet.rpc.request", {
+    method: methodName,
+    endpoint: starknetRpcUrls[healthyRpcIndex],
+  });
+
+  const startTime = Date.now();
+  let lastError: unknown = new Error("No RPC providers available");
+
   for (const index of rpcFailoverOrder()) {
-    const candidate = rpcProviders[index]!;
+    const candidate = rpcProviders[index];
+    if (!candidate) continue;
+
     try {
       const fn = Reflect.get(candidate, method) as (...a: unknown[]) => unknown;
       if (typeof fn !== "function") {
-        throw new TypeError(`RpcProvider.${String(method)} is not a function`);
+        throw new TypeError(`RpcProvider.${methodName} is not a function`);
       }
+
       const attemptArgs = cloneRpcArgs(args);
       const result = await fn.apply(candidate, attemptArgs);
+
+      const durationMs = Date.now() - startTime;
+      incStarknetMetric(STARKNET_METRICS.RPC_DURATION_MS, durationMs);
+
       if (index !== healthyRpcIndex) {
+        incStarknetMetric(STARKNET_METRICS.RPC_FAILOVERS);
+        logStarknetEvent("warn", "starknet.rpc.failover", {
+          method: methodName,
+          fromEndpoint: starknetRpcUrls[healthyRpcIndex],
+          toEndpoint: starknetRpcUrls[index],
+        });
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,
         );
         healthyRpcIndex = index;
       }
+
+      logStarknetEvent("debug", "starknet.rpc.success", {
+        method: methodName,
+        endpoint: starknetRpcUrls[index],
+        durationMs,
+      });
+
+      if (isFeeQuote) {
+        incStarknetMetric(STARKNET_METRICS.FEE_QUOTE_SUCCESS);
+        logStarknetEvent("info", "starknet.fee_quote.success", {
+          method: methodName,
+          durationMs,
+        });
+      }
+
       return result;
     } catch (err) {
       lastError = err;
+      incStarknetMetric(STARKNET_METRICS.RPC_ERRORS);
+      logStarknetEvent("warn", "starknet.rpc.error", {
+        method: methodName,
+        endpoint: starknetRpcUrls[index],
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
+
+  if (isFeeQuote) {
+    incStarknetMetric(STARKNET_METRICS.FEE_QUOTE_ERRORS);
+    logStarknetEvent("error", "starknet.fee_quote.error", {
+      method: methodName,
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+  }
+
   throw lastError;
 }
 
@@ -154,6 +264,8 @@ async function invokeWithFailover(
  * calls for the same cached data share a single in-flight RPC request rather
  * than fanning out N identical calls during a cache miss.
  */
+const methodCache = new Map<string | symbol, (...args: unknown[]) => Promise<unknown>>();
+
 export const provider = new Proxy(rpcProviders[0]!, {
   get(_target, prop, _receiver) {
     if (prop === "then") {
@@ -162,7 +274,12 @@ export const provider = new Proxy(rpcProviders[0]!, {
     const active = rpcProviders[healthyRpcIndex]!;
     const value = Reflect.get(active, prop, active);
     if (typeof value === "function") {
-      return (...args: unknown[]) => invokeWithFailover(prop, args);
+      let cachedFn = methodCache.get(prop);
+      if (!cachedFn) {
+        cachedFn = (...args: unknown[]) => invokeWithFailover(prop, args);
+        methodCache.set(prop, cachedFn);
+      }
+      return cachedFn;
     }
     return value;
   },
@@ -179,6 +296,10 @@ let agreementAbiCache: unknown[] | undefined;
 // the address in the key guarantees a cached instance is never reused for a
 // different address.
 const contractCache = new Map<string, Contract>();
+
+function normalizeAddress(address: string): string {
+  return address.trim().toLowerCase();
+}
 
 /**
  * Returns the escrow contract ABI, parsing the contract-class JSON from disk on
@@ -215,9 +336,11 @@ export function getAgreementAbi(): unknown[] {
 /**
  * Returns a cached escrow Contract for the given address, constructing it once
  * and reusing the same instance on later calls with the same address.
+ * Normalizes address hex casing and whitespace to avoid duplicate instances.
  */
 export function escrowContract(address: string): Contract {
-  const key = `escrow:${address}`;
+  const normalized = normalizeAddress(address);
+  const key = `escrow:${normalized}`;
   let contract = contractCache.get(key);
   if (!contract) {
     contract = new Contract(getEscrowAbi(), address, provider);
@@ -229,9 +352,11 @@ export function escrowContract(address: string): Contract {
 /**
  * Returns a cached agreement Contract for the given address, constructing it
  * once and reusing the same instance on later calls with the same address.
+ * Normalizes address hex casing and whitespace to avoid duplicate instances.
  */
 export function agreementContract(address: string): Contract {
-  const key = `agreement:${address}`;
+  const normalized = normalizeAddress(address);
+  const key = `agreement:${normalized}`;
   let contract = contractCache.get(key);
   if (!contract) {
     contract = new Contract(getAgreementAbi(), address, provider);
@@ -284,12 +409,18 @@ export async function getCachedNetworkInfo(
 ): Promise<{ chainId: string; specVersion: string }> {
   const now = Date.now();
   if (cachedChainId && cachedSpecVersion && now < cacheExpiryTime) {
+    incStarknetMetric(STARKNET_METRICS.NETWORK_INFO_CACHE_HITS);
+    logStarknetEvent("debug", "starknet.network_info.cache_hit", {
+      chainId: cachedChainId,
+      specVersion: cachedSpecVersion,
+    });
     return { chainId: cachedChainId, specVersion: cachedSpecVersion };
   }
 
   // Deduplicate concurrent cache-miss fetches so only one RPC round-trip goes
   // out regardless of how many callers hit the miss simultaneously.
   if (!pendingNetworkInfo) {
+    incStarknetMetric(STARKNET_METRICS.NETWORK_INFO_FETCHES);
     pendingNetworkInfo = (async () => {
       try {
         const [rawChainId, rawSpecVersion] = await Promise.all([
@@ -303,13 +434,27 @@ export async function getCachedNetworkInfo(
         cachedSpecVersion = specVersion;
         cacheExpiryTime = Date.now() + ttlMs;
 
+        logStarknetEvent("info", "starknet.network_info.fetched", {
+          chainId,
+          specVersion,
+        });
+
         return { chainId, specVersion };
+      } catch (err) {
+        incStarknetMetric(STARKNET_METRICS.NETWORK_INFO_ERRORS);
+        logStarknetEvent("error", "starknet.network_info.failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       } finally {
         // Always clear the pending promise — whether the fetch succeeded or
         // failed — so the next caller can issue a fresh request.
         pendingNetworkInfo = undefined;
       }
     })();
+  } else {
+    incStarknetMetric(STARKNET_METRICS.NETWORK_INFO_DEDUPED);
+    logStarknetEvent("debug", "starknet.network_info.deduplicated", {});
   }
 
   return pendingNetworkInfo;
@@ -330,4 +475,6 @@ export function clearNetworkCache(): void {
  */
 export function resetRpcFailoverForTests(): void {
   healthyRpcIndex = 0;
+  cachedHealthyIndex = -1;
+  cachedFailoverOrder = undefined;
 }
