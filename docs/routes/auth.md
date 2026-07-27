@@ -204,13 +204,15 @@ request while keeping the redaction logic identical for the normal case.
 
 ## Known limitations / out of scope
 
-- **Address format is intentionally unvalidated.** All four request schemas
-  (`AddressBody`, `VerifyBody`, `SessionBody`, `RefreshBody`) accept
-  `address` as an opaque `z.string().min(3)` with no Starknet-address/hex
-  format check. This is left as-is to preserve compatibility with existing
-  callers and tests (which use non-address placeholder strings such as
-  `"address"` or `"0xExpiredChallenge"`); tightening it is out of scope for
-  this change.
+- **Address format regex is intentionally loose.** All four request schemas
+  (`AddressBody`, `VerifyBody`, `SessionBody`, `RefreshBody`) restrict
+  `address` to a maximum string length of 100 characters to prevent huge
+  payloads from reaching downstream logic, but they deliberately omit a strict
+  Starknet-address/hex regex check. This is left as-is to preserve compatibility
+  with existing callers and tests (which use non-address placeholder strings such
+  as `"address"` or `"0xExpiredChallenge"`); tightening it to strictly require
+  hex digits is out of scope for this change.
+- `signature` arrays are clamped to realistic length bounds (between 2 and 10 elements, max 255 chars per element) to reject excessively large or deeply nested payloads before signature verification.
 - `getCachedNetworkInfo()` is already memoised in `src/starknet/client.ts`
   and adds no per-request overhead beyond a Map lookup; no change was
   needed there.

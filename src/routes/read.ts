@@ -287,10 +287,10 @@ function logReadTelemetry(entry: TelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
+       
       console.error(JSON.stringify(logEntry));
     } else {
-      // eslint-disable-next-line no-console
+       
       console.info(JSON.stringify(logEntry));
     }
   } else {
@@ -302,10 +302,10 @@ function logReadTelemetry(entry: TelemetryEntry) {
       logEntry.error ? ` error=${logEntry.error}` : ""
     }`;
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
+       
       console.error(msg);
     } else {
-      // eslint-disable-next-line no-console
+       
       console.info(msg);
     }
   }

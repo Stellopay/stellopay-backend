@@ -447,11 +447,14 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       },
     });
 
-    const responseBody = {
+    res.json({
       year,
       data: chartData,
       total: toDisplayNumber(totalRaw),
     });
+    } finally {
+      inflightRollups.delete(rollupKey);
+    }
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     if (!(e instanceof z.ZodError)) {

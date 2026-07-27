@@ -15,25 +15,28 @@ import { requireAuth } from "../auth/middleware.js";
 import { env } from "../config.js";
 import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
-const AddressBody = z.object({ address: z.string().min(3) }).strict();
+const AddressString = z.string().min(3).max(100);
+const TokenString = z.string().min(10).max(1000);
+
+const AddressBody = z.object({ address: AddressString }).strict();
 const VerifyBody = z.object({
-  address: z.string().min(3),
+  address: AddressString,
   // Some Starknet accounts/wallets produce variable-length signatures (not always 2 felts)
-  signature: z.array(z.string().min(1)).min(2),
+  signature: z.array(z.string().min(1).max(255)).min(2).max(10),
 }).strict();
 const SessionBody = z.object({
-  address: z.string().min(3),
-  session_token: z.string().min(10),
+  address: AddressString,
+  session_token: TokenString,
 }).strict();
 
 const RefreshBody = z.object({
-  address: z.string().min(3),
-  refresh_token: z.string().min(10),
+  address: AddressString,
+  refresh_token: TokenString,
 }).strict();
 
 const RevokeSessionBody = z.object({
-  token_hash: z.string().length(64),
-});
+  token_hash: z.string().length(64).regex(/^[0-9a-fA-F]{64}$/i),
+}).strict();
 
 /**
  * Lowercased admin address set, built once at module load from
