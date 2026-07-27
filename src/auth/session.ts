@@ -94,7 +94,6 @@ export async function createSession(address: string) {
       address: normalizedAddress,
       message: errorMessage(error),
     });
-    incSessionMetric(SESSION_METRICS.REJECTED);
     throw error;
   }
 
@@ -493,15 +492,19 @@ export async function revokeFamily(familyId: string): Promise<void> {
  * RELIABILITY (issue #125): see {@link revokeSession} — the same idempotent
  * re-revoke classification + bounded-retry policy applies here.
  *
+ * Empty or whitespace-only addresses are a no-op (mirrors the
+ * `isNonEmptyString` guard on `createSession`/`requireSession`/`rotateSession`):
+ * no DB write happens and `session.rejected` (reason `missing_input`) is
+ * logged instead of `session.all_revoked`.
+ *
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
   if (!isNonEmptyString(address)) {
-    recordRejection("missing_input", address);
+    recordRejection("missing_input", undefined);
     return;
   }
   const normalizedAddress = normalizeSessionAddress(address);
-
   const [existing] = await db
     .select()
     .from(sessionsTable)

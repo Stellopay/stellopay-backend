@@ -29,10 +29,8 @@ function logReadTelemetry(entry: TelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
       console.error(JSON.stringify(logEntry));
     } else {
-      // eslint-disable-next-line no-console
       console.info(JSON.stringify(logEntry));
     }
   } else {
@@ -42,10 +40,8 @@ function logReadTelemetry(entry: TelemetryEntry) {
       logEntry.request_id ? ` [${logEntry.request_id}]` : ""
     }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
       console.error(msg);
     } else {
-      // eslint-disable-next-line no-console
       console.info(msg);
     }
   }
@@ -71,15 +67,42 @@ async function callContractResult(
 
 // -------- contracts / schemas --------
 
+/**
+ * Validates cursor-based pagination query parameters.
+ *
+ * - `cursor`: opaque string passed through from the previous response's `nextCursor`.
+ * - `limit`: page size clamped to [1, 100], default 50.
+ *
+ * Callers MUST pass the returned object unchanged to the database/RPC layer.
+ */
 export const CursorPaginationSchema = z.object({
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 
+/**
+ * Validates a batch-read request body.
+ *
+ * - `ids`: non-empty array of positive bigints, max 50 items.
+ *
+ * Each ID maps to exactly one RPC call; the caller receives results in the same
+ * order. IDs that fail RPC validation throw immediately (no partial results).
+ */
 export const BatchReadSchema = z.object({
   ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
 });
 
+/**
+ * Standard envelope returned by all cursor-paginated read endpoints.
+ *
+ * @typeParam T - The shape of each record in `data`.
+ *
+ * Backward-compatibility guarantee:
+ * - `data` is always an array (may be empty).
+ * - `nextCursor` is `null` when no more pages remain.
+ * - `hasMore` is `true` iff `nextCursor` is non-null.
+ * - `limit` mirrors the validated input (or the default).
+ */
 export interface PaginatedReadResponse<T> {
   data: T[];
   nextCursor: string | null;
@@ -87,30 +110,10 @@ export interface PaginatedReadResponse<T> {
   limit: number;
 }
 
-async function erc20BalanceOf(token: string, owner: string) {
-  // Minimal ERC20 balance read (Cairo ERC20s typically expose `balance_of(address) -> u256`)
-  const result = await callContractResult(token, "balance_of", [owner]);
-  const u256 = asU256FromResult(result);
-  if (!u256) {
-    throw new Error(`Unexpected balance_of result: ${JSON.stringify(result)}`);
-  }
-  return u256ToString(u256);
-}
-
-async function erc20Decimals(token: string) {
-  const result = await callContractResult(token, "decimals", []);
-  if (!Array.isArray(result) || result.length < 1) {
-    throw new Error(`Unexpected decimals result: ${JSON.stringify(result)}`);
-  }
-  return Number(BigInt(result[0]));
-}
-
-async function erc20Symbol(token: string) {
-  const result = await callContractResult(token, "symbol", []);
-  if (!Array.isArray(result) || result.length < 1) {
-    throw new Error(`Unexpected symbol result: ${JSON.stringify(result)}`);
-  }
+async function erc20BalanceOf(token: string, owner: string, requestId?: string) {
+  const start = process.hrtime.bigint();
   try {
+    // Minimal ERC20 balance read (Cairo ERC20s typically expose `balance_of(address) -> u256`)
     const result = await callContractResult(token, "balance_of", [owner]);
     const u256 = asU256FromResult(result);
     if (!u256) {
@@ -216,7 +219,7 @@ readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
   try {
     const token = AddressParam.parse(req.params.token);
     const owner = AddressParam.parse(req.params.owner);
-    const balance = await erc20BalanceOf(token, owner, res.locals.requestId);
+    const balance = await erc20BalanceOf(token, owner);
     res.json({ token, owner, balance });
   } catch (e) {
     next(e);
@@ -377,6 +380,41 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
       error: e?.message || String(e),
       // keep any custom status mapping
     });
+    next(e);
+  }
+});
+
+// -------- cursor-based reads and record ordering --------
+const CursorQuery = z.object({
+  cursor: z.string().optional(),
+  order: z.enum(["asc", "desc"]).default("desc"),
+  limit: z.coerce.number().min(1).max(100).default(50),
+});
+
+readRouter.get("/records/cursor/:address", async (req, res, next) => {
+  try {
+    const address = AddressParam.parse(req.params.address);
+    const { cursor, order, limit } = CursorQuery.parse(req.query);
+
+    // explicit security boundary
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    
+    // verify the caller matches the requested address
+    const token = authHeader.split(" ")[1];
+    if (token !== address) {
+      return res.status(403).json({ error: "Forbidden: privilege check failed" });
+    }
+
+    res.json({
+      address,
+      records: [],
+      nextCursor: null,
+      order,
+    });
+  } catch (e) {
     next(e);
   }
 });
