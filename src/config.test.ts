@@ -34,6 +34,7 @@ describe("config env parsing", () => {
   it("applies defaults and coercions when only STARKNET_RPC_URL is set", async () => {
     const { env } = await loadConfig();
     expect(env.PORT).toBe(4000);
+    // In development (the default NODE_ENV), CORS_ORIGIN falls back to "*".
     expect(env.CORS_ORIGIN).toBe("*");
     expect(env.RATE_LIMIT_WINDOW_MS).toBe(15 * 60 * 1000);
     expect(env.RATE_LIMIT_MAX).toBe(100);
@@ -43,6 +44,19 @@ describe("config env parsing", () => {
     expect(env.SHUTDOWN_DRAIN_TIMEOUT_MS).toBe(10000);
     expect(env.TRUST_PROXY).toBe("1");
     expect(env.BILLING_ENABLED).toBe(false);
+  });
+
+  it("dev default: CORS_ORIGIN resolves to '*' when unset (permissive dev default)", async () => {
+    const { env } = await loadConfig({ NODE_ENV: "development" });
+    expect(env.CORS_ORIGIN).toBe("*");
+  });
+
+  it("dev explicit: CORS_ORIGIN resolves to the provided value in development", async () => {
+    const { env } = await loadConfig({
+      NODE_ENV: "development",
+      CORS_ORIGIN: "http://localhost:3000",
+    });
+    expect(env.CORS_ORIGIN).toBe("http://localhost:3000");
   });
 
   it("coerces numeric env strings to numbers", async () => {
@@ -131,5 +145,44 @@ describe("config env parsing", () => {
     const { defaults } = await loadConfig();
     expect(defaults.payrollEscrowAddress).toMatch(/^0x06d3599/);
     expect(defaults.workAgreementAddress).toMatch(/^0x067812/);
+  });
+
+  // ── CORS_ORIGIN non-development validation ────────────────────────────────
+
+  it("non-dev: throws when CORS_ORIGIN is absent (deny by default)", async () => {
+    await expect(
+      loadConfig({
+        NODE_ENV: "production",
+        ESCROW_CONTRACT_CLASS_JSON: "/abi/escrow.json",
+        AGREEMENT_CONTRACT_CLASS_JSON: "/abi/agreement.json",
+      }),
+    ).rejects.toThrow(/CORS_ORIGIN/i);
+  });
+
+  it("non-dev: throws when CORS_ORIGIN='*' (wildcard rejected in non-dev)", async () => {
+    await expect(
+      loadConfig({
+        NODE_ENV: "production",
+        CORS_ORIGIN: "*",
+        ESCROW_CONTRACT_CLASS_JSON: "/abi/escrow.json",
+        AGREEMENT_CONTRACT_CLASS_JSON: "/abi/agreement.json",
+      }),
+    ).rejects.toThrow(/CORS_ORIGIN/i);
+  });
+
+  it("non-dev: accepts an explicit allowlist for CORS_ORIGIN", async () => {
+    const { env } = await loadConfig({
+      NODE_ENV: "production",
+      CORS_ORIGIN: "https://app.stellopay.com",
+      ESCROW_CONTRACT_CLASS_JSON: "/abi/escrow.json",
+      AGREEMENT_CONTRACT_CLASS_JSON: "/abi/agreement.json",
+    });
+    expect(env.CORS_ORIGIN).toBe("https://app.stellopay.com");
+  });
+
+  it("non-dev staging: throws when CORS_ORIGIN is absent", async () => {
+    await expect(
+      loadConfig({ NODE_ENV: "staging" }),
+    ).rejects.toThrow(/CORS_ORIGIN/i);
   });
 });

@@ -103,4 +103,23 @@ describe("accessLogMiddleware", () => {
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
     expect(logObj.request_id).toBe(customId);
   });
+
+  it("should redact sensitive query parameters", async () => {
+    const res = await request(app).get("/test?token=secret123&signature=abc&normal=value");
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+
+    // Redacted sensitive params
+    expect(logObj.path).toContain("token=[REDACTED]");
+    expect(logObj.path).toContain("signature=[REDACTED]");
+    
+    // Non-sensitive param should remain unchanged
+    expect(logObj.path).toContain("normal=value");
+
+    // The original secret values should not be in the log at all
+    expect(logObj.path).not.toContain("secret123");
+    expect(logObj.path).not.toContain("abc");
+  });
 });

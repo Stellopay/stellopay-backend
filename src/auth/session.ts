@@ -26,12 +26,14 @@ const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 //   immutable absolute cap (`absoluteExpiresAt`);
 // - the row is invalidated once it is revoked or rotated.
 function normalizeSessionAddress(address: string): string {
-  return address.toLowerCase();
+  return address.trim().toLowerCase();
 }
 
 function getNextSlidingExpiryMs(nowMs: number, absoluteExpiresAt: Date): number {
   const slidingExpiryMs = nowMs + SESSION_TTL_MS;
   return Math.min(slidingExpiryMs, absoluteExpiresAt.getTime());
+}
+
 // ---------------------------------------------------------------------------
 // Input validation helpers
 // ---------------------------------------------------------------------------
@@ -92,7 +94,6 @@ export async function createSession(address: string) {
       address: normalizedAddress,
       message: errorMessage(error),
     });
-    incSessionMetric(SESSION_METRICS.REJECTED);
     throw error;
   }
 
@@ -415,35 +416,6 @@ export async function rotateSession(address: string, token: string): Promise<Rot
     });
     return { ok: false, reason: "invalid" };
   }
-
-  const newToken = crypto.randomBytes(24).toString("hex");
-  const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
-  const nowMs = now.getTime();
-  const newExpiresAtMs = getNextSlidingExpiryMs(nowMs, session.absoluteExpiresAt);
-
-  // Issue the replacement before marking the old one rotated, so a failure
-  // here leaves the old token intact instead of orphaning the session.
-  await db.insert(sessionsTable).values({
-    tokenHash: newTokenHash,
-    address: session.address,
-    familyId,
-    expiresAt: new Date(newExpiresAtMs),
-    absoluteExpiresAt: session.absoluteExpiresAt,
-  });
-
-  await db
-    .update(sessionsTable)
-    .set({ rotatedAt: now })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
-
-  incSessionMetric(SESSION_METRICS.ROTATED);
-  logSessionEvent("info", "session.rotated", {
-    address: normalizedAddress,
-    family_id: familyId,
-    expires_in_ms: newExpiresAtMs - nowMs,
-  });
-
-  return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
 }
 
 /**
@@ -520,15 +492,19 @@ export async function revokeFamily(familyId: string): Promise<void> {
  * RELIABILITY (issue #125): see {@link revokeSession} — the same idempotent
  * re-revoke classification + bounded-retry policy applies here.
  *
+ * Empty or whitespace-only addresses are a no-op (mirrors the
+ * `isNonEmptyString` guard on `createSession`/`requireSession`/`rotateSession`):
+ * no DB write happens and `session.rejected` (reason `missing_input`) is
+ * logged instead of `session.all_revoked`.
+ *
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
+  if (!isNonEmptyString(address)) {
+    recordRejection("missing_input", undefined);
+    return;
+  }
   const normalizedAddress = normalizeSessionAddress(address);
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.address, normalizedAddress));
-  const normalizedAddress = address.toLowerCase();
   const [existing] = await db
     .select()
     .from(sessionsTable)
@@ -540,9 +516,6 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
       kind: "all",
       address: normalizedAddress,
     });
-    // Already revoked — skip the retry/update loop AND the ALL_REVOKED
-    // bump so that `session_all_revoked_total` reflects distinct address
-    // revocations only.
     return;
   }
 
@@ -607,10 +580,48 @@ export async function revokeSessionByHash(tokenHash: string): Promise<void> {
   if (!tokenHash) return;
   const tokenHashShort = tokenHash.slice(0, 8);
 
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+    });
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.tokenHash, tokenHash)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "single",
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          token_hash_prefix: tokenHashShort,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.REVOKED);
   logSessionEvent("info", "session.revoked", {
