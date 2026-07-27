@@ -214,27 +214,27 @@ breaking, and needs a coordinated change in `routes/auth.ts`,
 
 `src/auth/middleware.test.ts` covers the full contract:
 
-- `requireAuth` failure paths (missing header, non-string array header,
-  non-Bearer, empty trimmed token, empty trimmed address, invalid session,
-  throwing session lookup).
-- `requireAuth` success path (lowercased address stored, raw token
-  stored, next called).
-- `requireAuth` idempotency paths (second call skips re-validation,
-  original principal preserved when headers change between calls).
+- `requireAuth` failure paths (missing header, non-string array header
+  — each header alone and both together — empty req.auth object falls
+  through to header validation, empty trimmed token, empty trimmed
+  address, invalid session, throwing session lookup).
 - `requireAdmin` idempotency paths (short-circuit when
   `res.locals.adminAuthorized` is pre-set, second call skips re-check,
   allowlist changes ignored after first authorization).
-- `requireAdmin` 401 path (missing `req.auth`, empty address).
+- `requireAdmin` 401 path (missing `req.auth`, empty address,
+  non-object `req.auth`, `req.auth.address` is null).
 - `requireAdmin` 403 path (non-admin authenticated, malformed
   principal, allowlist has malformed entries).
 - `requireAdmin` success paths including canonical padding equivalence
   between admin and principal.
 - The exported constants (header names, statuses, frozen bodies) and the
   fresh-copy-per-response guarantee.
-- `getPrincipal` / `requirePrincipal` presence, absence, and the
-  same-object-as-`req.auth` guarantee.
-- `isAdminPrincipal` across casing, padding, malformed principal, malformed
-  and empty allowlists, plus an agreement check against `requireAdmin`.
+- `getPrincipal` presence, absence, null `req.auth`, null address,
+  whitespace-only address, and the same-object-as-`req.auth` guarantee.
+- `requirePrincipal` presence, absence, and empty-address edge case.
+- `isAdminPrincipal` across casing, padding, malformed principal, empty
+  string, bare `0x` prefix, malformed and empty allowlists, plus an
+  agreement check against `requireAdmin`.
 - The nine compatibility guarantees above, one case each.
 
 `src/routes/diagnostics.test.ts` exercises the boundary end-to-end with
