@@ -11,7 +11,7 @@ import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
-import { parsePagination } from "../utils/validation.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
 
@@ -1044,7 +1044,8 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
     if (/^\d+$/.test(trimmed)) {
       const num = parseInt(trimmed, 10);
       // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
-      date = new Date(num < 10000000000 ? num * 1000 : num);
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
     } else {
       date = new Date(trimmed);
     }

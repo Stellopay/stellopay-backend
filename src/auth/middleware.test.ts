@@ -1,16 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Request, Response, NextFunction } from "express";
 import {
+  AUTH_METRICS,
   AUTHORIZATION_HEADER,
   BEARER_PREFIX,
   FORBIDDEN_BODY,
   FORBIDDEN_STATUS,
+  getAuthMetricsSnapshot,
   getPrincipal,
   isAdminPrincipal,
+  logAuthMiddlewareEvent,
   PRINCIPAL_HEADER,
   requireAdmin,
   requireAuth,
   requirePrincipal,
+  resetAuthMetrics,
   UNAUTHORIZED_BODY,
   UNAUTHORIZED_STATUS,
 } from "./middleware.js";
@@ -29,6 +33,7 @@ describe("Auth Middleware", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAuthMetrics();
 
     mockReq = {
       headers: {},
@@ -117,6 +122,47 @@ describe("Auth Middleware", () => {
       expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
       expect(requireSession).not.toHaveBeenCalled();
       expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it("returns 401 if both headers are multi-value arrays (boundary)", async () => {
+      mockReq.headers = {
+        "x-user-address": ["0xuser1", "0xuser2"] as unknown as string,
+        authorization: ["Bearer first", "Bearer second"] as unknown as string,
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
+      expect(requireSession).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it("returns 401 if x-user-address alone is a multi-value array (boundary)", async () => {
+      mockReq.headers = {
+        "x-user-address": ["0xuser1", "0xuser2"] as unknown as string,
+        authorization: "Bearer valid_token",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
+      expect(requireSession).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it("is idempotent: empty req.auth object falls through to header validation", async () => {
+      mockReq.auth = {} as any;
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(true);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(requireSession).toHaveBeenCalled();
+      expect(mockReq.auth).toEqual({ address: "0xuser", token: "valid_token" });
+      expect(mockNext).toHaveBeenCalled();
     });
 
     it("returns 401 if authorization is not Bearer", async () => {
@@ -257,6 +303,15 @@ describe("Auth Middleware", () => {
       expect(mockNext).not.toHaveBeenCalled();
     });
 
+    it("returns 401 if req.auth is set to a non-object (defensive against runtime shape drift)", () => {
+      mockReq.auth = "malformed" as any;
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
     it("returns 403 if the principal is authenticated but not in the admin allowlist", () => {
       // Note: this was 401 { error: "Unauthorized" } before. The 401/403
       // split is intentional — 401 here would tell the caller to log in,
@@ -362,6 +417,15 @@ describe("Auth Middleware", () => {
       expect(mockNext).toHaveBeenCalled();
     });
 
+    it("is idempotent: skips re-authorization when res.locals.adminAuthorized is already set", () => {
+      mockRes.locals!.adminAuthorized = true;
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockNext).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).not.toHaveBeenCalled();
+    });
+
     it("is idempotent: second call skips re-authorization and does not re-check allowlist", () => {
       mockReq.auth = { address: "0xabc1", token: "testtoken" };
 
@@ -439,9 +503,25 @@ describe("Auth Middleware", () => {
       expect(getPrincipal(mockReq as Request)).toBeNull();
     });
 
+    it("returns null when req.auth is null (defensive against runtime shape drift)", () => {
+      mockReq.auth = null as any;
+      expect(getPrincipal(mockReq as Request)).toBeNull();
+    });
+
+    it("returns null when req.auth.address is null", () => {
+      mockReq.auth = { address: null as any, token: "testtoken" };
+      expect(getPrincipal(mockReq as Request)).toBeNull();
+    });
+
     it("returns null when req.auth is present but the address is empty", () => {
       mockReq.auth = { address: "", token: "testtoken" };
       expect(getPrincipal(mockReq as Request)).toBeNull();
+    });
+
+    it("does NOT treat whitespace-only address as absent (falls through to isAdminPrincipal)", () => {
+      mockReq.auth = { address: "   ", token: "testtoken" };
+      expect(getPrincipal(mockReq as Request)).not.toBeNull();
+      expect(getPrincipal(mockReq as Request)!.address).toBe("   ");
     });
 
     it("returns the principal object bound by requireAuth", async () => {
@@ -473,6 +553,11 @@ describe("Auth Middleware", () => {
       // must surface as a 5xx rather than being papered over as a 401.
       expect(() => requirePrincipal(mockReq as Request)).toThrow(/requireAuth/);
     });
+
+    it("throws when req.auth is present but address is empty (delegates to getPrincipal)", () => {
+      mockReq.auth = { address: "", token: "testtoken" };
+      expect(() => requirePrincipal(mockReq as Request)).toThrow(/requireAuth/);
+    });
   });
 
   describe("isAdminPrincipal", () => {
@@ -501,6 +586,14 @@ describe("Auth Middleware", () => {
 
     it("returns false for a malformed principal instead of throwing", () => {
       expect(isAdminPrincipal("not-a-real-address")).toBe(false);
+    });
+
+    it("returns false for an empty string (cannot be parsed as address)", () => {
+      expect(isAdminPrincipal("")).toBe(false);
+    });
+
+    it("returns false for bare '0x' prefix with no hex digits", () => {
+      expect(isAdminPrincipal("0x")).toBe(false);
     });
 
     it("returns false — never true — when every allowlist entry is malformed", () => {
@@ -687,6 +780,194 @@ describe("Auth Middleware", () => {
       expect(mockNext).toHaveBeenCalledTimes(1);
       expect(mockNext).toHaveBeenCalledWith();
       expect(mockRes.status).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Telemetry & Observability
+  // -------------------------------------------------------------------------
+
+  describe("Telemetry & Observability", () => {
+    it("tracks metrics and logs on requireAuth success", async () => {
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(true);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_RESOLVED]).toBe(1);
+
+      expect(infoSpy).toHaveBeenCalled();
+      infoSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth cached idempotency hit", async () => {
+      const origLevel = env.LOG_LEVEL;
+      env.LOG_LEVEL = "debug";
+      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+
+      mockReq.auth = { address: "0xuser", token: "valid_token" };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_IDEMPOTENT_HITS]).toBe(1);
+
+      expect(debugSpy).toHaveBeenCalled();
+      debugSpy.mockRestore();
+      env.LOG_LEVEL = origLevel;
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to missing headers", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_MISSING_HEADER]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to non-Bearer format", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Basic token",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_INVALID_BEARER]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to empty credentials", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "   ",
+        authorization: "Bearer valid_token",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_EMPTY_CREDENTIALS]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAuth denial due to invalid session", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer invalid_token",
+      };
+      vi.mocked(requireSession).mockResolvedValue(false);
+
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.AUTH_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED]).toBe(1);
+      expect(metrics[AUTH_METRICS.AUTH_DENIED_INVALID_SESSION]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAdmin authorization success", () => {
+      const originalAdminAddresses = env.ADMIN_ADDRESSES;
+      env.ADMIN_ADDRESSES = ["0xabc1"];
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+      mockReq.auth = { address: "0xabc1", token: "testtoken" };
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_AUTHORIZED]).toBe(1);
+
+      expect(infoSpy).toHaveBeenCalled();
+      infoSpy.mockRestore();
+      env.ADMIN_ADDRESSES = originalAdminAddresses;
+    });
+
+    it("tracks metrics and logs on requireAdmin 401 unauthorized (no principal)", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_UNAUTHORIZED]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it("tracks metrics and logs on requireAdmin 403 forbidden (non-admin)", () => {
+      const originalAdminAddresses = env.ADMIN_ADDRESSES;
+      env.ADMIN_ADDRESSES = ["0xabc1"];
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      mockReq.auth = { address: "0xdef1", token: "testtoken" };
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_FORBIDDEN]).toBe(1);
+
+      expect(warnSpy).toHaveBeenCalled();
+      warnSpy.mockRestore();
+      env.ADMIN_ADDRESSES = originalAdminAddresses;
+    });
+
+    it("tracks metrics and logs on requireAdmin cached idempotency hit", () => {
+      const origLevel = env.LOG_LEVEL;
+      env.LOG_LEVEL = "debug";
+      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+
+      mockRes.locals = { adminAuthorized: true };
+      requireAdmin(mockReq as Request, mockRes as Response, mockNext);
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.ADMIN_REQUESTS]).toBe(1);
+      expect(metrics[AUTH_METRICS.ADMIN_IDEMPOTENT_HITS]).toBe(1);
+
+      expect(debugSpy).toHaveBeenCalled();
+      debugSpy.mockRestore();
+      env.LOG_LEVEL = origLevel;
+    });
+
+    it("tracks metrics and logs error when requirePrincipal is called without a principal", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      expect(() => requirePrincipal(mockReq as Request)).toThrow();
+
+      const metrics = getAuthMetricsSnapshot().counters;
+      expect(metrics[AUTH_METRICS.REQUIRE_PRINCIPAL_MISSING]).toBe(1);
+
+      expect(errorSpy).toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
   });
 });
