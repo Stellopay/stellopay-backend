@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { sql } from "drizzle-orm";
+import { sql, eq } from "drizzle-orm";
 
 export const backfillEventsRouter = Router();
 
@@ -27,6 +27,28 @@ export const BACKFILL_EVENT_INDEX = 0;
 
 /** How many result objects the response preview (`results` array) may contain. */
 export const RESULTS_PREVIEW_SIZE = 10;
+
+/**
+ * Number of rows inserted per checkpoint. Each batch runs in its own DB
+ * transaction that also persists {@link schema.backfillProgress} for the job,
+ * so a batch's inserts and its checkpoint commit atomically together — if the
+ * process crashes between batches, the last persisted checkpoint always
+ * matches what is actually durable in `agreement_events`.
+ */
+export const BACKFILL_CHECKPOINT_BATCH_SIZE = 100;
+
+// ---------------------------------------------------------------------------
+// Job identity
+// ---------------------------------------------------------------------------
+
+export type BackfillJobName = "employee-events" | "milestone-events";
+
+export const EMPLOYEE_BACKFILL_JOB: BackfillJobName = "employee-events";
+export const MILESTONE_BACKFILL_JOB: BackfillJobName = "milestone-events";
+export const BACKFILL_JOB_NAMES: readonly BackfillJobName[] = [
+  EMPLOYEE_BACKFILL_JOB,
+  MILESTONE_BACKFILL_JOB,
+];
 
 // ---------------------------------------------------------------------------
 // Synthetic event-ID builder
@@ -315,6 +337,14 @@ backfillEventsRouter.post(
       if (e instanceof z.ZodError || e?.name === "ZodError") {
         res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
+      }
+      try {
+        await upsertBackfillProgress(db, MILESTONE_BACKFILL_JOB, {
+          status: "failed",
+          lastError: e?.message ? String(e.message) : String(e),
+        });
+      } catch {
+        // Best-effort: don't let a failed checkpoint write mask the original error.
       }
       next(e);
     }
