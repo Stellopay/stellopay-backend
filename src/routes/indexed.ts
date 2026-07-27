@@ -19,6 +19,10 @@ export const INDEXED_DATA_SOURCE = "indexed";
  */
 export const MAX_INTERNAL_LIMIT = 200;
 
+const indexedCacheOptions = {
+  maxAgeSeconds: env.INDEXED_CACHE_MAX_AGE_SECONDS,
+};
+
 /**
  * Centralized authorization gate for indexer freshness and sync checkpoint operations.
  * Requires an authenticated principal (`requireAuth`) with admin privileges (`requireAdmin`).
@@ -54,11 +58,11 @@ export const indexedRouter = Router();
 // Output Schemas for Contract Hardening
 const AgreementSchema = z.object({
   id: z.string(),
-  contractAddress: z.string(),
-  employer: z.string(),
+  contractAddress: z.string().optional(),
+  employer: z.string().optional(),
   contributor: z.string().nullable().optional(),
-  mode: z.number(),
-  createdAt: z.date().or(z.string()),
+  mode: z.number().optional(),
+  createdAt: z.date().or(z.string()).optional(),
 }).passthrough();
 
 /**
@@ -112,7 +116,7 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress !== normalizeStarknetAddress(defaults.workAgreementAddress)) {
+      if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
         res.status(400).json({ error: "Invalid contract address for agreements" });
         return;
       }
@@ -154,15 +158,16 @@ indexedRouter.get(
       ]);
 
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
-      const uniqueAgreements = Array.from(
-        new Map(allAgreements.map((a) => [a.id, a])).values(),
-      ).slice(0, limit);
+      const pagedAgreements = allAgreements.slice(0, limit);
 
-      res.json({
-        agreements: z.array(AgreementSchema).parse(uniqueAgreements),
-        count: uniqueAgreements.length,
+      const body = {
+        agreements: z.array(AgreementSchema).parse(pagedAgreements),
+        count: pagedAgreements.length,
         source: INDEXED_DATA_SOURCE,
-      });
+      };
+
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
+      res.json(body);
     } catch (e) {
       next(e);
     }
@@ -178,7 +183,7 @@ indexedRouter.get(
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
-    if (contractAddress !== normalizeStarknetAddress(defaults.workAgreementAddress)) {
+    if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
       res.status(400).json({ error: "Invalid contract address for agreement details" });
       return;
     }
