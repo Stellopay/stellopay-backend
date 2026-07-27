@@ -130,7 +130,14 @@ export const StarknetAddress = z
     /^(0x)?[0-9a-fA-F]{1,64}$/,
     "must be a hex string of up to 64 hex characters, with an optional 0x prefix",
   )
-  .transform((value) => normalizeStarknetAddress(value));
+  .transform((value, ctx) => {
+    try {
+      return normalizeStarknetAddress(value);
+    } catch (e) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: e instanceof Error ? e.message : String(e) });
+      return z.NEVER;
+    }
+  });
 
 
 /**
