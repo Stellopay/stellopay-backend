@@ -6,7 +6,9 @@ import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
 import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
-import { processTxReceipt, normalizeTransactionHash, TxHashSchema, MAX_BATCH_SIZE, getWorkAgreementAbi, getPayrollEscrowAbi } from "./events.js";
+import { defaults, abiPaths } from "../config.js";
+import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
+import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 import fs from "fs";
 import path from "path";
@@ -22,8 +24,15 @@ export const MAX_STATUS_LIMIT = 1000;
 /** Default retry budget for reprocessing failures.
  * The number of allowed attempts before a transaction is moved to quarantine.
  * Can be overridden via the `RETRY_BUDGET` environment variable.
+ * A value of 0 means events are quarantined on the first failure.
  */
-export const RETRY_BUDGET = Number(process.env.RETRY_BUDGET) || 3;
+export const RETRY_BUDGET = (() => {
+  const raw = process.env.RETRY_BUDGET;
+  if (raw === undefined) return 3;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return 3;
+  return Math.floor(parsed);
+})();
 
 /** Directory where quarantined transaction hashes are persisted.
  * The path can be overridden with the `QUARANTINE_PATH` environment variable.
@@ -32,7 +41,8 @@ export const RETRY_BUDGET = Number(process.env.RETRY_BUDGET) || 3;
 export const QUARANTINE_PATH = process.env.QUARANTINE_PATH
   ? path.resolve(process.env.QUARANTINE_PATH)
   : path.resolve(process.cwd(), "quarantine");
-/** In‑memory map tracking retry attempts per normalized transaction hash. */
+
+/** In‑memory map tracking retry attempts per normalized transaction hash (batch/tx routes). */
 const retryCounts = new Map<string, number>();
 
 /** Per‑event retry counts for status‑changes reprocessing (keyed by txHash_eventIndex). */
@@ -43,10 +53,38 @@ const statusChangeRetryCounts = new Map<string, number>();
 const statusChangeQuarantine = new Set<string>();
 
 /**
+ * In-memory retry and quarantine tracking for /status-changes.
+ * Events that fail more than MAX_RETRIES times are quarantined and skipped
+ * on subsequent calls to avoid endless spinning on unparseable events.
+ */
+export const MAX_RETRIES = 3;
+export const statusChangeRetryCounts = new Map<string, number>();
+export const statusChangeQuarantine = new Set<string>();
+
+/**
+ * Reset in‑memory status-change retry and quarantine state. Exported for tests.
+ */
+export function __resetStatusChangeState() {
+  statusChangeRetryCounts.clear();
+  statusChangeQuarantine.clear();
+}
+
+/**
  * Reset in‑memory retry counts. Exported for tests to ensure isolation.
  */
 export function __resetRetryCounts() {
   retryCounts.clear();
+  statusChangeRetryCounts.clear();
+  statusChangeQuarantine.clear();
+}
+
+/**
+ * Clear retry count for a specific transaction after successful reprocessing.
+ * This allows the event to be safely reprocessed fresh if needed later.
+ */
+function clearRetryCount(txHash: string): void {
+  const norm = normaliseHash(txHash);
+  retryCounts.delete(norm);
 }
 
 /** Reset in‑memory status‑changes retry counts. Exported for tests. */
@@ -95,16 +133,22 @@ export function __resetReprocessLocks(): void {
   isReprocessingActive = false;
 }
 
-/**
- * Helper to record a failure and optionally quarantine the transaction.
- * Uses `attempts > RETRY_BUDGET` (quarantines on the 4th failure when budget is 3)
- * because the tx/batch routes track per-transaction retries across requests.
+/** Normalise a transaction hash to the canonical 0x + 64‑hex form.
+ * Uses the same normalization as processTxReceipt for consistency.
+ */
+function normaliseHash(hash: string): string {
+  return normalizeTransactionHash(hash);
+}
+
+/** Helper to record a failure and optionally quarantine the transaction.
+ * Uses >= comparison: RETRY_BUDGET=3 means 3 failed attempts are allowed,
+ * and the 3rd failure triggers quarantine.
  */
 function handleRetry(txHash: string, error: any) {
   const norm = normalizeTransactionHash(txHash);
   const attempts = (retryCounts.get(norm) ?? 0) + 1;
   retryCounts.set(norm, attempts);
-  if (attempts > RETRY_BUDGET) {
+  if (attempts >= RETRY_BUDGET) {
     try {
       fs.mkdirSync(QUARANTINE_PATH, { recursive: true });
       const filePath = path.join(QUARANTINE_PATH, `${norm}.json`);
@@ -120,6 +164,29 @@ function handleRetry(txHash: string, error: any) {
   return { status: "error" as const, attempts, error: error?.message ?? String(error) };
 }
 
+/**
+ * Structured log helper for the reprocess routes.
+ * Emits a JSON line to stdout (info) or stderr (error).
+ */
+function logReprocess(
+  level: "info" | "warn" | "error",
+  operation: string,
+  meta: Record<string, unknown>,
+): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    operation: `reprocess.${operation}`,
+    ...meta,
+  };
+  const line = JSON.stringify(entry);
+  if (level === "error") {
+    console.error(line);
+  } else {
+    console.info(line);
+  }
+}
+
 /** Zod schema for the status‑changes query parameters. */
 const StatusChangesQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(MAX_STATUS_LIMIT).optional().default(100),
@@ -129,6 +196,82 @@ const StatusChangesQuerySchema = z.object({
 
 // ABI functions are imported from events.ts (single source of truth).
 // The lazy‑loaded ABIs are shared across routes to avoid duplicate I/O.
+
+/** In-memory map tracking retry attempts per event ID for status-changes processing. */
+const statusChangeRetryCounts = new Map<string, number>();
+
+/** In-memory set of quarantined event IDs for status-changes processing. */
+const statusChangeQuarantine = new Set<string>();
+
+/**
+ * Reset in-memory retry counts for status-changes. Exported for tests.
+ */
+export function __resetStatusChangeRetryCounts() {
+  statusChangeRetryCounts.clear();
+}
+
+/**
+ * Reset in-memory quarantine set for status-changes. Exported for tests.
+ */
+export function __resetStatusChangeQuarantine() {
+  statusChangeQuarantine.clear();
+}
+
+/**
+ * Log reprocessing telemetry for status-changes.
+ */
+function logReprocess(level: string, operation: string, data: Record<string, unknown>): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level,
+    operation,
+    ...data,
+  };
+  if (level === "error") {
+    console.error(JSON.stringify(logEntry));
+  } else {
+    console.log(JSON.stringify(logEntry));
+  }
+}
+
+/**
+ * Handle a failure during status-changes reprocessing.
+ * Tracks retries and moves events to quarantine when budget is exhausted.
+ */
+function handleFailure(
+  eventId: string,
+  reason: string,
+): { eventId: string; status: "quarantined" | "no_receipt" | "event_not_found" | "no_change" | "error"; reason?: string } {
+  // If already quarantined, return immediately without incrementing count
+  if (statusChangeQuarantine.has(eventId)) {
+    return { eventId, status: "quarantined" };
+  }
+
+  const attempts = (statusChangeRetryCounts.get(eventId) ?? 0) + 1;
+  statusChangeRetryCounts.set(eventId, attempts);
+
+  if (attempts >= RETRY_BUDGET) {
+    statusChangeQuarantine.add(eventId);
+    // Write quarantine file
+    try {
+      fs.mkdirSync(QUARANTINE_PATH, { recursive: true });
+      const filePath = path.join(QUARANTINE_PATH, `${eventId}.json`);
+      fs.writeFileSync(filePath, JSON.stringify({ eventId, reason, attempts }, null, 2));
+    } catch (e) {
+      console.error("[reprocess] Failed to write quarantine file for event", e);
+    }
+    return { eventId, status: "quarantined", reason };
+  }
+
+  // Return appropriate status based on reason (no reason field for non-quarantined failures)
+  const statusMap: Record<string, "no_receipt" | "event_not_found" | "no_change" | "error"> = {
+    no_receipt: "no_receipt",
+    event_not_found: "event_not_found",
+    no_change: "no_change",
+    error: "error",
+  };
+  return { eventId, status: statusMap[reason] ?? "error" };
+}
 
 /** POST /reprocess-events/tx/:tx_hash */
 reprocessEventsRouter.post(
@@ -140,15 +283,16 @@ reprocessEventsRouter.post(
       res.status(409).json({ error: "Reprocessing operation already in progress" });
       return;
     }
-    try {
-      const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
-      const result = await processTxReceipt(tx_hash);
-      if (result.status === "not_found") {
-        notFoundResponse(res, "Transaction not found");
-        return;
-      }
-      res.json({ message: "Events reprocessed", result });
-    } catch (e: any) {
+try {
+       const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
+       const result = await processTxReceipt(tx_hash);
+       if (result.status === "not_found") {
+         notFoundResponse(res, "Transaction not found");
+         return;
+       }
+       clearRetryCount(tx_hash);
+       res.json({ message: "Events reprocessed", result });
+     } catch (e: any) {
       if (e instanceof z.ZodError) {
         res.status(400).json({ error: "Invalid Starknet transaction hash format" });
         return;
@@ -164,10 +308,11 @@ reprocessEventsRouter.post(
       }
       res.status(500).json({ attempts: retry.attempts, error: retry.error });
       return;
-    } finally {
-      releaseReprocessLock();
-    }
-  });
+} finally {
+       releaseReprocessLock();
+     }
+  },
+);
 
 /** POST /reprocess-events/batch */
 reprocessEventsRouter.post(
@@ -207,14 +352,21 @@ reprocessEventsRouter.post(
         let result;
         try {
           result = await processTxReceipt(txHash);
+          clearRetryCount(txHash);
         } catch (e: any) {
           const retry = handleRetry(txHash, e);
           if (retry.status === "quarantined") {
             result = { txHash, status: "quarantined", attempts: retry.attempts, error: retry.error };
           } else {
-            result = { txHash, status: "error", attempts: retry.attempts, eventsProcessed: 0, eventLabels: [], error: retry.error };
+            result = {
+              txHash,
+              status: "error",
+              attempts: retry.attempts,
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: retry.error,
+            };
           }
-
           resultByNormalizedHash.set(normalizedHash, result);
           results.push(result);
           continue;
@@ -242,11 +394,12 @@ reprocessEventsRouter.post(
         res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
         return;
       }
-      _next(e);
-    } finally {
-      releaseReprocessLock();
-    }
-  });
+      next(e);
+} finally {
+       releaseReprocessLock();
+     }
+  },
+);
 
 /** POST /reprocess-events/status-changes */
 reprocessEventsRouter.post(
@@ -334,8 +487,15 @@ reprocessEventsRouter.post(
         });
       };
 
-      const workAgreementAbi = await getWorkAgreementAbi();
-      const payrollEscrowAbi = await getPayrollEscrowAbi();
+      const workAgreementAbiResolved = await getWorkAgreementAbi();
+      const payrollEscrowAbiResolved = await getPayrollEscrowAbi();
+      const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
+      const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
+
+      const workAgreementContract = new Contract(workAgreementAbiResolved, workAgreementAddress, provider);
+      const payrollEscrowContract = new Contract(payrollEscrowAbiResolved, payrollEscrowAddress, provider);
+      void workAgreementContract; // used for ABI loading side-effect; per-event contracts created below
+      void payrollEscrowContract;
 
       const conditions = [eq(schema.agreementEvents.eventType, "AgreementStatusChange")];
       if (fromBlock !== undefined) conditions.push(gte(schema.agreementEvents.blockNumber, fromBlock));
@@ -349,41 +509,37 @@ reprocessEventsRouter.post(
         .limit(limit);
 
       for (const event of statusChangeEvents) {
+        const evtStart = Date.now();
         const dedupKey = `${event.transactionHash}_${event.eventIndex}`;
         if (processedKeys.has(dedupKey)) {
-          logReprocess("info", "status_changes", {
-            eventId: event.id,
-            outcome: "dedup_skipped",
-            dedupKey,
-            elapsed_ms: Date.now() - evtStart,
-          });
           results.push({ eventId: event.id, status: "dedup_skipped" });
           continue;
         }
         processedKeys.add(dedupKey);
 
-        // Skip events that have been quarantined (exceeded retry budget) —
-        // no RPC call needed, returned immediately to avoid repeated I/O.
-        if (statusChangeQuarantine.has(dedupKey)) {
-          results.push({ eventId: event.id, status: "quarantined" });
-          logReprocess("info", "status_changes", {
-            eventId: event.id,
-            outcome: "quarantine_skipped",
-            eventKey: dedupKey,
-            elapsed_ms: Date.now() - evtStart,
-          });
-          continue;
-        }
+        const handleFailure = (status: string, errorMsg?: string) => {
+          const attempts = (statusChangeRetryCounts.get(event.id) || 0) + 1;
+          if (attempts >= MAX_RETRIES) {
+            statusChangeQuarantine.add(event.id);
+            statusChangeRetryCounts.delete(event.id);
+            results.push({ eventId: event.id, status: "quarantined", reason: status, ...(errorMsg ? { error: errorMsg } : {}) });
+          } else {
+            statusChangeRetryCounts.set(event.id, attempts);
+            results.push({ eventId: event.id, status, ...(errorMsg ? { error: errorMsg } : {}) });
+          }
+        };
 
         try {
           const receipt = await provider.getTransactionReceipt(event.transactionHash);
           if (!receipt || !("events" in receipt && receipt.events)) {
-            handleFailure(event, "no_receipt");
+            const failure = handleFailure(event.id, "no_receipt");
+            results.push(failure);
             continue;
           }
           const receiptEvent = receipt.events[event.eventIndex];
           if (!receiptEvent) {
-            handleFailure(event, "event_not_found");
+            const failure = handleFailure(event.id, "event_not_found");
+            results.push(failure);
             continue;
           }
           const fromAddress = receiptEvent.from_address?.toLowerCase() || "";
@@ -391,18 +547,18 @@ reprocessEventsRouter.post(
           let decodedEvent: any = null;
           let eventType = "AgreementStatusChange";
           try {
-            const workContract = new Contract(workAgreementAbi, eventContractAddress, provider);
+            const workContract = new Contract(workAgreementAbiResolved, eventContractAddress, provider);
             try {
               decodedEvent = workContract.parseEvent(receiptEvent);
               eventType = decodedEvent.name;
             } catch {
-              const escrowContract = new Contract(payrollEscrowAbi, eventContractAddress, provider);
+              const escrowContract = new Contract(payrollEscrowAbiResolved, eventContractAddress, provider);
               try {
                 decodedEvent = escrowContract.parseEvent(receiptEvent);
                 eventType = decodedEvent.name;
               } catch {
                 const selector = receiptEvent.keys?.[0] || "";
-                const map: Record<string, string> = {
+                const selectorMap: Record<string, string> = {
                   "0x39935559db9e6f265020b5e7f9e32f707ec95bc7744e4313651be569076f335": "AgreementActivated",
                   "0x2fd23973c113c5a29f0779620b5bee73d19782f53a0d36ab5fb34fee90d61f3": "AgreementPaused",
                   "0xd8daf85c1fa0887e802a145d9f3c7db99b61aa78d5beb5c98ffd0fc8df3d45": "AgreementResumed",
@@ -417,7 +573,7 @@ reprocessEventsRouter.post(
                   "0x27eac42673c7b6ad77b281f32dfd605fc2994c6e2ba3bcb526bb46f4eaa636c": "DisputeResolved",
                 };
                 const normSel = selector.toLowerCase();
-                if (map[normSel]) eventType = map[normSel];
+                if (selectorMap[normSel]) eventType = selectorMap[normSel];
               }
             }
           } catch {
@@ -425,18 +581,33 @@ reprocessEventsRouter.post(
           }
           if (eventType !== "AgreementStatusChange") {
             await db.update(schema.agreementEvents).set({ eventType }).where(eq(schema.agreementEvents.id, event.id));
+            statusChangeRetryCounts.delete(event.id);
             updated++;
+            logReprocess("info", "status_changes", {
+              eventId: event.id,
+              outcome: "updated",
+              newType: eventType,
+              elapsed_ms: Date.now() - evtStart,
+            });
             results.push({ eventId: event.id, status: "updated", oldType: "AgreementStatusChange", newType: eventType });
           } else {
-            handleFailure(event, "no_change");
+            const failure = handleFailure(event.id, "no_change");
+            results.push(failure);
           }
-        } catch (e) {
-          handleFailure(event, "error", String(e));
+        } catch (e: any) {
+          const failure = handleFailure(event.id, "error");
+          failure.error = e?.message ?? String(e);
+          results.push(failure);
         }
       }
 
       const hasMore = statusChangeEvents.length === limit;
-      res.json({ message: `Reprocessed ${results.length} events, updated ${updated}`, updated, results, hasMore });
+      res.json({
+        message: `Reprocessed ${results.length} events, updated ${updated}`,
+        updated,
+        results,
+        hasMore,
+      });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });
