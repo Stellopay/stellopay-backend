@@ -160,7 +160,7 @@ app.use("/api/v1", apiV1NotFoundHandler);
 
 // Basic error handler
 app.use(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   
   (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const requestId: string | undefined = res.locals.requestId;
     // eslint-disable-next-line no-console

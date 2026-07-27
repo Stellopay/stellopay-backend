@@ -30,7 +30,8 @@ This module (`src/starknet/client.ts`) provides a Starknet RPC client with autom
 - On success, updates `healthyRpcIndex` to the successful endpoint
 - Logs `console.warn` on failover with old and new URLs
 - Clones RPC arguments before each retry to prevent mutation
-- Throws the last error if all endpoints fail
+- Throws the last error if all endpoints fail; if the last thrown value is falsy, throws `Error("All N RPC provider(s) failed for method "…"")`
+- Guards against an empty provider list: throws `Error("No RPC providers are configured")` before attempting any call
 - **Argument cloning supports**: primitives, arrays, plain objects, Date, Map, Set
 - **Argument cloning does NOT support**: custom class instances, cyclic structures
 - **Only `RETRYABLE_METHODS` are eligible for failover**; non-retryable (write/mutation) methods attempt the primary endpoint once and throw immediately on failure
@@ -49,11 +50,19 @@ This module (`src/starknet/client.ts`) provides a Starknet RPC client with autom
 #### 3. Network Info Caching
 
 - `getCachedNetworkInfo()` caches chainId and specVersion for default 5-minute TTL
-- TTL is configurable via `ttlMs` parameter (milliseconds)
+- TTL is configurable via `ttlMs` parameter (milliseconds); must be a positive finite number
+- Throws `RangeError` when `ttlMs` is zero, negative, `Infinity`, or `NaN`
 - Cache is not poisoned on RPC failure - subsequent calls retry RPC
 - `clearNetworkCache()` resets the cache
 
-#### 4. Error Handling
+#### 4. Input Validation
+
+- `validateContractAddress(address)` and `validateStarknetAddress(address)` reject empty, whitespace-only, or non-hex strings **before** any RPC or cache operation
+- `validateCallArray(calls)` asserts a non-empty `Call[]` with valid `contractAddress` and `entrypoint` on each item
+- `getNonceForAddress(address)` validates the address then delegates to `provider.getNonceForAddress`
+- `getInvokeEstimateFee(callerAddress, call)` validates caller + call, fetches nonce automatically, then delegates to `provider.getInvokeEstimateFee`
+
+#### 5. Error Handling
 
 - `getEscrowAbi()` throws Error if `ESCROW_CONTRACT_CLASS_JSON` is not configured
 - `getAgreementAbi()` throws Error if `AGREEMENT_CONTRACT_CLASS_JSON` is not configured
@@ -62,7 +71,7 @@ This module (`src/starknet/client.ts`) provides a Starknet RPC client with autom
 - Non-retryable methods that fail on the primary endpoint throw without failover
 - Chain ID mismatch during failover throws `ChainIdMismatchError`
 
-#### 5. Test-Only Functions
+#### 6. Test-Only Functions
 
 - `clearContractCache()`, `clearNetworkCache()`, `resetRpcFailoverForTests()`
 - These are exported for testing and should not be used in production code
@@ -175,6 +184,12 @@ See [circuit-breaker.md](./circuit-breaker.md) for full documentation.
 
 ## Fee Quotes
 
+`getInvokeEstimateFee(callerAddress, call)` validates the caller address and
+call object before issuing the RPC request. It fetches the pending nonce
+automatically via `getNonceForAddress` so callers do not need a separate
+nonce round-trip. The underlying request goes through `provider` and benefits
+from automatic endpoint failover.
+
 `estimateFee` is delegated to `starknet.js` `RpcProvider` via the failover
 proxy. The call is read-only and idempotent, and is listed in `RETRYABLE_METHODS`
 so it benefits from automatic failover.
@@ -199,6 +214,10 @@ The cache is **not poisoned on failure**: a rejected fetch clears
 default 5-minute TTL. Repeated calls within the TTL return the cached value
 without any RPC call.
 
+`getCachedChainId(ttlMs?)` is a convenience wrapper that returns only the
+`chainId` string, sharing the same cache so callers that only need the chain ID
+do not issue a separate RPC round-trip.
+
 - `clearNetworkCache()` — resets the cache and clears any pending in-flight
   request. Used by tests.
 
@@ -209,14 +228,39 @@ without any RPC call.
 Contracts are cached by `"<kind>:<address>"` key in a module-level `Map`.
 The ABI is parsed from disk exactly once per kind and memoized.
 
-- `escrowContract(address)` - cached escrow instance
-- `agreementContract(address)` - cached agreement instance
+- `escrowContract(address)` - cached escrow instance (validates address on entry)
+- `agreementContract(address)` - cached agreement instance (validates address on entry)
 - `clearContractCache()` - reset for tests
 
 The kind prefix in the cache key ensures escrow and agreement ABIs never
 cross-contaminate even when the same address is used for both.
 
-`getCachedNetworkInfo()` returns chainId and specVersion with a 5-minute TTL cache.
+## Input Validation
+
+### `validateContractAddress(address: string): void`
+
+Guards entry points that accept a contract address string.
+
+**Accepts:** strings with optional `0x`/`0X` prefix followed by hex digits.
+
+**Rejects with `Error`:**
+- Empty string or whitespace-only → `"Contract address must be a non-empty string"`
+- Non-hex characters after stripping optional prefix → `"Contract address must be a hex string (got "…")"`
+
+### `validateStarknetAddress(address: string): void`
+
+Same rules as `validateContractAddress`; separate export so call sites document
+intent clearly (nonce lookups, fee quotes, `callContract`, etc.).
+
+### `validateCallArray(calls: unknown): asserts calls is Call[]`
+
+Structural validation for fee-estimation call arrays.
+
+**Rejects:**
+- Non-array → `TypeError("calls must be an array")`
+- Empty array → `RangeError("calls array must not be empty")`
+- Element with invalid/missing `contractAddress` → `Error("calls[N].contractAddress …")`
+- Element with empty/missing `entrypoint` → `Error("calls[N].entrypoint must be a non-empty string")`
 
 ## Observability & Metrics
 
@@ -257,9 +301,20 @@ To reduce redundant computation and allocation during high-frequency RPC retries
 
 Configured via `STARKNET_RPC_URL` environment variable (comma-separated). Defaults in `config.ts`.
 
-## Edge Cases (Intentionally Out of Scope)
+## Error Handling Summary
 
-The following edge cases are intentionally out of scope for this compatibility contract:
+| Scenario | Error type | Message pattern |
+|---|---|---|
+| Empty / blank address | `Error` | `"Contract/Starknet address must be a non-empty string"` |
+| Non-hex address | `Error` | `"… must be a hex string (got …)"` |
+| Invalid `ttlMs` | `RangeError` | `"ttlMs must be a positive finite number (got …)"` |
+| ABI path not configured | `Error` | `"…path is not configured"` |
+| No RPC providers configured | `Error` | `"No RPC providers are configured"` |
+| All RPC providers fail | last provider error | (re-thrown as-is) |
+| Non-array calls | `TypeError` | `"calls must be an array"` |
+| Empty calls array | `RangeError` | `"calls array must not be empty"` |
+
+## Edge Cases (Intentionally Out of Scope)
 
 - **Custom class instances**: The argument cloning logic does not support custom class instances beyond Date, Map, and Set. Callers requiring such support should implement their own cloning before invoking RPC methods.
 - **Cyclic structures**: The argument cloning logic does not handle cyclic references. Callers should ensure their payloads are acyclic.

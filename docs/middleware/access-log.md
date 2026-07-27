@@ -1,6 +1,9 @@
 # Access-log middleware
 
-Source: [`src/middleware/access-log.ts`](../../src/middleware/access-log.ts)
+Source: [`src/middleware/access-log.ts`](../../src/middleware/access-log.ts)  
+Tests: [`src/middleware/access-log.test.ts`](../../src/middleware/access-log.test.ts)
+
+---
 
 ## Overview
 
@@ -35,8 +38,8 @@ so every log line always carries a valid correlation ID.
 
 ### `redactSensitiveParams(rawUrl)`
 
-Exported helper that strips sensitive query-parameter values before the URL
-is written to the log.
+Exported pure helper that strips sensitive query-parameter values before the
+URL is written to the log.
 
 ```ts
 import { redactSensitiveParams } from "./middleware/access-log.js";
@@ -127,6 +130,19 @@ interface AccessLogEntry {
 
 ---
 
+## Batching / pagination contract
+
+The middleware registers **one** `finish` listener per request. There is
+**no internal buffer, queue, or batch accumulation**. Each HTTP request
+produces exactly one `AccessLogEntry` when the response finishes. Concurrent
+requests each get their own independent listener and their own log line — they
+do not interfere with each other.
+
+Pagination-related query parameters (`page`, `limit`, `offset`, etc.) are
+**never redacted**; only the names in the redaction list above are replaced.
+
+---
+
 ## Log formats
 
 Controlled by `LOG_FORMAT` env var (default `"json"`).
@@ -182,6 +198,8 @@ TTL-based deduplication set (`SeenRequestIds`) to enforce this:
 | Error inside `finish` handler | Caught, written to `console.error("[access-log] failed to emit log entry …")`, never re-thrown |
 | Malformed request URL | `redactSensitiveParams` returns the path portion — never throws |
 | `/health` requests | Always skipped — no log noise from liveness probes |
+| Multiple sequential requests | Each produces exactly one log line — no batching |
+| Concurrent requests | Each gets an independent `finish` listener — no cross-request interference |
 
 ---
 
