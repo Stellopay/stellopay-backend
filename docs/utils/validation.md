@@ -1,112 +1,131 @@
-# Validation utilities
+# Validation — Schema Definitions & Error Mapping
 
-## Location
+Source of truth: [`src/utils/validation.ts`](../../src/utils/validation.ts)
 
-`src/utils/validation.ts`
+## Contract
 
-## Overview
+This module provides the shared schemas and error-mapping helpers used by every
+route handler that validates request parameters.  All of the following are
+exported:
 
-This module owns schema validation and error mapping for the entire backend.
-It exports Zod-based schemas for common parameter types and two helper
-functions that wrap validation with structured error handling.
-
-Callers **must not** use `z.parse()` directly on raw user input. Instead they
-should use one of the exported schemas (`StarknetAddress`, `AgreementId`) or
-wrap their own Zod schema with `loggedParse()` when the failure path needs
-structured observability. `parsePagination()` is the only pagination parser
-and must be used instead of ad-hoc Zod coercion at the call site.
-
-## Error contract
-
-All validation failures flow through one of two paths:
-
-| Path | Error type | Status | Serialization |
-|------|-----------|--------|---------------|
-| Direct `.parse()` on `StarknetAddress` / `AgreementId` | `z.ZodError` | 400 (via Express handler) | `err.issues` array |
-| `loggedParse()` | `ValidationError` | `err.status` = 400 | `err.toJSON()` produces a stable shape |
-
-### `ValidationError`
-
-```typescript
-class ValidationError extends Error {
-  name: "ValidationError";
-  validator: string;
-  issues: Array<{ path: (string | number)[]; message: string; code: string }>;
-  input: string;         // truncated to 40 chars
-  timestamp: string;     // ISO 8601
-  status: number;        // defaults to 400
-  cause?: Error;         // original ZodError (if available)
-
-  toJSON(): Record<string, unknown>;
-
-  static fromZodError(zodError: z.ZodError, validator: string, input: string): ValidationError;
-}
-```
-
-The `toJSON()` method guarantees a stable, serializable shape that survives
-`JSON.parse(JSON.stringify(err))`. This is essential for retry/replay
-pipelines where error diagnostics are persisted across process boundaries.
-
-### `loggedParse()`
-
-```typescript
-function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T;
-```
-
-- On success: returns the parsed value.
-- On failure: logs a structured JSON line via `console.warn` with prefix
-  `[validation:error]`, then throws a `ValidationError`.
-- The log shape is `{ validator, input, error, timestamp }` where `input` is
-  truncated to 40 characters.
-- The thrown `ValidationError` carries `status: 400` so Express-level error
-  handlers that check `err.status` map it to a client error response.
-
-### `parsePagination()`
-
-```typescript
-function parsePagination(query: unknown): { limit: number; offset: number };
-```
-
-- Never throws. All pathological inputs degrade gracefully to safe defaults.
-- `limit` is clamped to `[1, MAX_PAGE_LIMIT]` (default 50, max 100).
-- `offset` is clamped to `[0, ∞)`.
-- `Infinity`, `-Infinity`, and `NaN` in either value are treated as missing
-  (fall back to the corresponding default).
-- `null` and `""` are normalized to `undefined` before Zod coercion so they
-  fall back to the default rather than being coerced to `0`.
-
-## Retry and replay semantics
-
-When validation fails during a background job or event handler, the caller
-should:
-
-1. Catch the error.
-2. Check `error instanceof ValidationError` (for `loggedParse` calls) or
-   `error instanceof ZodError` (for direct `.parse()` calls).
-3. Persist the error diagnostics via `JSON.stringify(error)` (safe for
-   `ValidationError` via `toJSON()`; for `ZodError`, use `error.issues`
-   which is serializable).
-4. Decide whether to retry based on the `validator` and `issues` rather than
-   parsing an unstructured error message.
+| Export | Kind | Purpose |
+|---|---|---|
+| `StarknetAddress` | `z.ZodString` → transform | Parse + normalize a Starknet hex address |
+| `AgreementId` | `z.ZodString` | Parse a numeric-string agreement identifier |
+| `parsePagination` | function | Clamp `limit`/`offset` query params to safe defaults |
+| `loggedParse` | function | Parse + log structured diagnostics on failure |
+| `formatValidationError` | function | Map a caught error to the standard API JSON shape |
+| `ValidationErrorResponse` | interface | Return type of `formatValidationError` |
+| `MAX_PAGE_LIMIT` | `number` (= 100) | Upper bound for pagination limit |
+| `DEFAULT_PAGE_LIMIT` | `number` (= 50) | Fallback pagination limit |
 
 ## Schemas
 
 ### `StarknetAddress`
 
-- Accepts a hex string of up to 64 hex characters, with or without `0x` prefix.
-- Transforms to canonical form (zero-padded, lowercase) via `normalizeStarknetAddress`.
-- Rejects non-hex, empty, whitespace-only, or `null`/`undefined`/non-string inputs.
-- Mixed-case addresses are checksum-validated; a mismatch is rejected.
+- Accepts a hex string with or without `0x` prefix
+- Up to 64 hex characters (Starknet felt width)
+- Trims surrounding whitespace before validation
+- On success, returns the canonical lowercase `0x`-padded 64-char form
+- Mixed-case inputs are validated against SNIP-23/EIP-55 checksum
+- **Rejects**: non-hex, oversized, empty, whitespace-only, null, undefined,
+  non-string types, invalid checksum
+
+```typescript
+StarknetAddress.parse("0x4718F5a...") // "0x0..." (canonical)
+StarknetAddress.parse("abc")           // "0x0...0abc" (padded)
+StarknetAddress.parse("")              // throws ZodError
+```
 
 ### `AgreementId`
 
-- Accepts a numeric-only string (digits only, no decimal, no sign).
-- Rejects hex (`0x...`), floats, negatives, and non-string types.
-- Trims whitespace before validation.
+- Accepts a string containing only ASCII digits (`0`–`9`)
+- Leading zeros are preserved
+- Trims surrounding whitespace
+- **Rejects**: negative signs, floats, hex (`0x...`), unicode digits, empty
+  string, whitespace-only, null, undefined, non-string types
 
-## Out of scope
+```typescript
+AgreementId.parse("42")     // "42"
+AgreementId.parse("00042")  // "00042"
+AgreementId.parse("12ab")   // throws ZodError
+```
 
-- This module does **not** define HTTP response format for validation errors.
-  The Express error handler in `src/index.ts` owns the mapping from error type
-  to HTTP status and response body.
-- `normalizeStarknetAddress()` is defined in `src/utils/address.ts`, not here.
+## Pagination
+
+### `parsePagination(query)` → `{ limit, offset }`
+
+This function **never throws**.  Every input is gracefully degraded:
+
+| Input | Behaviour |
+|---|---|
+| Missing / `undefined` / `null` query | Defaults: `{ limit: 50, offset: 0 }` |
+| `limit` or `offset` is `null` / `""` | Treated as `undefined` → falls back to default |
+| `limit` > `MAX_PAGE_LIMIT` | Clamped down to `MAX_PAGE_LIMIT` (100) |
+| `limit` < 1 | Clamped up to `1` |
+| `offset` < 0 | Clamped up to `0` |
+| Non-numeric strings (`"abc"`, `"1.5"`) | Fall back to default via `.catch()` |
+| Array values | Single-element arrays coerce; multi-element fall back to default |
+| Object / boolean values | Fall back to default |
+
+```typescript
+parsePagination({ limit: "5000" })   // { limit: 100, offset: 0 }
+parsePagination({ offset: "-3" })    // { limit: 50, offset: 0 }
+parsePagination(null)                // { limit: 50, offset: 0 }
+```
+
+## Logged Parse
+
+### `loggedParse(schema, value, validatorName)` → `T`
+
+Wraps any Zod schema with structured error logging.  On failure:
+1. Logs a JSON entry via `console.warn` with `[validation:error]` prefix
+2. Log payload includes: `validator`, `input` (truncated to 40 chars),
+   `error` (semi-colon joined issues), `timestamp`
+3. Re-throws the original `ZodError`
+
+```typescript
+const address = loggedParse(StarknetAddress, raw, "createAgreement");
+```
+
+## Error Mapping
+
+### `formatValidationError(error)` → `ValidationErrorResponse`
+
+Maps a caught value to the standard API error shape used across all routes.
+When the error is a `ZodError`, the response includes the full issue list:
+
+```typescript
+try {
+  StarknetAddress.parse(raw);
+} catch (e) {
+  const { error, details } = formatValidationError(e);
+  res.status(400).json({ error, details });
+}
+```
+
+**Response shapes:**
+
+```json
+// ZodError
+{ "error": "Validation failed", "details": [{ "code": "invalid_type", ... }] }
+
+// Non-ZodError
+{ "error": "Invalid request" }
+```
+
+## Error Handling Architecture
+
+1. **Zod schemas throw `ZodError`** on invalid input
+2. **Route handlers** either:
+   - Catch `ZodError` inline and return 400 (e.g. `backfill-events.ts`)
+   - Let the error propagate to the global error handler
+3. **Global error handler** (`src/index.ts`) detects `instanceof ZodError`,
+   responds with HTTP 400, and attaches `err.issues` as the `details` field
+
+## Edge Cases (Intentionally Out of Scope)
+
+- Custom `ZodIssue` formatting for specific API versions
+- Automatic i18n of error messages
+- Async validation schemas
+- Integration testing of the global error handler with every schema
