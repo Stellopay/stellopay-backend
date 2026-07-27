@@ -95,7 +95,7 @@ export function normalizeTransactionHash(hash: string): string {
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
 
-async function getWorkAgreementAbi(): Promise<any[]> {
+export async function getWorkAgreementAbi(): Promise<any[]> {
   if (!workAgreementAbi) {
     if (!abiPaths.agreement) {
       throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
@@ -105,7 +105,7 @@ async function getWorkAgreementAbi(): Promise<any[]> {
   return workAgreementAbi;
 }
 
-async function getPayrollEscrowAbi(): Promise<any[]> {
+export async function getPayrollEscrowAbi(): Promise<any[]> {
   if (!payrollEscrowAbi) {
     if (!abiPaths.escrow) {
       throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");

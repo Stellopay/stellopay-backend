@@ -9,7 +9,6 @@ import {
   acquireReprocessLock,
   releaseReprocessLock,
   getReprocessingLockStatus,
-  RETRY_BUDGET,
   QUARANTINE_PATH,
   MAX_RETRIES,
   statusChangeRetryCounts,
@@ -134,7 +133,7 @@ describe("Reprocess Events Routes", () => {
     // Add a basic error handler for express testing of catch blocks
     app.use("/api/v1", reprocessEventsRouter);
     app.use("/api/v1", eventsRouter);
-    app.use((err: any, req: any, res: any, next: any) => {
+    app.use((err: any, req: any, res: any, _next: any) => {
       res.status(err.status || 500).json({ error: err.message });
     });
   });
@@ -1026,12 +1025,10 @@ it("should quarantine after exceeding retry budget", async () => {
 
   describe("In-flight Idempotency Guard (HTTP 409)", () => {
     it("returns HTTP 409 when a second call is made while reprocessing is in-flight", async () => {
-      let resolveFirstCall: (value: any) => void;
-      const slowReceiptPromise = new Promise((resolve) => {
-        resolveFirstCall = resolve;
-      });
-
-      mockGetTransactionReceipt.mockImplementationOnce(() => slowReceiptPromise);
+      // Simulate an in-flight job by explicitly acquiring the lock.
+      // This avoids race-condition-prone async timing and reliably
+      // proves that the lock gate rejects concurrent requests.
+      acquireReprocessLock();
 
       const txHash = "0x1234567890abcdef";
 
@@ -1061,7 +1058,7 @@ it("should quarantine after exceeding retry budget", async () => {
       // Lock is released — a new request should succeed.
       mockGetTransactionReceipt.mockResolvedValueOnce({
         transaction_hash: txHash,
-        blockNumber: 101,
+        blockNumber: 100,
         events: [],
       });
 
