@@ -1,14 +1,15 @@
-# Read Route Documentation
+# Read Route Contract
 
-This document defines the strict contracts for pagination and batching across
-`src/routes/read.ts` and its consumers, and the **reliability contract** that
-every on-chain RPC read in this module follows.
+All read-only data access lives in `src/routes/read.ts`. This document is the
+single source of truth for request/response shapes, error handling, and
+backward-compatibility guarantees.
 
-## Cursor-Based Pagination
+## Shared helpers
 
-When an endpoint supports cursor-based pagination to read streams of events
-or records, it MUST use `CursorPaginationSchema` to validate the incoming
-query parameters.
+### `CursorPaginationSchema`
+
+Validates cursor-based pagination query parameters used by streaming/listing
+endpoints.
 
 ```typescript
 export const CursorPaginationSchema = z.object({
@@ -17,25 +18,14 @@ export const CursorPaginationSchema = z.object({
 });
 ```
 
-- **limit**: Caps results per page. Minimum 1, Maximum 100, Default 50.
-- **cursor**: A string representing the starting position for the next page.
+| Field  | Type                  | Default | Constraint     |
+| ------ | --------------------- | ------- | -------------- |
+| cursor | `string \| undefined` | —       | Passed through |
+| limit  | `number`              | 50      | integer, 1–100 |
 
-The successful response MUST match the generic `PaginatedReadResponse<T>` shape:
+### `BatchReadSchema`
 
-```typescript
-export interface PaginatedReadResponse<T> {
-  data: T[]; // The actual array of records
-  nextCursor: string | null; // The cursor to use for the next page, or null if there are no more pages
-  hasMore: boolean; // True if there are more records remaining
-  limit: number; // The limit that was applied to the query
-}
-```
-
-## Batching
-
-When reading multiple discrete items by their ID (e.g. fetching summaries for
-multiple agreements), endpoints MUST use `BatchReadSchema` to prevent
-oversized queries or resource exhaustion.
+Validates a batch-read request body for fetching multiple discrete items.
 
 ```typescript
 export const BatchReadSchema = z.object({
@@ -43,131 +33,171 @@ export const BatchReadSchema = z.object({
 });
 ```
 
-- **ids**: A non-empty array of positive bigints.
-- **Max Batch Size**: Hardcoded to 50 items per request to keep RPC calls
-  and database lookups constrained.
+| Field | Constraint                               |
+| ----- | ---------------------------------------- |
+| ids   | Non-empty array, max 50 positive bigints |
 
-## Reliability — Bounded Read Retry
+### `PaginatedReadResponse<T>`
 
-Every Starknet RPC read exported by `src/routes/read.ts` is wrapped in a
-bounded retry policy defined by {@link withReadRetry}. This layer sits **on
-top of** the multi-RPC failover already implemented in
-`src/starknet/client.ts` so a transient failure on every configured
-endpoint still surfaces as a single retryable error.
+Standard envelope returned by all cursor-paginated endpoints.
 
-### Retry policy
+```typescript
+export interface PaginatedReadResponse<T> {
+  data: T[]; // always an array (may be empty)
+  nextCursor: string | null; // null when no more pages
+  hasMore: boolean; // true iff nextCursor is non-null
+  limit: number; // mirrors validated input or default
+}
+```
 
-| Knob                  | Default | Source                              |
-| --------------------- | ------- | ----------------------------------- |
-| `enabled`             | `true`  | `READ_RETRY_ENABLED`                |
-| `maxAttempts`         | `3`     | `READ_RETRY_MAX_ATTEMPTS`           |
-| `baseDelayMs`         | `50`    | `READ_RETRY_BASE_DELAY_MS`          |
-| `maxDelayMs`          | `500`   | `READ_RETRY_MAX_DELAY_MS`           |
+**Backward-compatibility guarantee:** The shape of `PaginatedReadResponse` will
+not change without a major version bump. Existing consumers that destructure
+`data`, `nextCursor`, `hasMore`, or `limit` will continue to work.
 
-Backoff between attempts is exponential with ±20 % jitter:
-`delay = min(maxDelayMs, baseDelayMs * 2^(attempt - 2) * jitter)`.
-Cancelling via `AbortSignal` aborts the backoff sleep, throwing
-`Error("aborted")` so the caller can drop the in-flight request.
+---
 
-### What counts as a retryable error
+## Token routes
 
-The retry layer retries **transport-level** errors and treats local
-**deterministic** errors as fail-fast:
+### `GET /token/:token/balance/:owner`
 
-- **Retried:**
-  - `ECONNRESET`, `ETIMEDOUT`, `ENOTFOUND`, `EPIPE`, `ECONNREFUSED`,
-    `EAI_AGAIN`
-  - `network`, `fetch`, `timeout`, `temporary`/`temporarily`
-  - Starknet-node transient 5xx-like: `try again`, `5\d\d`, `internal
-    server`, `service unavailable`
-- **Fail-fast (zero retries):**
-  - `"Unexpected … result: …"` (provider returned data that didn't match
-    our schema)
-  - `"Contract not found"`, `"Contract missing"`
-  - Caller-side validation errors (`"Invalid Starknet address"`, `"is
-    required"`, `"must be a hex"`)
+Returns the ERC-20 balance for an owner address.
 
-The default classification lives in {@link isRetriableRpcError} inside
-`src/routes/read.ts`.
+| Param | Constraint          |
+| ----- | ------------------- |
+| token | `z.string().min(3)` |
+| owner | `z.string().min(3)` |
 
-### Telemetry
+**Success response (200):**
 
-Every route handler emits exactly **one** `[read-telemetry]` log entry per
-request, containing:
+```json
+{ "token": "0xabc", "owner": "0xdef", "balance": "1000" }
+```
+
+**Error responses:**
+
+- `400` — invalid address (< 3 chars)
+- `500` — unexpected RPC result shape or RPC failure
+
+### `GET /token/:token/decimals`
+
+Returns the number of decimals for an ERC-20 token.
+
+**Success response (200):**
+
+```json
+{ "token": "0xabc", "decimals": 6 }
+```
+
+**Error responses:**
+
+- `400` — invalid address
+- `500` — empty/undefined RPC result
+
+### `GET /token/:token/symbol`
+
+Returns the ERC-20 symbol, decoded from Cairo short-string when possible.
+
+**Success response (200):**
+
+```json
+{ "token": "0xabc", "symbol": "USDC" }
+```
+
+If `decodeShortString` throws, the raw RPC value is returned as-is.
+
+**Error responses:**
+
+- `400` — invalid address
+- `500` — empty RPC result
+
+---
+
+## Escrow routes
+
+### `GET /escrow/:address/balance/:agreement_id`
+
+Returns the balance for a specific agreement within an escrow contract.
+
+**Success response (200):**
+
+```json
+{ "escrow": "0x1234", "agreement_id": "1", "balance": "5000" }
+```
+
+### `GET /escrow/:address/summary/:agreement_id`
+
+Returns a UI-friendly summary including token address, employer, and balance.
+
+**Success response (200):**
+
+```json
+{
+  "escrow": "0x1234",
+  "agreement_id": "1",
+  "employer": "0xabcd",
+  "token": "0x3039",
+  "balance": "2000000"
+}
+```
+
+---
+
+## Agreement route
+
+### `GET /agreement/:address/summary/:agreement_id`
+
+Returns the full agreement details (employer, contributor, amounts, status).
+
+**Success response (200):**
+
+```json
+{
+  "agreement": "0x5678",
+  "agreement_id": "2",
+  "employer": "0x64",
+  "contributor": "0x200",
+  "token": "0x12c",
+  "escrow": "0x190",
+  "total_amount": "1000",
+  "paid_amount": "500",
+  "status": 1,
+  "mode": 0,
+  "dispute_status": 2
+}
+```
+
+**Enum values:**
+
+- `mode`: 0 = Escrow, 1 = Payroll
+- `dispute_status`: 0 = None, 1 = Raised, 2 = Resolved
+
+---
+
+## Error handling
+
+All routes follow the same pattern:
+
+1. Input is validated via Zod. Validation failures propagate as `500` via
+   Express `next(e)`.
+2. RPC calls are wrapped in `try/catch`. On failure, structured telemetry is
+   logged and the error is forwarded via `next(e)`.
+3. The global error handler (in `src/index.ts`) returns a JSON envelope:
+   `{ "error": "<message>" }`.
+
+## Telemetry
+
+Every route emits a structured log entry via `logReadTelemetry` with:
 
 - `operation` — e.g. `erc20_balance_of`, `escrow_get_summary`
-- `duration_ms` — wall-clock time of the route handler
+- `duration_ms` — wall-clock milliseconds
 - `status` — `"success"` or `"error"`
-- `retries` — number of retry rounds that fired (0 on first-try success,
-  `maxAttempts - 1` at exhaustion). The single entry folds the retry
-  count instead of emitting one warn line per retry attempt so a flaky
-  provider doesn't drown the log stream.
-- `request_id`, `token`, `owner`, `escrow`, `agreement`, `agreement_id`
-  (as applicable)
-- `error` — present only on the error path
+- Optional context: `token`, `owner`, `escrow`, `agreement`, `agreement_id`,
+  `request_id`
 
-The auth subsystem uses a *separate* helper in
-`src/auth/session-retry.ts` and emits one `session.revoke_retry` warn line
-per retry. Read paths intentionally follow the **single folded-entry**
-style because read traffic is much higher volume than revoke/sweep
-traffic and per-retry log lines would be a noisy regression.
+Log format is controlled by `env.LOG_FORMAT` (`"json"` or `"pretty"`).
 
-### Disconnect-safe retries
+## Edge cases intentionally out of scope
 
-Each route constructs an `AbortSignal` via
-`makeRequestAbortSignal(req)` that aborts when the HTTP client closes
-the connection before the response is sent. Under `NODE_ENV === "test"`
-the helper returns a never-aborting signal so supertest doesn't trip the
-abort path on the normal end-of-response close.
-
-#### What the abort actually cancels
-
-`provider.callContract` (Starknet.js `RpcProvider`) does NOT honour an
-`AbortSignal` natively, so an in-flight RPC call will run to completion
-even after the client disconnects. What the signal does cancel:
-
-- the **backoff sleep** between retry attempts (so the next attempt
-  isn't started),
-- any **pending `withReadRetry` start** if the signal is already
-  aborted when the loop is entered,
-
-and the route handler logs the abort through the standard `Error("aborted")`
-error path. This is intentional: aborting an already-dispatched JSON-RPC
-in flight would just lose the work; routing the next retry through the
-abort path is enough to ensure the client sees no useful response.
-
-### Idempotency of retries
-
-Read routes are reads — replaying them against the same on-chain state
-yields the same result. The retry layer is therefore safe to invoke
-under retries without an explicit idempotency key. **Write paths** in
-`src/routes/escrow.ts`, `src/routes/agreement.ts`, and the transaction
-flows are NOT covered here; those need different idempotency primitives
-(see "Out of scope" below).
-
-## Out of scope (intentionally not addressed in this module)
-
-These items remain on the backlog and are explicitly NOT changed by
-`src/routes/read.ts`:
-
-- **Wire-up of `CursorPaginationSchema` / `BatchReadSchema`** into actual
-  paginated route handlers. The schemas are exported and documented for
-  future paged read endpoints; the current routes are single-shot
-  summary reads.
-- **Retry / idempotency for write paths.** `src/routes/escrow.ts` and
-  the transaction endpoints need write-side retry primitives that
-  account for nonce, fee, and idempotency keys — this PR doesn't touch
-  them.
-- **Retry-After on 429 responses.** Already handled by
-  `src/middleware/rate-limit.ts`; this module leaves that as-is.
-- **Background refresh / push-based invalidation** of cached reads.
-- **Shared `try/catch` telemetry helper** across read routes. The current
-  handlers keep their explicit per-route telemetry blocks because they
-  expose operation-specific context fields that don't generalize cleanly.
-- **Cross-RPC correlation / distributed tracing.** Retry attempts are
-  scoped to a single `request_id`; they do not yet emit per-attempt
-  spans.
-- **Cumulative retry budgets per request.** Each individual call has its
-  own budget; a worst-case parallel summary exhausts
-  `9 calls × (maxAttempts - 1)` retries. Acceptable for the current
-  module size, lifted later if read load changes.
+- Pagination of token routes (not yet needed; balance is a single value)
+- Partial batch failures (batch schema enforces all-or-nothing)
+- Rate limiting (handled by `src/middleware/rate-limit.ts`)

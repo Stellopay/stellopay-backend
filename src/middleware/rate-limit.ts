@@ -5,6 +5,34 @@ import rateLimit, {
 } from "express-rate-limit";
 import type { Request, Response } from "express";
 
+// ---------------------------------------------------------------------------
+// Idempotency-Key support
+// ---------------------------------------------------------------------------
+
+/** Canonical header name for the idempotency key. */
+export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
+/** Response header set to `"true"` when a request was recognized as a replay. */
+export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
+
+/**
+ * Extract an optional idempotency key from the request.
+ *
+ * Reads the `Idempotency-Key` header. Returns `undefined` when the header is
+ * absent, empty, or longer than 255 characters (defensive bound against
+ * unbounded storage growth).
+ */
+export function getIdempotencyKey(req: Request): string | undefined {
+  const value = req.headers[IDEMPOTENCY_KEY_HEADER.toLowerCase()];
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  if (value.length > 255) return undefined;
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// Retry-After
+// ---------------------------------------------------------------------------
+
 /**
  * Shared key generator for every rate limiter in the app.
  *
@@ -86,6 +114,21 @@ export interface MakeLimiterOptions {
    * see the store limitation note on {@link makeLimiter}.
    */
   store?: Store;
+  /**
+   * Enable idempotency-key deduplication. When `true`, requests with the same
+   * `Idempotency-Key` header **and** the same client IP are deduplicated:
+   * only the first occurrence counts against the rate limit; subsequent
+   * identical-key requests replay the first request's outcome.
+   *
+   * Idempotency state lives in an in-memory `Map` scoped to the limiter
+   * instance and expires after `windowMs`. For distributed deployments you
+   * should provide a shared `store` and extend the idempotency tracking to
+   * use the same backend — see the out-of-scope note in
+   * {@link makeLimiter}.
+   *
+   * @default false
+   */
+  idempotent?: boolean;
 }
 
 /** Default message used when a caller does not supply one. */
@@ -149,13 +192,13 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  * ```
  */
 export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandler {
-  const { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name } = options;
+  const { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent } = options;
 
   // Pre-compute the Retry-After value; it is constant for the lifetime of the
   // limiter because the window length is fixed at construction time.
   const retryAfter = retryAfterSeconds(windowMs);
 
-  return rateLimit({
+  const baseLimiter = rateLimit({
     windowMs,
     max,
     message,
@@ -187,4 +230,73 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
       res.status(429).json({ error: message });
     },
   });
+
+  if (!idempotent) {
+    return baseLimiter;
+  }
+
+  // ---- Idempotency-key deduplication wrapper --------------------------------
+  // Idempotency records are stored in an in-memory Map scoped to this limiter
+  // instance. Entries are cleaned up after windowMs.
+  const idempotencyCache = new Map<string, { outcome: "allowed" | "throttled" }>();
+
+  let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function startCleanup(): void {
+    if (cleanupTimer) return;
+    cleanupTimer = setInterval(() => {
+      idempotencyCache.clear();
+    }, windowMs);
+    if (cleanupTimer?.unref) cleanupTimer.unref();
+  }
+
+  function recordIdempotency(req: Request, outcome: "allowed" | "throttled"): void {
+    const idKey = getIdempotencyKey(req);
+    if (!idKey) return;
+    startCleanup();
+    idempotencyCache.set(`${name}:${keyByIp(req)}:${idKey}`, { outcome });
+  }
+
+  return (req: Request, res: Response, next: () => void) => {
+    const idKey = getIdempotencyKey(req);
+    if (!idKey) {
+      baseLimiter(req, res, next);
+      return;
+    }
+
+    const cacheKey = `${name}:${keyByIp(req)}:${idKey}`;
+    const existing = idempotencyCache.get(cacheKey);
+
+    // Known idempotency key: replay the previous outcome without touching the
+    // rate-limit store (no increment, no double-counting).
+    if (existing) {
+      res.setHeader(X_IDEMPOTENT_REPLAYED_HEADER, "true");
+      if (existing.outcome === "throttled") {
+        res.setHeader("Retry-After", retryAfter);
+        res.status(429).json({ error: message });
+        return;
+      }
+      next();
+      return;
+    }
+
+    // Track the outcome produced by the rate limiter.
+    const wrappedNext = () => {
+      recordIdempotency(req, "allowed");
+      next();
+    };
+
+    // Intercept 429 responses from the base limiter's handler.
+    const originalJson = res.json.bind(res);
+    res.json = function (body: unknown) {
+      // The handler calls res.status(429).json(...) only when throttling.
+      // Record the throttled outcome before sending the response.
+      if (res.statusCode === 429) {
+        recordIdempotency(req, "throttled");
+      }
+      return originalJson(body);
+    };
+
+    baseLimiter(req, res, wrappedNext);
+  };
 }

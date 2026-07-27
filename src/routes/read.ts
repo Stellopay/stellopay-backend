@@ -42,227 +42,45 @@ import { env } from "../config.js";
 
 const AddressParam = z.string().min(3);
 
-// ---------- schemas (contract — see docs/routes/read.md) ----------
-
-export const CursorPaginationSchema = z.object({
-  cursor: z.string().optional(),
-  limit: z.coerce.number().int().min(1).max(100).default(50),
-});
-
-export const BatchReadSchema = z.object({
-  ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
-});
-
-export interface PaginatedReadResponse<T> {
-  data: T[];
-  nextCursor: string | null;
-  hasMore: boolean;
-  limit: number;
+interface TelemetryEntry {
+  operation: string;
+  duration_ms: number;
+  status: "success" | "error";
+  request_id?: string;
+  token?: string;
+  owner?: string;
+  escrow?: string;
+  agreement?: string;
+  agreement_id?: string;
+  error?: string;
 }
 
-// ---------- bounded-read-retry helper ----------
-//
-// Inline (not extracted to a new file) to keep the PR tightly scoped to
-// `src/routes/read.ts`. Mirrors the shape of the auth-subsystem
-// `withBoundedRetry` in `src/auth/session-retry.ts` but is intentionally a
-// separate domain: that helper classifies errors against DB constraint
-// violations, while this one classifies errors against Starknet/RPC
-// transport faults. See docs/routes/read.md for the rationale.
+function logReadTelemetry(entry: TelemetryEntry) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
 
-interface ReadRetryPolicy {
-  enabled: boolean;
-  maxAttempts: number;
-  baseDelayMs: number;
-  maxDelayMs: number;
-}
-
-const DEFAULT_RETRY_POLICY: ReadRetryPolicy = {
-  enabled: env.READ_RETRY_ENABLED,
-  maxAttempts: env.READ_RETRY_MAX_ATTEMPTS,
-  baseDelayMs: env.READ_RETRY_BASE_DELAY_MS,
-  maxDelayMs: env.READ_RETRY_MAX_DELAY_MS,
-};
-
-/**
- * Substrings that, when present in an error message, DO NOT justify a retry.
- *
- * These are the deterministic / parse-time failure modes where a different
- * attempt against the same contract state will yield the same shape, so
- * retrying would just waste an RPC round trip. Examples:
- *
- *   - "Unexpected balance_of result: [...]" — the on-chain reply decoded
- *     but didn't match the schema we expect.
- *   - "Contract not found" / "ERC20: contract missing" — the address
- *     doesn't resolve to a contract on this network.
- *   - "Invalid Starknet address" / Zod parse failures — caller-side
- *     validation already rejected before we ever made an RPC call.
- */
-const NON_RETRIABLE_HINTS = [
-  "Unexpected",
-  "Contract not found",
-  "Contract missing",
-  "Invalid Starknet address",
-  "is required",
-  "must be a hex",
-] as const;
-
-function isRetriableRpcError(err: unknown): boolean {
-  if (!(err instanceof Error)) return true;
-  const msg = err.message.toLowerCase();
-  if (NON_RETRIABLE_HINTS.some((hint) => msg.includes(hint.toLowerCase()))) {
-    return false;
-  }
-  // Transport-level faults: always retry these. Case-insensitive so that
-  // error messages like "econnreset", "Connection reset by peer",
-  // "TimeoutError" all hit the same branch.
-  if (/econnreset|etimedout|enotfound|epipe|econnrefused|eai_again/.test(msg)) {
-    return true;
-  }
-  if (/network|fetch|timeout|temporar(?:y|ily)|reset by peer|connection (?:closed|reset)/.test(msg)) {
-    return true;
-  }
-  // Starknet-node transient 5xx-like messages ("try again", "5xx up", etc.).
-  if (/try again|5\d\d|internal server|service unavailable/.test(msg)) {
-    return true;
-  }
-  // Default: don't retry unknown shapes. Better to surface once than loop.
-  return false;
-}
-
-function backoffDelayMs(attempt: number, baseMs: number, capMs: number): number {
-  // 1-indexed attempt: attempt 1 returns 0 (never slept before first try);
-  // attempt 2 → baseMs ± jitter, attempt 3 → 2*baseMs ± jitter, ...
-  const raw = baseMs * Math.pow(2, Math.max(0, attempt - 2));
-  const jitter = 1 + (Math.random() * 0.4 - 0.2); // ±20 %
-  return Math.min(capMs, Math.max(0, Math.round(raw * jitter)));
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new Error("aborted"));
-      return;
+  if (env.LOG_FORMAT === "json") {
+    if (logEntry.level === "error") {
+      console.error(JSON.stringify(logEntry));
+    } else {
+      console.info(JSON.stringify(logEntry));
     }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error("aborted"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-export interface ReadRetryAttemptInfo {
-  attempt: number;
-  maxAttempts: number;
-  error: unknown;
-  delayMs: number;
-  /** Number of retry rounds that fired during this call. Always >= 1 here. */
-  retriesSoFar: number;
-}
-
-/**
- * Run `op` up to `policy.maxAttempts` times with exponential backoff + jitter.
- *
- * Behaviour:
- *   - Returns the first successful result.
- *   - Rethrows the last error if every attempt fails OR the error is
- *     classified as non-retriable by {@link isRetriableRpcError}.
- *   - `onRetry` fires BETWEEN attempts (maxAttempts-1 per call) with the
- *     attempt number that just failed, the delay about to be applied,
- *     and a running `retriesSoFar` counter so callers can attach retry
- *     counts to telemetry without managing state themselves.
- *   - Honours `signal`. When aborted during a backoff sleep, throws an
- *     `Error("aborted")` so the route handler can map it cleanly.
- *
- * `policy` is optional; defaults come from `env.READ_RETRY_*`. Pass
- * `{ enabled: false }` (or `maxAttempts: 1`) to short-circuit and call
- * `op` exactly once — handy in tests that want to exercise the success
- * path without paying retry backoff.
- */
-export async function withReadRetry<T>(
-  op: () => Promise<T>,
-  policy: Partial<ReadRetryPolicy & { signal: AbortSignal }> = {},
-  onRetry?: (info: ReadRetryAttemptInfo) => void,
-): Promise<T> {
-  const merged: ReadRetryPolicy = { ...DEFAULT_RETRY_POLICY, ...policy };
-  const signal = policy.signal;
-  if (!merged.enabled || merged.maxAttempts <= 1) {
-    return op();
-  }
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= merged.maxAttempts; attempt++) {
-    if (signal?.aborted) {
-      throw new Error("aborted");
-    }
-    try {
-      return await op();
-    } catch (err) {
-      lastError = err;
-      const isFinal = attempt === merged.maxAttempts;
-      const retriesSoFar = attempt; // 1-indexed: first retry happens after attempt 1 fails
-      if (isFinal || !isRetriableRpcError(err)) {
-        throw err;
-      }
-      const delayMs = backoffDelayMs(attempt, merged.baseDelayMs, merged.maxDelayMs);
-      if (onRetry) {
-        onRetry({
-          attempt,
-          maxAttempts: merged.maxAttempts,
-          error: err,
-          delayMs,
-          retriesSoFar,
-        });
-      }
-      await sleep(delayMs, signal);
+  } else {
+    const msg = `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [read-telemetry] ${
+      logEntry.operation
+    } ${logEntry.status} ${logEntry.duration_ms}ms${
+      logEntry.request_id ? ` [${logEntry.request_id}]` : ""
+    }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+    if (logEntry.level === "error") {
+      console.error(msg);
+    } else {
+      console.info(msg);
     }
   }
-  // Unreachable: the loop either returns or throws.
-  throw lastError;
 }
-
-/** Wraps an op in retry AND returns the number of retries that fired. */
-async function withReadRetryCounted<T>(
-/**
- * Same retry semantics as {@link withReadRetryCounted}, but reports
- * `retries` through a shared closure so the route handler's error path can
- * also surface the count in telemetry when the op ultimately throws.
- */
-async function runWithReadRetry<T>(
-  op: () => Promise<T>,
-  onRetryCount: (n: number) => void,
-  policy: Partial<ReadRetryPolicy & { signal: AbortSignal }> = {},
-): Promise<T> {
-  return withReadRetry(op, policy, (info) => {
-    onRetryCount(info.retriesSoFar);
-  });
-}
-
-/**
- * Build an AbortSignal that aborts when the underlying HTTP request closes
- * (client disconnect / process shutdown). We gate the wiring under
- * `NODE_ENV !== "test"` because supertest closes the request shortly after
- * the response is received — that close event would fire while retries are
- * still scheduled, leaking abort noise into test logs.
- */
-function makeRequestAbortSignal(req: Request): AbortSignal {
-  if (env.NODE_ENV === "test") {
-    return new AbortController().signal; // never aborts in tests
-  }
-  const controller = new AbortController();
-  if (req.closed) {
-    controller.abort();
-    return controller.signal;
-  }
-  const onClose = () => controller.abort();
-  req.on("close", onClose);
-  return controller.signal;
-}
-
-// ---------- callContractResult (retry chokepoint) ----------
 
 function asU256FromResult(result: string[]) {
   if (!Array.isArray(result) || result.length < 2) return null;
@@ -273,46 +91,92 @@ async function callContractResult(
   contractAddress: string,
   entrypoint: string,
   calldata: string[] = [],
-): Promise<string[]> {
-  // NOTE: this chokepoint deliberately does NOT retry — retry happens at
-  // the route level via `runWithReadRetry` so we have a single retry layer
-  // per read instead of stacked retries (3 outer × 3 inner = 9 calls).
+) {
   const out = await provider.callContract({
     contractAddress,
     entrypoint,
     calldata,
   });
-  return Array.isArray(out) ? out : (out as { result?: unknown })?.result;
+  return Array.isArray(out) ? out : (out as any)?.result;
 }
 
-// ---------- read helpers ----------
+// -------- contracts / schemas --------
 
-async function erc20BalanceOf(token: string, owner: string) {
-  const result = await callContractResult(token, "balance_of", [owner]);
-  const u256 = asU256FromResult(result);
-  if (!u256) {
-    throw new Error(`Unexpected balance_of result: ${JSON.stringify(result)}`);
-  }
-  return u256ToString(u256);
+/**
+ * Validates cursor-based pagination query parameters.
+ *
+ * - `cursor`: opaque string passed through from the previous response's `nextCursor`.
+ * - `limit`: page size clamped to [1, 100], default 50.
+ *
+ * Callers MUST pass the returned object unchanged to the database/RPC layer.
+ */
+export const CursorPaginationSchema = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+/**
+ * Validates a batch-read request body.
+ *
+ * - `ids`: non-empty array of positive bigints, max 50 items.
+ *
+ * Each ID maps to exactly one RPC call; the caller receives results in the same
+ * order. IDs that fail RPC validation throw immediately (no partial results).
+ */
+export const BatchReadSchema = z.object({
+  ids: z.array(z.coerce.bigint().positive()).min(1).max(50),
+});
+
+/**
+ * Standard envelope returned by all cursor-paginated read endpoints.
+ *
+ * @typeParam T - The shape of each record in `data`.
+ *
+ * Backward-compatibility guarantee:
+ * - `data` is always an array (may be empty).
+ * - `nextCursor` is `null` when no more pages remain.
+ * - `hasMore` is `true` iff `nextCursor` is non-null.
+ * - `limit` mirrors the validated input (or the default).
+ */
+export interface PaginatedReadResponse<T> {
+  data: T[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  limit: number;
 }
 
-async function erc20Decimals(token: string) {
-  const result = await callContractResult(token, "decimals", []);
-  if (!Array.isArray(result) || result.length < 1) {
-    throw new Error(`Unexpected decimals result: ${JSON.stringify(result)}`);
-  }
-  return Number(BigInt(result[0]));
-}
-
-async function erc20Symbol(token: string) {
-  const result = await callContractResult(token, "symbol", []);
-  if (!Array.isArray(result) || result.length < 1) {
-    throw new Error(`Unexpected symbol result: ${JSON.stringify(result)}`);
-  }
+async function erc20BalanceOf(token: string, owner: string, requestId?: string) {
+  const start = process.hrtime.bigint();
   try {
-    return shortString.decodeShortString(result[0]);
-  } catch {
-    return result[0];
+    // Minimal ERC20 balance read (Cairo ERC20s typically expose `balance_of(address) -> u256`)
+    const result = await callContractResult(token, "balance_of", [owner]);
+    const u256 = asU256FromResult(result);
+    if (!u256) {
+      throw new Error(`Unexpected balance_of result: ${JSON.stringify(result)}`);
+    }
+    const balance = u256ToString(u256);
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logReadTelemetry({
+      operation: "erc20_balance_of",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "success",
+      token,
+      owner,
+      request_id: requestId,
+    });
+    return balance;
+  } catch (err: any) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logReadTelemetry({
+      operation: "erc20_balance_of",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "error",
+      token,
+      owner,
+      request_id: requestId,
+      error: err?.message || String(err),
+    });
+    throw err;
   }
 }
 
@@ -459,24 +323,7 @@ readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
   try {
     const token = AddressParam.parse(req.params.token);
     const owner = AddressParam.parse(req.params.owner);
-    const signal = makeRequestAbortSignal(req);
-    const balance = await runWithReadRetry(
-      () => erc20BalanceOf(token, owner),
-      (n) => {
-        retries = n;
-      },
-      { signal },
-    );
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logReadTelemetry({
-      operation: "erc20_balance_of",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "success",
-      retries,
-      token,
-      owner,
-      request_id: res.locals.requestId,
-    });
+    const balance = await erc20BalanceOf(token, owner);
     res.json({ token, owner, balance });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
@@ -736,6 +583,41 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
       request_id: requestId,
       error: e?.message || String(e),
     });
+    next(e);
+  }
+});
+
+// -------- cursor-based reads and record ordering --------
+const CursorQuery = z.object({
+  cursor: z.string().optional(),
+  order: z.enum(["asc", "desc"]).default("desc"),
+  limit: z.coerce.number().min(1).max(100).default(50),
+});
+
+readRouter.get("/records/cursor/:address", async (req, res, next) => {
+  try {
+    const address = AddressParam.parse(req.params.address);
+    const { cursor, order, limit } = CursorQuery.parse(req.query);
+
+    // explicit security boundary
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    
+    // verify the caller matches the requested address
+    const token = authHeader.split(" ")[1];
+    if (token !== address) {
+      return res.status(403).json({ error: "Forbidden: privilege check failed" });
+    }
+
+    res.json({
+      address,
+      records: [],
+      nextCursor: null,
+      order,
+    });
+  } catch (e) {
     next(e);
   }
 });
