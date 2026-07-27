@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
-import { buildTypedChallenge, consumeChallenge, createChallenge } from "../auth/challenge.js";
+import { buildTypedChallenge, consumeChallenge, createChallenge, getChallenge } from "../auth/challenge.js";
 import {
   createSession,
   requireSession,
@@ -129,8 +129,8 @@ authRouter.post("/auth/verify", async (req, res, next) => {
         .json({ error: "No active challenge (or expired). Call /auth/challenge again." });
       return;
     }
-    const { chainId } = await getCachedNetworkInfo();
 
+    const { chainId } = await getCachedNetworkInfo();
     const typedData = buildTypedChallenge(address, chainId, ch.nonce);
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
