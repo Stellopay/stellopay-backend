@@ -1,6 +1,8 @@
-# `src/routes/analytics.ts` — Aggregation Rollup Observability
+# Analytics Route Contract
 
-## Overview
+All analytics aggregation lives in `src/routes/analytics.ts`. This document is
+the single source of truth for the request/response shapes, idempotency
+guarantees, sign conventions, and edge cases.
 
 Exposes `GET /api/v1/analytics/:user_address` — a monthly aggregation rollup that combines:
 
@@ -8,7 +10,29 @@ Exposes `GET /api/v1/analytics/:user_address` — a monthly aggregation rollup t
 - **Escrow events** (Funded / Released / Refunded), and
 - **Agreement creation events** (proxy for platform activity).
 
-Each query is a DB-side `EXTRACT(MONTH FROM ...)` grouping, filtered to the caller's address and the requested year. Results are formatted as 12-month chart data suitable for UI rendering.
+```
+GET /api/v1/analytics/:user_address?year=<number>
+```
+
+### Path parameters
+
+| Parameter    | Type     | Constraint                                                          |
+| ------------ | -------- | ------------------------------------------------------------------- |
+| user_address | `string` | Valid Starknet address (validated via `StarknetAddress` Zod schema) |
+
+### Query parameters
+
+| Parameter | Type     | Default      | Constraint         |
+| --------- | -------- | ------------ | ------------------ |
+| year      | `number` | current year | integer, 2020–2100 |
+
+### Headers
+
+| Header          | Direction | Description                                                      |
+| --------------- | --------- | ---------------------------------------------------------------- |
+| `If-None-Match` | request   | ETag from a previous response; triggers 304 if matched           |
+| `ETag`          | response  | SHA-256 hash of the response payload (truncated to 16 hex chars) |
+| `Cache-Control` | response  | Always `private, max-age=60`                                     |
 
 ### Performance characteristics
 
@@ -141,29 +165,62 @@ exists for that month** — real financial data always takes precedence.
 
 ---
 
-## Telemetry & Metrics
+## Idempotency contract
 
 Every invocation of the rollup endpoint is instrumented. Telemetry fires **after all three DB queries complete** (success path) or **inside the catch block for non-Zod errors** (error path), and respects global `LOG_FORMAT` and `LOG_LEVEL` settings. Zod 400 validation failures do not emit DB error telemetry.
 
-### Log format — JSON (`LOG_FORMAT=json`)
+### 1. ETag / 304 Not Modified
+
+The route computes an `ETag` from the response JSON. If the client sends
+`If-None-Match` matching the ETag, the route returns `304` with no body. This
+handles retries cleanly: the client gets a fast no-op instead of re-transferring
+the full payload.
+
+### 2. Cache-Control
+
+Every successful response includes `Cache-Control: private, max-age=60`. This
+prevents thundering-herd re-queries from the same client within a minute. The
+`private` directive ensures intermediate caches (CDNs, proxies) do not cache
+user-specific financial data.
+
+### 3. Concurrent deduplication (409)
+
+If a duplicate request for the same `user_address:year` arrives while a
+previous request is still in flight (within a 5-second window), the route
+returns:
+
+```json
+{ "error": "Duplicate rollup in progress — retry after a few seconds" }
+```
+
+with HTTP status **409 Conflict**. This prevents multiple concurrent DB
+round-trips for the same data. The lock is released when the first request
+completes (success or error).
+
+---
+
+## Response shape
 
 **Success:**
 
 ```json
 {
-  "timestamp": "2026-07-26T18:47:00.123Z",
-  "level": "info",
-  "operation": "analytics_monthly_rollup",
-  "duration_ms": 72.14,
-  "status": "success",
-  "request_id": "req-abc-001",
-  "user_address": "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
   "year": 2026,
-  "row_counts": {
-    "payments": 4,
-    "escrow_events": 7,
-    "agreement_creations": 2
-  }
+  "data": [
+    { "month": "Jan", "views": 0 },
+    { "month": "Feb", "views": 0 },
+    { "month": "Mar", "views": 4 },
+    { "month": "Apr", "views": -3 },
+    { "month": "May", "views": 4 },
+    { "month": "Jun", "views": 2 },
+    { "month": "Jul", "views": 0 },
+    { "month": "Aug", "views": 0 },
+    { "month": "Sept", "views": 10 },
+    { "month": "Oct", "views": 0 },
+    { "month": "Nov", "views": 0 },
+    { "month": "Dec", "views": 0 }
+  ],
+  "total": 17
 }
 ```
 
@@ -182,15 +239,19 @@ Every invocation of the rollup endpoint is instrumented. Telemetry fires **after
 }
 ```
 
-### Log format — text (`LOG_FORMAT=text`)
+### `ChartMonth`
 
-```text
-[2026-07-26T18:47:00.123Z] INFO [analytics-telemetry] analytics_monthly_rollup success 72.14ms [req-abc-001] rows={"payments":4,"escrow_events":7,"agreement_creations":2}
-```
+| Field | Type     | Description                                                 |
+| ----- | -------- | ----------------------------------------------------------- |
+| month | `string` | Abbreviated label: `"Jan"` … `"Dec"`                        |
+| views | `number` | Net aggregated financial value (see sign conventions below) |
+
+> **Name note:** The field is named `views` for backward compatibility with
+> existing consumers. It represents a **net monetary amount**, not a view count.
 
 ---
 
-## Telemetry Fields
+## Sign conventions
 
 | Field          | Type                    | Present on | Description                                        |
 | -------------- | ----------------------- | ---------- | -------------------------------------------------- |

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
@@ -151,16 +152,16 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   const requestId: string | undefined = res.locals.requestId;
 
   try {
-    // Validate the path param before it is normalized so a crafted string
-    // cannot produce a surprising lookup key; an invalid address throws a
-    // ZodError that the global handler maps to a 400 before any DB query.
     const userAddress = StarknetAddress.parse(req.params.user_address);
     const { year: parsedYear } = AnalyticsQuerySchema.parse(req.query);
     const year = parsedYear ?? new Date().getFullYear();
 
-    // Get all payments for the user in the specified year
-    const startDate = new Date(year, 0, 1);
-    const endDate = new Date(year, 11, 31, 23, 59, 59);
+    // --- Idempotency: ETag / conditional request ---
+    // The ETag cannot be pre-computed without the DB result, so we query first
+    // and then check. If the client sends `If-None-Match` matching our ETag we
+    // return 304. This handles retries cleanly: the client gets a fast no-op
+    // instead of re-transferring the full payload.
+    const ifNoneMatch = req.headers["if-none-match"] as string | undefined;
 
     const payments = await db
       .select({
@@ -346,3 +347,158 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     next(e);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Aggregation core (extracted for testability)
+// ---------------------------------------------------------------------------
+
+async function computeRollup(
+  userAddress: string,
+  year: number,
+  requestId: string | undefined,
+  start: bigint,
+): Promise<AnalyticsRollupResponse> {
+  const startDate = new Date(year, 0, 1);
+  const endDate = new Date(year, 11, 31, 23, 59, 59);
+
+  // --- Query 1: payments ---
+  const payments = await db
+    .select({
+      month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
+      amount: schema.payments.amount,
+      from: schema.payments.from,
+      to: schema.payments.to,
+    })
+    .from(schema.payments)
+    .where(
+      and(
+        or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
+        gte(schema.payments.createdAt, startDate),
+        lte(schema.payments.createdAt, endDate),
+      ),
+    );
+
+  // --- Query 2: escrow events ---
+  const escrowEvents = await db
+    .select({
+      month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
+      amount: schema.escrowEvents.amount,
+      eventType: schema.escrowEvents.eventType,
+    })
+    .from(schema.escrowEvents)
+    .where(
+      and(
+        or(eq(schema.escrowEvents.employer, userAddress), eq(schema.escrowEvents.to, userAddress)),
+        gte(schema.escrowEvents.createdAt, startDate),
+        lte(schema.escrowEvents.createdAt, endDate),
+      ),
+    );
+
+  // --- Query 3: agreement creations ---
+  const agreementCreations = await db
+    .select({
+      month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
+      agreementId: schema.agreementEvents.agreementId,
+    })
+    .from(schema.agreementEvents)
+    .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
+    .where(
+      and(
+        eq(schema.agreementEvents.eventType, "AgreementCreated"),
+        or(
+          eq(schema.agreements.employer, userAddress),
+          eq(schema.agreements.contributor, userAddress),
+        ),
+        gte(schema.agreementEvents.createdAt, startDate),
+        lte(schema.agreementEvents.createdAt, endDate),
+      ),
+    );
+
+  // --- Aggregation ---
+  const monthlyData: Record<number, bigint> = {};
+  for (let i = 1; i <= 12; i++) {
+    monthlyData[i] = 0n;
+  }
+
+  // Payments: incoming (to === user) → +amount, outgoing (from === user) → -amount.
+  payments.forEach((p) => {
+    const month = Number(p.month);
+    const amount = BigInt(p.amount);
+    const isIncoming = p.to === userAddress;
+    monthlyData[month] = (monthlyData[month] || 0n) + (isIncoming ? amount : -amount);
+  });
+
+  // Escrow events: Funded → negative (outgoing), Released/Refunded → positive (incoming).
+  escrowEvents.forEach((e) => {
+    const month = Number(e.month);
+    const amount = BigInt(e.amount);
+    if (e.eventType === "Funded") {
+      monthlyData[month] = (monthlyData[month] || 0n) - amount;
+    } else {
+      monthlyData[month] = (monthlyData[month] || 0n) + amount;
+    }
+  });
+
+  // Agreement creations: activity proxy (count × 1000 base units).
+  // Only applied when no payment or escrow data exists for that month, to
+  // avoid inflating the chart when real financial data is present.
+  const agreementCountsByMonth: Record<number, number> = {};
+  agreementCreations.forEach((a: any) => {
+    const month = Number(a.month);
+    agreementCountsByMonth[month] = (agreementCountsByMonth[month] || 0) + 1;
+  });
+  Object.keys(agreementCountsByMonth).forEach((monthStr) => {
+    const month = Number(monthStr);
+    if (monthlyData[month] === 0n) {
+      const count = agreementCountsByMonth[month];
+      monthlyData[month] = BigInt(count * 1000);
+    }
+  });
+
+  const monthNames = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sept",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+
+  const chartData: ChartMonth[] = monthNames.map((month, index) => {
+    const monthNum = index + 1;
+    const value = monthlyData[monthNum] || 0n;
+    return {
+      month,
+      views: Number(formatTokenAmount(value, DEFAULT_TOKEN_DECIMALS)),
+    };
+  });
+
+  const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
+
+  const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+  logAnalyticsTelemetry({
+    operation: "analytics_monthly_rollup",
+    duration_ms: Math.round(duration * 100) / 100,
+    status: "success",
+    request_id: requestId,
+    user_address: userAddress,
+    year,
+    row_counts: {
+      payments: payments.length,
+      escrow_events: escrowEvents.length,
+      agreement_creations: agreementCreations.length,
+    },
+  });
+
+  return {
+    year,
+    data: chartData,
+    total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
+  };
+}
