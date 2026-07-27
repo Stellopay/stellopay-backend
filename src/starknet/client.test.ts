@@ -333,6 +333,8 @@ describe("RPC endpoint failover", () => {
     client.resetRpcFailoverForTests();
 
     const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
     const complexRequest = {
       nested: {
         array: [1, 2, 3],
