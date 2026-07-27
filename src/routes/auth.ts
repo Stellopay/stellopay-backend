@@ -11,21 +11,21 @@ import {
 } from "../auth/session.js";
 import { requireAuth } from "../auth/middleware.js";
 
-const AddressBody = z.object({ address: z.string().min(3) });
+const AddressBody = z.object({ address: z.string().min(3) }).strict();
 const VerifyBody = z.object({
   address: z.string().min(3),
   // Some Starknet accounts/wallets produce variable-length signatures (not always 2 felts)
   signature: z.array(z.string().min(1)).min(2),
-});
+}).strict();
 const SessionBody = z.object({
   address: z.string().min(3),
   session_token: z.string().min(10),
-});
+}).strict();
 
 const RefreshBody = z.object({
   address: z.string().min(3),
   refresh_token: z.string().min(10),
-});
+}).strict();
 
 export const authRouter = Router();
 
