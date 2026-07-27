@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { vi, describe, it, expect, beforeEach } from "vitest";
 import express from "express";
 import request from "supertest";
 
@@ -35,25 +35,29 @@ vi.mock("../db/index.js", () => ({
                                                                                         loadAbiFromContractClassJsonPath: vi.fn().mockReturnValue([]),
                                                                                         }));
 
-                                                                                        // Deliberately NOT mocking ../auth/middleware.js — requireAuth/requireAdmin
-                                                                                        // run for real. We only stub their one DB-dependent dependency
-                                                                                        // (requireSession) and fix ADMIN_ADDRESSES, mirroring how the rest of this
-                                                                                        // suite already mocks the DB layer rather than the business logic.
-                                                                                        const ADMIN_ADDRESS = "0xadmin00000000000000000000000000000000000";
-                                                                                        const NON_ADMIN_ADDRESS = "0xnotadmin0000000000000000000000000000000";
-                                                                                        const VALID_TOKEN = "valid-session-token";
+                                                                                         // Deliberately NOT mocking ../auth/middleware.js — requireAuth/requireAdmin
+                                                                                         // run for real. We only stub their one DB-dependent dependency
+                                                                                         // (requireSession) and fix ADMIN_ADDRESSES, mirroring how the rest of this
+                                                                                         // suite already mocks the DB layer rather than the business logic.
+                                                                                         // Values are inlined in vi.mock factories (hoisted before const declarations).
 
-                                                                                        vi.mock("../auth/session.js", () => ({
-                                                                                          requireSession: vi.fn(async (_address: string, token: string) => token === VALID_TOKEN),
-                                                                                          }));
+                                                                                         vi.mock("../auth/session.js", () => ({
+                                                                                           requireSession: vi.fn(async (_address: string, token: string) =>
+                                                                                             token === "valid-session-token"
+                                                                                           ),
+                                                                                           }));
 
-                                                                                          vi.mock("../config.js", () => ({
-                                                                                            env: { ADMIN_ADDRESSES: [ADMIN_ADDRESS] },
-                                                                                              defaults: { workAgreementAddress: "0x1", payrollEscrowAddress: "0x2" },
-                                                                                                abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
-                                                                                                }));
+                                                                                           vi.mock("../config.js", () => ({
+                                                                                             env: { ADMIN_ADDRESSES: ["0xadmin00000000000000000000000000000000000"] },
+                                                                                               defaults: { workAgreementAddress: "0x1", payrollEscrowAddress: "0x2" },
+                                                                                                 abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
+                                                                                                 }));
 
-                                                                                                import { reprocessEventsRouter } from "./reprocess-events.js";
+                                                                                                 import { reprocessEventsRouter } from "./reprocess-events.js";
+
+                                                                                                 const ADMIN_ADDRESS = "0xadmin00000000000000000000000000000000000";
+                                                                                                 const NON_ADMIN_ADDRESS = "0xnotadmin0000000000000000000000000000000";
+                                                                                                 const VALID_TOKEN = "valid-session-token";
 
                                                                                                 function buildApp() {
                                                                                                   const app = express();
@@ -84,21 +88,21 @@ vi.mock("../db/index.js", () => ({
                                                                                                                                       for (const route of protectedRoutes) {
                                                                                                                                             it(`POST ${route.path}`, async () => {
                                                                                                                                                     const req = request(app).post(`/api/v1${route.path}`);
-                                                                                                                                                            const res = await (route.body ? req.send(route.body) : req);
-                                                                                                                                                                    expect(res.status).toBe(401);
-                                                                                                                                                                          });
-                                                                                                                                                                              }
-                                                                                                                                                                                });
+const res = await (route.body ? req.send(route.body) : req);
+                                                                                                                                                                                                                                                    expect(res.status).toBe(401);
+                                                                                                                                                                           });
+                                                                                                                                                                               }
+                                                                                                                                                                                 });
 
-                                                                                                                                                                                  describe("valid session but non-admin address → 401", () => {
+                                                                                                                                                                                   describe("valid session but non-admin address → 403", () => {
                                                                                                                                                                                       for (const route of protectedRoutes) {
                                                                                                                                                                                             it(`POST ${route.path}`, async () => {
                                                                                                                                                                                                     const req = request(app)
                                                                                                                                                                                                               .post(`/api/v1${route.path}`)
-                                                                                                                                                                                                                        .set("x-user-address", NON_ADMIN_ADDRESS)
-                                                                                                                                                                                                                                  .set("Authorization", `Bearer ${VALID_TOKEN}`);
-                                                                                                                                                                                                                                          const res = await (route.body ? req.send(route.body) : req);
-                                                                                                                                                                                                                                                  expect(res.status).toBe(401);
+.set("x-user-address", NON_ADMIN_ADDRESS)
+                                                                                                                                                                                                                                   .set("Authorization", `Bearer ${VALID_TOKEN}`);
+                                                                                                                                                                                                                                           const res = await (route.body ? req.send(route.body) : req);
+                                                                                                                                                                                                                                                   expect(res.status).toBe(403);
                                                                                                                                                                                                                                                         });
                                                                                                                                                                                                                                                             }
                                                                                                                                                                                                                                                               });
