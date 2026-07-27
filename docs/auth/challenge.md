@@ -78,24 +78,38 @@ Entries leave the store in three ways:
 
 ### Bounding memory growth
 
-Two independent bounds guard the in-memory store.
+Three independent bounds guard the in-memory store.
 
-**Opportunistic sweep.** `getChallenge` and `consumeChallenge` only evict an entry when it
-is _read_. An address that requests a challenge and never calls `/auth/verify` (an
-abandoned login, or an attacker enumerating addresses) would otherwise sit in the map
-forever. Every 50th `createChallenge` call therefore scans the map and deletes any entry
-whose TTL has already elapsed, regardless of whether it was ever read. This bounds
-unread/abandoned entries to roughly one sweep interval's worth of traffic instead of the
-lifetime of the process, without a background timer (which would complicate shutdown and
-test lifecycles).
+**Paginated opportunistic sweep.** `getChallenge` and `consumeChallenge` only evict an
+entry when it is _read_. An address that requests a challenge and never calls
+`/auth/verify` (an abandoned login, or an attacker enumerating addresses) would otherwise
+sit in the map forever. Every 50th `createChallenge` call therefore initiates a sweep
+pass that deletes entries whose TTL has already elapsed.
 
-**Hard cap.** `MAX_CHALLENGES` is 100,000 — roughly 8MB at ~80 bytes per entry. When a
-**new** entry would exceed it, `createChallenge` runs one last sweep to reclaim expired
-entries, and if the store is still full it emits `challenge_rejected` /
-`reason: "store_full"` and throws. The route layer surfaces that as a 5xx rather than
-silently dropping a security-relevant signal. Replaying an **existing** challenge is never
-blocked by the cap — a full store must not break an in-flight login for an unrelated
-address.
+The sweep is **paginated** to bound synchronous work: each invocation checks at most
+`SWEEP_BATCH_SIZE` (500) entries and advances a cursor (`sweepOffset`). The next sweep
+continues from where the previous one stopped, wrapping back to offset 0 after reaching
+the end of the store. This means a single sweep call costs O(SWEEP_BATCH_SIZE) regardless
+of store size.
+
+At `SWEEP_BATCH_SIZE = 500` and a full store of 100,000 entries, a complete pass requires
+200 sweep invocations. At the sweep interval of 50 `createChallenge` calls, a full pass
+completes every 10,000 calls, which at realistic traffic volumes is well within the
+5-minute TTL window. The page size (`SWEEP_BATCH_SIZE = 500`) and interval
+(`SWEEP_INTERVAL = 50`) are tuned to keep per-invocation latency negligible even under
+spike traffic.
+
+**Last-resort full sweep.** When a **new** entry would exceed `MAX_CHALLENGES`,
+`createChallenge` runs a full (un-paginated) sweep over the entire store to reclaim
+whatever has already expired before throwing. This guarantees all expired entries are
+reclaimed when the store is near the cap.
+
+**Hard cap.** `MAX_CHALLENGES` is 100,000 — roughly 8MB at ~80 bytes per entry. If the
+last-resort full sweep still leaves the store full, `createChallenge` emits
+`challenge_rejected` / `reason: "store_full"` and throws. The route layer surfaces that as
+a 5xx rather than silently dropping a security-relevant signal. Replaying an **existing**
+challenge is never blocked by the cap — a full store must not break an in-flight login for
+an unrelated address.
 
 ### Rationale for in-memory retention
 
@@ -168,10 +182,11 @@ call volume.
 
 ## Test helpers
 
-`clearChallengesForTesting()` empties the store and resets the sweep counter;
-`clearChainIdCacheForTesting()` empties the chain-ID memo. Both exist for test isolation
-only — calling either in production would invalidate every in-flight login or discard a
-warm cache for no reason.
+`clearChallengesForTesting()` empties the store and resets both the sweep counter
+(`creationsSinceSweep`) and the page cursor (`sweepOffset`); `clearChainIdCacheForTesting()`
+empties the chain-ID memo. Both exist for test isolation only — calling either in production
+would invalidate every in-flight login, reset pagination mid-pass, or discard a warm cache
+for no reason.
 
 The `challenges` Map itself is exported so tests can assert on store contents and drive the
 size cap directly without minting 100,000 real nonces. Production code outside this module
@@ -192,6 +207,10 @@ must go through the functions above.
   full-but-stale store, and recovery after draining.
 - Sweep: a valid entry surviving unrelated traffic, an abandoned expired entry being
   evicted without ever being read, and not-yet-expired entries left in place.
+- Batch sweep pagination: the per-invocation page limit (`SWEEP_BATCH_SIZE`), cursor
+  advancement across multiple sweeps, cursor wrap-around after a full pass, graceful
+  handling of an empty store, cursor reset when the store shrinks below the cursor, and
+  the last-resort full sweep when the store is full.
 - `getChallenge` / `clearChallenge` / `consumeChallenge`: success, expiry boundary,
   not-found and invalid-address misses, silent no-ops, the consume-once replay race, and
   cross-format address resolution.

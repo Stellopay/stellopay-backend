@@ -94,19 +94,6 @@ export const MAX_CHALLENGES = 100_000;
  */
 export const challenges = new Map<string, ChallengeRecord>();
 
-/** Decodes a Starknet chain-ID felt into a human-readable label (e.g. "SN_SEPOLIA"). */
-function getChainIdLabel(chainId: string): string {
-  const cached = chainIdCache.get(chainId);
-  if (cached) return cached;
-  try {
-    const label = shortString.decodeShortString(chainId);
-    chainIdCache.set(chainId, label);
-    return label;
-  } catch {
-    return chainId;
-  }
-}
-
 /**
  * Number of `createChallenge` calls between opportunistic sweeps of expired
  * entries.
@@ -122,6 +109,37 @@ const SWEEP_INTERVAL = 50;
 let creationsSinceSweep = 0;
 
 /**
+ * Maximum number of entries checked per sweep batch.
+ *
+ * Instead of iterating the entire store (up to `MAX_CHALLENGES` entries) in a
+ * single sweep call — which would block the event loop — each sweep processes
+ * at most this many entries. A cursor (`sweepOffset`) advances by
+ * `SWEEP_BATCH_SIZE` on each invocation, wrapping back to 0 after reaching
+ * the end of the store. This bounds the synchronous work of any single sweep
+ * to O(SWEEP_BATCH_SIZE) regardless of store size.
+ *
+ * With SWEEP_BATCH_SIZE = 500 and a full store of 100,000 entries, a complete
+ * sweep pass requires ceil(100000 / 500) = 200 invocations. At
+ * SWEEP_INTERVAL = 50, a full pass completes every 200 × 50 = 10,000
+ * `createChallenge` calls, which at realistic traffic volumes is well within
+ * the 5-minute TTL window.
+ *
+ * Exported for test assertions; production code must not depend on this value
+ * being stable across versions.
+ */
+export const SWEEP_BATCH_SIZE = 500;
+
+/**
+ * Cursor tracking the number of entries already checked in the current sweep
+ * pass. Each sweep invocation starts from this index (by snapshotting the
+ * store entries), processes up to `SWEEP_BATCH_SIZE` records, and advances
+ * the cursor. When the cursor reaches the end of the store it resets to 0.
+ *
+ * Reset by {@link clearChallengesForTesting}.
+ */
+let sweepOffset = 0;
+
+/**
  * Memoised mapping from encoded chain-ID felt → human-readable label.
  *
  * `buildTypedChallenge` runs on both `/auth/challenge` and `/auth/verify`,
@@ -132,13 +150,51 @@ let creationsSinceSweep = 0;
  */
 const chainIdCache = new Map<string, string>();
 
-/** Removes all entries whose TTL has already elapsed as of `now`. */
-function sweepExpiredChallenges(now: number): void {
-  for (const [key, rec] of challenges) {
-    if (now > rec.expiresAtMs) {
-      challenges.delete(key);
+/**
+ * Removes up to `SWEEP_BATCH_SIZE` entries whose TTL has already elapsed as
+ * of `now`. Advances `sweepOffset` so the next call continues from where this
+ * one stopped. When the end of the store is reached the cursor wraps back to 0.
+ *
+ * The store is snapshotted into an array before iterating so concurrent
+ * deletions (e.g. from `consumeChallenge`) do not shift the sweep position.
+ *
+ * @param now - Timestamp to compare against entry `expiresAtMs`.
+ * @param full - When `true` the entire store is swept in one pass (ignoring
+ *   the batch limit) and the cursor is reset. Only used as a last resort
+ *   before refusing a new entry in `createChallenge`.
+ */
+function sweepExpiredChallenges(now: number, full?: boolean): void {
+  if (full) {
+    for (const [key, rec] of challenges) {
+      if (now > rec.expiresAtMs) {
+        challenges.delete(key);
+      }
+    }
+    sweepOffset = 0;
+    return;
+  }
+
+  const size = challenges.size;
+  if (size === 0) {
+    sweepOffset = 0;
+    return;
+  }
+
+  // If the store has shrunk below our offset (e.g. entries consumed between
+  // sweeps), restart from the beginning.
+  if (sweepOffset >= size) sweepOffset = 0;
+
+  // Snapshot so deletions don't shift indices mid-iteration.
+  const entries = [...challenges.entries()];
+  const end = Math.min(sweepOffset + SWEEP_BATCH_SIZE, entries.length);
+
+  for (let i = sweepOffset; i < end; i++) {
+    if (now > entries[i][1].expiresAtMs) {
+      challenges.delete(entries[i][0]);
     }
   }
+
+  sweepOffset = end >= entries.length ? 0 : end;
 }
 
 /** Emits one structured metric line. `console.info` carries the request id. */
@@ -195,7 +251,7 @@ export function createChallenge(address: string): { nonce: string; expires_in_ms
 
   if (challenges.size >= MAX_CHALLENGES) {
     // Last resort before refusing: reclaim whatever has already expired.
-    sweepExpiredChallenges(now);
+    sweepExpiredChallenges(now, true);
     if (challenges.size >= MAX_CHALLENGES) {
       logChallengeMetric("challenge_rejected", { reason: "store_full", size: challenges.size });
       throw new Error("createChallenge: challenge store is full");
@@ -375,6 +431,7 @@ function canonicalWalletAddress(address: string): string {
 export function clearChallengesForTesting(): void {
   challenges.clear();
   creationsSinceSweep = 0;
+  sweepOffset = 0;
 }
 
 /**
