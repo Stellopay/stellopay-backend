@@ -282,12 +282,6 @@ function coerceNullOrEmptyToUndefined(value: unknown): unknown {
   return value;
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || value === undefined) return false;
-  if (Array.isArray(value)) return false;
-  return typeof value === "object";
-}
-
 /**
  * Parses and clamps pagination query parameters. Clamping happens server-side
  * so a client cannot request an unbounded, zero, or negative page: `limit` is
