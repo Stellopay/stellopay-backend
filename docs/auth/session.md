@@ -1,17 +1,23 @@
-# Session lifecycle contract
+# Session lifecycle: persistence, expiration, invalidation, observability, and reliability
 
-This document describes the persistence, expiration, and invalidation rules that
-are owned by [src/auth/session.ts](src/auth/session.ts). The goal is to keep the
-runtime behavior, tests, and maintenance guidance aligned.
+This document describes the full contract owned by
+[src/auth/session.ts](src/auth/session.ts): how sessions are persisted, how
+they expire, how they're invalidated, what side channels (logs/metrics) each
+state transition emits, and what's safely retryable. The goal is to keep the
+runtime behavior, tests, and this doc aligned — see
+[src/auth/session.test.ts](src/auth/session.test.ts) for the tests that pin
+down every rule below.
 
-## Persistence
+## Lifecycle contract: persistence, expiration, invalidation
+
+### Persistence
 
 A new session is created by `createSession(address)` and stored as a single row in
 `sessions` with the following contract:
 
 - the raw session token is generated client-side and never stored in the database;
 - the database stores a SHA-256 hash of the token, not the token itself;
-- the wallet address is normalized to lowercase before persistence;
+- the wallet address is normalized (trimmed, then lowercased) before persistence;
 - the row always carries two expiry timestamps:
   - `expiresAt`: the sliding TTL for the current token;
   - `absoluteExpiresAt`: the hard maximum lifetime for the token family.
@@ -21,7 +27,7 @@ The initial values are derived from the module configuration:
 - `expiresAt = now + SESSION_TTL_MS`
 - `absoluteExpiresAt = now + SESSION_MAX_TTL_MS`
 
-## Expiration
+### Expiration
 
 A session is considered valid only when all of the following are true:
 
@@ -29,7 +35,8 @@ A session is considered valid only when all of the following are true:
 - the token has not been revoked or rotated out;
 - `expiresAt` is still in the future;
 - `absoluteExpiresAt` is still in the future; and
-- the presented address matches the stored address (case-insensitive).
+- the presented address matches the stored address (whitespace-trimmed,
+  case-insensitive).
 
 The sliding expiry behaves as follows:
 
@@ -42,36 +49,50 @@ The boundary is inclusive for the current moment:
 - a request at exactly the expiry boundary is still accepted;
 - a request after the boundary is rejected.
 
-## Invalidation
+### Invalidation
 
 A session becomes invalid when one of the following happens:
 
 - `revokeSession(token)` marks the matching row as revoked;
 - `revokeFamily(familyId)` marks every row in that family as revoked;
 - `revokeAllSessionsForAddress(address)` marks every row for that wallet as revoked;
+  an empty or whitespace-only address is a no-op (no DB write, `reason:
+  "missing_input"` logged instead), matching the same guard on
+  `createSession` / `requireSession` / `rotateSession`;
 - `rotateSession(address, token)` marks the presented token as rotated and issues a replacement token;
 - `rotateSession` treats a reused rotated or revoked token as a compromise signal and revokes the whole family.
 
 Any revoked or rotated token is rejected by `requireSession`.
 
-## Sweep behavior
+### Sweep behavior
 
 `sweepExpiredSessions(now)` deletes rows whose sliding expiry, absolute expiry, or
 revocation state indicates they are no longer active. This is the cleanup path for
 expired or explicitly invalidated sessions.
 
-## Compatibility and scope
+### Compatibility and scope
 
 This contract is intentionally scoped to the existing module and its current
 callers. The public function signatures remain unchanged, and the behavior above
 is covered by the session tests in [src/auth/session.test.ts](src/auth/session.test.ts).
 
-## Edge cases intentionally out of scope
+### Edge cases intentionally out of scope
 
 - exporting session metrics to Prometheus or OTLP;
 - adding request-scoped correlation IDs to the session module;
-- changing the public function signatures for existing callers.
-# Session Lifecycle Observability
+- changing the public function signatures for existing callers;
+- **the idempotency check-then-act race**: `revokeSession`, `revokeFamily`,
+  and `revokeAllSessionsForAddress` each run a `SELECT` to classify the call
+  as "already revoked" before the retried `UPDATE`. Two concurrent calls
+  against the same token/family/address can both observe "not yet revoked"
+  and both proceed to write. This is harmless (the write itself is
+  idempotent — `revokedAt` ends up set either way) but means the
+  `session_*_revoke_already_total` counters can under-count concurrent
+  duplicate calls. Closing this would require a DB-level `UPDATE ...
+  WHERE revoked_at IS NULL RETURNING ...` instead of a separate read, which
+  is a larger change than this fix's scope.
+
+## Observability
 
 This document describes the **observability contract** for `src/auth/session.ts`.
 It pins down the structured logs and metric counters that every state
@@ -82,7 +103,7 @@ For the request-level access log, see `src/middleware/access-log.ts`. The
 conventions in this file mirror that middleware: JSON output when
 `LOG_FORMAT=json`, otherwise a single human-readable line.
 
-## When to read this
+### When to read this (observability)
 
 - You are debugging session-related production failures and need to know
   which event names and counter names to grep for.
@@ -95,7 +116,7 @@ conventions in this file mirror that middleware: JSON output when
 
 ---
 
-## Lifecycle at a glance
+### Lifecycle at a glance
 
 ```
                ┌─────────────┐
@@ -158,14 +179,25 @@ To minimize database write load during frequent API requests, `requireSession` i
 
 ### Token Rotation
 
-## Structured log events
-
 #### Concurrency & Transaction Safety
 Token rotation is executed within a database transaction using row-level locking (`FOR UPDATE` on the matched session). This guarantees that concurrent rotation requests do not result in race conditions, ensuring that compromise detection and family revocation behave deterministically.
 
 #### Compromise Detection (Family Revocation)
+If the token presented to `rotateSession` has already been rotated out
+(`rotatedAt` is set) or already revoked (`revokedAt` is set), presenting it
+again is treated as a compromise signal rather than a plain invalid-token
+rejection: someone is replaying a stale token, which only happens if it
+leaked. The entire token family (every row sharing that `familyId`) is
+revoked immediately, `session.reuse_detected` and `session.family_revoked`
+are both logged, and the call returns `{ ok: false, reason: "reused",
+familyId }` instead of `{ ok: false, reason: "invalid" }` — giving the
+caller (e.g. `routes/auth.ts`) enough information to force a full
+re-authentication rather than a silent retry.
 
 ---
+
+### Structured log events
+
 Every event is a single line. Format depends on `LOG_FORMAT`:
 
 | `LOG_FORMAT`     | Output shape (per line)                                            |
@@ -195,14 +227,14 @@ ascending verbosity: `error`, `warn`, `info`, `debug`.
 | `session.revoke_failed`   | error | `withBoundedRetry` (revoke-family path, exhausted) | `kind`, `message` + kind-specific fields                                       |
 | `session.sweep_retry`     | warn  | `withBoundedRetry` (`sweepExpiredSessions`) | `attempt`, `max_attempts`, `message`                                          |
 
-### `session.rejected` reasons
+#### `session.rejected` reasons
 
 The `reason` field is a **bounded enum** — never free-form text — so log
 searches and dashboards stay predictable:
 
 | Reason            | Meaning                                                                  |
 | ----------------- | ------------------------------------------------------------------------ |
-| `missing_input`   | `requireSession` called with empty `token` or empty `address`           |
+| `missing_input`   | `requireSession` / `rotateSession` called with empty `token` or empty `address`, or `revokeAllSessionsForAddress` called with an empty `address` |
 | `unknown_token`   | Hash of the presented token does not match any row in `sessions`         |
 | `address_mismatch`| Token is valid but was issued for a different wallet address            |
 | `revoked`         | Row exists but `revokedAt` is set                                        |
@@ -212,7 +244,7 @@ searches and dashboards stay predictable:
 
 ---
 
-## Metric counters
+### Metric counters
 
 All metrics are **process-local**, monotonic counters (plus a small set of
 gauges). They are exposed via `getSessionMetricsSnapshot()` from
@@ -249,7 +281,7 @@ out of scope for this PR.
 | `session_sweeper_last_deleted_count`    | `sweepExpiredSessions` (success)         |
 | `session_sweeper_last_run_at_ms`        | `sweepExpiredSessions` (success)         |
 
-### Cardinality
+#### Cardinality
 
 Counter names are fixed strings — no labels with attacker-controlled
 values. The only "label-like" field is the bounded `reason` enum, which is
@@ -259,7 +291,7 @@ stays at a fixed, small cardinality.
 
 ---
 
-## Security rules
+### Security rules
 
 These rules are enforced by code review and by the
 "never logs raw session tokens" test in `src/auth/session.test.ts`:
@@ -279,7 +311,7 @@ These rules are enforced by code review and by the
 
 ---
 
-## Reading the metrics in tests
+### Reading the metrics in tests
 
 `src/auth/session-metrics.ts` exports:
 
@@ -296,7 +328,7 @@ for examples.
 
 ---
 
-## Edge cases intentionally out of scope
+### Edge cases intentionally out of scope (observability)
 
 - **No Prometheus / OTLP exporter.** Metrics live in-process; exporting
   them is a separate concern.
@@ -324,30 +356,33 @@ for examples.
 
 ---
 
-## Compatibility
+### Compatibility (observability)
 
 - All public function signatures are unchanged.
 - All existing tests in `src/auth/session.test.ts` and
   `src/routes/auth.test.ts` pass without modification.
 - The background `setInterval` still runs only when `NODE_ENV !== "test"`.
-- The behaviour of `requireSession`, `revokeSession`, `rotateSession`,
-  `revokeFamily`, `revokeAllSessionsForAddress`, and `sweepExpiredSessions`
-  is identical to the prior version; this PR only adds side channels.
+- The observable behaviour of `requireSession`, `revokeSession`,
+  `rotateSession`, `revokeFamily`, `revokeAllSessionsForAddress`, and
+  `sweepExpiredSessions` on the happy path is unchanged by the
+  observability/reliability side channels described in this section. (See
+  the top-level [Compatibility notes](#compatibility-notes-this-fix) for
+  what *did* change in the most recent pass over this module.)
 
 ---
 
-# Session Lifecycle Reliability
+## Reliability
 
-This section describes the **reliability contract** introduced alongside
-the observability contract above. The goal is to make session persistence,
-expiration, and invalidation safely retryable on transient DB failure
-without changing what callers see on the happy path.
+This section describes the **reliability contract** for retryable DB writes.
+The goal is to make session persistence, expiration, and invalidation
+safely retryable on transient DB failure without changing what callers see
+on the happy path.
 
 For the structured event / counter names referenced below, see
 [Structured log events](#structured-log-events) and
 [Metric counters](#metric-counters) above.
 
-## When to read this
+### When to read this (reliability)
 
 - You are designing a new caller that performs bulk token revocation or
   relies on the sweeper, and want to know how many transient blips it
@@ -358,7 +393,7 @@ For the structured event / counter names referenced below, see
 - You are adding a new session mutation (e.g. a "freeze" or "rename"
   operation) and want to follow the same retry + idempotency pattern.
 
-## What we retry, and what we deliberately do not
+### What we retry, and what we deliberately do not
 
 Wrapped in `withBoundedRetry` (3 attempts, 50ms backoff, see
 `src/auth/session-retry.ts`):
@@ -383,7 +418,7 @@ The `isRetryable(error)` predicate treats anything other than
 retry. Deterministic constraint violations always surface immediately so
 the caller can react (e.g. surface a 4xx if appropriate).
 
-## Idempotent re-revoke classification
+### Idempotent re-revoke classification
 
 Before the retry loop runs, every revoke-family function performs one
 `SELECT` to check whether the row's `revokedAt` is already non-null. If
@@ -404,7 +439,7 @@ twice: `REVOKED_total` reflects "this is how many distinct revocation
 events happened" and `REVOKED_ALREADY_total` reflects "of those, how
 many were idempotent re-plays".
 
-## Retry events and counters
+### Retry events and counters
 
 | Event name               | Level | Bumped counter                    | Emitted by                                  |
 | ------------------------ | ----- | --------------------------------- | ------------------------------------------- |
@@ -418,7 +453,7 @@ handler can return a 5xx. The pre-existing `session.sweep_failed` path
 keeps running unchanged — it still returns `0` from the call side so the
 periodic sweeper stays self-healing on the next tick.
 
-## Compatibility with issue #124
+### Compatibility with issue #124
 
 The new event names reuse `SessionEventName`'s bounded enum in
 `src/auth/session-metrics.ts`, so the JSON / line-based log shape is
@@ -427,7 +462,7 @@ string names so dashboards can be migrated in lock-step. No public
 function signature changed. All existing tests pass without
 modification.
 
-## New reliability helper
+### New reliability helper
 
 `src/auth/session-retry.ts` exposes:
 
@@ -446,3 +481,35 @@ withBoundedRetry<T>(
 It is small enough to be re-used by future session mutations (e.g. an
 upcoming "freeze session" / "rename family" feature) so the entire
 session module keeps one retry policy.
+
+---
+
+## Compatibility notes (this fix)
+
+`src/auth/session.ts` had drifted from the contract described above — the
+runtime code, in a few places, no longer matched what this doc and
+`src/auth/session.test.ts` already said it should do. This pass reconciled
+them. No exported function's name, parameters, or return shape changed;
+every existing caller (`src/routes/auth.ts`, `src/auth/middleware.ts`,
+`src/routes/token.ts`, `src/routes/escrow.ts`, `src/routes/agreement.ts`)
+keeps working unmodified. What changed, all internal to the module:
+
+- `createSession`'s DB-error path no longer double-bumps
+  `session_rejected_total` for a single failure.
+- Dead, unreachable code after `rotateSession`'s transaction was removed
+  (it could never execute and referenced out-of-scope variables).
+- `revokeAllSessionsForAddress` no longer runs an unconditional, untracked
+  `UPDATE` before its documented idempotent-check-and-retry path — that
+  path is now the only path, matching [Invalidation](#invalidation) above.
+- `revokeAllSessionsForAddress` now guards against an empty/whitespace-only
+  `address` the same way every other exported function in this module
+  already does, instead of proceeding to query/write with a blank address.
+- `normalizeSessionAddress` now trims whitespace in addition to
+  lowercasing, so `createSession`/`rotateSession` tolerate padded addresses
+  the same way `requireSession` already did.
+
+These were all cases where the *tests* already encoded the intended
+contract but the runtime code — due to unrelated merge damage — didn't
+match it. Fixing the code to match the tests (rather than changing the
+tests to match the broken code) is what "backward-compatible" means here:
+restoring the behavior existing callers already assumed was true.

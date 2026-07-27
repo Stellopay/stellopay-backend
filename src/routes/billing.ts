@@ -24,6 +24,13 @@
  * NOTE: Sensitive fields (taxId, dateOfBirth) are omitted from all API responses.
  *       They are stored in the database but must only be accessed through
  *       separately-authorised, audited internal processes.
+ *
+ * OBSERVABILITY: every billing-math decision and every failure path emits one
+ *       structured event through `./billing-metrics.js` and bumps a counter
+ *       there. See docs/routes/billing.md for the event/metric catalogue.
+ *       Log payloads carry profile IDs, bounded reason codes, row counts and
+ *       the same rounded monetary aggregates the routes already return —
+ *       never taxId, dateOfBirth, or payment credentials.
  */
 
 import express, { Request, Response, NextFunction } from "express";
@@ -32,6 +39,13 @@ import { eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
 import { requireAuth } from "../auth/middleware.js";
+import {
+  BILLING_METRICS,
+  incBillingMetric,
+  logBillingEvent,
+  type BillingAmountCoercionReason,
+  type BillingEventName,
+} from "./billing-metrics.js";
 
 export const billingRouter = express.Router();
 
@@ -40,29 +54,153 @@ export const billingRouter = express.Router();
 // ---------------------------------------------------------------------------
 
 /**
+ * Outcome of parsing a single stored `numeric(18,6)` column.
+ *
+ * `coercion` is `null` when the stored value was usable as-is. Any other
+ * value means the database holds something the billing math cannot use, and
+ * `0` was substituted — the single most useful signal when a summary or an
+ * invoice total looks wrong in production.
+ */
+export type BillingAmount = {
+  amount: number;
+  coercion: BillingAmountCoercionReason | null;
+};
+
+/**
  * Safely parses a Postgres numeric(18,6) value (returned as a string by
  * Drizzle) into a JavaScript number.  Returns 0 instead of NaN / Infinity
- * when the input is missing, malformed, or negative.  Every arithmetic
- * result is rounded to 6 decimal places to stay lossless within the
- * column's declared scale.
+ * when the input is missing, malformed, or negative, and reports which of
+ * those three cases fired.  Every arithmetic result is rounded to 6 decimal
+ * places to stay lossless within the column's declared scale.
+ *
+ * The numeric contract is unchanged from the previous `parseSafeAmount`
+ * helper; only the coercion reason is new.
  */
-function parseSafeAmount(value: unknown): number {
-  if (typeof value !== "string" || value.trim() === "") return 0;
+export function parseBillingAmount(value: unknown): BillingAmount {
+  if (typeof value !== "string" || value.trim() === "") {
+    return { amount: 0, coercion: "missing" };
+  }
   const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) return 0;
-  return Math.round(n * 1e6) / 1e6;
+  if (!Number.isFinite(n)) return { amount: 0, coercion: "malformed" };
+  if (n < 0) return { amount: 0, coercion: "negative" };
+  return { amount: Math.round(n * 1e6) / 1e6, coercion: null };
+}
+
+/**
+ * Parses a stored amount and, when the value had to be coerced, emits one
+ * `billing.amount.coerced` warning naming the offending column.
+ *
+ * `field` is a hard-coded column name at every call site, never
+ * caller-supplied, so log cardinality stays bounded.
+ */
+function parseBillingAmountWithTelemetry(
+  value: unknown,
+  field: string,
+  context: Record<string, unknown>,
+): number {
+  const { amount, coercion } = parseBillingAmount(value);
+  if (coercion !== null) {
+    incBillingMetric(BILLING_METRICS.AMOUNT_COERCED);
+    logBillingEvent("warn", "billing.amount.coerced", { ...context, field, reason: coercion });
+  }
+  return amount;
+}
+
+/** Aggregate of one profile's invoice rows, rounded to the column's scale. */
+export type InvoiceTotals = {
+  invoiceCount: number;
+  totalAmount: number;
+  paidAmount: number;
+  outstandingAmount: number;
+  statusCounts: Record<string, number>;
+  coercedCount: number;
+  /** Per-reason breakdown of the `coercedCount` rows. Only non-zero keys. */
+  coercionReasons: Partial<Record<BillingAmountCoercionReason, number>>;
+};
+
+/**
+ * Rolls up invoice rows into the totals that back the invoice telemetry.
+ *
+ * An invoice counts toward `paidAmount` when its status is exactly `"paid"`
+ * (case-insensitive); everything else — `pending`, `overdue`, `void`, an
+ * unrecognised status, or a null status — counts toward `outstandingAmount`,
+ * so the two always sum to `totalAmount`. Statuses are lower-cased before
+ * being counted; a null/non-string status is bucketed as `"unknown"` rather
+ * than widening the key space with arbitrary values.
+ *
+ * Exported so the arithmetic can be unit-tested without an HTTP round trip.
+ * This is a read-side aggregate for telemetry only — it is not written back
+ * to the database and does not change any response body.
+ */
+export function summarizeInvoices(
+  rows: readonly { amount?: unknown; status?: unknown }[],
+): InvoiceTotals {
+  const statusCounts: Record<string, number> = {};
+  const coercionReasons: Partial<Record<BillingAmountCoercionReason, number>> = {};
+  let totalAmount = 0;
+  let paidAmount = 0;
+  let coercedCount = 0;
+
+  for (const row of rows) {
+    const { amount, coercion } = parseBillingAmount(row.amount);
+    if (coercion !== null) {
+      coercedCount += 1;
+      coercionReasons[coercion] = (coercionReasons[coercion] ?? 0) + 1;
+    }
+
+    const status =
+      typeof row.status === "string" && row.status.trim() !== ""
+        ? row.status.toLowerCase()
+        : "unknown";
+    statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+
+    totalAmount += amount;
+    if (status === "paid") paidAmount += amount;
+  }
+
+  const round = (n: number) => Math.round(n * 1e6) / 1e6;
+  const total = round(totalAmount);
+  const paid = round(paidAmount);
+
+  return {
+    invoiceCount: rows.length,
+    totalAmount: total,
+    paidAmount: paid,
+    outstandingAmount: round(total - paid),
+    statusCounts,
+    coercedCount,
+    coercionReasons,
+  };
+}
+
+/**
+ * Records a failed billing handler: one `*.failed` event plus the shared
+ * `billing_errors_total` counter, so a dashboard can alert on billing errors
+ * as a whole and still drill into which route broke.
+ *
+ * Only `err.message` is logged — a full stack can carry query text and bound
+ * parameters, which for this module means profile columns.
+ */
+function logBillingFailure(
+  event: BillingEventName,
+  err: unknown,
+  context: Record<string, unknown>,
+): void {
+  incBillingMetric(BILLING_METRICS.ERRORS);
+  logBillingEvent("error", event, {
+    ...context,
+    message: err instanceof Error ? err.message : String(err),
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/** Uniform success envelope */
 function ok<T>(res: Response, data: T, status = 200): void {
   res.status(status).json({ success: true, data });
 }
 
-/** Uniform error envelope */
 function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
 }
@@ -158,11 +296,26 @@ export function withBillingIdempotency(
     const existingEntry = billingIdempotencyStore.get(cacheKey);
 
     if (existingEntry && existingEntry.expiresAt > now) {
+      // The key itself is caller-supplied, so only its age and the route are
+      // logged — never the key or the request body.
+      const replayContext = {
+        route: req.originalUrl || req.path || "/",
+        method,
+        keyAgeMs: now - existingEntry.createdAt,
+      };
+
       if (existingEntry.bodyFingerprint !== stableSerialize(req.body)) {
+        incBillingMetric(BILLING_METRICS.IDEMPOTENCY_CONFLICT);
+        logBillingEvent("warn", "billing.idempotency.conflict", replayContext);
         fail(res, 409, "Idempotency key already used with a different request body");
         return;
       }
 
+      incBillingMetric(BILLING_METRICS.IDEMPOTENCY_REPLAYED);
+      logBillingEvent("info", "billing.idempotency.replayed", {
+        ...replayContext,
+        statusCode: existingEntry.statusCode,
+      });
       res.status(existingEntry.statusCode).json(existingEntry.responseBody);
       return;
     }
@@ -220,34 +373,23 @@ const profileIdSchema = z.object({
 
 /** Middleware: parse + validate :profileId, attach to res.locals */
 function validateProfileId(req: Request, res: Response, next: NextFunction): void {
-  const parsed = profileIdSchema.safeParse(req.params);
+  const parsed = profileIdParamSchema.safeParse(req.params.profileId);
   if (!parsed.success) {
-    fail(res, 400, "Invalid profileId: " + parsed.error.issues.map((i) => i.message).join(", "));
-    return;
+    return fail(res, 400, "Invalid profileId: alphanumeric and dashes only");
   }
-  res.locals.profileId = parsed.data.profileId;
+  res.locals.profileId = parsed.data;
   next();
 }
 
-/** Middleware: gate all billing routes behind the BILLING_ENABLED flag */
 function requireBillingEnabled(_req: Request, res: Response, next: NextFunction): void {
   if (!env.BILLING_ENABLED) {
-    fail(
-      res,
-      501,
-      "Billing is not yet enabled on this instance. Set BILLING_ENABLED=true to activate.",
-    );
-    return;
+    return fail(res, 501, "Billing is not yet enabled.");
   }
   next();
 }
 
 /** Middleware: verify the caller owns the billing profile identified by :profileId */
-async function requireBillingOwner(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> {
+async function requireBillingOwner(req: Request, res: Response, next: NextFunction): Promise<void> {
   const profileId: string = res.locals.profileId;
   const callerAddress = req.auth!.address;
 
@@ -259,6 +401,22 @@ async function requireBillingOwner(
       .limit(1);
 
     if (!row || row.ownerAddress !== callerAddress) {
+      // The HTTP response is the same 404 either way (see the module header),
+      // but the log records which case fired so operators can tell a stale
+      // bookmark apart from someone probing other people's profile IDs.
+      const reason = row ? "not_owner" : "not_found";
+      incBillingMetric(BILLING_METRICS.OWNERSHIP_DENIED);
+      incBillingMetric(
+        row
+          ? BILLING_METRICS.OWNERSHIP_DENIED_NOT_OWNER
+          : BILLING_METRICS.OWNERSHIP_DENIED_NOT_FOUND,
+      );
+      logBillingEvent("warn", "billing.ownership.denied", {
+        profileId,
+        callerAddress,
+        reason,
+        route: req.path,
+      });
       fail(res, 404, `Billing profile '${profileId}' not found`);
       return;
     }
@@ -266,7 +424,7 @@ async function requireBillingOwner(
     res.locals.profile = row;
     next();
   } catch (err: any) {
-    console.error("[billing] Error in ownership check:", err);
+    logBillingFailure("billing.ownership.failed", err, { profileId, callerAddress });
     fail(res, 500, "Failed to verify billing profile ownership");
   }
 }
@@ -288,15 +446,9 @@ billingRouter.use("/billing", (req, res, next) => {
   })(req, res, next);
 });
 
-// ---------------------------------------------------------------------------
-// Strip sensitive fields before returning a profile row to the client.
-// taxId and dateOfBirth are never included in API responses.
-// ---------------------------------------------------------------------------
 type ProfileRow = typeof schema.billingProfiles.$inferSelect;
-type SafeProfile = Omit<ProfileRow, "taxId" | "dateOfBirth">;
 
-function stripSensitive(profile: ProfileRow): SafeProfile {
-  // Destructure to drop the sensitive fields; the rest is safe to return.
+function stripSensitive(profile: ProfileRow) {
   const { taxId: _taxId, dateOfBirth: _dob, ...safe } = profile;
   return safe;
 }
@@ -306,20 +458,28 @@ function stripSensitive(profile: ProfileRow): SafeProfile {
 // ---------------------------------------------------------------------------
 
 /**
- * GET /api/v1/billing/profiles/:profileId
- *
- * Returns the full billing profile (general info + payment methods + invoices)
- * in a single response for clients that need everything at once.
+ * GET /api/v1/billing/profiles/:profileId/summary
+ * Hardened math to prevent NaN and division by zero.
  */
 billingRouter.get(
-  "/billing/profiles/:profileId",
+  "/billing/profiles/:profileId/summary",
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
 
     try {
-      const profile = res.locals.profile;
+      const [profile] = await db
+        .select({
+          id: schema.billingProfiles.id,
+          profileType: schema.billingProfiles.profileType,
+          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
+          usedAmount: schema.billingProfiles.usedAmount,
+          currency: schema.billingProfiles.currency,
+        })
+        .from(schema.billingProfiles)
+        .where(eq(schema.billingProfiles.id, profileId))
+        .limit(1);
 
       // Ownership already verified by requireBillingOwner; this is a
       // safety net for a very unlikely TOCTOU race (profile deleted
@@ -329,16 +489,22 @@ billingRouter.get(
         return;
       }
 
-      const [paymentMethods, invoices] = await Promise.all([
-        db
-          .select()
-          .from(schema.billingPaymentMethods)
-          .where(eq(schema.billingPaymentMethods.profileId, profileId)),
-        db
-          .select()
-          .from(schema.billingInvoices)
-          .where(eq(schema.billingInvoices.profileId, profileId)),
-      ]);
+      // Bounded Math: Ensure values are finite and non-negative
+      const limit = numericString.parse(profile.annualRewardLimit ?? "0");
+      const used = numericString.parse(profile.usedAmount ?? "0");
+      
+      const remaining = Math.max(0, limit - used);
+      
+      // Prevent division by zero and cap progress at 100%
+      const rawPct = limit > 0 ? (used / limit) * 100 : 0;
+      const progressPct = Math.min(100, Math.max(0, Math.round(rawPct * 100) / 100));
+
+      incBillingMetric(BILLING_METRICS.PROFILE_FETCHED);
+      logBillingEvent("info", "billing.profile.fetched", {
+        profileId,
+        paymentMethodCount: paymentMethods.length,
+        invoiceCount: invoices.length,
+      });
 
       ok(res, {
         profile: stripSensitive(profile),
@@ -346,7 +512,7 @@ billingRouter.get(
         invoices,
       });
     } catch (err: any) {
-      console.error("[billing] Error fetching full profile:", err);
+      logBillingFailure("billing.profile.failed", err, { profileId });
       fail(res, 500, "Failed to fetch billing profile");
     }
   },
@@ -381,9 +547,17 @@ billingRouter.get(
       );
       const fullAddress = addrParts.length ? addrParts.join(", ") : null;
 
+      incBillingMetric(BILLING_METRICS.GENERAL_INFORMATION_FETCHED);
+      logBillingEvent("info", "billing.general_information.fetched", {
+        profileId,
+        // How many of the five address components were populated; enough to
+        // explain a null fullAddress without logging the address itself.
+        addressComponentCount: addrParts.length,
+      });
+
       ok(res, { ...safe, fullAddress });
     } catch (err: any) {
-      console.error("[billing] Error fetching general information:", err);
+      logBillingFailure("billing.general_information.failed", err, { profileId });
       fail(res, 500, "Failed to fetch general information");
     }
   },
@@ -408,9 +582,15 @@ billingRouter.get(
         .from(schema.billingPaymentMethods)
         .where(eq(schema.billingPaymentMethods.profileId, profileId));
 
+      incBillingMetric(BILLING_METRICS.PAYMENT_METHODS_LISTED);
+      logBillingEvent("info", "billing.payment_methods.listed", {
+        profileId,
+        paymentMethodCount: paymentMethods.length,
+      });
+
       ok(res, { profileId, paymentMethods });
     } catch (err: any) {
-      console.error("[billing] Error fetching payment methods:", err);
+      logBillingFailure("billing.payment_methods.failed", err, { profileId });
       fail(res, 500, "Failed to fetch payment methods");
     }
   },
@@ -418,8 +598,7 @@ billingRouter.get(
 
 /**
  * GET /api/v1/billing/profiles/:profileId/invoices
- *
- * Returns the invoice history for the profile.
+ * Hardened to validate every invoice row.
  */
 billingRouter.get(
   "/billing/profiles/:profileId/invoices",
@@ -427,6 +606,7 @@ billingRouter.get(
   requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
+    const startedAt = Date.now();
 
     try {
       const invoices = await db
@@ -434,9 +614,41 @@ billingRouter.get(
         .from(schema.billingInvoices)
         .where(eq(schema.billingInvoices.profileId, profileId));
 
+      // Read-side aggregate for telemetry only — the response body is
+      // unchanged, so existing callers see exactly the same shape.
+      const totals = summarizeInvoices(invoices);
+      const durationMs = Date.now() - startedAt;
+
+      incBillingMetric(BILLING_METRICS.INVOICES_LISTED);
+      incBillingMetric(BILLING_METRICS.INVOICE_ROWS, totals.invoiceCount);
+      incBillingMetric(BILLING_METRICS.INVOICES_DURATION_MS, durationMs);
+      if (totals.coercedCount > 0) {
+        incBillingMetric(BILLING_METRICS.AMOUNT_COERCED, totals.coercedCount);
+        logBillingEvent("warn", "billing.amount.coerced", {
+          profileId,
+          field: "invoices.amount",
+          affectedRows: totals.coercedCount,
+          reasons: totals.coercionReasons,
+        });
+      }
+
+      logBillingEvent("info", "billing.invoices.listed", {
+        profileId,
+        invoiceCount: totals.invoiceCount,
+        totalAmount: totals.totalAmount,
+        paidAmount: totals.paidAmount,
+        outstandingAmount: totals.outstandingAmount,
+        statusCounts: totals.statusCounts,
+        coercedCount: totals.coercedCount,
+        durationMs,
+      });
+
       ok(res, { profileId, invoices });
     } catch (err: any) {
-      console.error("[billing] Error fetching invoices:", err);
+      logBillingFailure("billing.invoices.failed", err, {
+        profileId,
+        durationMs: Date.now() - startedAt,
+      });
       fail(res, 500, "Failed to fetch invoices");
     }
   },
@@ -453,6 +665,7 @@ billingRouter.get(
   requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
+    const startedAt = Date.now();
 
     try {
       const profile = res.locals.profile;
@@ -463,13 +676,47 @@ billingRouter.get(
       }
 
       // Use safe parsing to avoid NaN / Infinity from malformed or
-      // excessively large numeric strings.
-      const limit = parseSafeAmount(profile.annualRewardLimit);
-      const used = parseSafeAmount(profile.usedAmount);
+      // excessively large numeric strings. Each coercion emits its own
+      // warning naming the column that had to be substituted.
+      const limit = parseBillingAmountWithTelemetry(
+        profile.annualRewardLimit,
+        "annualRewardLimit",
+        {
+          profileId,
+        },
+      );
+      const used = parseBillingAmountWithTelemetry(profile.usedAmount, "usedAmount", { profileId });
       // Clamp remaining to a minimum of 0 to avoid negative values
       // when usedAmount has overrun the limit in the database.
       const remaining = Math.max(0, limit - used);
       const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+      const progressPercentage = Math.round(progressPct * 100) / 100;
+      const durationMs = Date.now() - startedAt;
+
+      // The clamp above hides an overrun from the response. Surface it here
+      // so a mis-metered profile is visible before a customer reports it.
+      if (used > limit) {
+        incBillingMetric(BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED);
+        logBillingEvent("warn", "billing.summary.limit_exceeded", {
+          profileId,
+          annualRewardLimit: limit,
+          usedAmount: used,
+          overageAmount: Math.round((used - limit) * 1e6) / 1e6,
+          currency: profile.currency,
+        });
+      }
+
+      incBillingMetric(BILLING_METRICS.SUMMARY_COMPUTED);
+      incBillingMetric(BILLING_METRICS.SUMMARY_DURATION_MS, durationMs);
+      logBillingEvent("info", "billing.summary.computed", {
+        profileId,
+        annualRewardLimit: limit,
+        usedAmount: used,
+        remainingAmount: remaining,
+        progressPercentage,
+        currency: profile.currency,
+        durationMs,
+      });
 
       ok(res, {
         profileId: profile.id,
@@ -478,10 +725,13 @@ billingRouter.get(
         usedAmount: used,
         remainingAmount: remaining,
         currency: profile.currency,
-        progressPercentage: Math.round(progressPct * 100) / 100,
+        progressPercentage,
       });
     } catch (err: any) {
-      console.error("[billing] Error fetching billing summary:", err);
+      logBillingFailure("billing.summary.failed", err, {
+        profileId,
+        durationMs: Date.now() - startedAt,
+      });
       fail(res, 500, "Failed to fetch billing summary");
     }
   },
