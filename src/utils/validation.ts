@@ -51,6 +51,42 @@ function logValidationError(metric: ValidationErrorMetric): void {
  * // On failure logs:
  * // [validation:error] {"validator":"createAgreement","input":"0xbad...","error":"...","timestamp":"..."}
  */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export class ValidationError extends Error {
+  name = "ValidationError";
+  validator: string;
+  input: string;
+  metric: ValidationErrorMetric;
+
+  constructor(message: string, validator: string, input: string, metric: ValidationErrorMetric) {
+    super(message);
+    this.validator = validator;
+    this.input = input;
+    this.metric = metric;
+  }
+
+  static fromZodError(error: z.ZodError, validator: string, input: string): ValidationError {
+    const message = error.issues.map((i) => i.message).join("; ");
+    const metric: ValidationErrorMetric = {
+      validator,
+      input,
+      error: message,
+      timestamp: new Date().toISOString(),
+    };
+    return new ValidationError(message, validator, input, metric);
+  }
+}
+
+export function mapZodError(error: unknown) {
+  if (!(error instanceof z.ZodError)) return undefined;
+  const issue = error.issues[0];
+  if (!issue) return undefined;
+  return issue;
+}
+
 export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
