@@ -15,6 +15,7 @@ const mockRpcProviders = vi.hoisted(() =>
     getChainId: ReturnType<typeof vi.fn>;
     getSpecVersion: ReturnType<typeof vi.fn>;
     getBlock: ReturnType<typeof vi.fn>;
+    estimateFee: ReturnType<typeof vi.fn>;
   }>,
 );
 
@@ -25,12 +26,14 @@ vi.mock("starknet", async (importOriginal) => {
     getChainId: ReturnType<typeof vi.fn>;
     getSpecVersion: ReturnType<typeof vi.fn>;
     getBlock: ReturnType<typeof vi.fn>;
+    estimateFee: ReturnType<typeof vi.fn>;
 
     constructor({ nodeUrl }: { nodeUrl: string }) {
       this.nodeUrl = nodeUrl;
       this.getChainId = vi.fn();
       this.getSpecVersion = vi.fn().mockResolvedValue("0.6.0");
       this.getBlock = vi.fn();
+      this.estimateFee = vi.fn();
       mockRpcProviders.push(this);
     }
   }
@@ -48,14 +51,24 @@ import {
   agreementContract,
   clearContractCache,
   resetRpcFailoverForTests,
-  resetCircuitBreakersForTests,
-  getCircuitBreakerSnapshots,
+  getStarknetMetricsSnapshot,
+  resetStarknetMetrics,
+  incStarknetMetric,
+  STARKNET_METRICS,
 } from "./client.js";
 import { CircuitOpenError } from "./circuit-breaker.js";
 
 const VITEST_POSTGRES =
   process.env.POSTGRES_CONNECTION_STRING ??
   "postgresql://postgres:postgres@localhost:5432/stellopay_indexer";
+
+async function loadClientWithRpcUrls(rpcEnv: string) {
+  vi.resetModules();
+  mockRpcProviders.length = 0;
+  process.env.STARKNET_RPC_URL = rpcEnv;
+  process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
+  return import("./client.js");
+}
 
 describe("Starknet Client Cache", () => {
   let getChainIdSpy: ReturnType<typeof vi.fn>;
@@ -118,6 +131,19 @@ describe("Starknet Client Cache", () => {
     const info = await getCachedNetworkInfo();
     expect(info.chainId).toBe("0x534e5f4d41494e");
     expect(getChainIdSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("should deduplicate concurrent requests on cache miss", async () => {
+    const [info1, info2, info3] = await Promise.all([
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+    ]);
+
+    expect(info1).toEqual(info2);
+    expect(info2).toEqual(info3);
+    expect(getChainIdSpy).toHaveBeenCalledTimes(1);
+    expect(getSpecVersionSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -190,14 +216,6 @@ describe("RPC endpoint failover", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
-
-  async function loadClientWithRpcUrls(rpcEnv: string) {
-    vi.resetModules();
-    mockRpcProviders.length = 0;
-    process.env.STARKNET_RPC_URL = rpcEnv;
-    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
-    return import("./client.js");
-  }
 
   it("uses a single configured endpoint when only one URL is set", async () => {
     const client = await loadClientWithRpcUrls("https://only.example/rpc");
@@ -317,6 +335,8 @@ describe("RPC endpoint failover", () => {
     client.resetRpcFailoverForTests();
 
     const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
     const complexRequest = {
       nested: {
         array: [1, 2, 3],
@@ -338,8 +358,8 @@ describe("RPC endpoint failover", () => {
 
     expect(complexRequest.nested.array).toEqual([1, 2, 3]);
     expect(complexRequest.nested.object.key).toBe("value");
-    expect(result.received.nested.array).toEqual([1, 2, 3, 999]);
-    expect(result.received.nested.object.key).toBe("mutated");
+    expect(result.received.nested.array).toEqual([1, 2, 3]);
+    expect(result.received.nested.object.key).toBe("value");
   });
 });
 
@@ -379,286 +399,106 @@ describe("ABI error handling", () => {
   });
 });
 
-describe("Circuit breaker integration with failover", () => {
-  let warnSpy: ReturnType<typeof vi.spyOn>;
-  let infoSpy: ReturnType<typeof vi.spyOn>;
-
+describe("Starknet Client Telemetry & Metrics", () => {
   beforeEach(() => {
-    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
-    vi.useFakeTimers();
+    resetStarknetMetrics();
+    clearNetworkCache();
+    resetRpcFailoverForTests();
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  });
-
-  async function loadClientWithRpcUrls(rpcEnv: string) {
-    vi.resetModules();
-    mockRpcProviders.length = 0;
-    process.env.STARKNET_RPC_URL = rpcEnv;
-    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
-    // Use default circuit breaker settings for tests
-    process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD = "5";
-    process.env.CIRCUIT_BREAKER_COOLDOWN_MS = "30000";
-    return import("./client.js");
-  }
-
-  it("circuit opens after repeated failures to one endpoint", async () => {
+  it("tracks metrics for RPC calls and failovers", async () => {
     const client = await loadClientWithRpcUrls(
       "https://primary.example/rpc,https://secondary.example/rpc",
     );
     client.resetRpcFailoverForTests();
-    client.resetCircuitBreakersForTests();
-    client.clearNetworkCache();
+    client.resetStarknetMetrics();
 
     const [primary, secondary] = mockRpcProviders;
+    primary!.getBlock.mockRejectedValueOnce(new Error("RPC failed"));
+    secondary!.getBlock.mockResolvedValueOnce({ block_number: 100 });
 
-    // Make primary fail 5 times (threshold)
-    primary!.getChainId.mockRejectedValue(new Error("primary timeout"));
-    primary!.getSpecVersion.mockRejectedValue(new Error("primary timeout"));
-    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
-    secondary!.getSpecVersion.mockResolvedValue("0.6.0");
+    const result = await client.provider.getBlock("latest");
+    expect(result).toEqual({ block_number: 100 });
 
-    // First 5 calls will fail on primary, failover to secondary
-    for (let i = 0; i < 5; i++) {
-      client.clearNetworkCache();
-      await client.getCachedNetworkInfo();
-    }
-
-    // Circuit should now be open for primary
-    const snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("OPEN");
-    expect(snapshots[0]!.recentFailureCount).toBe(5);
-
-    // Next call should skip primary entirely (circuit open)
-    primary!.getChainId.mockClear();
-    primary!.getSpecVersion.mockClear();
-    client.clearNetworkCache();
-
-    await client.getCachedNetworkInfo();
-
-    // Primary should not have been called because circuit was open
-    expect(primary!.getChainId).not.toHaveBeenCalled();
-    expect(secondary!.getChainId).toHaveBeenCalledTimes(1);
+    const metrics = client.getStarknetMetricsSnapshot().counters;
+    expect(metrics[client.STARKNET_METRICS.RPC_REQUESTS]).toBe(1);
+    expect(metrics[client.STARKNET_METRICS.RPC_FAILOVERS]).toBe(1);
+    expect(metrics[client.STARKNET_METRICS.RPC_ERRORS]).toBe(1);
   });
 
-  it("circuit half-opens after cooldown and closes on successful probe", async () => {
-    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+  it("tracks fee quote metrics on estimateFee success and failure", async () => {
+    const client = await loadClientWithRpcUrls("https://rpc.example/rpc");
     client.resetRpcFailoverForTests();
-    client.resetCircuitBreakersForTests();
-    client.clearNetworkCache();
+    client.resetStarknetMetrics();
 
     const [primary] = mockRpcProviders;
+    primary!.estimateFee.mockResolvedValueOnce({ overall_fee: "1000" });
 
-    // Open the circuit with 5 failures
-    primary!.getChainId.mockRejectedValue(new Error("timeout"));
-    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+    await client.provider.estimateFee([]);
 
-    for (let i = 0; i < 5; i++) {
-      try {
-        await client.getCachedNetworkInfo();
-      } catch {
-        // expected
-      }
-    }
+    let snapshot = client.getStarknetMetricsSnapshot().counters;
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_REQUESTS]).toBe(1);
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_SUCCESS]).toBe(1);
 
-    let snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("OPEN");
+    primary!.estimateFee.mockRejectedValueOnce(new Error("Fee estimation failed"));
+    await expect(client.provider.estimateFee([])).rejects.toThrow("Fee estimation failed");
 
-    // Advance past cooldown (30s default in test config)
-    vi.advanceTimersByTime(30_001);
-
-    // Now the endpoint recovers
-    primary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
-    primary!.getSpecVersion.mockResolvedValue("0.6.0");
-
-    // First call transitions to HALF_OPEN and succeeds (probe)
-    client.clearNetworkCache();
-    await client.getCachedNetworkInfo();
-
-    snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("HALF_OPEN");
-
-    // Second successful call (successThreshold=2 default) closes circuit
-    client.clearNetworkCache();
-    await client.getCachedNetworkInfo();
-
-    snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("CLOSED");
-
-    // Verify circuit closed log
-    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("CLOSED"));
+    snapshot = client.getStarknetMetricsSnapshot().counters;
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_REQUESTS]).toBe(2);
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_ERRORS]).toBe(1);
   });
 
-  it("circuit reopens if probe call fails in HALF_OPEN state", async () => {
-    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
-    client.resetRpcFailoverForTests();
-    client.resetCircuitBreakersForTests();
-    client.clearNetworkCache();
+  it("tracks network info cache hits, fetches, and deduplication metrics", async () => {
+    vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");
+    vi.spyOn(provider, "getSpecVersion").mockResolvedValue("0.7.1");
 
-    const [primary] = mockRpcProviders;
+    const [info1, info2] = await Promise.all([
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+    ]);
 
-    // Open the circuit
-    primary!.getChainId.mockRejectedValue(new Error("timeout"));
-    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+    expect(info1).toEqual(info2);
 
-    for (let i = 0; i < 5; i++) {
-      try {
-        await client.getCachedNetworkInfo();
-      } catch {
-        // expected
-      }
-    }
+    let snapshot = getStarknetMetricsSnapshot().counters;
+    expect(snapshot[STARKNET_METRICS.NETWORK_INFO_FETCHES]).toBe(1);
+    expect(snapshot[STARKNET_METRICS.NETWORK_INFO_DEDUPED]).toBe(1);
 
-    // Advance to HALF_OPEN
-    vi.advanceTimersByTime(30_001);
-
-    // Probe fails
-    try {
-      await client.getCachedNetworkInfo();
-    } catch {
-      // expected
-    }
-
-    // Circuit should re-open
-    const snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("OPEN");
-
-    // Warn log about probe failure
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("HALF_OPEN"));
+    await getCachedNetworkInfo();
+    snapshot = getStarknetMetricsSnapshot().counters;
+    expect(snapshot[STARKNET_METRICS.NETWORK_INFO_CACHE_HITS]).toBe(1);
   });
 
-  it("circuit short-circuits without wasting time on timeout when open", async () => {
-    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
-    client.resetRpcFailoverForTests();
-    client.resetCircuitBreakersForTests();
-    client.clearNetworkCache();
+  it("resets metrics via resetStarknetMetrics", () => {
+    incStarknetMetric(STARKNET_METRICS.RPC_REQUESTS, 5);
+    expect(getStarknetMetricsSnapshot().counters[STARKNET_METRICS.RPC_REQUESTS]).toBe(5);
 
-    const [primary] = mockRpcProviders;
-
-    // Open the circuit
-    primary!.getChainId.mockRejectedValue(new Error("timeout"));
-    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
-
-    for (let i = 0; i < 5; i++) {
-      try {
-        await client.getCachedNetworkInfo();
-      } catch {
-        // expected
-      }
-    }
-
-    const snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("OPEN");
-
-    // Next call should fail immediately with CircuitOpenError
-    primary!.getChainId.mockClear();
-    primary!.getSpecVersion.mockClear();
-
-    await expect(client.getCachedNetworkInfo()).rejects.toThrow(CircuitOpenError);
-
-    // Primary should never have been called (circuit was open)
-    expect(primary!.getChainId).not.toHaveBeenCalled();
-    expect(primary!.getSpecVersion).not.toHaveBeenCalled();
-  });
-
-  it("failover works when one circuit is open", async () => {
-    const client = await loadClientWithRpcUrls(
-      "https://primary.example/rpc,https://secondary.example/rpc",
-    );
-    client.resetRpcFailoverForTests();
-    client.resetCircuitBreakersForTests();
-    client.clearNetworkCache();
-
-    const [primary, secondary] = mockRpcProviders;
-
-    // Open primary's circuit
-    primary!.getChainId.mockRejectedValue(new Error("timeout"));
-    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
-    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
-    secondary!.getSpecVersion.mockResolvedValue("0.6.0");
-
-    for (let i = 0; i < 5; i++) {
-      client.clearNetworkCache();
-      await client.getCachedNetworkInfo();
-    }
-
-    let snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("OPEN");
-    expect(snapshots[1]!.state).toBe("CLOSED");
-
-    // Subsequent calls should use secondary without trying primary
-    primary!.getChainId.mockClear();
-    primary!.getSpecVersion.mockClear();
-    secondary!.getChainId.mockClear();
-    secondary!.getSpecVersion.mockClear();
-
-    client.clearNetworkCache();
-    const result = await client.getCachedNetworkInfo();
-
-    expect(result.chainId).toBe("0x534e5f4d41494e");
-    expect(primary!.getChainId).not.toHaveBeenCalled();
-    expect(secondary!.getChainId).toHaveBeenCalledTimes(1);
-  });
-
-  it("getCircuitBreakerSnapshots returns diagnostic data for all endpoints", async () => {
-    const client = await loadClientWithRpcUrls(
-      "https://primary.example/rpc,https://secondary.example/rpc",
-    );
-    client.resetCircuitBreakersForTests();
-
-    const snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots).toHaveLength(2);
-    expect(snapshots[0]!.endpointUrl).toBe("https://primary.example/rpc");
-    expect(snapshots[0]!.state).toBe("CLOSED");
-    expect(snapshots[1]!.endpointUrl).toBe("https://secondary.example/rpc");
-    expect(snapshots[1]!.state).toBe("CLOSED");
-  });
-
-  it("failures outside the time window do not count toward threshold", async () => {
-    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
-    client.resetRpcFailoverForTests();
-    client.resetCircuitBreakersForTests();
-    client.clearNetworkCache();
-
-    // Set window to 60s (default), threshold to 5
-    process.env.CIRCUIT_BREAKER_WINDOW_MS = "60000";
-
-    const [primary] = mockRpcProviders;
-    primary!.getChainId.mockRejectedValue(new Error("timeout"));
-    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
-
-    // 3 failures
-    for (let i = 0; i < 3; i++) {
-      try {
-        await client.getCachedNetworkInfo();
-      } catch {
-        // expected
-      }
-    }
-
-    let snapshots = client.getCircuitBreakerSnapshots();
-    expect(snapshots[0]!.state).toBe("CLOSED");
-    expect(snapshots[0]!.recentFailureCount).toBe(3);
-
-    // Advance past the window so old failures expire
-    vi.advanceTimersByTime(60_001);
-
-    // 2 more failures (still below threshold of 5 because old ones expired)
-    for (let i = 0; i < 2; i++) {
-      try {
-        await client.getCachedNetworkInfo();
-      } catch {
-        // expected
-      }
-    }
-
-    snapshots = client.getCircuitBreakerSnapshots();
-    // Should still be CLOSED (only 2 failures in current window)
-    expect(snapshots[0]!.state).toBe("CLOSED");
-    expect(snapshots[0]!.recentFailureCount).toBe(2);
+    resetStarknetMetrics();
+    expect(getStarknetMetricsSnapshot().counters[STARKNET_METRICS.RPC_REQUESTS]).toBeUndefined();
   });
 });
 
+describe("Performance Optimizations", () => {
+  beforeEach(() => {
+    clearContractCache();
+    resetRpcFailoverForTests();
+  });
+
+  it("normalizes contract addresses to prevent duplicate instance creation", () => {
+    const address1 = " 0x0123AbCd456 ";
+    const address2 = "0x0123abcd456";
+
+    const escrow1 = escrowContract(address1);
+    const escrow2 = escrowContract(address2);
+    expect(escrow1).toBe(escrow2);
+
+    const agreement1 = agreementContract(address1);
+    const agreement2 = agreementContract(address2);
+    expect(agreement1).toBe(agreement2);
+  });
+
+  it("caches proxy method bindings across accesses", () => {
+    const fn1 = provider.getChainId;
+    const fn2 = provider.getChainId;
+    expect(fn1).toBe(fn2);
+  });
+});

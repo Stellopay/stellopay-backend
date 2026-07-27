@@ -239,7 +239,7 @@ diagnosticsRouter.get(
   "/diagnostics/events",
     requireAuth,
       requireAdmin,
-        async (_req, res, next) => {
+        async (req, res, next) => {
     try {
       const rawLimit = Number(req.query.limit);
       const rawOffset = Number(req.query.offset);
@@ -252,7 +252,7 @@ diagnosticsRouter.get(
     } catch (e) {
       next(e);
     }
-  }),
+  }
 );
 
 
