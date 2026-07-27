@@ -1,36 +1,111 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
-import { accessLogMiddleware } from "./access-log.js";
+import { accessLogMiddleware, redactSensitiveParams } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Standard app: requestIdMiddleware → accessLogMiddleware → routes. */
+function makeApp() {
+  const app = express();
+  app.use(express.json());
+  app.use(requestIdMiddleware);
+  app.use(accessLogMiddleware);
+
+  app.get("/test", (_req, res) => res.status(200).json({ ok: true }));
+  app.post("/test-body", (_req, res) => res.status(201).json({ created: true }));
+  app.get("/error", (_req, res) => res.status(500).json({ error: "Server Error" }));
+  app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
+  return app;
+}
+
+/** Standalone app: accessLogMiddleware WITHOUT requestIdMiddleware. */
+function makeStandaloneApp() {
+  const app = express();
+  app.use(accessLogMiddleware);
+  app.get("/test", (_req, res) => res.status(200).json({ ok: true }));
+  return app;
+}
+
+// ---------------------------------------------------------------------------
+// redactSensitiveParams — unit tests
+// ---------------------------------------------------------------------------
+
+describe("redactSensitiveParams", () => {
+  it("returns the URL unchanged when there is no query string", () => {
+    expect(redactSensitiveParams("/api/v1/users")).toBe("/api/v1/users");
+  });
+
+  it("returns the URL unchanged when no params are sensitive", () => {
+    expect(redactSensitiveParams("/api/v1/users?page=1&limit=20")).toBe(
+      "/api/v1/users?page=1&limit=20",
+    );
+  });
+
+  it("redacts 'token' param value", () => {
+    const result = redactSensitiveParams("/auth?token=super-secret");
+    expect(result).not.toContain("super-secret");
+    expect(result).toContain("token=");
+  });
+
+  it("redacts 'access_token' param value", () => {
+    const result = redactSensitiveParams("/api?access_token=eyJhbGc");
+    expect(result).not.toContain("eyJhbGc");
+  });
+
+  it("redacts 'password' while leaving other params intact", () => {
+    const result = redactSensitiveParams("/reset?password=hunter2&email=x%40y.com");
+    expect(result).not.toContain("hunter2");
+    expect(result).toContain("email=x%40y.com");
+  });
+
+  it("redacts 'address' (wallet address) while leaving other params intact", () => {
+    const result = redactSensitiveParams("/balance?address=0xDEADBEEF&chain=starknet");
+    expect(result).not.toContain("0xDEADBEEF");
+    expect(result).toContain("chain=starknet");
+  });
+
+  it("is case-insensitive for param names", () => {
+    const result = redactSensitiveParams("/api?Token=abc&ACCESS_TOKEN=def");
+    expect(result).not.toContain("abc");
+    expect(result).not.toContain("def");
+  });
+
+  it("leaves non-sensitive params intact when redacting sensitive ones", () => {
+    const result = redactSensitiveParams("/search?q=hello&token=secret&page=2");
+    expect(result).toContain("q=hello");
+    expect(result).toContain("page=2");
+    expect(result).not.toContain("secret");
+  });
+
+  it("returns only the path for a malformed URL (never throws)", () => {
+    // This URL has un-encoded spaces which prevents parsing
+    const malformed = "/path?token=abc&foo bar=baz";
+    const result = redactSensitiveParams(malformed);
+    expect(result).not.toContain("abc");
+    expect(typeof result).toBe("string");
+    expect(() => redactSensitiveParams(malformed)).not.toThrow();
+  });
+
+  it("handles an empty query string gracefully", () => {
+    expect(redactSensitiveParams("/api?")).toBe("/api?");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// accessLogMiddleware — original tests (preserved)
+// ---------------------------------------------------------------------------
 
 describe("accessLogMiddleware", () => {
   let app: express.Express;
-  let consoleInfoSpy: any;
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    app = express();
-    app.use(express.json());
-    // Mount requestIdMiddleware before accessLogMiddleware so request_id is set
-    app.use(requestIdMiddleware);
-    app.use(accessLogMiddleware);
-
-    app.get("/test", (req, res) => {
-      res.status(200).json({ ok: true });
-    });
-
-    app.post("/test-body", (req, res) => {
-      res.status(201).json({ created: true });
-    });
-
-    app.get("/error", (req, res) => {
-      res.status(500).json({ error: "Server Error" });
-    });
-
-    app.get("/health", (req, res) => {
-      res.status(200).json({ ok: true });
-    });
-
+    app = makeApp();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
   });
 
