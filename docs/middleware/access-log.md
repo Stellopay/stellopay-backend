@@ -6,8 +6,11 @@ Source: [`src/middleware/access-log.ts`](../../src/middleware/access-log.ts)
 
 `accessLogMiddleware` emits one structured log line per request after the
 response is sent. It records the HTTP method, sanitised path, status code,
-duration, and the correlation ID from `requestIdMiddleware`. Bodies, headers,
+duration, correlation ID, and optional `content-length`. Bodies, headers,
 and auth material are never logged.
+
+The middleware also maintains in-memory request metrics that can be consumed
+for health/observability endpoints.
 
 ---
 
@@ -43,9 +46,34 @@ redactSensitiveParams("/api/v1/balance?address=0xDEAD&page=1");
 ```
 
 Parameters whose names match the redaction list (case-insensitive) have their
-values replaced with `[redacted]`. All other parameters pass through unchanged.
-Malformed URLs that cannot be parsed return the path portion only — the
-function never throws and never leaks data.
+values replaced with `[redacted]` (URL-encoded as `%5Bredacted%5D`). All other
+parameters pass through unchanged. Malformed URLs that cannot be parsed return
+the path portion only — the function never throws and never leaks data.
+
+---
+
+### `getMetrics()`
+
+Return a snapshot of the in-memory metrics counters:
+
+```ts
+import { getMetrics } from "./middleware/access-log.js";
+
+const metrics = getMetrics();
+console.log(metrics.totalRequests);       // total non-/health requests
+console.log(metrics.requestsByStatus);    // { 200: 5, 404: 1, … }
+console.log(metrics.requestsByPath);      // { "/api/v1/users": 3, … }
+console.log(metrics.totalDurationMs);     // cumulative wall-clock ms
+```
+
+### `resetMetrics()`
+
+Reset all counters to zero. Intended for use in tests.
+
+```ts
+import { resetMetrics } from "./middleware/access-log.js";
+resetMetrics();
+```
 
 ---
 
@@ -70,13 +98,14 @@ test case in `access-log.test.ts`.
 
 ```ts
 interface AccessLogEntry {
-  timestamp: string;   // ISO-8601
+  timestamp: string;       // ISO-8601
   level: "info";
-  method: string;      // "GET", "POST", …
-  path: string;        // req.originalUrl with sensitive params redacted
-  status: number;      // HTTP status code
-  duration_ms: number; // wall-clock ms from middleware mount to finish (2 dp)
-  request_id: string;  // correlation ID or a fresh UUID fallback
+  method: string;          // "GET", "POST", …
+  path: string;            // req.originalUrl with sensitive params redacted
+  status: number;          // HTTP status code
+  duration_ms: number;     // wall-clock ms from middleware mount to finish (2 dp)
+  request_id: string;      // correlation ID or a fresh UUID fallback
+  content_length?: number; // response Content-Length header if set
 }
 ```
 
@@ -88,7 +117,7 @@ Controlled by `LOG_FORMAT` env var (default `"json"`).
 
 **json**
 ```
-{"timestamp":"…","level":"info","method":"GET","path":"/api/v1/users","status":200,"duration_ms":4.72,"request_id":"…"}
+{"timestamp":"…","level":"info","method":"GET","path":"/api/v1/users","status":200,"duration_ms":4.72,"request_id":"…","content_length":42}
 ```
 
 **text** (any value other than `"json"`)
@@ -109,6 +138,20 @@ Controlled by `LOG_FORMAT` env var (default `"json"`).
 
 ---
 
+## Metrics contract
+
+| Field | Description |
+|---|---|
+| `totalRequests` | Count of all non-/health requests processed |
+| `requestsByStatus` | Map of HTTP status code → count |
+| `requestsByPath` | Map of route path → count |
+| `totalDurationMs` | Cumulative wall-clock duration of all requests |
+
+Metrics are updated atomically inside the `finish` handler. `/health` requests
+are excluded from all counters.
+
+---
+
 ## Out of scope
 
 - **Response / request body logging** — never included; increases memory
@@ -116,3 +159,5 @@ Controlled by `LOG_FORMAT` env var (default `"json"`).
 - **Header logging** — headers can carry credentials; none are ever written.
 - **Per-route suppression** beyond `/health` — treat as a separate concern.
 - **Log sampling / rate-limiting** — out of scope for this middleware layer.
+- **Persistent metrics export** (e.g. Prometheus) — `getMetrics()` provides an
+  in-memory snapshot; a separate adapter can scrape it for external systems.

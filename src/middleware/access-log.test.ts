@@ -1,14 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
-import { accessLogMiddleware, redactSensitiveParams } from "./access-log.js";
+import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Standard app: requestIdMiddleware → accessLogMiddleware → routes. */
 function makeApp() {
   const app = express();
   app.use(express.json());
@@ -19,11 +18,13 @@ function makeApp() {
   app.post("/test-body", (_req, res) => res.status(201).json({ created: true }));
   app.get("/error", (_req, res) => res.status(500).json({ error: "Server Error" }));
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+  app.get("/redirect", (_req, res) => res.redirect(302, "/test"));
+  app.get("/bad-request", (_req, res) => res.status(400).json({ error: "Bad Request" }));
+  app.get("/no-content", (_req, res) => res.status(204).send());
 
   return app;
 }
 
-/** Standalone app: accessLogMiddleware WITHOUT requestIdMiddleware. */
 function makeStandaloneApp() {
   const app = express();
   app.use(accessLogMiddleware);
@@ -83,7 +84,6 @@ describe("redactSensitiveParams", () => {
   });
 
   it("returns only the path for a malformed URL (never throws)", () => {
-    // This URL has un-encoded spaces which prevents parsing
     const malformed = "/path?token=abc&foo bar=baz";
     const result = redactSensitiveParams(malformed);
     expect(result).not.toContain("abc");
@@ -94,10 +94,24 @@ describe("redactSensitiveParams", () => {
   it("handles an empty query string gracefully", () => {
     expect(redactSensitiveParams("/api?")).toBe("/api?");
   });
+
+  it("redacts 'account' param", () => {
+    const result = redactSensitiveParams("/api?account=0x123");
+    expect(result).not.toContain("0x123");
+    expect(result).toContain("account=%5Bredacted%5D");
+  });
+
+  it("redacts multiple sensitive params in any order", () => {
+    const result = redactSensitiveParams("/api?key=abc&wallet=def&page=1&sig=ghi");
+    expect(result).not.toContain("abc");
+    expect(result).not.toContain("def");
+    expect(result).not.toContain("ghi");
+    expect(result).toContain("page=1");
+  });
 });
 
 // ---------------------------------------------------------------------------
-// accessLogMiddleware — original tests (preserved)
+// accessLogMiddleware — integration tests
 // ---------------------------------------------------------------------------
 
 describe("accessLogMiddleware", () => {
@@ -107,6 +121,7 @@ describe("accessLogMiddleware", () => {
   beforeEach(() => {
     app = makeApp();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    resetMetrics();
   });
 
   afterEach(() => {
@@ -129,6 +144,7 @@ describe("accessLogMiddleware", () => {
     expect(typeof logObj.request_id).toBe("string");
     expect(logObj.request_id.length).toBeGreaterThan(0);
     expect(logObj.level).toBe("info");
+    expect(typeof logObj.timestamp).toBe("string");
   });
 
   it("should not log /health requests", async () => {
@@ -158,12 +174,10 @@ describe("accessLogMiddleware", () => {
     expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
     const logLine = consoleInfoSpy.mock.calls[0][0];
 
-    // Ensure the sensitive data is not anywhere in the log string
     expect(logLine).not.toContain("my-secret-token");
     expect(logLine).not.toContain("my-secret-password");
 
     const logObj = JSON.parse(logLine);
-    // Explicitly check that there's no body or token property
     expect(logObj.body).toBeUndefined();
     expect(logObj.token).toBeUndefined();
     expect(logObj.headers).toBeUndefined();
@@ -186,15 +200,235 @@ describe("accessLogMiddleware", () => {
     expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
 
-    // Redacted sensitive params
-    expect(logObj.path).toContain("token=[REDACTED]");
-    expect(logObj.path).toContain("signature=[REDACTED]");
-    
-    // Non-sensitive param should remain unchanged
+    expect(logObj.path).toContain("token=%5Bredacted%5D");
+    expect(logObj.path).toContain("signature=%5Bredacted%5D");
     expect(logObj.path).toContain("normal=value");
-
-    // The original secret values should not be in the log at all
     expect(logObj.path).not.toContain("secret123");
     expect(logObj.path).not.toContain("abc");
+  });
+
+  it("should include content_length when the header is set", async () => {
+    const res = await request(app).get("/test");
+    expect(res.status).toBe(200);
+
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+
+    if (res.headers["content-length"] !== undefined) {
+      expect(logObj.content_length).toBe(Number(res.headers["content-length"]));
+    }
+  });
+
+  it("should log 204 no-content responses", async () => {
+    const res = await request(app).get("/no-content");
+    expect(res.status).toBe(204);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.status).toBe(204);
+  });
+
+  it("should log 302 redirect responses", async () => {
+    const res = await request(app).get("/redirect");
+    expect(res.status).toBe(302);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.status).toBe(302);
+    expect(logObj.method).toBe("GET");
+  });
+
+  it("should log 400 bad-request responses", async () => {
+    const res = await request(app).get("/bad-request");
+    expect(res.status).toBe(400);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Standalone mode (without requestIdMiddleware)
+// ---------------------------------------------------------------------------
+
+describe("accessLogMiddleware — standalone (no requestIdMiddleware)", () => {
+  let app: express.Express;
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    app = makeStandaloneApp();
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    resetMetrics();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("should generate a fallback requestId when requestIdMiddleware is absent", async () => {
+    const res = await request(app).get("/test");
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+
+    expect(typeof logObj.request_id).toBe("string");
+    expect(logObj.request_id.length).toBeGreaterThan(0);
+    expect(logObj.request_id).not.toBe("unknown");
+    expect(logObj.request_id).not.toBe("");
+  });
+
+  it("should still redact sensitive params without requestIdMiddleware", async () => {
+    const res = await request(app).get("/test?token=my-secret");
+    expect(res.status).toBe(200);
+
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.path).not.toContain("my-secret");
+    expect(logObj.path).toContain("token=%5Bredacted%5D");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Text log format
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an app with the given LOG_FORMAT using dynamic imports so the env
+ * variable takes effect before the module evaluates.
+ */
+async function buildAppWithFormat(format: string) {
+  vi.resetModules();
+  vi.stubEnv("LOG_FORMAT", format);
+  vi.stubEnv("NODE_ENV", "test");
+  vi.stubEnv("CORS_ORIGIN", "http://localhost:3000");
+  vi.stubEnv("STARKNET_RPC_URL", "https://starknet-sepolia.public.invalid/rpc");
+  vi.stubEnv("POSTGRES_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/stellopay_indexer");
+
+  const accessLogModule = await import("./access-log.js");
+  const requestIdModule = await import("./request-id.js");
+
+  const a = express();
+  a.use(express.json());
+  a.use(requestIdModule.requestIdMiddleware);
+  a.use(accessLogModule.accessLogMiddleware);
+  a.get("/test", (_req: any, res: any) => res.status(200).json({ ok: true }));
+
+  return { app: a, resetMetricsFn: accessLogModule.resetMetrics };
+}
+
+describe("accessLogMiddleware — text format", () => {
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it("should emit a human-readable log line in text format", async () => {
+    const { app, resetMetricsFn } = await buildAppWithFormat("text");
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    resetMetricsFn();
+
+    const res = await request(app).get("/test");
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logLine = consoleInfoSpy.mock.calls[0][0];
+
+    expect(logLine).toContain("INFO");
+    expect(logLine).toContain("GET");
+    expect(logLine).toContain("/test");
+    expect(logLine).toContain("200");
+    expect(logLine).toContain("ms");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+describe("getMetrics / resetMetrics", () => {
+  let app: express.Express;
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    app = makeApp();
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    resetMetrics();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("should return zeroed metrics after reset", () => {
+    const m = getMetrics();
+    expect(m.totalRequests).toBe(0);
+    expect(m.requestsByStatus).toEqual({});
+    expect(m.requestsByPath).toEqual({});
+    expect(m.totalDurationMs).toBe(0);
+  });
+
+  it("should increment metrics after a request", async () => {
+    await request(app).get("/test");
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+
+    const m = getMetrics();
+    expect(m.totalRequests).toBe(1);
+    expect(m.requestsByStatus[200]).toBe(1);
+    expect(m.totalDurationMs).toBeGreaterThan(0);
+  });
+
+  it("should track multiple requests with different status codes", async () => {
+    await request(app).get("/test");
+    await request(app).get("/error");
+    await request(app).get("/test");
+    await request(app).get("/bad-request");
+
+    const m = getMetrics();
+    expect(m.totalRequests).toBe(4);
+    expect(m.requestsByStatus[200]).toBe(2);
+    expect(m.requestsByStatus[500]).toBe(1);
+    expect(m.requestsByStatus[400]).toBe(1);
+  });
+
+  it("should not track /health requests in metrics", async () => {
+    await request(app).get("/health");
+    await request(app).get("/test");
+
+    const m = getMetrics();
+    expect(m.totalRequests).toBe(1);
+    expect(m.requestsByStatus[200]).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resilience — logging failures
+// ---------------------------------------------------------------------------
+
+describe("accessLogMiddleware — resilience", () => {
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    resetMetrics();
+    consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("should not crash if an error occurs inside the finish handler", async () => {
+    const app = express();
+    app.use(accessLogMiddleware);
+
+    app.get("/test", (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+
+    const res = await request(app).get("/test");
+    expect(res.status).toBe(200);
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
   });
 });
