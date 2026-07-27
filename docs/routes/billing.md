@@ -144,29 +144,51 @@ present in the API.
 
 ### `GET /billing/profiles/:profileId/invoices`
 
-Returns the invoice history for the profile.
+Returns the invoice history for the profile. Supports optional pagination via
+`limit` and `offset` query parameters.
 
-**Response (`200`):**
+**Query parameters:**
+
+| Parameter | Type    | Default | Max | Description                                              |
+| --------- | ------- | ------- | --- | -------------------------------------------------------- |
+| `limit`   | integer | —       | 200 | Maximum rows to return. When omitted, returns all rows.  |
+| `offset`  | integer | 0       | —   | Number of rows to skip before returning results.         |
+
+When neither `limit` nor `offset` is supplied, the response envelope omits the
+`pagination` block (backward-compatible with earlier callers).
+
+**Paginated response (`200`):**
 
 ```json
 {
   "success": true,
   "data": {
     "profileId": "profile-001",
-    "invoices": [
-      {
-        "id": "inv-1",
-        "invoiceNumber": "INV-2025-001",
-        "amount": "500.000000",
-        "currency": "USD",
-        "status": "pending",
-        "description": "Monthly retainer",
-        "issuedAt": "2025-06-01T00:00:00.000Z",
-        "paidAt": null,
-        "createdAt": "2025-06-01T00:00:00.000Z",
-        "updatedAt": "2025-06-01T00:00:00.000Z"
-      }
-    ]
+    "invoices": [ … ],
+    "pagination": {
+      "limit": 50,
+      "offset": 0,
+      "hasMore": true
+    }
+  }
+}
+```
+
+`hasMore` is computed by fetching `limit + 1` rows and discarding the probe
+row — no separate `COUNT` query.
+
+**Ordering:** Invoices are returned in descending order by `createdAt` with
+`id` as a tiebreaker, ensuring deterministic pagination even when rows share
+the same timestamp.
+
+**Unpaginated response (`200` — backward-compatible):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "profileId": "profile-001",
+    "invoices": [ … ]
   }
 }
 ```
@@ -280,7 +302,8 @@ The two `*_duration_ms_total` counters are cumulative sums: divide by the matchi
 
 `summarizeInvoices(rows)` is exported so the arithmetic can be unit-tested directly. It is
 a **read-side aggregate for telemetry only** — nothing is written back to the database and
-no response body changes.
+no response body changes. When pagination is active the aggregate covers only the returned
+page, not the full dataset.
 
 - An invoice counts toward `paidAmount` when its status is exactly `paid`
   (case-insensitive). Everything else — `pending`, `overdue`, `void`, an unrecognised
@@ -295,11 +318,84 @@ no response body changes.
 
 | Status | Condition                                                       |
 | ------ | --------------------------------------------------------------- |
-| `400`  | Invalid `profileId` (empty, illegal characters, or > 128 chars) |
+| `400`  | Invalid `profileId`, or invalid pagination parameters           |
 | `401`  | Missing or invalid session credentials                          |
 | `404`  | Profile does not exist, **or** the caller does not own it       |
+| `409`  | Idempotency key reused with a different request body            |
 | `500`  | Unexpected server error (e.g. database failure)                 |
 | `501`  | `BILLING_ENABLED` feature flag is `false`                       |
+
+## Idempotency contract
+
+Mutating billing routes (POST, PUT, PATCH, DELETE) support request replay protection
+through the `Idempotency-Key` header.
+
+### Header
+
+| Header             | Value                        | Required |
+| ------------------ | ---------------------------- | -------- |
+| `Idempotency-Key`  | A caller-chosen unique key   | No       |
+| `idempotency-key`  | Lowercase alias (same value) | No       |
+
+When the header is absent, the handler executes normally for every request — no caching
+and no replay protection. GET, HEAD, and OPTIONS requests always pass through regardless
+of the header.
+
+### Behaviour
+
+1. **First request** — the handler runs and the response `(statusCode, body)` is cached
+   keyed by `{accountScope, method, route, profileId, idempotencyKey}`. The
+   `accountScope` is resolved from `x-user-address`, `x-account-id`, or `x-user-id` (in
+   that order), falling back to the request IP.
+
+2. **Replay (same key, same body)** — the cached response is returned without running the
+   handler. The process-local counter `billing_idempotency_replayed_total` is bumped and a
+   `billing.idempotency.replayed` info event is emitted.
+
+3. **Conflict (same key, different body)** — the request is rejected with `409 Conflict`.
+   The counter `billing_idempotency_conflict_total` is bumped and a
+   `billing.idempotency.conflict` warning is emitted. Neither the key nor the body is
+   written to the log — only `route`, `method`, and `keyAgeMs` are recorded.
+
+### Cache lifetime and scope
+
+- **TTL**: 24 hours from the first successful response. After expiry, a subsequent request
+  with the same key is treated as a fresh request and re-executed.
+- **Scope**: cache keys are isolated by account scope. The same idempotency key used by
+  two different `x-user-address` values will each execute independently.
+- **Storage**: in-process `Map` — see the caveat under
+  [Intentionally out of scope](#intentionally-out-of-scope) about horizontal scaling.
+- **Pruning**: expired entries are lazily removed on the next request that carries an
+  `Idempotency-Key` header.
+
+### Security
+
+The caller-supplied `Idempotency-Key` is never written to logs, metrics, or response
+bodies. Only its age (`keyAgeMs`) and the associated route appear in structured log
+events.
+
+## Billing math determinism
+
+The two exported billing math helpers are **pure, deterministic functions** — calling them
+multiple times with the same input always produces the same output:
+
+### `parseBillingAmount(value): BillingAmount`
+
+- No internal state, no side effects (the telemetry variant
+  `parseBillingAmountWithTelemetry` is the one that emits logs).
+- `stableSerialize` ensures that JSON bodies with different key orderings produce the same
+  fingerprint, so the idempotency fingerprint is byte-for-byte reproducible.
+
+### `summarizeInvoices(rows): InvoiceTotals`
+
+- Iterates rows in the order given, applies `parseBillingAmount` per row, and
+  accumulator logic that is purely arithmetic.
+- No database writes, no external state mutations.
+- Calling `summarizeInvoices` twice on the same `rows` input yields identical
+  `InvoiceTotals`.
+
+These functions are tested as pure functions in
+`src/routes/billing.test.ts` without any HTTP or database setup.
 
 ## Intentionally out of scope
 
@@ -322,6 +418,11 @@ no response body changes.
 - **Counter durability** — counters reset on process restart and are per-instance, so a
   horizontally scaled deployment sees N independent sets. This matches the existing
   in-process idempotency store's caveat.
+- **Cursor-based pagination** — the invoices endpoint uses offset-based pagination.
+  Cursor-based pagination (e.g., `createdAt` + `id`-anchored) would be more robust
+  against insertions shifting page boundaries, but would require database-level
+  `WHERE` filtering the mock infrastructure cannot currently simulate. This is a
+  candidate improvement if offset drift becomes measurable in production.
 
 ## Testing
 
@@ -340,9 +441,14 @@ The test suite covers:
   per-column coercion warnings, over-limit flagging, and the zero-limit boundary
 - Invoice route: response shape unchanged, aggregate event contents, empty-list boundary,
   and the single per-request coercion warning with its reason breakdown
+- Invoice pagination: paginated response with hasMore, boundary cases (limit equals total,
+  limit exceeds total, offset skip), validation rejection for out-of-range values, and
+  backward-compatible envelope when no pagination params are supplied
 - Ownership denial: `not_found` vs `not_owner` logged distinctly behind an identical
   `404` body
 - Failure paths: handler and ownership-lookup rejections produce one `*.failed` event and
   bump `billing_errors_total` without also bumping a success counter
 - Idempotency: pass-through without a key, replay, `409` on a body mismatch, and the
   guarantee that the caller-supplied key never reaches the logs
+- Idempotency edge cases: TTL expiry, lowercase header acceptance, body key-ordering
+  invariance (`stableSerialize`), and per-account-scope cache isolation
