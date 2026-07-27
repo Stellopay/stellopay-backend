@@ -31,8 +31,90 @@ import { sql } from "drizzle-orm";
  *
  * Used as a DB-level CHECK constraint on every `amount` column that stores a
  * Cairo u256 value serialised as a decimal string.
+ *
+ * @example
+ *   isValidU256("0")        // true
+ *   isValidU256("12345")    // true
+ *   isValidU256("01")       // false — leading zero
+ *   isValidU256("-1")       // false — negative
+ *   isValidU256("1.5")      // false — decimal
  */
-const U256_DECIMAL_REGEX = "^(0|[1-9][0-9]{0,77})$";
+export const U256_DECIMAL_REGEX = "^(0|[1-9][0-9]{0,77})$";
+
+/** Compiled pattern for runtime validation — see {@link U256_DECIMAL_REGEX}. */
+export const U256_DECIMAL_PATTERN = new RegExp(U256_DECIMAL_REGEX);
+
+/**
+ * Regex that matches ISO 4217-style currency codes — exactly three uppercase
+ * ASCII letters. Used in CHECK constraints on `currency` columns.
+ *
+ * @example
+ *   isValidCurrencyCode("USD")  // true
+ *   isValidCurrencyCode("usd")  // false — lowercase
+ *   isValidCurrencyCode("US")   // false — too short
+ */
+export const CURRENCY_CODE_REGEX = /^[A-Z]{3}$/;
+
+/**
+ * Returns true when `value` is a canonical decimal string representing a
+ * valid Cairo u256 (0 … 2²⁵⁶−1).
+ *
+ * This is the runtime counterpart of the DB-level CHECK constraint using
+ * {@link U256_DECIMAL_REGEX}. Callers should validate early to produce
+ * actionable errors rather than relying on a database constraint violation.
+ */
+export function isValidU256(value: string): boolean {
+  return U256_DECIMAL_PATTERN.test(value);
+}
+
+/**
+ * Returns true when `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters).
+ *
+ * Runtime counterpart of the DB-level CHECK constraint using
+ * {@link CURRENCY_CODE_REGEX}.
+ */
+export function isValidCurrencyCode(code: string): boolean {
+  return CURRENCY_CODE_REGEX.test(code);
+}
+
+/**
+ * Returns true when `value` is a non-negative integer.
+ */
+export function isValidNonNegativeInteger(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * Asserts that `value` is a non-negative integer. Throws a descriptive
+ * {@link RangeError} when the assertion fails.
+ *
+ * Use this in write-path code to fail fast before a query reaches the
+ * database, making failures easier to catch and retry.
+ */
+export function assertNonNegative(value: number, name: string): void {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new RangeError(`${name} must be a non-negative integer, got ${value}`);
+  }
+  if (value < 0) {
+    throw new RangeError(`${name} must be non-negative, got ${value}`);
+  }
+}
+
+/**
+ * Asserts that `value` is a valid u256 decimal string. Throws a descriptive
+ * {@link RangeError} when the assertion fails.
+ *
+ * Use this in write-path code to validate amounts before inserting into
+ * columns guarded by the `U256_DECIMAL_REGEX` CHECK constraint.
+ */
+export function assertValidU256(value: string, name: string): void {
+  if (!U256_DECIMAL_PATTERN.test(value)) {
+    throw new RangeError(
+      `${name} must be a valid u256 decimal string (0 or positive integer up to 78 digits), got "${value}"`,
+    );
+  }
+}
 
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
@@ -400,11 +482,35 @@ export function clampPageLimit(requested: number): number {
 
 /**
  * Clamp a caller-supplied batch size to the allowed range [1, MAX_BATCH_SIZE].
- * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 � callers must
+ * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 — callers must
  * validate before proceeding with a bulk operation.
+ *
+ * Prefer {@link validateBatchSize} in new code because it throws a descriptive
+ * error instead of silently returning 0, making failures visible and retryable.
  */
 export function clampBatchSize(requested: number): number {
   if (requested <= 0 || requested > MAX_BATCH_SIZE) return 0;
+  return requested;
+}
+
+/**
+ * Validate and return a batch size, throwing a {@link RangeError} when
+ * `requested` is outside [1, {@link MAX_BATCH_SIZE}].
+ *
+ * Unlike {@link clampBatchSize} — which returns 0 on invalid input — this
+ * function fails fast with a descriptive message. This makes it suitable for
+ * user-facing input validation where the caller should know the value was
+ * rejected rather than silently adjusted, and for retry-safe code paths that
+ * need explicit errors rather than silent fallbacks.
+ *
+ * @throws {RangeError} when `requested` is not an integer in [1, MAX_BATCH_SIZE].
+ */
+export function validateBatchSize(requested: number, name?: string): number {
+  if (!Number.isInteger(requested) || requested <= 0 || requested > MAX_BATCH_SIZE) {
+    throw new RangeError(
+      `${name ?? "batchSize"} must be an integer between 1 and ${MAX_BATCH_SIZE}, got ${requested}`,
+    );
+  }
   return requested;
 }
 
