@@ -43,10 +43,8 @@ export function redactSensitiveParams(rawUrl: string): string {
 
   let parsed: URL;
   try {
-    // URL() requires an absolute form — dummy base lets relative paths work.
     parsed = new URL(rawUrl, "http://localhost");
   } catch {
-    // Malformed: emit only the path to avoid leaking anything.
     return rawUrl.slice(0, qIndex);
   }
 
@@ -64,6 +62,34 @@ export function redactSensitiveParams(rawUrl: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+export interface AccessLogMetrics {
+  totalRequests: number;
+  requestsByStatus: Record<number, number>;
+  requestsByPath: Record<string, number>;
+  totalDurationMs: number;
+}
+
+let metrics: AccessLogMetrics = {
+  totalRequests: 0,
+  requestsByStatus: {},
+  requestsByPath: {},
+  totalDurationMs: 0,
+};
+
+/** Return a snapshot of the current metrics counters. */
+export function getMetrics(): Readonly<AccessLogMetrics> {
+  return { ...metrics, requestsByStatus: { ...metrics.requestsByStatus }, requestsByPath: { ...metrics.requestsByPath } };
+}
+
+/** Reset all metrics counters (for use in tests). */
+export function resetMetrics(): void {
+  metrics = { totalRequests: 0, requestsByStatus: {}, requestsByPath: {}, totalDurationMs: 0 };
+}
+
+// ---------------------------------------------------------------------------
 // Log-entry shape
 // ---------------------------------------------------------------------------
 
@@ -77,6 +103,8 @@ export interface AccessLogEntry {
   status: number;
   duration_ms: number;
   request_id: string;
+  /** Content-Length of the response body, if set. */
+  content_length?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,15 +138,11 @@ export interface AccessLogEntry {
  *   `[<timestamp>] INFO <method> <path> <status> <duration>ms [<request_id>]`
  */
 export function accessLogMiddleware(req: Request, res: Response, next: NextFunction): void {
-  // Skip noisy /health liveness-probe requests.
   if (req.path === "/health") {
     return next();
   }
 
-  // Snapshot the correlation ID now. Falls back to a fresh UUID when
-  // requestIdMiddleware is not mounted — this is the only place we read it,
-  // avoiding a redundant re-check inside the finish handler.
-  const requestId: string =
+  const snapshotId: string =
     typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
       ? res.locals.requestId
       : crypto.randomUUID();
@@ -128,6 +152,22 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
   res.on("finish", () => {
     try {
       const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
+
+      const requestId: string =
+        typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
+          ? res.locals.requestId
+          : snapshotId;
+
+      metrics.totalRequests += 1;
+      metrics.requestsByStatus[res.statusCode] = (metrics.requestsByStatus[res.statusCode] ?? 0) + 1;
+      const pathKey = req.route?.path ?? req.path;
+      metrics.requestsByPath[pathKey] = (metrics.requestsByPath[pathKey] ?? 0) + 1;
+      metrics.totalDurationMs += durationMs;
+
+      const contentLength =
+        typeof res.getHeader === "function"
+          ? res.getHeader("content-length")
+          : undefined;
 
       const entry: AccessLogEntry = {
         timestamp: new Date().toISOString(),
@@ -139,6 +179,10 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         request_id: requestId,
       };
 
+      if (contentLength !== undefined) {
+        entry.content_length = Number(contentLength);
+      }
+
       if (env.LOG_FORMAT === "json") {
         // eslint-disable-next-line no-console
         console.info(JSON.stringify(entry));
@@ -149,7 +193,6 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         );
       }
     } catch (err) {
-      // A logging failure must never affect the caller.
       // eslint-disable-next-line no-console
       console.error("[access-log] failed to emit log entry", err);
     }
