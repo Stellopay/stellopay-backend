@@ -221,6 +221,8 @@ Database schema migrations are managed using Drizzle Kit. To bootstrap or update
    pnpm db:migrate
    ```
 
+> **Naming Convention**: All migration filenames in `src/db/migrations` must start with a 13 to 14 digit timestamp prefix (e.g., `20240101123000_add_users.sql`). This ensures migrations are ordered chronologically and unambiguously. This rule is enforced in CI via `pnpm check:migrations`.
+
 Migration execution uses a StelloPay-namespaced PostgreSQL advisory lock. If another
 migration process is already running against the same database, subsequent runs wait
 for it to finish; the lock is released after either success or failure.
