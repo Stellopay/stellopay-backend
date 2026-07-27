@@ -51,6 +51,92 @@ function logValidationError(metric: ValidationErrorMetric): void {
  * // On failure logs:
  * // [validation:error] {"validator":"createAgreement","input":"0xbad...","error":"...","timestamp":"..."}
  */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export interface ValidationErrorOptions {
+  validator: string;
+  message: string;
+  issues: any[];
+  input: string;
+  status?: number;
+  cause?: unknown;
+}
+
+export class ValidationError extends Error {
+  override name = "ValidationError";
+  validator: string;
+  input: string;
+  issues: any[];
+  status: number;
+  timestamp: string;
+  override cause?: unknown;
+  metric: ValidationErrorMetric;
+
+  constructor(opts: ValidationErrorOptions | string, validator?: string, input?: string, metric?: ValidationErrorMetric) {
+    if (typeof opts === "object" && opts !== null) {
+      super(opts.message);
+      this.validator = opts.validator;
+      this.input = opts.input;
+      this.issues = opts.issues || [];
+      this.status = opts.status ?? 400;
+      this.cause = opts.cause;
+      this.timestamp = new Date().toISOString();
+      this.metric = {
+        validator: this.validator,
+        input: this.input,
+        error: opts.message,
+        timestamp: this.timestamp,
+      };
+    } else {
+      super(opts);
+      this.validator = validator || "";
+      this.input = input || "";
+      this.issues = [];
+      this.status = 400;
+      this.timestamp = metric?.timestamp || new Date().toISOString();
+      this.metric = metric || {
+        validator: this.validator,
+        input: this.input,
+        error: opts,
+        timestamp: this.timestamp,
+      };
+    }
+  }
+
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      validator: this.validator,
+      issues: this.issues,
+      input: this.input,
+      status: this.status,
+      timestamp: this.timestamp,
+    };
+  }
+
+  static fromZodError(error: z.ZodError, validator: string, input: string): ValidationError {
+    const message = error.issues.map((i) => i.message).join("; ");
+    return new ValidationError({
+      validator,
+      message,
+      issues: error.issues,
+      input,
+      cause: error,
+      status: 400,
+    });
+  }
+}
+
+export function mapZodError(error: unknown) {
+  if (!(error instanceof z.ZodError)) return undefined;
+  const issue = error.issues[0];
+  if (!issue) return undefined;
+  return issue;
+}
+
 export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
