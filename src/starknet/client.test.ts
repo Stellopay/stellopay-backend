@@ -130,6 +130,19 @@ describe("Starknet Client Cache", () => {
     expect(info.chainId).toBe("0x534e5f4d41494e");
     expect(getChainIdSpy).toHaveBeenCalledTimes(2);
   });
+
+  it("should deduplicate concurrent requests on cache miss", async () => {
+    const [info1, info2, info3] = await Promise.all([
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+    ]);
+
+    expect(info1).toEqual(info2);
+    expect(info2).toEqual(info3);
+    expect(getChainIdSpy).toHaveBeenCalledTimes(1);
+    expect(getSpecVersionSpy).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("ABI memoization and contract caching", () => {
