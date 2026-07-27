@@ -569,6 +569,58 @@ describe("Reprocess Events Routes", () => {
       selectMock.mockRestore();
       callCount = 0;
     });
+
+    it("handles multiple events sharing the same contract address without creating redundant Contract instances", async () => {
+      const mockEvents = [
+        {
+          id: "event_1",
+          transactionHash: "0x123",
+          eventIndex: 0,
+          contractAddress: "0xwork",
+          eventType: "AgreementStatusChange",
+        },
+        {
+          id: "event_2",
+          transactionHash: "0x456",
+          eventIndex: 0,
+          contractAddress: "0xwork",
+          eventType: "AgreementStatusChange",
+        },
+      ];
+
+      const selectMock = vi.spyOn(db, "select").mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue(mockEvents),
+          }),
+        }),
+      } as any);
+
+      mockGetTransactionReceipt
+        .mockResolvedValueOnce({
+          events: [{ from_address: "0xwork", keys: ["0xunknown"], shouldFail: true }],
+        })
+        .mockResolvedValueOnce({
+          events: [{ from_address: "0xwork", keys: ["0xunknown"], shouldFail: true }],
+        });
+
+      const res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+
+      expect(res.body.updated).toBe(0);
+      expect(res.body.results).toHaveLength(2);
+      expect(res.body.results[0]).toEqual({
+        eventId: "event_1",
+        status: "no_change",
+        eventType: "AgreementStatusChange",
+      });
+      expect(res.body.results[1]).toEqual({
+        eventId: "event_2",
+        status: "no_change",
+        eventType: "AgreementStatusChange",
+      });
+
+      selectMock.mockRestore();
+    });
   });
 
   describe("POST /reprocess-events/batch", () => {
@@ -638,7 +690,7 @@ describe("Reprocess Events Routes", () => {
         .send({ tx_hashes: ["not-a-valid-hash"] })
         .expect(400);
 
-      expect(res.body.error).toBeDefined();
+      expect(res.body.error).toBe("Invalid Starknet transaction hash format");
       expect(fetchMock).not.toHaveBeenCalled();
       expect(mockGetTransactionReceipt).not.toHaveBeenCalled();
     });

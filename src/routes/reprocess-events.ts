@@ -2,10 +2,10 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { provider } from "../starknet/client.js";
 import { eq, and, gte, lte } from "drizzle-orm";
 import { Contract } from "starknet";
-import { defaults, abiPaths } from "../config.js";
+import { provider } from "../starknet/client.js";
+import { abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
 
@@ -45,6 +45,10 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
   return payrollEscrowAbi;
 }
 
+function getFirstZodErrorMessage(error: z.ZodError): string {
+  return error.issues?.[0]?.message ?? error.message ?? "Validation failed";
+}
+
 /**
  * POST /reprocess-events/tx/:tx_hash
  *
@@ -54,6 +58,13 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
  *
  * **Validation**
  * - `:tx_hash` must be a valid Starknet transaction hash (0x-prefixed, 3–66 chars).
+ *
+ * **Authentication**
+ * - Requires a valid admin session.
+ *
+ * **Response**
+ * Returns `{ message, result }` where `result` is the shared
+ * {@link processTxReceipt} result shape (`TxProcessResult`).
  */
 reprocessEventsRouter.post(
   "/reprocess-events/tx/:tx_hash",
@@ -99,6 +110,10 @@ reprocessEventsRouter.post(
  * **Validation**
  * - `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
  * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request.
+ *
+ * **Retry budget**
+ * - Up to {@link MAX_BATCH_SIZE} transactions per request.
+ * - Per-tx errors never abort the rest of the batch.
  *
  * **Response**
  * Returns a `results` array where each entry corresponds to one tx hash.
@@ -154,7 +169,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request body" });
+        res.status(400).json({ error: getFirstZodErrorMessage(e) });
         return;
       }
       next(e);
@@ -174,6 +189,12 @@ reprocessEventsRouter.post(
  * **Validation**
  * - `limit` (query, optional, default 100, max {@link MAX_STATUS_LIMIT})
  * - `fromBlock` / `toBlock` (query, optional) — filter by block number range.
+ *
+ * **Retry budget**
+ * - Up to {@link MAX_STATUS_LIMIT} events per request.
+ * - Unrecoverable events are returned in the `results` array with a status
+ *   such as `no_receipt`, `event_not_found`, or `error` instead of failing
+ *   the whole request.
  */
 reprocessEventsRouter.post(
   "/reprocess-events/status-changes",
@@ -183,15 +204,21 @@ reprocessEventsRouter.post(
     try {
       const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
 
-      // Get contract ABIs
+      // Load ABIs (lazy-cached singletons)
       const workAgreementAbi = await getWorkAgreementAbi();
       const payrollEscrowAbi = await getPayrollEscrowAbi();
-      const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
-      const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-      // Create contract instances for event parsing
-      const workAgreementContract = new Contract(workAgreementAbi, workAgreementAddress, provider);
-      const payrollEscrowContract = new Contract(payrollEscrowAbi, payrollEscrowAddress, provider);
+      // In-memory contract cache keyed by address to avoid repeated instantiation.
+      const contractCache = new Map<string, Contract>();
+
+      function getContract(abi: any[], address: string): Contract {
+        let contract = contractCache.get(address);
+        if (!contract) {
+          contract = new Contract(abi, address, provider);
+          contractCache.set(address, contract);
+        }
+        return contract;
+      }
 
       // Build where clause: only process events still tagged as AgreementStatusChange
       const conditions = [eq(schema.agreementEvents.eventType, "AgreementStatusChange")];
@@ -247,13 +274,13 @@ reprocessEventsRouter.post(
 
           try {
             // Try to parse with WorkAgreement contract (use event's contract address)
-            const workContract = new Contract(workAgreementAbi, eventContractAddress, provider);
+            const workContract = getContract(workAgreementAbi, eventContractAddress);
             try {
               decodedEvent = workContract.parseEvent(receiptEvent);
               eventType = decodedEvent.name;
             } catch (e1) {
               // Try with PayrollEscrow contract
-              const escrowContract = new Contract(payrollEscrowAbi, eventContractAddress, provider);
+              const escrowContract = getContract(payrollEscrowAbi, eventContractAddress);
               try {
                 decodedEvent = escrowContract.parseEvent(receiptEvent);
                 eventType = decodedEvent.name;
@@ -328,7 +355,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.errors[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: getFirstZodErrorMessage(e) });
         return;
       }
       next(e);
