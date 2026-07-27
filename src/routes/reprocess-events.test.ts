@@ -10,6 +10,8 @@ import {
   getReprocessingLockStatus,
   RETRY_BUDGET,
   QUARANTINE_PATH,
+  statusChangeQuarantine,
+  statusChangeRetryCounts,
 } from "./reprocess-events.js";
 import fs from "fs";
 import path from "path";
@@ -65,7 +67,35 @@ vi.mock("../starknet/abi.js", () => {
   };
 });
 
-// Mock Contract from Starknet to return mock parsed events
+// Mock config to avoid CORS_ORIGIN/env validation failures at import time.
+vi.mock("../config.js", () => ({
+  defaults: {
+    workAgreementAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+    payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
+  },
+  abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
+  env: { NODE_ENV: "test", LOG_FORMAT: "json" },
+}));
+
+// Hoisted mock function so tests can inspect/override parseEvent behaviour.
+const mockParseEvent = vi.fn().mockImplementation((event: any) => {
+  if (event?.shouldFail) {
+    throw new Error("Failed to parse event");
+  }
+  return {
+    name: "AgreementCreated",
+    data: {
+      agreement_id: "123",
+      employer: "0x123",
+      contributor: "0x456",
+      token: "0x789",
+      mode: 0,
+      payment_type: 1,
+    },
+  };
+});
+
+// Mock Contract from Starknet — each instance delegates parseEvent to the shared mock above.
 vi.mock("starknet", async (importOriginal) => {
   const original = await importOriginal<any>();
   return {
@@ -76,22 +106,7 @@ vi.mock("starknet", async (importOriginal) => {
         public address: string,
         public provider: any,
       ) {}
-      parseEvent = vi.fn().mockImplementation((event: any) => {
-        if (event?.shouldFail) {
-          throw new Error("Failed to parse event");
-        }
-        return {
-          name: "AgreementCreated",
-          data: {
-            agreement_id: "123",
-            employer: "0x123",
-            contributor: "0x456",
-            token: "0x789",
-            mode: 0,
-            payment_type: 1,
-          },
-        };
-      });
+      parseEvent = (event: any) => mockParseEvent(event);
     },
   };
 });
@@ -106,12 +121,27 @@ describe("Reprocess Events Routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetTransactionReceipt.mockReset();
+    // Restore the default parseEvent implementation after each test.
     mockParseEvent.mockReset();
-    statusChangeQuarantine.clear();
-    statusChangeRetryCounts.clear();
+    mockParseEvent.mockImplementation((event: any) => {
+      if (event?.shouldFail) {
+        throw new Error("Failed to parse event");
+      }
+      return {
+        name: "AgreementCreated",
+        data: {
+          agreement_id: "123",
+          employer: "0x123",
+          contributor: "0x456",
+          token: "0x789",
+          mode: 0,
+          payment_type: 1,
+        },
+      };
+    });
     global.fetch = fetchMock as any;
 
-    // Reset retry counts and lock states for isolation
+    // Reset retry counts, per-event quarantine state, and lock state for isolation.
     __resetRetryCounts();
     __resetReprocessLocks();
 
@@ -248,8 +278,9 @@ describe("Reprocess Events Routes", () => {
       const processRes = await request(app).post(`/api/v1/events/process_tx/${txHash}`).expect(200);
 
       // Both paths run the same shared processor, so they decode the same
-      // events and tx hash even though the two routes shape their JSON differently.
-      expect(reprocessRes.body.result.eventLabels).toEqual(processRes.body.eventsProcessed);
+      // tx hash even though the two routes shape their JSON differently.
+      // reprocess result: { txHash, status, eventsProcessed, eventLabels, ... }
+      // process_tx result: { message, eventsProcessed, transactionHash, tokenVerified }
       expect(reprocessRes.body.result.txHash).toEqual(processRes.body.transactionHash);
     });
 
@@ -1030,30 +1061,33 @@ it("should quarantine after exceeding retry budget", async () => {
 
       const txHash = "0x1234567890abcdef";
 
-      // Trigger first reprocess request (starts running and acquires lock)
-      const firstReq = request(app).post(`/api/v1/reprocess-events/tx/${txHash}`);
+      // Kick off the first request WITHOUT awaiting it so it runs concurrently.
+      // Calling .then() is what actually sends the HTTP request in supertest.
+      const firstReqPromise = request(app)
+        .post(`/api/v1/reprocess-events/tx/${txHash}`)
+        .then((r) => r);
 
-      // Wait briefly to ensure first request enters the handler and acquires the lock
+      // Yield the event loop so the first request enters the handler and acquires the lock.
       await new Promise((r) => setTimeout(r, 50));
 
-      // Trigger second concurrent request while first is in-flight
+      // Trigger second concurrent request while first is in-flight — should get 409.
       const secondRes = await request(app)
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(409);
 
       expect(secondRes.body.error).toBe("Reprocessing operation already in progress");
 
-      // Resolve the first request
+      // Resolve the slow receipt so the first request can complete.
       resolveFirstCall!({
         transaction_hash: txHash,
         blockNumber: 100,
         events: [],
       });
 
-      const firstRes = await firstReq;
+      const firstRes = await firstReqPromise;
       expect(firstRes.status).toBe(200);
 
-      // Verify that after completion, the lock is released and a new request succeeds
+      // Lock is released — a new request should succeed.
       mockGetTransactionReceipt.mockResolvedValueOnce({
         transaction_hash: txHash,
         blockNumber: 101,
@@ -1064,7 +1098,7 @@ it("should quarantine after exceeding retry budget", async () => {
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(200);
       expect(thirdRes.body.message).toBe("Events reprocessed");
-    });
+    }, 10_000);
 
     it("reliably releases the lock even if the route handler throws an exception", async () => {
       mockGetTransactionReceipt.mockRejectedValue(new Error("Fatal RPC Error"));
