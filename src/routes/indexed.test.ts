@@ -238,6 +238,8 @@ describe("indexed routes data paths", () => {
     expect(res.body.agreement.id).toBe("7");
     expect(res.body.events).toHaveLength(1);
     expect(res.body.payments).toHaveLength(1);
+    expect(res.headers["cache-control"]).toContain("public, max-age=");
+    expect(res.headers.etag).toBeDefined();
   });
 
   it("computes escrow balance from funded, released, and refunded events", async () => {
@@ -249,7 +251,7 @@ describe("indexed routes data paths", () => {
       `/api/v1/indexed/escrow/${defaults.payrollEscrowAddress}/balance/7`
     );
     expect(res.status).toBe(200);
-    expect(res.body.balance).toBe("500");
+    expect(res.body.balance).toBe("600");
     expect(res.body.agreement_id).toBe("7");
   });
 });

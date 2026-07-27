@@ -3,12 +3,10 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
-import { defaults } from "../config.js";
-import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
+import { env, defaults } from "../config.js";
+import { normalizeStarknetAddress } from "../utils/address.js";
 import { notFoundResponse } from "./not-found.js";
 import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
-import { env, defaults } from "../config.js";
-import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 
 /**
  * Source identifier tag returned in indexed route responses.
@@ -20,6 +18,10 @@ export const INDEXED_DATA_SOURCE = "indexed";
  * to prevent unbounded database scans.
  */
 export const MAX_INTERNAL_LIMIT = 200;
+
+const indexedCacheOptions = {
+  maxAgeSeconds: env.INDEXED_CACHE_MAX_AGE_SECONDS,
+};
 
 /**
  * Derives the indexer sync checkpoint (highest block number) from a set of
@@ -49,11 +51,11 @@ export const indexedRouter = Router();
 // Output Schemas for Contract Hardening
 const AgreementSchema = z.object({
   id: z.string(),
-  contractAddress: z.string(),
-  employer: z.string(),
+  contractAddress: z.string().optional(),
+  employer: z.string().optional(),
   contributor: z.string().nullable().optional(),
-  mode: z.number(),
-  createdAt: z.date().or(z.string()),
+  mode: z.number().optional(),
+  createdAt: z.date().or(z.string()).optional(),
 }).passthrough();
 
 const PaginatedResponse = (dataSchema: z.ZodTypeAny) => z.object({
@@ -80,7 +82,7 @@ indexedRouter.get(
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress !== normalizeStarknetAddress(defaults.workAgreementAddress)) {
+      if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
         res.status(400).json({ error: "Invalid contract address for agreements" });
         return;
       }
@@ -126,15 +128,16 @@ indexedRouter.get(
       ]);
 
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
-      const uniqueAgreements = Array.from(
-        new Map(allAgreements.map((a) => [a.id, a])).values(),
-      ).slice(0, limit);
+      const pagedAgreements = allAgreements.slice(0, limit);
 
-      res.json({
-        agreements: z.array(AgreementSchema).parse(uniqueAgreements),
-        count: uniqueAgreements.length,
+      const body = {
+        agreements: z.array(AgreementSchema).parse(pagedAgreements),
+        count: pagedAgreements.length,
         source: INDEXED_DATA_SOURCE,
-      });
+      };
+
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
+      res.json(body);
     } catch (e) {
       next(e);
     }
@@ -156,7 +159,7 @@ indexedRouter.get(
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
-    if (contractAddress !== normalizeStarknetAddress(defaults.workAgreementAddress)) {
+    if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
       res.status(400).json({ error: "Invalid contract address for agreement details" });
       return;
     }
@@ -201,7 +204,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
         .orderBy(desc(schema.escrowEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
     ]);
 
-    res.json({
+    const body = {
       agreement: AgreementSchema.parse(agreement[0]),
       events,
       payments,
@@ -210,7 +213,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       escrowEvents,
     };
 
-    applyIndexedCacheHeaders(res, body, cacheOpts);
+    applyIndexedCacheHeaders(res, body, indexedCacheOptions);
     res.json(body);
   } catch (e) {
     next(e);
@@ -241,7 +244,7 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
 
     const body = { payments, count: payments.length };
 
-    applyIndexedCacheHeaders(res, body, cacheOpts);
+    applyIndexedCacheHeaders(res, body, indexedCacheOptions);
     res.json(body);
   } catch (e) {
     next(e);
@@ -299,7 +302,7 @@ indexedRouter.get(
         events: escrowEvents,
       };
 
-      applyIndexedCacheHeaders(res, body, cacheOpts);
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
     } catch (e) {
       next(e);
