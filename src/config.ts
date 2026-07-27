@@ -194,21 +194,23 @@ export const starknetRpcUrls = parseStarknetRpcUrls(env.STARKNET_RPC_URL);
 // In production, these should be set as absolute paths or paths relative to the deployed location
 export const abiPaths = {
   escrow:
-    env.ESCROW_CONTRACT_CLASS_JSON ||
-    (process.env.NODE_ENV === "production"
+    env.ESCROW_CONTRACT_CLASS_JSON !== undefined
+      ? env.ESCROW_CONTRACT_CLASS_JSON || null
+      : process.env.NODE_ENV === "production"
       ? null
       : path.resolve(
           process.cwd(),
           "contracts/starknet_contracts_PayrollEscrow.contract_class.json",
-        )),
+        ),
   agreement:
-    env.AGREEMENT_CONTRACT_CLASS_JSON ||
-    (process.env.NODE_ENV === "production"
+    env.AGREEMENT_CONTRACT_CLASS_JSON !== undefined
+      ? env.AGREEMENT_CONTRACT_CLASS_JSON || null
+      : process.env.NODE_ENV === "production"
       ? null
       : path.resolve(
           process.cwd(),
           "contracts/starknet_contracts_WorkAgreement.contract_class.json",
-        )),
+        ),
 };
 
 // Validate that ABI paths are set in production

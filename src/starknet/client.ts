@@ -116,9 +116,10 @@ async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
 ): Promise<unknown> {
-  let lastError: unknown;
+  let lastError: unknown = new Error("No RPC providers available");
   for (const index of rpcFailoverOrder()) {
-    const candidate = rpcProviders[index]!;
+    const candidate = rpcProviders[index];
+    if (!candidate) continue;
     try {
       const fn = Reflect.get(candidate, method) as (...a: unknown[]) => unknown;
       if (typeof fn !== "function") {
