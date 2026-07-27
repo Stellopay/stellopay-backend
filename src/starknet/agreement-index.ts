@@ -1,11 +1,41 @@
 /**
- * Agreement Index - In-memory cache for fast agreement lookups
+ * Agreement Index — In-memory index for fast agreement lookups
  *
- * This module maintains an index of agreements by user address for instant lookups.
- * It can be populated by:
- * 1. Listening to AgreementCreated events
- * 2. Scanning the contract on startup (one-time)
- * 3. Real-time updates when agreements are created
+ * This module maintains an in-memory index of agreements keyed by contract
+ * address. Each contract address gets its own sub-index containing:
+ *   - `byUser`: user address (normalized) → set of agreement IDs
+ *   - `agreements`: agreement ID → metadata snapshot
+ *   - `lastSyncedBlock`: the block number at which the index was last synced
+ *
+ * The index can be populated by:
+ * 1. Listening to AgreementCreated on-chain events
+ * 2. Scanning the contract on startup (one-time backfill)
+ * 3. Real-time calls to `addAgreementToIndex` as agreements are created
+ *
+ * ---
+ * Staleness / consistency guarantees
+ *
+ * - **Lookup before any entry is added** (`getUserAgreements` / `getAgreementMetadata`
+ *   without a prior `addAgreementToIndex`): returns `[]` / `undefined`. Never
+ *   throws or returns stale data from a different contract.
+ *
+ * - **Eviction** is all-or-nothing per contract address via `clearIndex`. There
+ *   is no per-entry TTL or LRU eviction. After `clearIndex`, all lookups for
+ *   that contract behave as if never synced.
+ *
+ * - **No automatic refresh**: the index does NOT poll the chain or track block
+ *   progress beyond `lastSyncedBlock`. Downstream callers (e.g. route handlers)
+ *   are responsible for triggering a re-sync before trusting the index for
+ *   authorization decisions.
+ *
+ * - **Concurrent access safety**: because JavaScript's event loop executes on a
+ *   single thread, plain `Map` / `Set` mutations interleaved with reads on the
+ *   same tick are safe. However, async operations that `await` between read and
+ *   write may observe intermediate states. No external locking is provided.
+ *
+ * - **Cardinality warning**: entries live forever until `clearIndex()` is called.
+ *   At large agreement volumes the in-memory maps should be periodically trimmed
+ *   via `clearIndex()` + re-sync, or by introducing a TTL eviction layer.
  */
 
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";

@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 
+/**
+ * COMPATIBILITY TESTS: src/starknet/client.ts
+ *
+ * These tests verify the compatibility contract defined in client.ts.
+ * They cover both success paths and failure/boundary paths to ensure
+ * the module behaves as documented and maintains backward compatibility.
+ */
+
 const mockRpcProviders = vi.hoisted(() =>
   [] as Array<{
     nodeUrl: string;
@@ -280,5 +288,89 @@ describe("RPC endpoint failover", () => {
     expect(request.pagination.limit).toBe(10);
     expect(secondary!.getBlock).toHaveBeenCalledTimes(1);
     expect(secondary!.getBlock.mock.calls[0]?.[0]).toEqual(request);
+  });
+
+  it("throws the last error when all endpoints fail", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.clearNetworkCache();
+
+    const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockRejectedValue(new Error("primary down"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("primary down"));
+    secondary!.getChainId.mockRejectedValue(new Error("secondary down"));
+    secondary!.getSpecVersion.mockRejectedValue(new Error("secondary down"));
+
+    await expect(client.getCachedNetworkInfo()).rejects.toThrow("secondary down");
+  });
+
+  it("clones complex nested objects during failover", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+
+    const [primary, secondary] = mockRpcProviders;
+    const complexRequest = {
+      nested: {
+        array: [1, 2, 3],
+        object: { key: "value" },
+      },
+      date: new Date("2024-01-01"),
+    };
+
+    primary!.getBlock.mockImplementationOnce((payload: typeof complexRequest) => {
+      payload.nested.array.push(999);
+      payload.nested.object.key = "mutated";
+      throw new Error("primary down");
+    });
+    secondary!.getBlock.mockImplementationOnce((payload: typeof complexRequest) => {
+      return Promise.resolve({ received: payload });
+    });
+
+    const result = await client.provider.getBlock(complexRequest);
+
+    expect(complexRequest.nested.array).toEqual([1, 2, 3]);
+    expect(complexRequest.nested.object.key).toBe("value");
+    expect(result.received.nested.array).toEqual([1, 2, 3, 999]);
+    expect(result.received.nested.object.key).toBe("mutated");
+  });
+});
+
+describe("ABI error handling", () => {
+  beforeEach(() => {
+    clearContractCache();
+  });
+
+  it("throws error when ESCROW_CONTRACT_CLASS_JSON is not configured", () => {
+    vi.resetModules();
+    mockRpcProviders.length = 0;
+    process.env.STARKNET_RPC_URL = "https://example.com/rpc";
+    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
+    process.env.ESCROW_CONTRACT_CLASS_JSON = "";
+    process.env.AGREEMENT_CONTRACT_CLASS_JSON = "/fake/path.json";
+
+    return import("./client.js").then((client) => {
+      expect(() => client.getEscrowAbi()).toThrow(
+        "ESCROW_CONTRACT_CLASS_JSON path is not configured",
+      );
+    });
+  });
+
+  it("throws error when AGREEMENT_CONTRACT_CLASS_JSON is not configured", () => {
+    vi.resetModules();
+    mockRpcProviders.length = 0;
+    process.env.STARKNET_RPC_URL = "https://example.com/rpc";
+    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
+    process.env.ESCROW_CONTRACT_CLASS_JSON = "/fake/path.json";
+    process.env.AGREEMENT_CONTRACT_CLASS_JSON = "";
+
+    return import("./client.js").then((client) => {
+      expect(() => client.getAgreementAbi()).toThrow(
+        "AGREEMENT_CONTRACT_CLASS_JSON path is not configured",
+      );
+    });
   });
 });

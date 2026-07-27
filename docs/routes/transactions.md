@@ -4,7 +4,7 @@ This document explicitly defines the backwards-compatible behavior for transacti
 
 ## Exported Contracts
 
-The backend guarantees the following response shapes for its existing callers. Any future modifications to the transaction fetching, filtering, or aggregating logic must preserve these structures to ensure safe maintenance.
+The backend guarantees the following response shapes for its existing callers. Any future modifications to the transaction fetching, filtering, or aggregating logic must preserve these structures to ensure safe maintenance. These contracts are strictly enforced at runtime using Zod schemas (`TransactionExportSchema` and `TransactionRecordSchema`) to prevent regressions.
 
 ### `TransactionRecord`
 

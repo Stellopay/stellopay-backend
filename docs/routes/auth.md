@@ -164,6 +164,45 @@ Implemented in `src/auth/session.ts` (`rotateSession` / `revokeFamily`):
   The caller must re-authenticate from `/auth/challenge` to get a new
   family.
 
+## Performance notes
+
+### Admin address Set (`rebuildAdminSet`)
+
+`/auth/session/revoke` must check whether the authenticated caller is an
+admin. The naive implementation allocates a new lowercased array on every
+request:
+
+```ts
+// before — O(n) allocation + linear scan on every request
+env.ADMIN_ADDRESSES.map((a) => a.toLowerCase()).includes(callerAddress.toLowerCase())
+```
+
+`auth.ts` now builds a `Set<string>` of lowercased admin addresses once at
+module load and reuses it across all requests:
+
+```ts
+// after — O(1) per request, one allocation at startup
+adminAddressSet.has(callerAddress.toLowerCase())
+```
+
+If `env.ADMIN_ADDRESSES` is mutated after module load (e.g. in tests), call
+the exported `rebuildAdminSet()` to synchronise the Set with the new array
+contents.
+
+### Debug middleware body clone
+
+The debug middleware clones `req.body` only when it is a non-null object.
+Previously it always spread `req.body` into a new object, including on
+requests that have no body (e.g. `GET` health checks routed through the
+same middleware, or malformed requests without a JSON body). The guard:
+
+```ts
+if (req.body && typeof req.body === "object") { /* clone and redact */ }
+```
+
+...avoids an unnecessary object allocation and spread on every no-body
+request while keeping the redaction logic identical for the normal case.
+
 ## Known limitations / out of scope
 
 - **Address format is intentionally unvalidated.** All four request schemas
@@ -173,8 +212,9 @@ Implemented in `src/auth/session.ts` (`rotateSession` / `revokeFamily`):
   callers and tests (which use non-address placeholder strings such as
   `"address"` or `"0xExpiredChallenge"`); tightening it is out of scope for
   this change.
-- This document and the associated change only tighten the
-  session/refresh-token response contract (making the dual-role token
-  explicit in both endpoints' JSON) and write down the existing
-  single-outstanding-challenge-per-address behavior. No runtime behavior
-  changes; response shapes only gain fields.
+- `getCachedNetworkInfo()` is already memoised in `src/starknet/client.ts`
+  and adds no per-request overhead beyond a Map lookup; no change was
+  needed there.
+- The `chainIdCache` inside `src/auth/challenge.ts` (`buildTypedChallenge`)
+  is likewise already memoised; the double-decode concern is already
+  handled at that layer.
