@@ -3,6 +3,7 @@ import request from "supertest";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ZodError } from "zod";
 import { defaults } from "../config.js";
+import { computeETag } from "../utils/cache-headers.js";
 
 // Mock the db module (no real Postgres or config needed) and drizzle-orm
 // helpers. Each query resolves to the rows configured for its table, records

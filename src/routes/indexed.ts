@@ -6,6 +6,9 @@ import { StarknetAddress, AgreementId, parsePagination } from "../utils/validati
 import { defaults } from "../config.js";
 import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 import { notFoundResponse } from "./not-found.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
+import { env, defaults } from "../config.js";
+import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
 
 /**
  * Source identifier tag returned in indexed route responses.
@@ -205,7 +208,10 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       milestones,
       employees,
       escrowEvents,
-    });
+    };
+
+    applyIndexedCacheHeaders(res, body, cacheOpts);
+    res.json(body);
   } catch (e) {
     next(e);
   }
@@ -233,7 +239,10 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
       .limit(limit)
       .offset(offset);
 
-    res.json({ payments, count: payments.length });
+    const body = { payments, count: payments.length };
+
+    applyIndexedCacheHeaders(res, body, cacheOpts);
+    res.json(body);
   } catch (e) {
     next(e);
   }
@@ -284,11 +293,14 @@ indexedRouter.get(
         }
       }
 
-      res.json({
+      const body = {
         agreement_id: agreementId,
         balance: balance.toString(),
         events: escrowEvents,
-      });
+      };
+
+      applyIndexedCacheHeaders(res, body, cacheOpts);
+      res.json(body);
     } catch (e) {
       next(e);
     }
