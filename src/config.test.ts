@@ -119,6 +119,7 @@ describe("config env parsing", () => {
   it("uses explicit ABI paths when provided in production", async () => {
     const { abiPaths } = await loadConfig({
       NODE_ENV: "production",
+      CORS_ORIGIN: "https://app.example.com",
       ESCROW_CONTRACT_CLASS_JSON: "/abi/escrow.json",
       AGREEMENT_CONTRACT_CLASS_JSON: "/abi/agreement.json",
     });
@@ -127,7 +128,7 @@ describe("config env parsing", () => {
   });
 
   it("throws in production when ABI paths are unset, so the guard cannot be bypassed", async () => {
-    await expect(loadConfig({ NODE_ENV: "production" })).rejects.toThrow(
+    await expect(loadConfig({ NODE_ENV: "production", CORS_ORIGIN: "https://app.example.com" })).rejects.toThrow(
       /must be set in production/i,
     );
   });
