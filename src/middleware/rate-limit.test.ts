@@ -3,7 +3,14 @@ import request from "supertest";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import type { Store, ClientRateLimitInfo } from "express-rate-limit";
 
-import { makeLimiter, keyByIp, retryAfterSeconds } from "./rate-limit";
+import {
+  makeLimiter,
+  keyByIp,
+  retryAfterSeconds,
+  getIdempotencyKey,
+  IDEMPOTENCY_KEY_HEADER,
+  X_IDEMPOTENT_REPLAYED_HEADER,
+} from "./rate-limit";
 
 /**
  * Minimal in-memory `Store` for asserting distributed wiring. Each instance
@@ -341,5 +348,249 @@ describe("retryAfterSeconds", () => {
     expect(retryAfterSeconds(15 * 60 * 1000)).toBe(900);  // 15 min
     expect(retryAfterSeconds(5 * 60 * 1000)).toBe(300);   // 5 min
     expect(retryAfterSeconds(60 * 60 * 1000)).toBe(3600); // 1 hour
+  });
+});
+
+// ---------------------------------------------------------------------------
+// idempotency helpers
+// ---------------------------------------------------------------------------
+
+describe("getIdempotencyKey", () => {
+  it("returns the value of the Idempotency-Key header", () => {
+    const req = { headers: { "idempotency-key": "key-001" } } as express.Request;
+    expect(getIdempotencyKey(req)).toBe("key-001");
+  });
+
+  it("returns undefined when the header is absent", () => {
+    const req = { headers: {} } as express.Request;
+    expect(getIdempotencyKey(req)).toBeUndefined();
+  });
+
+  it("returns undefined when the header is an empty string", () => {
+    const req = { headers: { "idempotency-key": "" } } as express.Request;
+    expect(getIdempotencyKey(req)).toBeUndefined();
+  });
+
+  it("returns undefined when the header is an array (multiple values)", () => {
+    const req = { headers: { "idempotency-key": ["a", "b"] } } as unknown as express.Request;
+    expect(getIdempotencyKey(req)).toBeUndefined();
+  });
+
+  it("returns undefined when the header exceeds 255 characters", () => {
+    const req = { headers: { "idempotency-key": "x".repeat(256) } } as express.Request;
+    expect(getIdempotencyKey(req)).toBeUndefined();
+  });
+
+  it("accepts a key of exactly 255 characters", () => {
+    const req = { headers: { "idempotency-key": "x".repeat(255) } } as express.Request;
+    expect(getIdempotencyKey(req)).toBe("x".repeat(255));
+  });
+});
+
+describe("idempotency constants", () => {
+  it("exports the correct header names", () => {
+    expect(IDEMPOTENCY_KEY_HEADER).toBe("Idempotency-Key");
+    expect(X_IDEMPOTENT_REPLAYED_HEADER).toBe("X-Idempotent-Replayed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeLimiter with idempotent: true
+// ---------------------------------------------------------------------------
+
+describe("makeLimiter with idempotent option", () => {
+  it("deduplicates requests with the same idempotency key (success path)", async () => {
+    const app = makeApp(makeLimiter({ name: "idem-success", windowMs: 60_000, max: 2, idempotent: true }));
+
+    // First request with key counts against the limit.
+    const r1 = await request(app).get("/api/ping").set("Idempotency-Key", "dup-1");
+    expect(r1.status).toBe(200);
+
+    // Second request with the same key does NOT count — still allowed.
+    const r2 = await request(app).get("/api/ping").set("Idempotency-Key", "dup-1");
+    expect(r2.status).toBe(200);
+
+    // A different key counts as a separate request (now at 2/2).
+    const r3 = await request(app).get("/api/ping").set("Idempotency-Key", "other");
+    expect(r3.status).toBe(200);
+
+    // Next request with any key is throttled (limit reached).
+    const r4 = await request(app).get("/api/ping").set("Idempotency-Key", "new-key");
+    expect(r4.status).toBe(429);
+  });
+
+  it("replays a throttled outcome for a duplicate idempotency key (boundary path)", async () => {
+    const app = makeApp(makeLimiter({ name: "idem-throttle", windowMs: 60_000, max: 1, idempotent: true }));
+
+    // Exhaust the limit with key "first".
+    await request(app).get("/api/ping").set("Idempotency-Key", "first").expect(200);
+
+    // A request with a different key gets throttled (limit already exhausted).
+    await request(app).get("/api/ping").set("Idempotency-Key", "doomed").expect(429);
+
+    // Retry with the throttled key: outcome is replayed — still 429.
+    const r1 = await request(app).get("/api/ping").set("Idempotency-Key", "doomed");
+    expect(r1.status).toBe(429);
+    expect(r1.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBe("true");
+
+    // Second retry with same key: also throttled (replayed again).
+    const r2 = await request(app).get("/api/ping").set("Idempotency-Key", "doomed");
+    expect(r2.status).toBe(429);
+    expect(r2.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBe("true");
+
+    // A fresh key is also throttled (limit still exhausted).
+    const r3 = await request(app).get("/api/ping").set("Idempotency-Key", "fresh");
+    expect(r3.status).toBe(429);
+  });
+
+  it("sets X-Idempotent-Replayed on duplicate requests", async () => {
+    const app = makeApp(makeLimiter({ name: "idem-header", windowMs: 60_000, max: 5, idempotent: true }));
+
+    // First use: header absent.
+    const r1 = await request(app).get("/api/ping").set("Idempotency-Key", "hdr-test");
+    expect(r1.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBeUndefined();
+
+    // Duplicate: header present.
+    const r2 = await request(app).get("/api/ping").set("Idempotency-Key", "hdr-test");
+    expect(r2.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBe("true");
+  });
+
+  it("does not set X-Idempotent-Replayed when no idempotency key is present", async () => {
+    const app = makeApp(makeLimiter({ name: "idem-no-header", windowMs: 60_000, max: 1, idempotent: true }));
+
+    await request(app).get("/api/ping").expect(200);
+    const r2 = await request(app).get("/api/ping").expect(429);
+
+    expect(r2.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBeUndefined();
+  });
+
+  it("preserves normal behavior when idempotent: true but no header is sent", async () => {
+    const app = makeApp(makeLimiter({ name: "idem-normal", windowMs: 60_000, max: 2, idempotent: true }));
+
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(429);
+  });
+
+  it("treats different idempotency keys as separate replay scopes", async () => {
+    const app = makeApp(makeLimiter({ name: "idem-scope", windowMs: 60_000, max: 2, idempotent: true }));
+
+    // Two unique keys each count.
+    await request(app).get("/api/ping").set("Idempotency-Key", "alpha").expect(200);
+    await request(app).get("/api/ping").set("Idempotency-Key", "bravo").expect(200);
+
+    // Limit exhausted: third unique key is throttled.
+    await request(app).get("/api/ping").set("Idempotency-Key", "charlie").expect(429);
+
+    // Replay of alpha is allowed (original was allowed, and deduped).
+    const replay = await request(app).get("/api/ping").set("Idempotency-Key", "alpha");
+    expect(replay.status).toBe(200);
+    expect(replay.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBe("true");
+
+    // Replay of charlie is throttled (original was throttled).
+    const replayThrottled = await request(app).get("/api/ping").set("Idempotency-Key", "charlie");
+    expect(replayThrottled.status).toBe(429);
+    expect(replayThrottled.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBe("true");
+  });
+
+  it("works with a shared store (distributed idempotency)", async () => {
+    const backing = new Map<string, number>();
+    const app = makeApp(
+      makeLimiter({
+        name: "idem-store",
+        windowMs: 60_000,
+        max: 2,
+        idempotent: true,
+        store: new FakeSharedStore(backing),
+      }),
+    );
+
+    // First request with key "dedup".
+    await request(app).get("/api/ping").set("Idempotency-Key", "dedup").expect(200);
+
+    // Duplicate request with same key (allowed, not double-counted).
+    const dup = await request(app).get("/api/ping").set("Idempotency-Key", "dedup");
+    expect(dup.status).toBe(200);
+    expect(dup.headers[X_IDEMPOTENT_REPLAYED_HEADER.toLowerCase()]).toBe("true");
+
+    // Another unique key.
+    await request(app).get("/api/ping").set("Idempotency-Key", "unique").expect(200);
+
+    // Limit exhausted.
+    await request(app).get("/api/ping").expect(429);
+  });
+
+  it("respects the skip predicate alongside idempotency", async () => {
+    const app = express();
+    app.set("trust proxy", 1);
+    const limiter = makeLimiter({
+      name: "idem-skip",
+      windowMs: 60_000,
+      max: 1,
+      idempotent: true,
+      skip: (req) => req.path === "/health",
+    });
+    app.use(limiter);
+    app.get("/health", (_req, res) => res.json({ ok: true }));
+    app.get("/ping", (_req, res) => res.json({ ok: true }));
+
+    // Skipped route is never counted.
+    await request(app).get("/health").expect(200);
+    await request(app).get("/health").expect(200);
+
+    // Counted route exhausts its limit.
+    await request(app).get("/ping").set("Idempotency-Key", "key-1").expect(200);
+
+    // Duplicate key replays allowed outcome.
+    await request(app).get("/ping").set("Idempotency-Key", "key-1").expect(200);
+  });
+
+  it("logs a warning on first throttling with idempotency enabled", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const app = makeApp(
+      makeLimiter({ name: "idem-warn", windowMs: 60_000, max: 1, idempotent: true }),
+    );
+
+    await request(app).get("/api/ping").set("Idempotency-Key", "warn-test").expect(200);
+    await request(app).get("/api/ping").set("Idempotency-Key", "warn-test").expect(200);
+
+    // A fresh key that exhausts the limit must log the warning.
+    await request(app).get("/api/ping").set("Idempotency-Key", "trigger").expect(429);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('limiter="idem-warn"'),
+    );
+  });
+
+  it("does not log a warning when a throttled outcome is replayed", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const app = makeApp(
+      makeLimiter({ name: "idem-no-warn", windowMs: 60_000, max: 1, idempotent: true }),
+    );
+
+    // Exhaust.
+    await request(app).get("/api/ping").set("Idempotency-Key", "silent").expect(200);
+    await request(app).get("/api/ping").set("Idempotency-Key", "silent").expect(200);
+
+    warnSpy.mockClear();
+
+    // Replay of throttled key — must not log a new warning.
+    // First, trigger throttling with a fresh key.
+    await request(app).get("/api/ping").set("Idempotency-Key", "trigger-throttle").expect(429);
+
+    const throttleWarningCount = warnSpy.mock.calls.filter(([msg]) =>
+      String(msg).includes("limit reached"),
+    ).length;
+    expect(throttleWarningCount).toBe(1);
+
+    warnSpy.mockClear();
+
+    // Replay the throttled key.
+    await request(app).get("/api/ping").set("Idempotency-Key", "trigger-throttle").expect(429);
+
+    const replayWarningCount = warnSpy.mock.calls.filter(([msg]) =>
+      String(msg).includes("limit reached"),
+    ).length;
+    expect(replayWarningCount).toBe(0);
   });
 });

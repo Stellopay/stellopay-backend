@@ -7,7 +7,10 @@ import {
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
   loggedParse,
+  formatValidationError,
+  type ValidationErrorResponse,
 } from "./validation";
+import type { ValidationErrorMetric } from "./validation";
 
 // --------------------------------------------------------------------------
 // StarknetAddress
@@ -469,5 +472,215 @@ describe("loggedParse", () => {
     loggedParse(schema, "ok", "silentOnSuccess");
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  // -------------------------------------------------------------------------
+  // ValidationError — thrown type contract
+  // -------------------------------------------------------------------------
+
+  it("throws a ValidationError (not a plain Error) on failure", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(1);
+    let caught: unknown;
+    try {
+      loggedParse(schema, "", "typeCheck");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ValidationError);
+    vi.restoreAllMocks();
+  });
+
+  it("ValidationError carries the ZodError as .cause", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(1);
+    let caught: unknown;
+    try {
+      loggedParse(schema, "", "causeCheck");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ValidationError);
+    const err = caught as ValidationError;
+    expect(err.cause).toBeInstanceOf(z.ZodError);
+    vi.restoreAllMocks();
+  });
+
+  it("ValidationError.metric matches the ValidationErrorMetric shape", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(1);
+    let caught: unknown;
+    try {
+      loggedParse(schema, "", "metricShape");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ValidationError);
+    const metric: ValidationErrorMetric = (caught as ValidationError).metric;
+    expect(typeof metric.validator).toBe("string");
+    expect(typeof metric.input).toBe("string");
+    expect(typeof metric.error).toBe("string");
+    expect(typeof metric.timestamp).toBe("string");
+    expect(Number.isNaN(Date.parse(metric.timestamp))).toBe(false);
+    vi.restoreAllMocks();
+  });
+
+  it("ValidationError.metric.validator equals the validatorName argument", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(1);
+    let caught: unknown;
+    try {
+      loggedParse(schema, "", "myValidator");
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as ValidationError).metric.validator).toBe("myValidator");
+    vi.restoreAllMocks();
+  });
+
+  it("ValidationError.name is 'ValidationError'", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(1);
+    let caught: unknown;
+    try {
+      loggedParse(schema, "", "nameCheck");
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as ValidationError).name).toBe("ValidationError");
+    vi.restoreAllMocks();
+  });
+
+  it("ValidationError.message equals the joined Zod issue messages", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const schema = z.string().min(5).email();
+    let caught: unknown;
+    try {
+      loggedParse(schema, "ab", "msgCheck");
+    } catch (e) {
+      caught = e;
+    }
+    const err = caught as ValidationError;
+    // message must be the same '; '-joined string stored in metric.error
+    expect(err.message).toBe(err.metric.error);
+    vi.restoreAllMocks();
+  });
+});
+
+// --------------------------------------------------------------------------
+// parsePagination — non-object top-level input (isPlainObject guard)
+// --------------------------------------------------------------------------
+
+describe("parsePagination — non-object top-level input", () => {
+  // These inputs were previously cast silently via `(query ?? {}) as
+  // Record<string, unknown>`. The isPlainObject guard now makes the intent
+  // explicit: any non-plain-object falls back to an empty object, so limit
+  // and offset both resolve to their documented defaults.
+
+  it("returns defaults for a top-level string input", () => {
+    expect(parsePagination("limit=10&offset=5")).toEqual({
+      limit: DEFAULT_PAGE_LIMIT,
+      offset: 0,
+    });
+  });
+
+  it("returns defaults for a top-level number input", () => {
+    expect(parsePagination(42)).toEqual({ limit: DEFAULT_PAGE_LIMIT, offset: 0 });
+    expect(parsePagination(0)).toEqual({ limit: DEFAULT_PAGE_LIMIT, offset: 0 });
+  });
+
+  it("returns defaults for a top-level array input", () => {
+    // Arrays are objects in JS but not plain objects — they carry no
+    // limit/offset keys and must not be indexed as if they did.
+    expect(parsePagination([{ limit: "10" }])).toEqual({
+      limit: DEFAULT_PAGE_LIMIT,
+      offset: 0,
+    });
+    expect(parsePagination(["10", "5"])).toEqual({ limit: DEFAULT_PAGE_LIMIT, offset: 0 });
+  });
+
+  it("returns defaults for a top-level boolean input", () => {
+    expect(parsePagination(true)).toEqual({ limit: DEFAULT_PAGE_LIMIT, offset: 0 });
+    expect(parsePagination(false)).toEqual({ limit: DEFAULT_PAGE_LIMIT, offset: 0 });
+  });
+
+  it("does not throw for any non-object top-level input", () => {
+    const nonObjects = ["string", 42, 0, -1, true, false, [], [1, 2], Symbol("x")];
+    for (const val of nonObjects) {
+      expect(() => parsePagination(val)).not.toThrow();
+      const out = parsePagination(val);
+      expect(out.limit).toBeGreaterThanOrEqual(1);
+      expect(out.limit).toBeLessThanOrEqual(MAX_PAGE_LIMIT);
+      expect(out.offset).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+// --------------------------------------------------------------------------
+// formatValidationError
+// --------------------------------------------------------------------------
+
+describe("formatValidationError", () => {
+  it("returns 'Validation failed' with Zod issues for a ZodError", () => {
+    const raw = "not-a-number";
+    try {
+      z.number().parse(raw);
+    } catch (e) {
+      const result = formatValidationError(e);
+      expect(result).toMatchObject<ValidationErrorResponse>({
+        error: "Validation failed",
+        details: expect.any(Array),
+      });
+      expect(result.details?.length).toBeGreaterThanOrEqual(1);
+      expect(result.details![0]).toHaveProperty("message");
+      expect(result.details![0]).toHaveProperty("code");
+    }
+  });
+
+  it("returns 'Invalid request' without details for a non-Zod error", () => {
+    const result = formatValidationError(new Error("something broke"));
+    expect(result).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+    expect(result.details).toBeUndefined();
+  });
+
+  it("returns 'Invalid request' without details for a plain string", () => {
+    const result = formatValidationError("unexpected string error");
+    expect(result).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+  });
+
+  it("returns 'Invalid request' without details for null / undefined input", () => {
+    expect(formatValidationError(null)).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+    expect(formatValidationError(undefined)).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+  });
+
+  it("returns 'Invalid request' without details for an object that is not a ZodError", () => {
+    const result = formatValidationError({ custom: true });
+    expect(result).toEqual<ValidationErrorResponse>({
+      error: "Invalid request",
+    });
+  });
+
+  it("preserves the original Zod issue shape in details", () => {
+    const schema = z.object({
+      name: z.string().min(1, "name is required"),
+      age: z.number().int().positive(),
+    });
+    try {
+      schema.parse({ name: "", age: -1 });
+    } catch (e) {
+      const result = formatValidationError(e);
+      expect(result.error).toBe("Validation failed");
+      expect(result.details).toHaveLength(2);
+      expect(result.details![0].path).toEqual(["name"]);
+      expect(result.details![1].path).toEqual(["age"]);
+    }
   });
 });
