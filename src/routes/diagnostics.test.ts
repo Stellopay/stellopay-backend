@@ -25,9 +25,16 @@ vi.mock("../db/index.js", () => ({
   schema: {},
 }));
 
+vi.mock("../starknet/client.js", () => ({
+  getCircuitBreakerSnapshots: vi.fn(() => [
+    { endpointUrl: "https://rpc.example.com", state: "CLOSED", recentFailureCount: 0, openedAt: null },
+  ]),
+}));
+
 import { redactRecentEvent, fetchDiagnosticsData, diagnosticsRouter } from "./diagnostics.js";
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
 
 const ADMIN = "0xadmin";
@@ -209,7 +216,10 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.summary.latestBlock).toBe("100");
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
+    expect(res.body.circuitBreakers).toHaveLength(1);
+    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
     expect(getPoolStats).toHaveBeenCalledOnce();
+    expect(getCircuitBreakerSnapshots).toHaveBeenCalledOnce();
   });
 
   it("handles case-insensitive admin address matching", async () => {

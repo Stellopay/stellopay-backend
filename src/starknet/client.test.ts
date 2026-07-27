@@ -37,7 +37,10 @@ import {
   agreementContract,
   clearContractCache,
   resetRpcFailoverForTests,
+  resetCircuitBreakersForTests,
+  getCircuitBreakerSnapshots,
 } from "./client.js";
+import { CircuitOpenError } from "./circuit-breaker.js";
 
 const VITEST_POSTGRES =
   process.env.POSTGRES_CONNECTION_STRING ??
@@ -49,6 +52,7 @@ describe("Starknet Client Cache", () => {
 
   beforeEach(() => {
     resetRpcFailoverForTests();
+    resetCircuitBreakersForTests();
     clearNetworkCache();
 
     getChainIdSpy = vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");
@@ -251,3 +255,287 @@ describe("RPC endpoint failover", () => {
     expect(secondary!.getSpecVersion).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Circuit breaker integration with failover", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let infoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  async function loadClientWithRpcUrls(rpcEnv: string) {
+    vi.resetModules();
+    mockRpcProviders.length = 0;
+    process.env.STARKNET_RPC_URL = rpcEnv;
+    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
+    // Use default circuit breaker settings for tests
+    process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD = "5";
+    process.env.CIRCUIT_BREAKER_COOLDOWN_MS = "30000";
+    return import("./client.js");
+  }
+
+  it("circuit opens after repeated failures to one endpoint", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+    client.clearNetworkCache();
+
+    const [primary, secondary] = mockRpcProviders;
+
+    // Make primary fail 5 times (threshold)
+    primary!.getChainId.mockRejectedValue(new Error("primary timeout"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("primary timeout"));
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getSpecVersion.mockResolvedValue("0.6.0");
+
+    // First 5 calls will fail on primary, failover to secondary
+    for (let i = 0; i < 5; i++) {
+      client.clearNetworkCache();
+      await client.getCachedNetworkInfo();
+    }
+
+    // Circuit should now be open for primary
+    const snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("OPEN");
+    expect(snapshots[0]!.recentFailureCount).toBe(5);
+
+    // Next call should skip primary entirely (circuit open)
+    primary!.getChainId.mockClear();
+    primary!.getSpecVersion.mockClear();
+    client.clearNetworkCache();
+
+    await client.getCachedNetworkInfo();
+
+    // Primary should not have been called because circuit was open
+    expect(primary!.getChainId).not.toHaveBeenCalled();
+    expect(secondary!.getChainId).toHaveBeenCalledTimes(1);
+  });
+
+  it("circuit half-opens after cooldown and closes on successful probe", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+    client.clearNetworkCache();
+
+    const [primary] = mockRpcProviders;
+
+    // Open the circuit with 5 failures
+    primary!.getChainId.mockRejectedValue(new Error("timeout"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+
+    for (let i = 0; i < 5; i++) {
+      try {
+        await client.getCachedNetworkInfo();
+      } catch {
+        // expected
+      }
+    }
+
+    let snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("OPEN");
+
+    // Advance past cooldown (30s default in test config)
+    vi.advanceTimersByTime(30_001);
+
+    // Now the endpoint recovers
+    primary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    primary!.getSpecVersion.mockResolvedValue("0.6.0");
+
+    // First call transitions to HALF_OPEN and succeeds (probe)
+    client.clearNetworkCache();
+    await client.getCachedNetworkInfo();
+
+    snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("HALF_OPEN");
+
+    // Second successful call (successThreshold=2 default) closes circuit
+    client.clearNetworkCache();
+    await client.getCachedNetworkInfo();
+
+    snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("CLOSED");
+
+    // Verify circuit closed log
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("CLOSED"));
+  });
+
+  it("circuit reopens if probe call fails in HALF_OPEN state", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+    client.clearNetworkCache();
+
+    const [primary] = mockRpcProviders;
+
+    // Open the circuit
+    primary!.getChainId.mockRejectedValue(new Error("timeout"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+
+    for (let i = 0; i < 5; i++) {
+      try {
+        await client.getCachedNetworkInfo();
+      } catch {
+        // expected
+      }
+    }
+
+    // Advance to HALF_OPEN
+    vi.advanceTimersByTime(30_001);
+
+    // Probe fails
+    try {
+      await client.getCachedNetworkInfo();
+    } catch {
+      // expected
+    }
+
+    // Circuit should re-open
+    const snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("OPEN");
+
+    // Warn log about probe failure
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("HALF_OPEN"));
+  });
+
+  it("circuit short-circuits without wasting time on timeout when open", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+    client.clearNetworkCache();
+
+    const [primary] = mockRpcProviders;
+
+    // Open the circuit
+    primary!.getChainId.mockRejectedValue(new Error("timeout"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+
+    for (let i = 0; i < 5; i++) {
+      try {
+        await client.getCachedNetworkInfo();
+      } catch {
+        // expected
+      }
+    }
+
+    const snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("OPEN");
+
+    // Next call should fail immediately with CircuitOpenError
+    primary!.getChainId.mockClear();
+    primary!.getSpecVersion.mockClear();
+
+    await expect(client.getCachedNetworkInfo()).rejects.toThrow(CircuitOpenError);
+
+    // Primary should never have been called (circuit was open)
+    expect(primary!.getChainId).not.toHaveBeenCalled();
+    expect(primary!.getSpecVersion).not.toHaveBeenCalled();
+  });
+
+  it("failover works when one circuit is open", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+    client.clearNetworkCache();
+
+    const [primary, secondary] = mockRpcProviders;
+
+    // Open primary's circuit
+    primary!.getChainId.mockRejectedValue(new Error("timeout"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getSpecVersion.mockResolvedValue("0.6.0");
+
+    for (let i = 0; i < 5; i++) {
+      client.clearNetworkCache();
+      await client.getCachedNetworkInfo();
+    }
+
+    let snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("OPEN");
+    expect(snapshots[1]!.state).toBe("CLOSED");
+
+    // Subsequent calls should use secondary without trying primary
+    primary!.getChainId.mockClear();
+    primary!.getSpecVersion.mockClear();
+    secondary!.getChainId.mockClear();
+    secondary!.getSpecVersion.mockClear();
+
+    client.clearNetworkCache();
+    const result = await client.getCachedNetworkInfo();
+
+    expect(result.chainId).toBe("0x534e5f4d41494e");
+    expect(primary!.getChainId).not.toHaveBeenCalled();
+    expect(secondary!.getChainId).toHaveBeenCalledTimes(1);
+  });
+
+  it("getCircuitBreakerSnapshots returns diagnostic data for all endpoints", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetCircuitBreakersForTests();
+
+    const snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0]!.endpointUrl).toBe("https://primary.example/rpc");
+    expect(snapshots[0]!.state).toBe("CLOSED");
+    expect(snapshots[1]!.endpointUrl).toBe("https://secondary.example/rpc");
+    expect(snapshots[1]!.state).toBe("CLOSED");
+  });
+
+  it("failures outside the time window do not count toward threshold", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+    client.clearNetworkCache();
+
+    // Set window to 60s (default), threshold to 5
+    process.env.CIRCUIT_BREAKER_WINDOW_MS = "60000";
+
+    const [primary] = mockRpcProviders;
+    primary!.getChainId.mockRejectedValue(new Error("timeout"));
+    primary!.getSpecVersion.mockRejectedValue(new Error("timeout"));
+
+    // 3 failures
+    for (let i = 0; i < 3; i++) {
+      try {
+        await client.getCachedNetworkInfo();
+      } catch {
+        // expected
+      }
+    }
+
+    let snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots[0]!.state).toBe("CLOSED");
+    expect(snapshots[0]!.recentFailureCount).toBe(3);
+
+    // Advance past the window so old failures expire
+    vi.advanceTimersByTime(60_001);
+
+    // 2 more failures (still below threshold of 5 because old ones expired)
+    for (let i = 0; i < 2; i++) {
+      try {
+        await client.getCachedNetworkInfo();
+      } catch {
+        // expected
+      }
+    }
+
+    snapshots = client.getCircuitBreakerSnapshots();
+    // Should still be CLOSED (only 2 failures in current window)
+    expect(snapshots[0]!.state).toBe("CLOSED");
+    expect(snapshots[0]!.recentFailureCount).toBe(2);
+  });
+});
+

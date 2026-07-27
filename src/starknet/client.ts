@@ -1,8 +1,19 @@
 import { Contract, RpcProvider } from "starknet";
-import { abiPaths, starknetRpcUrls } from "../config.js";
+import { abiPaths, circuitBreakerConfig, starknetRpcUrls } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "./abi.js";
+import {
+  CircuitOpenError,
+  EndpointCircuitBreaker,
+  snapshotCircuitBreaker,
+  type CircuitBreakerSnapshot,
+} from "./circuit-breaker.js";
 
 const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
+
+/** Circuit breaker per RPC endpoint, aligned with `rpcProviders` by index. */
+const circuitBreakers = starknetRpcUrls.map(
+  (url) => new EndpointCircuitBreaker(url, circuitBreakerConfig),
+);
 
 /** Index into rpcProviders for the last known healthy endpoint. */
 let healthyRpcIndex = 0;
@@ -22,7 +33,16 @@ async function invokeWithFailover(
   args: unknown[],
 ): Promise<unknown> {
   let lastError: unknown;
+
   for (const index of rpcFailoverOrder()) {
+    const breaker = circuitBreakers[index]!;
+
+    // Circuit is open for this endpoint — skip immediately and try the next
+    if (!breaker.isCallPermitted()) {
+      lastError = new CircuitOpenError(starknetRpcUrls[index]!);
+      continue;
+    }
+
     const candidate = rpcProviders[index]!;
     try {
       const fn = Reflect.get(candidate, method) as (...a: unknown[]) => unknown;
@@ -30,6 +50,9 @@ async function invokeWithFailover(
         throw new TypeError(`RpcProvider.${String(method)} is not a function`);
       }
       const result = await fn.apply(candidate, args);
+
+      // Success path
+      breaker.recordSuccess();
       if (index !== healthyRpcIndex) {
         console.warn(
           `[starknet] RPC endpoint failover: ${starknetRpcUrls[healthyRpcIndex]} -> ${starknetRpcUrls[index]}`,
@@ -38,15 +61,22 @@ async function invokeWithFailover(
       }
       return result;
     } catch (err) {
+      // Don't count CircuitOpenError as a new failure against the breaker
+      if (!(err instanceof CircuitOpenError)) {
+        breaker.recordFailure();
+      }
       lastError = err;
     }
   }
+
   throw lastError;
 }
 
 /**
  * Starknet RPC client with automatic failover across configured endpoints.
  * Subsequent calls reuse the last healthy endpoint until it fails again.
+ * Each endpoint is guarded by a circuit breaker that opens after repeated
+ * failures and half-opens after a configurable cooldown period.
  */
 export const provider = new Proxy(rpcProviders[0]!, {
   get(_target, prop, _receiver) {
@@ -191,4 +221,21 @@ export function clearNetworkCache(): void {
  */
 export function resetRpcFailoverForTests(): void {
   healthyRpcIndex = 0;
+}
+
+/**
+ * Resets all circuit breakers to their initial CLOSED state. For tests only.
+ */
+export function resetCircuitBreakersForTests(): void {
+  for (const breaker of circuitBreakers) {
+    breaker.reset();
+  }
+}
+
+/**
+ * Returns a read-only diagnostic snapshot of all circuit breakers.
+ * Safe to include in health-check and diagnostics responses.
+ */
+export function getCircuitBreakerSnapshots(): CircuitBreakerSnapshot[] {
+  return circuitBreakers.map(snapshotCircuitBreaker);
 }
