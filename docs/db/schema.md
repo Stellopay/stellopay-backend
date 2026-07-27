@@ -4,9 +4,38 @@ Source of truth: [`src/db/schema.ts`](../../src/db/schema.ts)
 
 ## Overview
 
-All tables are defined with [Drizzle ORM](https://orm.drizzle.team/) and targeting PostgreSQL.
+All tables are defined with [Drizzle ORM](https://orm.drizzle.team/) targeting PostgreSQL.
 Migrations live in [`src/db/migrations/`](../../src/db/migrations/) and are applied via
 `pnpm db:migrate` (or `pnpm db:migrate -- --dry-run` for a preview).
+
+---
+
+## Schema Contract
+
+`schema.ts` is the single source of truth for the database shape. Every table,
+constraint, and runtime helper is defined there — no divergent copies exist in
+routes or auth modules. The following invariants are enforced by
+[`schema-consistency.test.ts`](../../src/db/schema-consistency.test.ts):
+
+| # | Invariant | Enforcement |
+|---|-----------|-------------|
+| I1 | **Table inventory** — exactly 10 tables, all listed in `SCHEMA_TABLES`. | Test asserts `Object.keys(schema)` matches `SCHEMA_TABLES`. |
+| I2 | **FK index** — every `*Id` → `*_id` column has a btree `index()` (PKs and documented exclusions like `taxId` excepted). | `schema-fk-indexes.ts` walks every table and asserts. |
+| I3 | **u256 amount CHECK** — every amount column uses the shared `U256_DECIMAL_REGEX`. | Test verifies each named amount CHECK references the regex. |
+| I4 | **Currency CHECK** — every `currency` column uses `'^[A-Z]{3}$'`. | Test verifies `currency_check` constraints. |
+| I5 | **Block-number CHECK** — every `block_number` column has `CHECK >= 0`. | Test verifies each named block-number CHECK. |
+| I6 | **Enum CHECK** — every column with a closed value set has a `CHECK IN` / `CHECK BETWEEN`. | Test asserts each enum-bearing table has at least one non-numeric CHECK. |
+| I7 | **Runtime ↔ DB parity** — every DB CHECK has a runtime helper (e.g. `assertValidU256`). | Test asserts all helpers and regex constants are exported. |
+
+### Adding a new table
+
+1. Define the table in `src/db/schema.ts` with CHECK constraints, FK indexes,
+   and runtime helpers.
+2. Add the table to the `SCHEMA_TABLES` array.
+3. Add a CHECK-constraint test in `src/db/migration.test.ts`.
+4. Write a migration in `src/db/migrations/` and register it in
+   `src/db/migrations/meta/_journal.json`.
+5. Document the table below.
 
 ---
 
@@ -271,6 +300,51 @@ by the Cairo contract.
 
 ---
 
+## Runtime validation helpers
+
+`schema.ts` exports runtime counterparts of every DB-level CHECK constraint. Callers
+should validate early to produce actionable errors rather than relying on a database
+constraint violation — this makes failures easier to catch, log, and retry.
+
+| Helper | Input | Returns | Description |
+|---|---|---|---|
+| `isValidU256(value)` | `string` | `boolean` | True when `value` matches the u256 decimal CHECK constraint |
+| `isValidCurrencyCode(code)` | `string` | `boolean` | True when `code` matches `^[A-Z]{3}$` |
+| `isValidNonNegativeInteger(value)` | `number` | `boolean` | True when `value` is an integer ≥ 0 |
+| `assertValidU256(value, name)` | `string` | throws on failure | Same as `isValidU256` but throws a `RangeError` |
+| `assertNonNegative(value, name)` | `number` | throws on failure | Same as `isValidNonNegativeInteger` but throws a `RangeError` |
+
+### Exported constraint constants
+
+| Constant | Type | Value | Description |
+|---|---|---|---|
+| `U256_DECIMAL_REGEX` | `string` | `^(0\|[1-9][0-9]{0,77})$` | Raw regex string used in the DB CHECK constraint |
+| `U256_DECIMAL_PATTERN` | `RegExp` | compiled `RegExp` | Pre-compiled pattern for runtime `test()` calls |
+| `CURRENCY_CODE_REGEX` | `RegExp` | `/^[A-Z]{3}$/` | Compiled pattern for ISO 4217-style currency codes |
+
+### Pagination & batching helpers
+
+| Helper | Input | Returns | Description |
+|---|---|---|---|
+| `clampPageLimit(n)` | `number` | `number` | Clamps to [1, `MAX_PAGE_SIZE`]; values ≤ 0 default to `DEFAULT_PAGE_SIZE` |
+| `clampBatchSize(n)` | `number` | `number` | Returns `0` when `n` is outside [1, `MAX_BATCH_SIZE`]; prefer `validateBatchSize` in new code |
+| `validateBatchSize(n, name?)` | `number` | `number` or throws | Returns `n` if valid; throws `RangeError` with a descriptive message otherwise |
+
+| Constant | Value | Description |
+|---|---|---|
+| `MAX_PAGE_SIZE` | `100` | Maximum rows per page across all list endpoints |
+| `DEFAULT_PAGE_SIZE` | `50` | Default page size when the caller does not specify a limit |
+| `MAX_BATCH_SIZE` | `100` | Maximum batch size for bulk operations |
+
+**Design note — `clampBatchSize` vs `validateBatchSize`:**
+`clampBatchSize` silently returns 0 on invalid input, which can make failures
+invisible and hard to retry. New code should prefer `validateBatchSize`, which
+throws a descriptive `RangeError` so the caller knows the input was rejected.
+The error message includes the field name and the invalid value, making it safe
+to propagate to user-facing validation responses.
+
+---
+
 ## Migration safety
 
 Migrations are run with a PostgreSQL advisory lock (`pg_advisory_lock`) so that only one
@@ -284,6 +358,21 @@ pnpm db:migrate -- --dry-run
 
 Each new migration file must be registered in
 [`src/db/migrations/meta/_journal.json`](../../src/db/migrations/meta/_journal.json).
+
+### Retry and replay semantics
+
+- **Advisory lock** (`pg_advisory_lock`) serialises concurrent migration attempts.
+  Only one process holds the lock at a time; others queue and wait.
+- **Lock release is guaranteed** via a `try`/`finally` block — even when the
+  migration itself fails, the lock is released so waiting processes can proceed.
+- **CHECK constraints are additive** — adding a new CHECK constraint to an
+  existing column via a migration is safe to replay if the data already
+  satisfies it. The migration runner does not wrap each migration in a
+  transaction, so each `.sql` file should be idempotent (use `IF NOT EXISTS`
+  where appropriate).
+- **Runtime validation** (`assertNonNegative`, `assertValidU256`, etc.) catches
+  constraint violations early so write-path code can be retried without
+  incurring a round-trip to the database.
 
 ### Out-of-scope notes
 
