@@ -81,22 +81,58 @@ const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl 
 
 /** Index into rpcProviders for the last known healthy endpoint. */
 let healthyRpcIndex = 0;
+let cachedFailoverOrder: number[] | undefined;
+let cachedHealthyIndex = -1;
 
 function rpcFailoverOrder(): number[] {
+  if (rpcProviders.length === 1) {
+    return [0];
+  }
+
+  if (healthyRpcIndex === cachedHealthyIndex && cachedFailoverOrder) {
+    return cachedFailoverOrder;
+  }
+
   const order = [healthyRpcIndex];
   for (let i = 0; i < rpcProviders.length; i++) {
     if (i !== healthyRpcIndex) {
       order.push(i);
     }
   }
+  cachedHealthyIndex = healthyRpcIndex;
+  cachedFailoverOrder = order;
   return order;
 }
 
+function isPrimitiveOrImmutable(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  const type = typeof value;
+  return type !== "object" && type !== "function";
+}
+
 function cloneRpcArgs(args: unknown[]): unknown[] {
+  if (args.length === 0) return [];
+
+  let hasMutable = false;
+  for (let i = 0; i < args.length; i++) {
+    if (!isPrimitiveOrImmutable(args[i])) {
+      hasMutable = true;
+      break;
+    }
+  }
+
+  if (!hasMutable) {
+    return [...args];
+  }
+
   return args.map((argument) => cloneRpcValue(argument));
 }
 
 function cloneRpcValue(value: unknown): unknown {
+  if (isPrimitiveOrImmutable(value)) {
+    return value;
+  }
+
   if (Array.isArray(value)) {
     return value.map((item) => cloneRpcValue(item));
   }
@@ -113,7 +149,7 @@ function cloneRpcValue(value: unknown): unknown {
     return new Set(Array.from(value.values(), (entryValue) => cloneRpcValue(entryValue)));
   }
 
-  if (value && typeof value === "object") {
+  if (typeof value === "object") {
     const prototype = Object.getPrototypeOf(value);
     if (prototype === Object.prototype || prototype === null) {
       const clone: Record<string, unknown> = {};
@@ -228,6 +264,8 @@ async function invokeWithFailover(
  * calls for the same cached data share a single in-flight RPC request rather
  * than fanning out N identical calls during a cache miss.
  */
+const methodCache = new Map<string | symbol, (...args: unknown[]) => Promise<unknown>>();
+
 export const provider = new Proxy(rpcProviders[0]!, {
   get(_target, prop, _receiver) {
     if (prop === "then") {
@@ -236,7 +274,12 @@ export const provider = new Proxy(rpcProviders[0]!, {
     const active = rpcProviders[healthyRpcIndex]!;
     const value = Reflect.get(active, prop, active);
     if (typeof value === "function") {
-      return (...args: unknown[]) => invokeWithFailover(prop, args);
+      let cachedFn = methodCache.get(prop);
+      if (!cachedFn) {
+        cachedFn = (...args: unknown[]) => invokeWithFailover(prop, args);
+        methodCache.set(prop, cachedFn);
+      }
+      return cachedFn;
     }
     return value;
   },
@@ -253,6 +296,10 @@ let agreementAbiCache: unknown[] | undefined;
 // the address in the key guarantees a cached instance is never reused for a
 // different address.
 const contractCache = new Map<string, Contract>();
+
+function normalizeAddress(address: string): string {
+  return address.trim().toLowerCase();
+}
 
 /**
  * Returns the escrow contract ABI, parsing the contract-class JSON from disk on
@@ -289,9 +336,11 @@ export function getAgreementAbi(): unknown[] {
 /**
  * Returns a cached escrow Contract for the given address, constructing it once
  * and reusing the same instance on later calls with the same address.
+ * Normalizes address hex casing and whitespace to avoid duplicate instances.
  */
 export function escrowContract(address: string): Contract {
-  const key = `escrow:${address}`;
+  const normalized = normalizeAddress(address);
+  const key = `escrow:${normalized}`;
   let contract = contractCache.get(key);
   if (!contract) {
     contract = new Contract(getEscrowAbi(), address, provider);
@@ -303,9 +352,11 @@ export function escrowContract(address: string): Contract {
 /**
  * Returns a cached agreement Contract for the given address, constructing it
  * once and reusing the same instance on later calls with the same address.
+ * Normalizes address hex casing and whitespace to avoid duplicate instances.
  */
 export function agreementContract(address: string): Contract {
-  const key = `agreement:${address}`;
+  const normalized = normalizeAddress(address);
+  const key = `agreement:${normalized}`;
   let contract = contractCache.get(key);
   if (!contract) {
     contract = new Contract(getAgreementAbi(), address, provider);
@@ -424,4 +475,6 @@ export function clearNetworkCache(): void {
  */
 export function resetRpcFailoverForTests(): void {
   healthyRpcIndex = 0;
+  cachedHealthyIndex = -1;
+  cachedFailoverOrder = undefined;
 }

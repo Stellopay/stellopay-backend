@@ -459,3 +459,29 @@ describe("Starknet Client Telemetry & Metrics", () => {
     expect(getStarknetMetricsSnapshot().counters[STARKNET_METRICS.RPC_REQUESTS]).toBeUndefined();
   });
 });
+
+describe("Performance Optimizations", () => {
+  beforeEach(() => {
+    clearContractCache();
+    resetRpcFailoverForTests();
+  });
+
+  it("normalizes contract addresses to prevent duplicate instance creation", () => {
+    const address1 = " 0x0123AbCd456 ";
+    const address2 = "0x0123abcd456";
+
+    const escrow1 = escrowContract(address1);
+    const escrow2 = escrowContract(address2);
+    expect(escrow1).toBe(escrow2);
+
+    const agreement1 = agreementContract(address1);
+    const agreement2 = agreementContract(address2);
+    expect(agreement1).toBe(agreement2);
+  });
+
+  it("caches proxy method bindings across accesses", () => {
+    const fn1 = provider.getChainId;
+    const fn2 = provider.getChainId;
+    expect(fn1).toBe(fn2);
+  });
+});

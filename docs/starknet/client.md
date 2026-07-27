@@ -162,6 +162,15 @@ Process-local metric counters accessed via `getStarknetMetricsSnapshot()`:
 
 - `resetStarknetMetrics()` — resets counters (used by tests).
 
+## Performance Optimizations
+
+To reduce redundant computation and allocation during high-frequency RPC retries, fee quotes, and chain interactions:
+
+- **Fast-Path Argument Cloning**: Empty argument arrays (`[]`) and primitive value arguments (`string`, `number`, `boolean`, `bigint`, `symbol`, `null`, `undefined`) bypass recursive deep tree traversal, returning immediate shallow copies without garbage collection overhead.
+- **Failover Order Array Caching**: Prevents allocating new index arrays on every RPC invocation when a single provider is configured or when the healthy endpoint index has not changed.
+- **Proxy Method Binding Cache**: Caches method wrappers on the `provider` proxy to avoid creating new function closures on repeated method accesses.
+- **Contract Address Normalization**: Normalizes hex casing and surrounding whitespace in contract addresses before building cache keys, preventing duplicate `Contract` instance creation for equivalent addresses.
+
 ## RPC URLs
 
 Configured via `STARKNET_RPC_URL` environment variable (comma-separated). Defaults in `config.ts`.
