@@ -49,6 +49,9 @@ export const EnvSchema = z
   DB_POOL_MAX: z.coerce.number().int().positive().optional().default(10),
   DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(30_000),
   DB_POOL_CONNECTION_TIMEOUT_MS: z.coerce.number().int().positive().optional().default(5_000),
+  // Retry configuration for initial DB connectivity check
+  DB_CONNECTION_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().optional().default(5),
+  DB_CONNECTION_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().optional().default(500),
 
   // Token addresses (optional, with defaults)
   TOKEN_STRK: z.string().optional(),

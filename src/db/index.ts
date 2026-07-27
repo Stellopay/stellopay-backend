@@ -108,7 +108,22 @@ export async function checkDbHealth(): Promise<boolean> {
   }
 }
 
-const DB_READINESS_POLL_MS = 500;
+export async function waitForDbReadiness(): Promise<void> {
+  const maxAttempts = env.DB_CONNECTION_RETRY_MAX_ATTEMPTS;
+  const baseDelay = env.DB_CONNECTION_RETRY_BASE_DELAY_MS;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const healthy = await checkDbHealth();
+    if (healthy) {
+      return;
+    }
+    if (attempt < maxAttempts) {
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      console.warn(`[db] DB not ready (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error(`[db] Unable to connect to database after ${env.DB_CONNECTION_RETRY_MAX_ATTEMPTS} attempts`);
+}
 
 /**
  * Polls {@link checkDbHealth} until the database accepts a connection.
