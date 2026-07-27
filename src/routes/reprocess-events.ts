@@ -8,7 +8,7 @@ import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
 import { defaults, abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxReceipt, normalizeTransactionHash, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 import fs from "fs";
 import path from "path";
@@ -36,6 +36,23 @@ export const QUARANTINE_PATH = process.env.QUARANTINE_PATH
   : path.resolve(process.cwd(), "quarantine");
 /** In‑memory map tracking retry attempts per normalized transaction hash. */
 const retryCounts = new Map<string, number>();
+
+/**
+ * In-memory retry and quarantine tracking for /status-changes.
+ * Events that fail more than MAX_RETRIES times are quarantined and skipped
+ * on subsequent calls to avoid endless spinning on unparseable events.
+ */
+export const MAX_RETRIES = 3;
+export const statusChangeRetryCounts = new Map<string, number>();
+export const statusChangeQuarantine = new Set<string>();
+
+/**
+ * Reset in‑memory status-change retry and quarantine state. Exported for tests.
+ */
+export function __resetStatusChangeState() {
+  statusChangeRetryCounts.clear();
+  statusChangeQuarantine.clear();
+}
 
 /**
  * Reset in‑memory retry counts. Exported for tests to ensure isolation.
@@ -171,8 +188,7 @@ reprocessEventsRouter.post(
     } finally {
       releaseReprocessLock();
     }
-  }),
-);
+  });
 
 /** POST /reprocess-events/batch */
 reprocessEventsRouter.post(
@@ -242,8 +258,6 @@ reprocessEventsRouter.post(
         },
         results,
       });
-
-      res.json({ summary, results });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
@@ -253,8 +267,7 @@ reprocessEventsRouter.post(
     } finally {
       releaseReprocessLock();
     }
-  }),
-);
+  });
 
 /** POST /reprocess-events/status-changes */
 reprocessEventsRouter.post(
@@ -293,18 +306,30 @@ reprocessEventsRouter.post(
       const processedKeys = new Set<string>();
 
       for (const event of statusChangeEvents) {
+        if (statusChangeQuarantine.has(event.id)) {
+          results.push({ eventId: event.id, status: "quarantined" });
+          continue;
+        }
+
         const dedupKey = `${event.transactionHash}_${event.eventIndex}`;
         if (processedKeys.has(dedupKey)) {
-          logReprocess("info", "status_changes", {
-            eventId: event.id,
-            outcome: "dedup_skipped",
-            dedupKey,
-            elapsed_ms: Date.now() - evtStart,
-          });
           results.push({ eventId: event.id, status: "dedup_skipped" });
           continue;
         }
         processedKeys.add(dedupKey);
+
+        const handleFailure = (status: string, errorMsg?: string) => {
+          const attempts = (statusChangeRetryCounts.get(event.id) || 0) + 1;
+          if (attempts >= MAX_RETRIES) {
+            statusChangeQuarantine.add(event.id);
+            statusChangeRetryCounts.delete(event.id);
+            results.push({ eventId: event.id, status: "quarantined", reason: status, ...(errorMsg ? { error: errorMsg } : {}) });
+          } else {
+            statusChangeRetryCounts.set(event.id, attempts);
+            results.push({ eventId: event.id, status, ...(errorMsg ? { error: errorMsg } : {}) });
+          }
+        };
+
         try {
           const receipt = await provider.getTransactionReceipt(event.transactionHash);
           if (!receipt || !("events" in receipt && receipt.events)) {
@@ -355,6 +380,7 @@ reprocessEventsRouter.post(
           }
           if (eventType !== "AgreementStatusChange") {
             await db.update(schema.agreementEvents).set({ eventType }).where(eq(schema.agreementEvents.id, event.id));
+            statusChangeRetryCounts.delete(event.id);
             updated++;
             results.push({ eventId: event.id, status: "updated", oldType: "AgreementStatusChange", newType: eventType });
           } else {
@@ -376,7 +402,6 @@ reprocessEventsRouter.post(
     } finally {
       releaseReprocessLock();
     }
-  }),
-);
+  });
 
 export default reprocessEventsRouter;

@@ -20,11 +20,10 @@ To prevent race conditions, duplicate notification side effects, or redundant RP
 
 ## Idempotency
 
-All endpoints in this router support request-level idempotency via the `Idempotency-Key` header.
-When this header is provided, the first successful JSON response is cached in memory for 24 hours.
-Replays with the same key and the same request body will immediately return the cached response
-without re-executing the handler (ensuring robust retries). Replays with the same key but a
-different request body will be rejected with `409 Conflict`.
+Request-level idempotency via `Idempotency-Key` is **not currently implemented** on this router.
+Retry safety relies on the in-flight guard (see above) and the database's `ON CONFLICT DO NOTHING`
+in the underlying `processTxReceipt` helper. Clients should wait for a response before retrying;
+a locked endpoint returns `409 Conflict`.
 
 ## `POST /reprocess-events/tx/:tx_hash`
 
@@ -93,3 +92,14 @@ Reprocess all events still tagged `AgreementStatusChange` so their real event na
 
 - **Deterministic order**: matching rows are ordered by `block_number ASC, event_index ASC`.
 - **`hasMore` flag**: `true` whenever the page returned exactly `limit` rows. `false` when fewer than `limit` rows were returned.
+
+### Retry budget and quarantine
+
+Each event gets at most `MAX_RETRIES` (3) attempts per status-changes run. A per-event retry count
+is kept in an in-memory `Map` and incremented on each failure. When the count exceeds
+`MAX_RETRIES`, that event's ID is added to a `Set`-based quarantine. On subsequent runs within the
+same process lifetime, quarantined IDs are skipped at the start of the loop — they are logged as
+`"skipping"` events. A failed event result includes both `status: "error"` and an `error` field.
+
+The quarantine and retry maps are in-memory only (not persisted across restarts) and are reset by
+the `__resetStatusChangeState()` export (used in tests, not intended for production callers).
