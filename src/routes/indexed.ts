@@ -3,12 +3,18 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
-import { defaults } from "../config.js";
-import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
+import { env, defaults } from "../config.js";
+import { normalizeStarknetAddress } from "../utils/address.js";
 import { notFoundResponse } from "./not-found.js";
 import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
-import { env, defaults } from "../config.js";
-import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
+
+const cacheOpts = { maxAgeSeconds: env.INDEXED_CACHE_MAX_AGE_SECONDS };
+
+// Fallback for missing global in validation utility
+if (!(globalThis as any).isPlainObject) {
+  (globalThis as any).isPlainObject = (val: unknown): val is Record<string, unknown> =>
+    !!val && typeof val === "object" && !Array.isArray(val);
+}
 
 /**
  * Source identifier tag returned in indexed route responses.
@@ -56,10 +62,6 @@ const AgreementSchema = z.object({
   createdAt: z.date().or(z.string()),
 }).passthrough();
 
-const PaginatedResponse = (dataSchema: z.ZodTypeAny) => z.object({
-  count: z.number().nonnegative(),
-  source: z.string().optional(),
-}).catchall(z.any());
 
 /**
  * GET /indexed/agreements/:contract_address/user/:user_address
@@ -129,6 +131,9 @@ indexedRouter.get(
       const uniqueAgreements = Array.from(
         new Map(allAgreements.map((a) => [a.id, a])).values(),
       ).slice(0, limit);
+
+      const checkpoint = deriveSyncCheckpoint(uniqueAgreements);
+      res.setHeader("x-indexer-sync-checkpoint", String(checkpoint));
 
       res.json({
         agreements: z.array(AgreementSchema).parse(uniqueAgreements),
@@ -201,7 +206,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
         .orderBy(desc(schema.escrowEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
     ]);
 
-    res.json({
+    const body = {
       agreement: AgreementSchema.parse(agreement[0]),
       events,
       payments,
@@ -209,6 +214,16 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       employees,
       escrowEvents,
     };
+
+    const checkpoint = deriveSyncCheckpoint([
+      agreement[0],
+      ...events,
+      ...payments,
+      ...milestones,
+      ...employees,
+      ...escrowEvents,
+    ]);
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpoint));
 
     applyIndexedCacheHeaders(res, body, cacheOpts);
     res.json(body);
@@ -240,6 +255,9 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
       .offset(offset);
 
     const body = { payments, count: payments.length };
+
+    const checkpoint = deriveSyncCheckpoint(payments);
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpoint));
 
     applyIndexedCacheHeaders(res, body, cacheOpts);
     res.json(body);
@@ -298,6 +316,9 @@ indexedRouter.get(
         balance: balance.toString(),
         events: escrowEvents,
       };
+
+      const checkpoint = deriveSyncCheckpoint(escrowEvents);
+      res.setHeader("x-indexer-sync-checkpoint", String(checkpoint));
 
       applyIndexedCacheHeaders(res, body, cacheOpts);
       res.json(body);

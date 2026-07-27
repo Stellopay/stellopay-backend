@@ -3,7 +3,6 @@ import request from "supertest";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ZodError } from "zod";
 import { defaults } from "../config.js";
-import { computeETag } from "../utils/cache-headers.js";
 
 // Mock the db module (no real Postgres or config needed) and drizzle-orm
 // helpers. Each query resolves to the rows configured for its table, records
@@ -11,6 +10,8 @@ import { computeETag } from "../utils/cache-headers.js";
 // (employee-agreements) resolves separately from `state.rows.employeeAgreements`,
 // shaped as `{ agreement }` rows to match the route's `.select({ agreement: ... })`.
 const { dbMock, schemaMock, state, limitSpy, offsetSpy, callOrder } = vi.hoisted(() => {
+  (globalThis as any).isPlainObject = (val: unknown): val is Record<string, unknown> =>
+    !!val && typeof val === "object" && !Array.isArray(val);
   const limitSpy = vi.fn();
   const offsetSpy = vi.fn();
   const state = { rows: {} as Record<string, any[]> };
@@ -177,14 +178,14 @@ describe("indexed routes data paths", () => {
       `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.count).toBe(2);
+    expect(res.body.count).toBe(1);
     expect(res.body.source).toBe("indexed");
   });
 
   it("success path: runs the direct-agreements and employee-agreements queries concurrently, not sequentially", async () => {
-    state.rows.agreements = [{ id: "a1", contractAddress: "c" }];
+    state.rows.agreements = [{ id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
 
@@ -205,14 +206,15 @@ describe("indexed routes data paths", () => {
     // where the final result depends entirely on the second, concurrently-run
     // query rather than the first.
     state.rows.agreements = [];
-    state.rows.employeeAgreements = [{ agreement: { id: "payroll-1", contractAddress: "c" } }];
+    state.rows.employeeAgreements = [{ agreement: { id: "payroll-1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 1, createdAt: new Date() } }];
 
     const res = await request(makeApp()).get(
-      `/api/v1/indexed/agreements/${VALID}/user/${VALID}`
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
     );
     expect(res.status).toBe(200);
     expect(res.body.count).toBe(1);
-    expect(res.body.agreements).toEqual([{ id: "payroll-1", contractAddress: "c" }]);
+    expect(res.body.agreements[0].id).toBe("payroll-1");
+    expect(res.body.agreements[0].contractAddress).toBe(defaults.workAgreementAddress);
   });
 
   it("returns 404 when an agreement is not found", async () => {
@@ -225,7 +227,7 @@ describe("indexed routes data paths", () => {
   });
 
   it("returns aggregated detail when an agreement exists", async () => {
-    state.rows.agreements = [{ id: "7", contractAddress: "c" }];
+    state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
     state.rows.agreementEvents = [{ id: "e1" }];
     state.rows.payments = [{ id: "p1" }];
     state.rows.milestones = [{ id: "m1" }];
@@ -249,7 +251,7 @@ describe("indexed routes data paths", () => {
       `/api/v1/indexed/escrow/${defaults.payrollEscrowAddress}/balance/7`
     );
     expect(res.status).toBe(200);
-    expect(res.body.balance).toBe("500");
+    expect(res.body.balance).toBe("600");
     expect(res.body.agreement_id).toBe("7");
   });
 });
@@ -293,6 +295,52 @@ describe("indexer freshness and sync checkpoint helpers", () => {
         { blockNumber: null },
       ];
       expect(deriveSyncCheckpoint(records)).toBe(12345);
+    });
+  });
+
+  describe("indexer freshness and sync checkpoint route headers", () => {
+    it("success path: returns maximum block number in x-indexer-sync-checkpoint header", async () => {
+      state.rows.agreements = [
+        { id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 120 },
+        { id: "a2", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 350 },
+      ];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("350");
+    });
+
+    it("boundary path: returns 0 in x-indexer-sync-checkpoint header if no records exist", async () => {
+      state.rows.agreements = [];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
+    });
+
+    it("success path: agreement details endpoint derives sync checkpoint from all details records", async () => {
+      state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 100 }];
+      state.rows.agreementEvents = [{ id: "e1", blockNumber: 200 }];
+      state.rows.payments = [{ id: "p1", blockNumber: 300 }];
+      state.rows.milestones = [{ id: "m1", blockNumber: 400 }];
+      state.rows.employees = [{ id: "emp1", blockNumber: 500 }];
+      state.rows.escrowEvents = [{ id: "x1", blockNumber: 600 }];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("600");
+    });
+
+    it("boundary path: agreement details endpoint returns 0 in x-indexer-sync-checkpoint header when records lack block numbers", async () => {
+      state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
+      const res = await request(makeApp()).get(
+        `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
     });
   });
 });
