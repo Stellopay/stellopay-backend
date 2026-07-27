@@ -108,6 +108,8 @@ function sweepExpiredChallenges(now: number): void {
       challenges.delete(key);
     }
   }
+
+  sweepOffset = end >= entries.length ? 0 : end;
 }
 
 /** Emits one structured metric line. `console.info` carries the request id. */
@@ -173,7 +175,7 @@ export function createChallenge(address: unknown): { nonce: string; expires_in_m
 
   if (challenges.size >= MAX_CHALLENGES) {
     // Last resort before refusing: reclaim whatever has already expired.
-    sweepExpiredChallenges(now);
+    sweepExpiredChallenges(now, true);
     if (challenges.size >= MAX_CHALLENGES) {
       logChallengeMetric("challenge_rejected", { reason: "store_full", size: challenges.size });
       throw new Error("createChallenge: challenge store is full");
@@ -289,6 +291,7 @@ export function buildTypedChallenge(address: unknown, chainId: unknown, nonce: u
 export function clearChallengesForTesting(): void {
   challenges.clear();
   creationsSinceSweep = 0;
+  sweepOffset = 0;
 }
 
 /**
