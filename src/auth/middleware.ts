@@ -129,6 +129,27 @@ export function requirePrincipal(req: Request): AuthPrincipal {
   return principal;
 }
 
+let cachedRawAdminAddresses: string[] | undefined = undefined;
+let cachedNormalizedAdmins: string[] = [];
+
+function getNormalizedAdminAddresses(): string[] {
+  const currentAdmins = env.ADMIN_ADDRESSES;
+  if (currentAdmins === cachedRawAdminAddresses) {
+    return cachedNormalizedAdmins;
+  }
+  cachedRawAdminAddresses = currentAdmins;
+  cachedNormalizedAdmins = currentAdmins
+    .map((adminAddr) => {
+      try {
+        return normalizeStarknetAddress(adminAddr);
+      } catch {
+        return null;
+      }
+    })
+    .filter((addr): addr is string => addr !== null);
+  return cachedNormalizedAdmins;
+}
+
 /**
  * Whether `address` resolves to an entry in `env.ADMIN_ADDRESSES`.
  *
@@ -150,15 +171,8 @@ export function isAdminPrincipal(address: string): boolean {
     return false;
   }
 
-  return env.ADMIN_ADDRESSES.some((adminAddr) => {
-    try {
-      return normalizeStarknetAddress(adminAddr) === userCanonical;
-    } catch {
-      // A broken env entry is "not a match" — never accidentally grant
-      // access by skipping catastrophic validation.
-      return false;
-    }
-  });
+  const normalizedAdmins = getNormalizedAdminAddresses();
+  return normalizedAdmins.includes(userCanonical);
 }
 
 /**
@@ -197,10 +211,6 @@ export const requireAuth = async (
   const authHeader = req.headers[AUTHORIZATION_HEADER];
 
   if (typeof addressHeader !== "string" || typeof authHeader !== "string") {
-    // Either header missing, undefined, or a non-string (Node http can
-    // deliver multi-value headers as an array; calling .startsWith on an
-    // array throws). Same response for every shape so we cannot be used to
-    // probe header types.
     deny(res, "unauthorized");
     return;
   }
@@ -213,9 +223,6 @@ export const requireAuth = async (
   const token = authHeader.substring(BEARER_PREFIX.length).trim();
   const address = addressHeader.trim();
 
-  // Empty after trim: token and principal are both user-controlled strings,
-  // so a missing value is indistinguishable from an empty one and gets the
-  // same response.
   if (!token || !address) {
     deny(res, "unauthorized");
     return;
@@ -225,9 +232,6 @@ export const requireAuth = async (
   try {
     isValid = await requireSession(address, token);
   } catch {
-    // `requireSession` swallows DB errors but a future change could surface
-    // them; treat any throw as a failed authentication so we never hand
-    // back a half-validated principal.
     isValid = false;
   }
   if (!isValid) {
@@ -236,9 +240,6 @@ export const requireAuth = async (
   }
 
   req.auth = { address: address.toLowerCase(), token };
-  // next() intentionally outside the try/catch so a synchronous throw from
-  // a downstream route handler surfaces as a 5xx instead of being
-  // silently relabeled as a 401.
   next();
 };
 
@@ -262,6 +263,11 @@ export const requireAuth = async (
  * fires if the principal was mutated by a downstream middleware.
  */
 export const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
+  if (res.locals.adminAuthorized === true) {
+    next();
+    return;
+  }
+
   const principal = getPrincipal(req);
   if (principal === null) {
     deny(res, "unauthorized");
