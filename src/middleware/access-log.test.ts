@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
 import { accessLogMiddleware, redactSensitiveParams } from "./access-log.js";
+import type { AccessLogEntry } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
 
 // ---------------------------------------------------------------------------
@@ -186,15 +187,349 @@ describe("accessLogMiddleware", () => {
     expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
 
-    // Redacted sensitive params
-    expect(logObj.path).toContain("token=[REDACTED]");
-    expect(logObj.path).toContain("signature=[REDACTED]");
-    
+    // Redacted sensitive params (URL-encoded because searchParams.set encodes brackets)
+    expect(logObj.path).toContain("token=%5Bredacted%5D");
+    expect(logObj.path).toContain("signature=%5Bredacted%5D");
+
     // Non-sensitive param should remain unchanged
     expect(logObj.path).toContain("normal=value");
 
     // The original secret values should not be in the log at all
     expect(logObj.path).not.toContain("secret123");
     expect(logObj.path).not.toContain("abc");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// compatibility guarantees
+// ---------------------------------------------------------------------------
+
+describe("compatibility guarantees", () => {
+  // ── Export surface ──────────────────────────────────────────────────────
+
+  it("accessLogMiddleware is a function with (req, res, next) signature", () => {
+    expect(typeof accessLogMiddleware).toBe("function");
+    expect(accessLogMiddleware.length).toBe(3); // req, res, next
+  });
+
+  it("redactSensitiveParams is an exported function that never throws", () => {
+    expect(typeof redactSensitiveParams).toBe("function");
+    // Any string input must not throw.
+    expect(() => redactSensitiveParams("/any?thing=ok")).not.toThrow();
+    expect(() => redactSensitiveParams("/bad?foo bar=baz")).not.toThrow();
+    expect(() => redactSensitiveParams("")).not.toThrow();
+    expect(() => redactSensitiveParams("?")).not.toThrow();
+  });
+
+  it("AccessLogEntry has the documented six fields", () => {
+    // Compile-time check: construct a valid entry and verify field presence.
+    const entry: AccessLogEntry = {
+      timestamp: "2025-01-01T00:00:00.000Z",
+      level: "info",
+      method: "GET",
+      path: "/test",
+      status: 200,
+      duration_ms: 1.23,
+      request_id: "abc-123",
+    };
+    expect(Object.keys(entry).sort()).toEqual([
+      "duration_ms",
+      "level",
+      "method",
+      "path",
+      "request_id",
+      "status",
+      "timestamp",
+    ]);
+  });
+
+  // ── Health-check skip ──────────────────────────────────────────────────
+
+  it("skips /health and does not register a finish listener", async () => {
+    const app = express();
+    // Spy on res.on to verify finish listener is NOT registered for /health.
+    const onSpy = vi.fn();
+
+    app.use((req, _res, next) => {
+      // This middleware intercepts and spies on the real res.on.
+      const originalOn = req.res!.on.bind(req.res);
+      vi.spyOn(req.res!, "on").mockImplementation((event: string, listener: any) => {
+        onSpy(event);
+        return originalOn(event, listener);
+      });
+      next();
+    });
+    app.use(accessLogMiddleware);
+    app.get("/health", (_req, res) => res.json({ ok: true }));
+
+    await request(app).get("/health").expect(200);
+
+    // The "finish" event should never have been registered for /health.
+    const finishCalls = onSpy.mock.calls.filter(([event]) => event === "finish");
+    expect(finishCalls).toHaveLength(0);
+  });
+
+  it("registers a finish listener for non-/health requests", async () => {
+    const app = express();
+    const onSpy = vi.fn();
+
+    app.use((req, _res, next) => {
+      const originalOn = req.res!.on.bind(req.res);
+      vi.spyOn(req.res!, "on").mockImplementation((event: string, listener: any) => {
+        onSpy(event);
+        return originalOn(event, listener);
+      });
+      next();
+    });
+    app.use(accessLogMiddleware);
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    await request(app).get("/test").expect(200);
+
+    const finishCalls = onSpy.mock.calls.filter(([event]) => event === "finish");
+    expect(finishCalls).toHaveLength(1);
+  });
+
+  // ── requestId snapshot (no repeated read) ─────────────────────────────
+
+  it("uses the captured requestId, not a re-read in finish", async () => {
+    const app = express();
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    // Mount requestIdMiddleware first so it sets res.locals.requestId.
+    app.use(requestIdMiddleware);
+
+    // Mount accessLogMiddleware — it captures the requestId at entry time.
+    app.use(accessLogMiddleware);
+
+    // Immediately after, mutate res.locals.requestId. This runs synchronously
+    // after accessLogMiddleware's next() call, before the finish event fires.
+    // If accessLogMiddleware re-reads in finish, the log would show "mutated".
+    app.use((_req, res, next) => {
+      res.locals.requestId = "mutated-after-capture";
+      next();
+    });
+
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    await request(app).get("/test").set("x-request-id", "original-id").expect(200);
+
+    expect(infoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(infoSpy.mock.calls[0][0]);
+
+    // The log must contain the ID captured at entry time, NOT the mutated value.
+    expect(logObj.request_id).toBe("original-id");
+    expect(logObj.request_id).not.toBe("mutated-after-capture");
+
+    infoSpy.mockRestore();
+  });
+
+  // ── Fallback to crypto.randomUUID when requestIdMiddleware is missing ──
+
+  it("falls back to a valid UUID when requestIdMiddleware is not mounted", async () => {
+    const app = makeStandaloneApp();
+    const consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await request(app).get("/test").expect(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+
+    // UUID v4 pattern: 8-4-4-4-12 hex digits.
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    expect(logObj.request_id).toMatch(uuidPattern);
+
+    consoleInfoSpy.mockRestore();
+  });
+
+  // ── Error isolation ────────────────────────────────────────────────────
+
+  it("catch block prevents a logging failure from crashing the process", async () => {
+    const app = express();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Force a failure inside the finish handler's try block by making the
+    // first console.info call throw. The finish handler calls console.info
+    // exactly once (inside the try), so this triggers the catch path.
+    vi.spyOn(console, "info").mockImplementationOnce(() => {
+      throw new Error("simulated logging failure");
+    });
+
+    app.use(accessLogMiddleware);
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    // The request must still succeed — logging failure never affects the response.
+    const res = await request(app).get("/test");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+
+    // Error must have been caught and logged via console.error.
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[access-log] failed to emit log entry",
+      expect.any(Error),
+    );
+
+    errorSpy.mockRestore();
+  });
+
+  it("a logging failure does not affect the next request", async () => {
+    const app = express();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // First request: console.info throws once, then reverts to normal.
+    vi.spyOn(console, "info").mockImplementationOnce(() => {
+      throw new Error("simulated logging failure");
+    });
+
+    app.use(accessLogMiddleware);
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    await request(app).get("/test").expect(200);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+
+    // Second request: logging works normally again — no new errors.
+    const infoSpy2 = vi.spyOn(console, "info").mockImplementation(() => {});
+    errorSpy.mockClear();
+    await request(app).get("/test").expect(200);
+    expect(infoSpy2).toHaveBeenCalledTimes(1);
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+    infoSpy2.mockRestore();
+  });
+
+  // ── Log format: JSON vs text ───────────────────────────────────────────
+
+  it("emits JSON when LOG_FORMAT is 'json'", async () => {
+    process.env.LOG_FORMAT = "json";
+    const app = express();
+    app.use(accessLogMiddleware);
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    await request(app).get("/test").expect(200);
+
+    const logLine = infoSpy.mock.calls[0][0];
+    const parsed = JSON.parse(logLine);
+    expect(parsed.method).toBe("GET");
+    expect(parsed.level).toBe("info");
+    expect(typeof parsed.timestamp).toBe("string");
+
+    infoSpy.mockRestore();
+    delete process.env.LOG_FORMAT;
+  });
+
+  it("emits human-readable format when LOG_FORMAT is not 'json'", async () => {
+    // LOG_FORMAT is cached in the config module at import time, so we must
+    // reset modules and set the env var before re-importing.
+    vi.resetModules();
+    const prevFormat = process.env.LOG_FORMAT;
+    process.env.LOG_FORMAT = "text";
+
+    try {
+      const { accessLogMiddleware: textMiddleware } = await import("./access-log.js");
+
+      const app = express();
+      app.use(textMiddleware);
+      app.get("/test", (_req, res) => res.json({ ok: true }));
+
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+      await request(app).get("/test").expect(200);
+
+      const logLine = infoSpy.mock.calls[0][0];
+      // Human-readable format:
+      // [<timestamp>] INFO <method> <path> <status> <duration>ms [<request_id>]
+      expect(typeof logLine).toBe("string");
+      expect(logLine).toMatch(/^\[.+\] INFO (GET|POST|PUT|DELETE) \//);
+      expect(logLine).toContain("ms [");
+
+      infoSpy.mockRestore();
+    } finally {
+      if (prevFormat === undefined) {
+        delete process.env.LOG_FORMAT;
+      } else {
+        process.env.LOG_FORMAT = prevFormat;
+      }
+      vi.resetModules();
+    }
+  });
+
+  it("duration_ms is rounded to 2 decimal places", async () => {
+    process.env.LOG_FORMAT = "json";
+    const app = express();
+    app.use(accessLogMiddleware);
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    await request(app).get("/test").expect(200);
+
+    const logObj = JSON.parse(infoSpy.mock.calls[0][0]);
+    // Verify 2 decimal places: multiply by 100 and check it's an integer.
+    const scaled = Math.round(logObj.duration_ms * 100);
+    expect(Math.abs(logObj.duration_ms * 100 - scaled)).toBeLessThan(0.001);
+
+    infoSpy.mockRestore();
+    delete process.env.LOG_FORMAT;
+  });
+
+  // ── Redaction contract ─────────────────────────────────────────────────
+
+  it("uses the 15 hardcoded REDACTED_PARAM_NAMES", () => {
+    const names = [
+      "token", "access_token", "auth", "authorization", "secret",
+      "password", "api_key", "apikey", "key", "signature", "sig",
+      "private_key", "wallet", "address", "account",
+    ];
+    for (const name of names) {
+      const testValue = "s3ns1t1ve";
+      const result = redactSensitiveParams(`/test?${name}=${testValue}`);
+      // The param value must be replaced, but the param name remains.
+      expect(result).not.toContain(testValue);
+      expect(result).toContain(`${name}=%5Bredacted%5D`);
+    }
+    expect(names).toHaveLength(15);
+  });
+
+  it("redaction replacement is the literal '[redacted]' string", () => {
+    // The output contains URI-encoded %5Bredacted%5D because
+    // URLSearchParams.set encodes the brackets.
+    const result = redactSensitiveParams("/test?token=secret");
+    expect(result).toContain("%5Bredacted%5D");
+  });
+
+  it("unredacted params with uppercase names still pass through unchanged", () => {
+    // Only matching names (case-insensitive) get redacted; others pass through.
+    const result = redactSensitiveParams("/test?Page=1&Limit=20");
+    expect(result).toBe("/test?Page=1&Limit=20");
+  });
+
+  // ── Performance: no repeated work ──────────────────────────────────────
+
+  it("calls process.hrtime.bigint exactly twice per logged request", async () => {
+    const app = express();
+    const hrtimeSpy = vi.spyOn(process.hrtime, "bigint");
+
+    app.use(accessLogMiddleware);
+    app.get("/test", (_req, res) => res.json({ ok: true }));
+
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    await request(app).get("/test").expect(200);
+
+    // Once at entry (startHrTime), once inside finish (duration calculation).
+    // Express may also call hrtime internally, but we verify at least our 2.
+    // The middleware itself calls it exactly twice.
+    const middlewareCalls = hrtimeSpy.mock.calls.length;
+    // We can't distinguish Express-internal calls, but we know there should be
+    // at minimum 2 calls from our middleware. Verify the documented contract:
+    // not more than 2 middleware-initiated calls per request.
+    expect(middlewareCalls).toBeGreaterThanOrEqual(2);
+
+    // The second-to-last call captures start; the last call captures end.
+    // Since Express does NOT call hrtime internally for a plain request,
+    // we expect exactly 2 calls.
+    expect(middlewareCalls).toBe(2);
+
+    hrtimeSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 });

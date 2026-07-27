@@ -6,34 +6,6 @@ import { env } from "../config.js";
 // PII / sensitive query-param redaction
 // ---------------------------------------------------------------------------
 
-/**
- * Redact sensitive query parameters from a URL string or path.
- */
-function redactQueryParams(originalPath: string): string {
-  try {
-    // URL requires a base, dummy one is fine for parsing relative paths
-    const url = new URL(originalPath, "http://localhost");
-    let redacted = false;
-    for (const [key, value] of url.searchParams.entries()) {
-      if (env.LOG_REDACT_QUERY_PARAMS.includes(key.toLowerCase()) && value) {
-        url.searchParams.set(key, "[REDACTED]");
-        redacted = true;
-      }
-    }
-    return redacted ? url.pathname + url.search : originalPath;
-  } catch {
-    return originalPath;
-  }
-}
-
-/**
- * Structured access log middleware.
- * Records method, path, status code, and duration of requests.
- * Explicitly skips bodies and auth tokens for security.
- *
- * Reads `res.locals.requestId` set by {@link requestIdMiddleware}, which must
- * be mounted before this middleware.
- */
 const REDACTED_PARAM_NAMES = new Set([
   "token",
   "access_token",
@@ -143,9 +115,10 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
     return next();
   }
 
-  // Snapshot the correlation ID now.
-  // Falls back to a fresh UUID when requestIdMiddleware is not mounted.
-  const snapshotId: string =
+  // Snapshot the correlation ID now. Falls back to a fresh UUID when
+  // requestIdMiddleware is not mounted — this is the only place we read it,
+  // avoiding a redundant re-check inside the finish handler.
+  const requestId: string =
     typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
       ? res.locals.requestId
       : crypto.randomUUID();
@@ -155,13 +128,6 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
   res.on("finish", () => {
     try {
       const durationMs = Number(process.hrtime.bigint() - startHrTime) / 1_000_000;
-
-      // Prefer the live value (requestIdMiddleware may have run after us),
-      // but keep the snapshot as the guaranteed-valid fallback.
-      const requestId: string =
-        typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
-          ? res.locals.requestId
-          : snapshotId;
 
       const entry: AccessLogEntry = {
         timestamp: new Date().toISOString(),
@@ -186,31 +152,6 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
       // A logging failure must never affect the caller.
       // eslint-disable-next-line no-console
       console.error("[access-log] failed to emit log entry", err);
-    const endHrTime = process.hrtime.bigint();
-    const durationMs = Number(endHrTime - startHrTime) / 1_000_000;
-
-    const logEntry = {
-      timestamp: new Date().toISOString(),
-      level: "info",
-      method: req.method,
-      path: redactQueryParams(req.originalUrl || req.path),
-      status: res.statusCode,
-      duration_ms: Math.round(durationMs * 100) / 100,
-      request_id: res.locals.requestId ?? requestId,
-    };
-
-    if (env.LOG_FORMAT === "json") {
-      // The global logger override will handle JSON formatting and injecting request_id
-      // eslint-disable-next-line no-console
-      console.info({
-        method: logEntry.method,
-        path: logEntry.path,
-        status: logEntry.status,
-        duration_ms: logEntry.duration_ms,
-      });
-    } else {
-      // eslint-disable-next-line no-console
-      console.info(`${logEntry.method} ${logEntry.path} ${logEntry.status} ${logEntry.duration_ms}ms`);
     }
   });
 
