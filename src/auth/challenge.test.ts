@@ -495,3 +495,281 @@ describe("consumeChallenge", () => {
     expect(challenges.size).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Compatibility guarantees
+//
+// Each case pins a promise made in docs/auth/challenge.md that an existing
+// caller already depends on. Breaking one of these is a breaking change for
+// src/routes/auth.ts and any dashboard or alert that consumes the metrics.
+// ---------------------------------------------------------------------------
+
+describe("compatibility guarantees", () => {
+  // --- Export surface ----------------------------------------------------
+
+  it("createChallenge returns exactly { nonce, expires_in_ms } keys", () => {
+    const result = createChallenge("0xabc");
+    expect(Object.keys(result).sort()).toEqual(["expires_in_ms", "nonce"]);
+  });
+
+  it("createChallenge nonce is 0x + 32 lower-case hex characters", () => {
+    const { nonce } = createChallenge("0xabc");
+    expect(nonce).toMatch(/^0x[0-9a-f]{32}$/);
+    // Lowercase only — the wire format the wallet signs must be stable.
+    expect(nonce).toBe(nonce.toLowerCase());
+  });
+
+  it("consumeChallenge atomically deletes (the replay-race guarantee for /auth/verify)", () => {
+    createChallenge("0xface");
+    const first = consumeChallenge("0xface");
+    const second = consumeChallenge("0xface");
+
+    // /auth/verify depends on this: two concurrent calls must never both
+    // see the same nonce. Only the first may return a record.
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
+    expect(getChallenge("0xface")).toBeNull();
+  });
+
+  it("getChallenge is read-only — never deletes a valid entry", () => {
+    const { nonce } = createChallenge("0xbeef");
+
+    const rec = getChallenge("0xbeef");
+    expect(rec?.nonce).toBe(nonce);
+
+    // The entry must still be present after a read-only access.
+    expect(getChallenge("0xbeef")).not.toBeNull();
+    expect(challenges.has(canonical("beef"))).toBe(true);
+  });
+
+  it("clearChallenge is a no-op when there is nothing to delete (no metric)", () => {
+    infoSpy.mockClear();
+    clearChallenge("0xbeef");
+    expect(metricNames()).toEqual([]);
+  });
+
+  it("buildTypedChallenge normalizes the wallet field to the canonical address", () => {
+    // /auth/challenge and /auth/verify both call this; the wallet must
+    // sign the same bytes regardless of how the caller cased/padded.
+    const td = buildTypedChallenge("0xAABB", CHAIN_ID_SEPOLIA, "0xnonce");
+    expect((td.message as Record<string, unknown>).wallet).toBe(canonical("aabb"));
+  });
+
+  // --- Constants ---------------------------------------------------------
+
+  it("CHALLENGE_TTL_MS is exactly 5 minutes", () => {
+    expect(CHALLENGE_TTL_MS).toBe(5 * 60 * 1000);
+  });
+
+  it("MAX_CHALLENGES is exactly 100_000", () => {
+    expect(MAX_CHALLENGES).toBe(100_000);
+  });
+
+  // --- Expiry contract ---------------------------------------------------
+
+  it("expiry is now > expiresAtMs (strictly greater — exact instant is valid)", () => {
+    createChallenge("0xabcd");
+
+    // Advance to the exact expiry instant.
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS);
+    expect(getChallenge("0xabcd")).not.toBeNull();
+
+    // One ms past: expired.
+    vi.advanceTimersByTime(1);
+    expect(getChallenge("0xabcd")).toBeNull();
+  });
+
+  it("retry never extends the TTL — returns the remaining, not the full", () => {
+    createChallenge("0xcafe");
+    vi.advanceTimersByTime(30_000);
+
+    const replayed = createChallenge("0xcafe");
+    expect(replayed.expires_in_ms).toBe(CHALLENGE_TTL_MS - 30_000);
+    expect(replayed.expires_in_ms).toBeLessThan(CHALLENGE_TTL_MS);
+  });
+
+  it("retry never overwrites the nonce (in-flight /auth/verify is safe)", () => {
+    const first = createChallenge("0xdec0de");
+    const second = createChallenge("0xdec0de");
+    expect(second.nonce).toBe(first.nonce);
+  });
+
+  // --- Address keying ----------------------------------------------------
+
+  it("keys by canonical address — casing and padding variants are the same slot", () => {
+    createChallenge("0xAABB");
+    expect(getChallenge("0xaabb")).not.toBeNull();
+    expect(getChallenge(canonical("aabb"))).not.toBeNull();
+    expect(challenges.size).toBe(1);
+  });
+
+  it("createChallenge throws on a malformed address (caller asked to store unusable data)", () => {
+    expect(() => createChallenge("not-a-real-address")).toThrow();
+  });
+
+  it("getChallenge tolerates malformed addresses — returns null, no throw", () => {
+    expect(getChallenge("not-a-real-address")).toBeNull();
+  });
+
+  it("clearChallenge tolerates malformed addresses — no-op, no throw", () => {
+    expect(() => clearChallenge("not-a-real-address")).not.toThrow();
+  });
+
+  it("consumeChallenge tolerates malformed addresses — returns null, no throw", () => {
+    expect(consumeChallenge("not-a-real-address")).toBeNull();
+  });
+
+  it("buildTypedChallenge throws on a malformed address (must never sign unusable payload)", () => {
+    expect(() => buildTypedChallenge("not-a-real-address", CHAIN_ID_SEPOLIA, "0xnonce")).toThrow();
+  });
+
+  // --- Metrics contract --------------------------------------------------
+
+  it("every state transition emits exactly one metric line on console.info", () => {
+    infoSpy.mockClear();
+    createChallenge("0xabc1");
+    expect(metricNames()).toEqual(["challenge_created"]);
+
+    infoSpy.mockClear();
+    getChallenge("0xabc2");
+    // getChallenge miss emits challenge_miss.
+    expect(metricNames()).toEqual(["challenge_miss"]);
+
+    infoSpy.mockClear();
+    getChallenge("0xabc1");
+    // getChallenge hit emits nothing (read-only, no state transition).
+    expect(metricNames()).toEqual([]);
+
+    infoSpy.mockClear();
+    clearChallenge("0xabc1");
+    expect(metricNames()).toEqual(["challenge_cleared"]);
+
+    infoSpy.mockClear();
+    clearChallenge("0xabc1");
+    // clearChallenge no-op emits nothing.
+    expect(metricNames()).toEqual([]);
+  });
+
+  it("the seven metric names are stable", () => {
+    // Trigger every metric name exactly once.
+    // 1. challenge_created
+    createChallenge("0xabc0");
+    // 2. challenge_replayed
+    createChallenge("0xabc0");
+    // 3. challenge_miss (not_found)
+    getChallenge("0xabc1");
+    // 4. challenge_miss (invalid_address — same metric name, different reason)
+    getChallenge("not-a-real-address");
+    // 5. challenge_expired
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+    getChallenge("0xabc0");
+    // 6. challenge_cleared — must happen on a live entry (the one above was
+    //    already evicted by the expired read, so create a fresh one).
+    createChallenge("0xabc2");
+    clearChallenge("0xabc2");
+    // 7. challenge_consumed
+    createChallenge("0xabc3");
+    consumeChallenge("0xabc3");
+    // 8. challenge_rejected — fill the store then refuse a fresh address.
+    for (let i = 0; i < MAX_CHALLENGES; i++) {
+      challenges.set(canonical(i.toString(16)), {
+        nonce: `0x${i.toString(16).padStart(32, "0")}`,
+        expiresAtMs: Date.now() + CHALLENGE_TTL_MS,
+      });
+    }
+    try {
+      createChallenge("0xfffff");
+    } catch {
+      // Expected — store is full.
+    }
+
+    const seen = new Set(metrics().map((m) => m.metric));
+
+    // Operators and dashboards depend on these seven names.
+    expect([...seen].sort()).toEqual([
+      "challenge_cleared",
+      "challenge_consumed",
+      "challenge_created",
+      "challenge_expired",
+      "challenge_miss",
+      "challenge_rejected",
+      "challenge_replayed",
+    ]);
+  });
+
+  it("every metric carries a timestamp", () => {
+    createChallenge("0xabc1");
+    getChallenge("0xabc2");
+
+    for (const m of metrics()) {
+      expect(m.timestamp).toEqual(expect.any(String));
+    }
+  });
+
+  it("metric address field is the canonical key, never a raw caller-supplied string", () => {
+    createChallenge("0xABC");
+
+    const created = metrics().find((m) => m.metric === "challenge_created");
+    expect(created?.address).toBe(canonical("abc"));
+    expect(created?.address).not.toBe("0xABC");
+  });
+
+  // --- Store lifecycle ---------------------------------------------------
+
+  it("entries leave the store only via consume, lazy eviction, or sweep (no background timer)", () => {
+    // Create a challenge and verify it stays in the map indefinitely unless
+    // removed by one of the three documented mechanisms.
+    createChallenge("0xabc0");
+    const key = canonical("abc0");
+
+    // Still present after well under TTL.
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS - 1);
+    expect(challenges.has(key)).toBe(true);
+
+    // Consumed: gone.
+    createChallenge("0xabc0");
+    consumeChallenge("0xabc0");
+    expect(challenges.has(key)).toBe(false);
+  });
+
+  it("a full store still replays an existing challenge (never breaks in-flight login)", () => {
+    const { nonce } = createChallenge("0xfffff");
+
+    // Fill to cap.
+    for (let i = 0; i < MAX_CHALLENGES; i++) {
+      challenges.set(canonical(i.toString(16)), {
+        nonce: `0x${i.toString(16).padStart(32, "0")}`,
+        expiresAtMs: Date.now() + CHALLENGE_TTL_MS,
+      });
+    }
+
+    expect(createChallenge("0xfffff").nonce).toBe(nonce);
+  });
+
+  it("the store is in-memory (challenges is a plain Map)", () => {
+    expect(challenges).toBeInstanceOf(Map);
+    // Production code outside this module must go through the functions;
+    // tests may read the Map directly to drive the size cap.
+  });
+
+  // --- Test helpers ------------------------------------------------------
+
+  it("clearChallengesForTesting resets the store and sweep counter", () => {
+    createChallenge("0xabc0");
+    expect(challenges.size).toBeGreaterThan(0);
+
+    clearChallengesForTesting();
+    expect(challenges.size).toBe(0);
+    // A fresh create works after reset.
+    expect(() => createChallenge("0xabc0")).not.toThrow();
+  });
+
+  it("clearChainIdCacheForTesting resets the chain-ID cache", () => {
+    buildTypedChallenge("0x1", CHAIN_ID_SEPOLIA, "0xnonce");
+    expect(shortString.decodeShortString).toHaveBeenCalledTimes(1);
+
+    clearChainIdCacheForTesting();
+    buildTypedChallenge("0x1", CHAIN_ID_SEPOLIA, "0xnonce");
+    expect(shortString.decodeShortString).toHaveBeenCalledTimes(2);
+  });
+});

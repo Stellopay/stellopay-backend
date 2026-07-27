@@ -94,19 +94,6 @@ export const MAX_CHALLENGES = 100_000;
  */
 export const challenges = new Map<string, ChallengeRecord>();
 
-/** Decodes a Starknet chain-ID felt into a human-readable label (e.g. "SN_SEPOLIA"). */
-function getChainIdLabel(chainId: string): string {
-  const cached = chainIdCache.get(chainId);
-  if (cached) return cached;
-  try {
-    const label = shortString.decodeShortString(chainId);
-    chainIdCache.set(chainId, label);
-    return label;
-  } catch {
-    return chainId;
-  }
-}
-
 /**
  * Number of `createChallenge` calls between opportunistic sweeps of expired
  * entries.
