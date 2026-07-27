@@ -224,10 +224,11 @@ export const requireAuth = async (
   let isValid: boolean;
   try {
     isValid = await requireSession(address, token);
-  } catch {
+  } catch (err) {
     // `requireSession` swallows DB errors but a future change could surface
     // them; treat any throw as a failed authentication so we never hand
     // back a half-validated principal.
+    console.warn("[auth] requireSession threw — treating as failed auth", err);
     isValid = false;
   }
   if (!isValid) {
@@ -262,6 +263,11 @@ export const requireAuth = async (
  * fires if the principal was mutated by a downstream middleware.
  */
 export const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
+  if (res.locals.adminAuthorized) {
+    next();
+    return;
+  }
+
   const principal = getPrincipal(req);
   if (principal === null) {
     deny(res, "unauthorized");
