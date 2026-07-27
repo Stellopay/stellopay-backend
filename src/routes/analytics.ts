@@ -254,13 +254,16 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         ),
     ]);
 
-    // Aggregate by month
+    // -----------------------------------------------------------------------
+    // Aggregation — all arithmetic is in BigInt space so u256 amounts never
+    // overflow or lose precision before the final formatTokenAmount call.
+    // -----------------------------------------------------------------------
     const monthlyData: Record<number, bigint> = {};
     for (let i = 1; i <= 12; i++) {
       monthlyData[i] = 0n;
     }
 
-    // Sum payment amounts (received payments are positive, sent are negative)
+    // Payments: always positive (net inflow from the user's perspective).
     payments.forEach((p) => {
       const month = Number(p.month);
       if (!isValidMonth(month)) return;
@@ -273,7 +276,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       }
     });
 
-    // Add escrow events (funding is negative, releases/refunds are positive)
+    // Escrow events: Funded is negative (outgoing), Released/Refunded are positive.
     escrowEvents.forEach((e) => {
       const month = Number(e.month);
       if (!isValidMonth(month)) return;
@@ -293,10 +296,13 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       }
     });
 
-    // Add agreement creation counts (use count as a proxy for activity)
-    // Since there are no payments yet, we'll show agreement creation activity
+    // Agreement creation activity: each creation adds a small proxy value so
+    // months with only agreement activity remain visible on a chart even when
+    // no payments or escrow events exist. The 1 000-unit-per-creation constant
+    // is part of the frozen contract: changing it would alter displayed totals
+    // for existing callers.
     const agreementCountsByMonth: Record<number, number> = {};
-    agreementCreations.forEach((a: any) => {
+    agreementCreations.forEach((a: { month: number; agreementId: string }) => {
       const month = Number(a.month);
       if (!isValidMonth(month)) return;
       agreementCountsByMonth[month] = (agreementCountsByMonth[month] || 0) + 1;

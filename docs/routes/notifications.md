@@ -6,6 +6,32 @@ Starknet user address.
 
 ---
 
+## Backward-Compatibility Contract
+
+The response shape is **stable**. The fields and behaviors described in this
+document MUST be preserved across future changes so that existing callers
+continue to work without modification.
+
+---
+
+## Authorization Boundary
+
+The route queries data strictly scoped to the address supplied in the URL path:
+
+- All three DB queries (payments, agreement events, escrow events) filter on the
+  supplied `user_address`.
+- The address is validated by `StarknetAddress.parse` before being used as a
+  filter, preventing lookup-key injection.
+- Callers can only read notifications for the exact address they supply;
+  cross-user data access is structurally impossible from this route.
+
+**Current auth state**: This route is unauthenticated — it returns aggregated
+public on-chain data and does not expose any private state. If per-user write
+state (e.g. persistent read/unread) is added in the future, a `requireAuth`
+guard MUST be added at that point.
+
+---
+
 ## Endpoint Contract
 
 ### `GET /api/v1/notifications/:user_address`
@@ -55,6 +81,36 @@ count for a user.
   "unreadCount": 2
 }
 ```
+
+**Frozen fields (must not change):**
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `notifications` | array | Up to `limit` items, sorted newest-first by `date`. |
+| `notifications[].id` | string | DB row identifier. |
+| `notifications[].title` | string | Human-readable title (see frozen title set below). |
+| `notifications[].message` | string | Detail sentence; format is stable per event type. |
+| `notifications[].read` | boolean | Always `false` (no server-side read state). |
+| `notifications[].date` | string | ISO 8601 timestamp. |
+| `notifications[].type` | string | Raw on-chain `eventType` string. |
+| `notifications[].txHash` | string | Transaction hash. |
+| `total` | integer | Length of `notifications` array. |
+| `unreadCount` | integer | Count of items where `read === false` (always equals `total`). |
+
+**Frozen event-type → title mapping:**
+
+| `type` | `title` |
+| :--- | :--- |
+| `PaymentSent` | `"Payment Sent"` |
+| `PaymentReceived` | `"Payment Received"` |
+| `DisputeRaised` | `"Dispute Raised"` |
+| `DisputeResolved` | `"Dispute Resolved"` |
+| `AgreementActivated` | `"Agreement Activated"` |
+| `AgreementCreated` | `"Agreement Created"` |
+| `AgreementCancelled` | `"Agreement Cancelled"` |
+| `Funded` | `"Agreement Funded"` |
+| `Released` | `"Funds Released"` |
+| `Refunded` | `"Funds Refunded"` |
 
 ---
 
@@ -126,6 +182,25 @@ export interface NotificationPreferences {
   notifications route invokes this helper on its outgoing payload rather
   than reaching for `Array.length` directly, so the response stays in
   lockstep with the helper's semantics.
+
+Both helpers are exported for unit-testing and future preference-filtering logic without making HTTP requests.
+
+---
+
+## Amount Formatting
+
+Token amounts in notification messages are formatted by `formatTokenAmount` with
+the token's decimal precision. Token lookup is by contract address:
+
+| Token | Decimals |
+| :--- | :--- |
+| STRK | 18 |
+| USDC | 6 |
+| USDT | 6 |
+| unknown / null | 6 (default) |
+
+Formatting uses BigInt arithmetic so u256 amounts are never truncated through
+`Number` before display.
 
 ---
 

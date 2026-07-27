@@ -242,6 +242,8 @@ reprocessEventsRouter.post(
         },
         results,
       });
+
+      res.json({ summary, results });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
         res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
@@ -293,6 +295,12 @@ reprocessEventsRouter.post(
       for (const event of statusChangeEvents) {
         const dedupKey = `${event.transactionHash}_${event.eventIndex}`;
         if (processedKeys.has(dedupKey)) {
+          logReprocess("info", "status_changes", {
+            eventId: event.id,
+            outcome: "dedup_skipped",
+            dedupKey,
+            elapsed_ms: Date.now() - evtStart,
+          });
           results.push({ eventId: event.id, status: "dedup_skipped" });
           continue;
         }

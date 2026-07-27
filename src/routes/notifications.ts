@@ -109,6 +109,63 @@ function createTitleCache() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Response-shape contract (stable)
+//
+// NotificationItem — one notification in the response array.
+//   id        — unique event/payment/escrow row identifier string.
+//   title     — human-readable title derived from eventType (frozen set below).
+//   message   — detail sentence; format is stable for existing event types.
+//   read      — always false; per-user read state is not persisted server-side.
+//   date      — ISO 8601 timestamp of the underlying on-chain event.
+//   type      — the raw on-chain eventType string.
+//   txHash    — transaction hash of the event.
+//
+// NotificationsResponse — top-level response envelope.
+//   notifications — array of up to `limit` items, sorted newest-first.
+//   total         — length of the notifications array.
+//   unreadCount   — count of items where read === false (always === total today).
+//
+// Backward-compatibility rules:
+//   - All fields listed above are frozen; existing callers depend on them.
+//   - New optional fields may be added to NotificationsResponse in the future.
+//   - Existing title/message strings for each eventType are stable.
+//   - The default limit (10) and the maximum (50) are frozen.
+// ---------------------------------------------------------------------------
+
+/** One item in the notifications payload. */
+export interface NotificationItem {
+  id: string;
+  title: string;
+  message: string;
+  read: boolean;
+  date: string;
+  type: string;
+  txHash: string;
+}
+
+/** Top-level response envelope for GET /notifications/:user_address. */
+export interface NotificationsResponse {
+  notifications: NotificationItem[];
+  total: number;
+  unreadCount: number;
+}
+
+// ---------------------------------------------------------------------------
+// Authorization boundary
+//
+// The route only queries data for the address supplied in the path.  All three
+// DB queries (payments, agreements/events, escrow events) are filtered to that
+// address, so callers can never read another user's notifications by crafting
+// the path.  The address is validated and canonicalized by StarknetAddress.parse
+// before being used as a filter, preventing lookup-key injection.
+//
+// NOTE: This route is currently unauthenticated (no session check). The data it
+// returns is aggregated on-chain public data scoped to the caller-supplied
+// address, so there is no credential leak risk. If per-user write state is
+// added in the future, a requireAuth guard MUST be added at that point.
+// ---------------------------------------------------------------------------
+
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
   try {
