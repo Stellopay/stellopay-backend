@@ -20,10 +20,12 @@ The primary resource is the `BillingProfile`, loaded during authorization by the
 ## Endpoints
 
 - **GET `/billing/profiles/:profileId`**
-  Returns the full profile, including payment methods and invoices.
+  Returns the full profile, payment methods, and invoices. Sensitive fields
+  (`taxId`, `dateOfBirth`) are stripped before serialisation.
 
 - **GET `/billing/profiles/:profileId/general-information`**
-  Returns identity fields, with sensitive information stripped.
+  Returns identity fields, with sensitive information stripped, plus a
+  convenience `fullAddress` field.
 
 - **GET `/billing/profiles/:profileId/payment-methods`**
   Returns the list of payment methods for the profile.
@@ -32,9 +34,49 @@ The primary resource is the `BillingProfile`, loaded during authorization by the
   Returns the invoice history.
 
 - **GET `/billing/profiles/:profileId/summary`**
-  Returns the reward-limit and spend summary, utilizing shared billing math logic for numeric fields (`parseSafeAmount`).
+  Returns the reward-limit and spend summary, utilizing shared billing math
+  logic for numeric fields (`parseBillingAmount`).
 
 ## Billing Math and Idempotency
+
+---
+
+### `GET /billing/profiles/:profileId`
+
+Returns the full billing profile (with sensitive fields stripped), the list of
+payment methods, and the invoice history — all in a single response.
+
+**Response (`200`):**
+
+```json
+{
+  "success": true,
+  "data": {
+    "profile": {
+      "id": "profile-001",
+      "ownerAddress": "0xabc123...",
+      "profileType": "Individual",
+      "firstName": "Alice",
+      "lastName": "Example",
+      "email": "alice@example.com",
+      "street": "123 Main St",
+      "city": "Metropolis",
+      "state": "NY",
+      "zipCode": "10001",
+      "country": "US",
+      "annualRewardLimit": "10000.000000",
+      "usedAmount": "2500.500000",
+      "currency": "USD",
+      "createdAt": "…",
+      "updatedAt": "…"
+    },
+    "paymentMethods": [ … ],
+    "invoices": [ … ]
+  }
+}
+```
+
+Sensitive fields (`taxId`, `dateOfBirth`) are never included in the response.
 
 ---
 
@@ -219,6 +261,8 @@ Read them with `getBillingMetricsSnapshot()`; `resetBillingMetrics()` exists for
 | `billing_summary_computed_total`            | Successful summary computations                           |
 | `billing_amount_coerced_total`              | Stored amounts coerced to `0` (per column, per row)       |
 | `billing_summary_limit_exceeded_total`      | Summaries where `usedAmount` overran the limit            |
+| `billing_profile_fetched_total`             | Successful full-profile reads (profile + payment methods + invoices) |
+| `billing_profile_duration_ms_total`         | Cumulative full-profile handler wall-time                 |
 | `billing_ownership_denied_total`            | Ownership rejections (both reasons)                       |
 | `billing_ownership_denied_not_found_total`  | …of which the profile did not exist                       |
 | `billing_ownership_denied_not_owner_total`  | …of which the caller was not the owner                    |

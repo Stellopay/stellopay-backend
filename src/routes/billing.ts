@@ -362,14 +362,18 @@ export function withBillingIdempotency(
   };
 }
 
-/** Zod schema for the :profileId path param – non-empty string, max 128 chars */
-const profileIdSchema = z.object({
-  profileId: z
-    .string()
-    .min(1)
-    .max(128)
-    .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash"),
-});
+/**
+ * Zod schema for the :profileId path param – non-empty string, max 128 chars.
+ *
+ * This is a standalone string schema (not an object) so it can be passed
+ * directly to `.safeParse(req.params.profileId)` in the
+ * {@link validateProfileId} middleware.
+ */
+const profileIdParamSchema = z
+  .string()
+  .min(1, "profileId is required")
+  .max(128, "profileId must be at most 128 characters")
+  .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash");
 
 /** Middleware: parse + validate :profileId, attach to res.locals */
 function validateProfileId(req: Request, res: Response, next: NextFunction): void {
@@ -458,52 +462,68 @@ function stripSensitive(profile: ProfileRow) {
 // ---------------------------------------------------------------------------
 
 /**
- * GET /api/v1/billing/profiles/:profileId/summary
- * Hardened math to prevent NaN and division by zero.
+ * GET /api/v1/billing/profiles/:profileId
+ *
+ * Full billing profile — the identity fields, payment methods, and invoice
+ * history for the owning caller. Sensitive fields (taxId, dateOfBirth) are
+ * stripped from the profile object before the response is serialised.
+ *
+ * The ownership check runs in middleware (`requireBillingOwner`) before this
+ * handler is reached, so no additional authorisation is needed here.
  */
 billingRouter.get(
-  "/billing/profiles/:profileId/summary",
+  "/billing/profiles/:profileId",
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
     const profileId: string = res.locals.profileId;
+    const startedAt = Date.now();
 
     try {
-      const [profile] = await db
-        .select({
-          id: schema.billingProfiles.id,
-          profileType: schema.billingProfiles.profileType,
-          annualRewardLimit: schema.billingProfiles.annualRewardLimit,
-          usedAmount: schema.billingProfiles.usedAmount,
-          currency: schema.billingProfiles.currency,
-        })
-        .from(schema.billingProfiles)
-        .where(eq(schema.billingProfiles.id, profileId))
-        .limit(1);
+      const profile = res.locals.profile;
 
-      // Ownership already verified by requireBillingOwner; this is a
-      // safety net for a very unlikely TOCTOU race (profile deleted
-      // between middleware and handler).
+      // Safety net for a TOCTOU race between middleware and handler.
       if (!profile) {
         fail(res, 404, `Billing profile '${profileId}' not found`);
         return;
       }
 
-      // Bounded Math: Ensure values are finite and non-negative
-      const limit = numericString.parse(profile.annualRewardLimit ?? "0");
-      const used = numericString.parse(profile.usedAmount ?? "0");
-      
-      const remaining = Math.max(0, limit - used);
-      
-      // Prevent division by zero and cap progress at 100%
-      const rawPct = limit > 0 ? (used / limit) * 100 : 0;
-      const progressPct = Math.min(100, Math.max(0, Math.round(rawPct * 100) / 100));
+      const [paymentMethods, invoices] = await Promise.all([
+        db
+          .select()
+          .from(schema.billingPaymentMethods)
+          .where(eq(schema.billingPaymentMethods.profileId, profileId)),
+        db
+          .select()
+          .from(schema.billingInvoices)
+          .where(eq(schema.billingInvoices.profileId, profileId)),
+      ]);
+
+      // Read-side aggregate for telemetry only.
+      const totals = summarizeInvoices(invoices);
+      const durationMs = Date.now() - startedAt;
 
       incBillingMetric(BILLING_METRICS.PROFILE_FETCHED);
+      incBillingMetric(BILLING_METRICS.PROFILE_DURATION_MS, durationMs);
+      if (totals.coercedCount > 0) {
+        incBillingMetric(BILLING_METRICS.AMOUNT_COERCED, totals.coercedCount);
+        logBillingEvent("warn", "billing.amount.coerced", {
+          profileId,
+          field: "invoices.amount",
+          affectedRows: totals.coercedCount,
+          reasons: totals.coercionReasons,
+        });
+      }
+
       logBillingEvent("info", "billing.profile.fetched", {
         profileId,
         paymentMethodCount: paymentMethods.length,
-        invoiceCount: invoices.length,
+        invoiceCount: totals.invoiceCount,
+        totalAmount: totals.totalAmount,
+        paidAmount: totals.paidAmount,
+        outstandingAmount: totals.outstandingAmount,
+        coercedCount: totals.coercedCount,
+        durationMs,
       });
 
       ok(res, {
@@ -512,7 +532,10 @@ billingRouter.get(
         invoices,
       });
     } catch (err: any) {
-      logBillingFailure("billing.profile.failed", err, { profileId });
+      logBillingFailure("billing.profile.failed", err, {
+        profileId,
+        durationMs: Date.now() - startedAt,
+      });
       fail(res, 500, "Failed to fetch billing profile");
     }
   },
