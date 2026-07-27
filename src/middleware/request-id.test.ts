@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import express from "express";
 import request from "supertest";
 import { requestIdMiddleware } from "./request-id.js";
+import { requestIdContext, initLogger, originalConsole } from "../utils/logger.js";
 
 /** Call the middleware directly with a hand-crafted req so we can test
  *  header values that the HTTP layer (supertest/superagent) would reject. */
@@ -135,5 +136,57 @@ describe("requestIdMiddleware", () => {
     const id = "req-id_abc.123-XYZ";
     const res = await request(makeApp()).get("/ok").set("X-Request-Id", id);
     expect(res.headers["x-request-id"]).toBe(id);
+  });
+
+  // ── AsyncLocalStorage Concurrency ────────────────────────────────────────
+
+  describe("AsyncLocalStorage concurrency", () => {
+    beforeAll(() => {
+      initLogger();
+    });
+
+    it("does not leak request ids across concurrent requests", async () => {
+      const app = express();
+      app.use(requestIdMiddleware);
+      
+      app.get("/delay", async (req, res) => {
+        // Sleep to force overlapping execution
+        const sleepMs = Number(req.query.ms) || 50;
+        await new Promise((resolve) => setTimeout(resolve, sleepMs));
+        
+        // Use logger via console.info (mocked by initLogger)
+        console.info(`finishing request for ms=${sleepMs}`);
+        
+        res.json({ id: requestIdContext.getStore() });
+      });
+
+      // Note: since initLogger wraps originalConsole, we mock originalConsole.info
+      const origInfo = originalConsole.info;
+      const calls: string[][] = [];
+      originalConsole.info = (...args: any[]) => {
+        calls.push(args);
+      };
+      
+      // Launch requests concurrently
+      const [res1, res2] = await Promise.all([
+        request(app).get("/delay?ms=100").set("X-Request-Id", "req-1"),
+        request(app).get("/delay?ms=50").set("X-Request-Id", "req-2"),
+      ]);
+
+      expect(res1.body.id).toBe("req-1");
+      expect(res2.body.id).toBe("req-2");
+
+      // Verify the logs output the correct ID due to AsyncLocalStorage isolation
+      // req-2 finishes first (50ms)
+      expect(calls[0][0]).toContain("[req-2]");
+      expect(calls[0][1]).toContain("finishing request for ms=50");
+
+      // req-1 finishes second (100ms)
+      expect(calls[1][0]).toContain("[req-1]");
+      expect(calls[1][1]).toContain("finishing request for ms=100");
+      
+      // restore
+      originalConsole.info = origInfo;
+    });
   });
 });

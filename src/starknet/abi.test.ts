@@ -8,6 +8,7 @@ import path from "node:path";
 // are unaffected by this mock.
 vi.mock("../config.js", () => ({
   env: { STARKNET_RPC_URL: "https://rpc.test.invalid" },
+  starknetRpcUrls: ["https://rpc.test.invalid"],
   abiPaths: { escrow: null, agreement: null },
   starknetRpcUrls: ["https://rpc.test.invalid"],
   defaults: {
