@@ -113,6 +113,18 @@ export const EnvSchema = z
   // A Starknet block is produced roughly every 6–12 s; 12 s is a safe default.
   INDEXED_CACHE_MAX_AGE_SECONDS: z.coerce.number().int().positive().optional().default(12),
 
+  // Analytics aggregation in-process cache TTL (milliseconds).
+  // Repeated identical requests within this window hit the in-memory cache
+  // instead of re-running expensive aggregation queries.  Default is 30 s
+  // (≈ 2–5 Starknet blocks) which is conservative enough that a re-fetch after
+  // a new block will see up-to-date data within a reasonable time.
+  ANALYTICS_CACHE_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(30_000),
+
   // Session token lifetime in milliseconds (sliding expiry) - default 24 hours
   SESSION_TTL_MS: z.coerce
     .number()
@@ -153,7 +165,7 @@ export const EnvSchema = z
     ),
   })
   .superRefine((data, ctx) => {
-    const isDev = !data.NODE_ENV || data.NODE_ENV === "development";
+    const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
     const origin = data.CORS_ORIGIN;
 
     if (isDev) {

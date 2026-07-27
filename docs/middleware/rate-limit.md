@@ -249,6 +249,69 @@ health independently and alert on store errors or on the
 
 ---
 
+---
+
+## Environment-variable overrides
+
+Each `MakeLimiterOptions` field can be overridden at deployment time via the
+environment. Overrides are read once when `makeLimiter()` is called and take
+precedence over the hard-coded option.
+
+### Convention
+
+```
+RATE_LIMIT_<NAME>_<FIELD>
+```
+
+`<NAME>` is the limiter `name` uppercased with non-alphanumeric characters
+replaced by `_`. `<FIELD>` is one of `MAX`, `WINDOW_MS`, or `MESSAGE`.
+
+| Env var | Overrides | Example |
+|---|---|---|
+| `RATE_LIMIT_<NAME>_MAX` | `max` | `RATE_LIMIT_GLOBAL_MAX=50` |
+| `RATE_LIMIT_<NAME>_WINDOW_MS` | `windowMs` | `RATE_LIMIT_STRICT_WINDOW_MS=120000` |
+| `RATE_LIMIT_<NAME>_MESSAGE` | `message` | `RATE_LIMIT_CONTACT_MESSAGE="Slow down"` |
+
+### Guard rails
+
+- If an overridden `max` exceeds 1000, a `console.warn` is emitted at
+  construction time. This catches accidentally high operator-driven overrides
+  (e.g. a missing zero) before they reach production.
+- If an env-var value cannot be parsed as a positive number (for `MAX` or
+  `WINDOW_MS`) it is silently ignored and the hard-coded value is used.
+
+### Example
+
+```ts
+// src/index.ts
+const globalLimiter = makeLimiter({
+  name: "global",
+  windowMs: 900_000,   // 15 min
+  max: 100,
+});
+
+// Override at deploy time without touching code:
+//   RATE_LIMIT_GLOBAL_MAX=50 node dist/index.js
+```
+
+---
+
+## Input validation
+
+`makeLimiter` validates its options at construction time and throws a
+`TypeError` when any of the following is violated:
+
+| Condition | Reason |
+|---|---|
+| `name` is empty, missing, or not a string | All limiters need a stable identifier for logging and cache-key scoping |
+| `windowMs` is ≤ 0, `NaN`, or `Infinity` | A non-positive window would produce degenerate `Retry-After` values |
+| `max` is ≤ 0, `NaN`, or `Infinity` | A non-positive max is either a no-op (allow everything) or a denial (block everything) |
+
+Validation runs **before** env-var overrides are applied, so invalid hard-coded
+values are caught even when an override would have replaced them.
+
+---
+
 ## Production limiters
 
 Configured in `src/index.ts` from environment variables:

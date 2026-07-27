@@ -7,6 +7,8 @@ Event ingestion endpoints decode `WorkAgreement` and `PayrollEscrow` contract ev
 
 The read endpoint (`GET /api/v1/events`) allows consumers to query indexed events with database-level filtering by event type, time range, agreement ID, contract address, and pagination parameters.
 
+The ingestion endpoints preserve the same validation and batching contract as the existing route implementation: transaction hashes are normalized and validated consistently, batch requests deduplicate repeated hashes within the same request, and per-transaction results stay aligned with the original input order.
+
 ---
 
 ## Endpoints
@@ -26,8 +28,8 @@ Fetch indexed events with event-type and time-range filtering pushed directly do
 | Parameter | Type | Description |
 | --- | --- | --- |
 | `eventType` | `string` or `string[]` | Single event type (`AgreementCreated`), comma-separated types (`AgreementCreated,PaymentSent`), or repeated query params (`?eventType=A&eventType=B`). |
-| `from` | `string` or `number` | Bounds start of time range (inclusive: `createdAt >= from`). Accepts ISO 8601 strings or numeric epoch timestamps (seconds or milliseconds). |
-| `to` | `string` or `number` | Bounds end of time range (inclusive: `createdAt <= to`). Accepts ISO 8601 strings or numeric epoch timestamps (seconds or milliseconds). |
+| `from` | `string` or `number` | Bounds start of time range (inclusive: `createdAt >= from`). Accepts ISO 8601 strings or numeric epoch timestamps; numeric values under 10,000,000,000 are treated as seconds and larger values as milliseconds. |
+| `to` | `string` or `number` | Bounds end of time range (inclusive: `createdAt <= to`). Accepts ISO 8601 strings or numeric epoch timestamps; numeric values under 10,000,000,000 are treated as seconds and larger values as milliseconds. |
 | `agreement_id` / `agreementId` | `string` | Optional filter by numeric agreement ID. |
 | `contract_address` / `contractAddress` | `string` | Optional filter by contract address. |
 | `limit` | `number` | Page limit (default 50, maximum 100). |
@@ -111,6 +113,10 @@ Process multiple Starknet transactions in a single request.
 `results` always has the same length and index-correspondence as the input `tx_hashes` array — `results[i]` corresponds to `tx_hashes[i]`, even when `tx_hashes[i]` is a duplicate of an earlier entry.
 
 `summary.total` equals `tx_hashes.length`. `summary.processed` / `noEvents` / `notFound` / `errors` are counted over the **unique** (deduplicated) work actually performed, and `summary.duplicates` accounts for the rest, so the following always holds:
+
+`total === processed + noEvents + notFound + errors + duplicates`
+
+The route also preserves the input-order correspondence in `results`: each entry in `results` maps to the same index in the request array, even when a duplicate hash is reused from an earlier occurrence.
 
 ```
 total === processed + noEvents + notFound + errors + duplicates
