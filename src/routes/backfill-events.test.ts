@@ -309,13 +309,6 @@ function makeDescendingRows(count: number, idOffset = 0) {
   );
 }
 
-function authHeaders(address: string) {
-  return {
-    "x-user-address": address,
-    authorization: "Bearer testtoken",
-  };
-}
-
 beforeEach(() => {
   vi.clearAllMocks();
   store.reset();
