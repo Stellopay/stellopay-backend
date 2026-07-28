@@ -60,10 +60,6 @@ For example, if `max` is 100, and a request has a cost of 10, the effective limi
 2. **Zero or Negative Cost**: If the cost function evaluates to zero or a negative value, the limiter defaults back to the base `max` (effectively treating the cost as 1).
 3. **Mixed Traffic**: Because the underlying token bucket natively tracks requests rather than items, a client mixing high-cost and low-cost requests might exceed the exact item count slightly. This proportional-limit approach remains an approximation, but strictly bounds the maximum workload and remains safe for growth.
 
-## Edge Cases (Intentionally Out of Scope)
-- Distributed Idempotency: The current idempotency caching is strictly in-memory per-instance. Coordinating idempotency across distributed replicas is explicitly out of scope for this module.
-- Cost accounting precision: The inverse scaling method used for batching costs may lead to slight precision loss in high mixed-traffic scenarios, but exact token accounting is beyond the scope of this implementation.
-
 ## Usage Example
 ```ts
 import { makeLimiter } from './middleware/rate-limit';
