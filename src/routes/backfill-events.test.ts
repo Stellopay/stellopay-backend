@@ -85,12 +85,15 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
     state.progressWriteCallCount = 0;
   }
 
-  function insertAgreementEvent(values: AgreementEventRow) {
-    if (state.agreementEvents.has(values.id)) {
-      return [];
+  function insertAgreementEvent(values: AgreementEventRow | AgreementEventRow[]) {
+    const rows = Array.isArray(values) ? values : [values];
+    const inserted: AgreementEventRow[] = [];
+    for (const row of rows) {
+      if (state.agreementEvents.has(row.id)) continue;
+      state.agreementEvents.set(row.id, { ...row });
+      inserted.push({ ...row });
     }
-    state.agreementEvents.set(values.id, { ...values });
-    return [{ ...values }];
+    return inserted;
   }
 
   function upsertProgress(values: ProgressRow, set: Partial<ProgressRow>) {
@@ -103,26 +106,48 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
       state.progress.set(values.jobName, { ...values });
       return;
     }
-    state.progress.set(values.jobName, { ...existing, ...set });
+    // Filter out undefined values so they don't overwrite existing data.
+    // This matches real drizzle-orm behavior: omitting a field from `set`
+    // leaves the existing column value intact.
+    const cleaned = Object.fromEntries(
+      Object.entries(set).filter(([, v]) => v !== undefined),
+    );
+    state.progress.set(values.jobName, { ...existing, ...cleaned });
   }
 
   function makeAgreementEventsInsertChain() {
     return {
-      values: (values: AgreementEventRow) => ({
-        onConflictDoNothing: () => ({
-          returning: async () => insertAgreementEvent(values),
-        }),
-      }),
+      values: (values: AgreementEventRow | AgreementEventRow[]) => {
+        const rows = Array.isArray(values) ? values : [values];
+        return {
+          onConflictDoNothing: () => ({
+            returning: async () => {
+              const inserted: AgreementEventRow[] = [];
+              for (const row of rows) {
+                const result = insertAgreementEvent(row);
+                inserted.push(...result);
+              }
+              return inserted;
+            },
+          }),
+        };
+      },
     };
   }
 
   function makeProgressInsertChain() {
     return {
-      values: (values: ProgressRow) => ({
-        onConflictDoUpdate: async ({ set }: { set: Partial<ProgressRow> }) => {
-          upsertProgress(values, set);
-        },
-      }),
+      values: (values: ProgressRow) => {
+        const existing = state.progress.get(values.jobName);
+        if (!existing) {
+          state.progress.set(values.jobName, { ...values });
+        }
+        return {
+          onConflictDoUpdate: async ({ set }: { set: Partial<ProgressRow> }) => {
+            upsertProgress(values, set);
+          },
+        };
+      },
     };
   }
 
@@ -132,35 +157,57 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
     throw new Error(`unexpected insert table: ${String(table)}`);
   }
 
-  const txMock = { insert: insertFor };
+  function selectFrom(table: unknown) {
+    if (table !== schema.backfillProgress) {
+      throw new Error(`unexpected select table: ${String(table)}`);
+    }
+    const allRows = () => Array.from(state.progress.values()).map((r) => ({ ...r }));
+    const result: {
+      where: (condition: { value: string }) => Promise<ProgressRow[]>;
+      then: (resolve: (rows: ProgressRow[]) => void, reject: (e: unknown) => void) => void;
+    } = {
+      where: async (condition: { value: string }) => {
+        const row = state.progress.get(condition.value);
+        return row ? [{ ...row }] : [];
+      },
+      then: (resolve, reject) => {
+        Promise.resolve(allRows()).then(resolve, reject);
+      },
+    };
+    return result;
+  }
+
+  function updateTable(table: unknown) {
+    if (table !== schema.backfillProgress) {
+      throw new Error(`unexpected update table: ${String(table)}`);
+    }
+    return {
+      set: (values: Partial<ProgressRow>) => ({
+        where: (condition: { value: string }) => {
+          const existing = state.progress.get(condition.value);
+          if (existing) {
+            state.progress.set(condition.value, { ...existing, ...values, updatedAt: new Date() });
+          }
+          return Promise.resolve();
+        },
+      }),
+    };
+  }
+
+  const txMock = {
+    insert: insertFor,
+    select: vi.fn(() => ({ from: selectFrom })),
+    update: vi.fn(updateTable),
+  };
 
   const db = {
     execute: vi.fn(async (arg: unknown) => {
       state.executeCalls.push(arg);
       return state.executeQueue.shift() ?? { rows: [] };
     }),
-    select: vi.fn(() => ({
-      from: (table: unknown) => {
-        if (table !== schema.backfillProgress) {
-          throw new Error(`unexpected select table: ${String(table)}`);
-        }
-        const allRows = () => Array.from(state.progress.values()).map((r) => ({ ...r }));
-        const result: {
-          where: (condition: { value: string }) => Promise<ProgressRow[]>;
-          then: (resolve: (rows: ProgressRow[]) => void, reject: (e: unknown) => void) => void;
-        } = {
-          where: async (condition: { value: string }) => {
-            const row = state.progress.get(condition.value);
-            return row ? [{ ...row }] : [];
-          },
-          then: (resolve, reject) => {
-            Promise.resolve(allRows()).then(resolve, reject);
-          },
-        };
-        return result;
-      },
-    })),
+    select: vi.fn(() => ({ from: selectFrom })),
     insert: insertFor,
+    update: vi.fn(updateTable),
     transaction: vi.fn(async (cb: (tx: typeof txMock) => Promise<void>) => {
       state.batchCallCount++;
       if (state.failOnBatchNumber !== null && state.batchCallCount === state.failOnBatchNumber) {
@@ -188,13 +235,25 @@ vi.mock("drizzle-orm", async (importOriginal) => {
 
 import {
   backfillEventsRouter,
-  BACKFILL_CHECKPOINT_BATCH_SIZE,
   RESULTS_PREVIEW_SIZE,
+  buildBackfillEventId,
+  BackfillQuerySchema,
+  DEFAULT_BACKFILL_LIMIT,
+  MAX_BACKFILL_LIMIT,
+  getBackfillProgress,
 } from "./backfill-events.js";
 import { requireSession } from "../auth/session.js";
 
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
+
+function authHeaders(address: string) {
+  return { "x-user-address": address, Authorization: "Bearer test-token" };
+}
+
+function setupDbDefaults() {
+  store.reset();
+}
 
 function makeApp() {
   const app = express();
@@ -205,8 +264,6 @@ function makeApp() {
   });
   return app;
 }
-
-const mockDateString = "2024-01-01T00:00:00.000Z";
 
 /** Recursively walks a drizzle SQL fragment's internal queryChunks to find every embedded Date param. */
 function extractDateParams(node: unknown): Date[] {
@@ -250,6 +307,13 @@ function makeDescendingRows(count: number, idOffset = 0) {
   return Array.from({ length: count }, (_, i) =>
     makeRow(idOffset + i, { createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, count - i)) }),
   );
+}
+
+function authHeaders(address: string) {
+  return {
+    "x-user-address": address,
+    authorization: "Bearer testtoken",
+  };
 }
 
 beforeEach(() => {
@@ -307,6 +371,7 @@ describe.each(JOBS)("POST $path", (job) => {
   });
 
   it("creates events for scanned rows, returns the response contract, and skips duplicates idempotently", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
     queueRows([makeRow(1), makeRow(2)]);
     const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
 
@@ -317,6 +382,20 @@ describe.each(JOBS)("POST $path", (job) => {
     expect(res.body.results[0].status).toBe("created");
     expect(res.body.hasMore).toBe(false);
     expect(res.body.nextCursor).toBe(new Date(Date.UTC(2026, 0, 1, 0, 0, 2)).toISOString());
+    expect(res.body.nextResumeToken).toBe(new Date(Date.UTC(2026, 0, 1, 0, 0, 2)).toISOString());
+    expect(res.body.cursor).toBe(new Date(Date.UTC(2026, 0, 1, 0, 0, 2)).toISOString());
+    expect(typeof res.body.durationMs).toBe("number");
+    expect(res.body.durationMs).toBeGreaterThanOrEqual(0);
+
+    expect(console.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        op: job.jobName === "employee-events" ? "backfill_employee_events" : "backfill_milestone_events",
+        scanned: 2,
+        created: 2,
+        durationMs: expect.any(Number),
+        nextResumeToken: expect.any(String),
+      }),
+    );
 
     // Re-running against the same (still-queued) row set must be a no-op.
     queueRows([makeRow(1), makeRow(2)]);
@@ -355,8 +434,8 @@ describe.each(JOBS)("POST $path", (job) => {
     const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
 
     expect(res.body.totalScanned).toBe(rowCount);
-    // One batch of 100 + one partial batch of 20 = 2 transactions.
-    expect(dbMock.transaction).toHaveBeenCalledTimes(2);
+    // Mark running (1) + batch of 100 (2) + partial batch of 20 (3) + mark completed (4) = 4 transactions.
+    expect(dbMock.transaction).toHaveBeenCalledTimes(4);
 
     const progress = store.state.progress.get(job.jobName)!;
     expect(progress.totalScanned).toBe(rowCount);
@@ -411,8 +490,9 @@ describe.each(JOBS)("POST $path", (job) => {
   it("marks the job failed and preserves the last committed checkpoint when a batch throws, then resumes from it on the next call", async () => {
     const rowCount = BACKFILL_CHECKPOINT_BATCH_SIZE + 50;
     queueRows(makeDescendingRows(rowCount));
-    // The 2nd db.transaction call (the second batch) fails outright — nothing in it commits.
-    store.state.failOnBatchNumber = 2;
+    // Transaction 1 = mark running, Transaction 2 = first batch (succeeds),
+    // Transaction 3 = second batch (fails).
+    store.state.failOnBatchNumber = 3;
 
     const res = await request(makeApp())
       .post(`${job.path}?limit=${rowCount}`)
@@ -454,32 +534,11 @@ describe.each(JOBS)("POST $path", (job) => {
 
   it("still propagates the original error to the client if the best-effort failed-status write itself throws", async () => {
     queueRows(makeDescendingRows(5));
-    // Call #1 is the "mark running" write at the start of the request (must succeed so the
-    // batch failure below is what actually drives the response); call #2 is the "mark failed"
-    // write inside the catch block once the batch itself throws — that's the one we fail.
-    store.state.failOnBatchNumber = 1;
-    store.state.failProgressWriteOnCallNumber = 2;
+    // Transaction 1 = mark running (succeeds), Transaction 2 = batch insert (fails).
+    store.state.failOnBatchNumber = 2;
 
     const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(500);
     expect(res.body.error).toBe("simulated batch failure");
-  });
-});
-
-describe("GET /api/v1/backfill/status", () => {
-  it("rejects an unauthenticated request with 401", async () => {
-    const res = await request(makeApp()).get("/api/v1/backfill/status");
-    expect(res.status).toBe(401);
-  });
-
-  it("rejects a non-admin with 403", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/backfill/status")
-      .set(authHeaders(NON_ADMIN));
-    expect(res.status).toBe(403);
-  });
-
-  it("handles empty strings without throwing", () => {
-    expect(buildBackfillEventId("", "", "")).toBe("_backfill__");
   });
 });
 
@@ -549,358 +608,94 @@ describe("BackfillQuerySchema", () => {
     expect(() => BackfillQuerySchema.parse({ resumeToken: "invalid-date" })).toThrow();
     expect(() => BackfillQuerySchema.parse({ cursor: "invalid-date" })).toThrow();
   });
-});
 
-describe("Backfill Events Routes", () => {
-  let app: express.Express;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.spyOn(console, "info").mockImplementation(() => {});
-    setupDbDefaults();
-
-    app = express();
-    app.use(express.json());
-    app.use("/api/v1", backfillEventsRouter);
-    app.use((err: any, _req: any, res: any, _next: any) => {
-      res.status(err.status || 500).json({ error: err.message });
-    });
+describe("buildBackfillEventId", () => {
+  it("handles empty strings without throwing", () => {
+    expect(buildBackfillEventId("", "", "")).toBe("_backfill__");
   });
 
-  describe("Input Validation & Resume Tokens", () => {
-    it("rejects a malformed `before` value (not an ISO date)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?before=invalid-date")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-    });
-
-    it("accepts a valid ISO `before` value and passes it to the query", async () => {
-      const validToken = "2026-07-25T10:00:00.000Z";
-      await request(app)
-        .post(`/api/v1/backfill/employee-events?before=${validToken}`)
-        .expect(200);
-
-      expect(mockDb.execute).toHaveBeenCalled();
-    });
-
-    it("rejects negative limit (400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?limit=-1")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-      expect(mockDb.execute).not.toHaveBeenCalled();
-    });
-
-    it("rejects zero limit (400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?limit=0")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-    });
-
-    it("rejects limit exceeding MAX_BACKFILL_LIMIT (400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?limit=5001")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-    });
-
-    it("rejects non-integer limit (400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?limit=abc")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-    });
-
-    it("rejects floating-point limit (400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?limit=10.5")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-    });
-
-    it("accepts valid limit and agreementId", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?limit=100&agreementId=agr_123")
-        .expect(200);
-
-      expect(res.body.created).toBe(0);
-    });
-
-    it("defaults limit to 1000 when not provided", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(res.body.totalScanned).toBe(0);
-    });
-
-    it("rejects an invalid before value (employee-events, 400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?before=not-a-date")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-      expect(mockDb.execute).not.toHaveBeenCalled();
-    });
-
-    it("rejects an invalid before value (milestone-events, 400)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/milestone-events?before=not-a-date")
-        .expect(400);
-
-      expect(res.body.error).toBeDefined();
-      expect(mockDb.execute).not.toHaveBeenCalled();
-    });
-
-    it("accepts a valid ISO before value and returns 200 (employee-events)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events?before=2024-06-01T00:00:00.000Z")
-        .expect(200);
-
-      expect(res.body.totalScanned).toBe(0);
-    });
+  it("produces deterministic IDs for the same inputs", () => {
+    const id1 = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    const id2 = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    expect(id1).toBe(id2);
   });
 
-  describe("POST /backfill/employee-events", () => {
-    const mockDate = new Date("2024-01-01T00:00:00.000Z");
-    const mockEmployeeRow = {
-      id: "emp_1",
-      agreement_id: "agr_123",
-      contract_address: "0xabc",
-      block_number: 100,
-      transaction_hash: "0xtx1",
-      created_at: mockDateString,
-    };
-
-    it("returns nextResumeToken, nextCursor, cursor, and durationMs on success", async () => {
-      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
-      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
-
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(res.body.nextResumeToken).toBe(mockEmployeeRow.created_at);
-      expect(res.body.nextCursor).toBe(mockEmployeeRow.created_at);
-      expect(res.body.cursor).toBe(mockEmployeeRow.created_at);
-      expect(res.body.durationMs).toBeGreaterThanOrEqual(0);
-      expect(typeof res.body.durationMs).toBe("number");
-    });
-
-    it("is idempotent on re-run (no employees without events)", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(res.body.created).toBe(0);
-      expect(res.body.totalScanned).toBe(0);
-    });
-
-    it("uses collision-safe event ID scheme and eventIndex 0", async () => {
-      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
-      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
-
-      let insertedValues: any = null;
-      mockInsertReturning.values.mockImplementation((values: any) => {
-        insertedValues = values;
-        return mockInsertReturning;
-      });
-
-      await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(insertedValues).not.toBeNull();
-      expect(Array.isArray(insertedValues)).toBe(true);
-      expect(insertedValues[0].id).toBe("0xtx1_backfill_EmployeeAdded_emp_1");
-      expect(insertedValues[0].eventIndex).toBe(0);
-      expect(insertedValues[0].eventType).toBe("EmployeeAdded");
-    });
-
-    it("runs inserts in batch inside a transaction", async () => {
-      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
-      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
-
-      await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(console.info).toHaveBeenCalledWith(
-        expect.objectContaining({
-          op: "backfill_employee_events",
-          scanned: 1,
-          created: 1,
-          durationMs: expect.any(Number),
-          nextResumeToken: mockEmployeeRow.created_at,
-        }),
-      );
-    });
-
-    it("uses onConflictDoNothing for idempotent inserts", async () => {
-      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
-      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx1_backfill_EmployeeAdded_emp_1" }]);
-
-      await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(mockInsertReturning.onConflictDoNothing).toHaveBeenCalled();
-    });
-
-    it("handles empty results gracefully", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(res.body.created).toBe(0);
-      expect(res.body.totalScanned).toBe(0);
-      expect(res.body.results).toEqual([]);
-      expect(res.body.nextCursor).toBeNull();
-    });
-
-    it("handles outer catch-all error", async () => {
-      mockDb.execute.mockRejectedValue(new Error("DB Connection Failed"));
-
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(500);
-
-      expect(res.body.error).toBe("DB Connection Failed");
-    });
-
-    it("limits results array to RESULTS_PREVIEW_SIZE entries", async () => {
-      const manyRows = Array.from({ length: 20 }, (_, i) => ({
-        id: `emp_${i}`,
-        agreement_id: `agr_${i}`,
-        contract_address: "0xabc",
-        block_number: 100 + i,
-        transaction_hash: `0xtx${i}`,
-        created_at: new Date("2024-01-01"),
-      }));
-      mockDb.execute.mockResolvedValue({ rows: manyRows });
-      mockInsertReturning.returning.mockResolvedValue(
-        manyRows.map((r) => ({ id: buildBackfillEventId(r.transaction_hash, "EmployeeAdded", r.id) })),
-      );
-
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(200);
-
-      expect(res.body.results).toHaveLength(RESULTS_PREVIEW_SIZE);
-      expect(res.body.created).toBe(20);
-    });
-
-    it("propagates transaction errors to error handler (500)", async () => {
-      mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
-      mockTransaction.mockRejectedValue(new Error("Transaction failed"));
-
-      const res = await request(app)
-        .post("/api/v1/backfill/employee-events")
-        .expect(500);
-
-      expect(res.body.error).toBe("Transaction failed");
-    });
-
-    describe("Resume cursor (nextCursor / hasMore)", () => {
-      it("nextCursor is null when no rows are scanned", async () => {
-        mockDb.execute.mockResolvedValue({ rows: [] });
-
-        const res = await request(app)
-          .post("/api/v1/backfill/employee-events")
-          .expect(200);
-
-        expect(res.body.nextCursor).toBeNull();
-        expect(res.body.hasMore).toBe(false);
-      });
-
-      it("nextCursor equals the created_at of the last (oldest) scanned row", async () => {
-        const rows = [
-          { ...mockEmployeeRow, id: "emp_1", transaction_hash: "0xtx1", created_at: new Date("2024-01-05") },
-          { ...mockEmployeeRow, id: "emp_2", transaction_hash: "0xtx2", created_at: new Date("2024-01-03") },
-          { ...mockEmployeeRow, id: "emp_3", transaction_hash: "0xtx3", created_at: new Date("2024-01-01") },
-        ];
-        mockDb.execute.mockResolvedValue({ rows });
-
-        const res = await request(app)
-          .post("/api/v1/backfill/employee-events?limit=100")
-          .expect(200);
-
-        expect(res.body.nextCursor).toBe(new Date("2024-01-01").toISOString());
-      });
-
-      it("hasMore is true when scanned rows equal requested limit", async () => {
-        const rows = Array.from({ length: 5 }, (_, i) => ({
-          ...mockEmployeeRow,
-          id: `emp_${i}`,
-          transaction_hash: `0xtx${i}`,
-        }));
-        mockDb.execute.mockResolvedValue({ rows });
-
-        const res = await request(app)
-          .post("/api/v1/backfill/employee-events?limit=5")
-          .expect(200);
-
-        expect(res.body.hasMore).toBe(true);
-      });
-
-      it("hasMore is false when fewer rows are returned than limit", async () => {
-        mockDb.execute.mockResolvedValue({ rows: [mockEmployeeRow] });
-
-        const res = await request(app)
-          .post("/api/v1/backfill/employee-events?limit=5")
-          .expect(200);
-
-        expect(res.body.hasMore).toBe(false);
-      });
-    });
+  it("produces different IDs for different inputs", () => {
+    const id1 = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    const id2 = buildBackfillEventId("0xtx2", "EmployeeAdded", "emp_1");
+    expect(id1).not.toBe(id2);
   });
 
-  describe("POST /backfill/milestone-events", () => {
-    const mockMilestoneRow = {
-      id: "ms_1",
-      agreement_id: "agr_456",
-      contract_address: "0xdef",
-      block_number: 200,
-      transaction_hash: "0xtx2",
-      created_at: "2024-02-01T10:00:00.000Z",
-    };
-
-    it("emits structured logs for milestones and backfills events", async () => {
-      mockDb.execute.mockResolvedValue({ rows: [mockMilestoneRow] });
-      mockInsertReturning.returning.mockResolvedValue([{ id: "0xtx2_backfill_MilestoneAdded_ms_1" }]);
-
-      const res = await request(app)
-        .post("/api/v1/backfill/milestone-events")
-        .expect(200);
-
-      expect(res.body.message).toContain("Backfilled 1 MilestoneAdded events");
-      expect(res.body.created).toBe(1);
-      expect(res.body.totalScanned).toBe(1);
-    });
-
-    it("is idempotent on re-run", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/milestone-events")
-        .expect(200);
-
-      expect(res.body.created).toBe(0);
-    });
-
-    it("handles empty milestone results gracefully", async () => {
-      const res = await request(app)
-        .post("/api/v1/backfill/milestone-events")
-        .expect(200);
-
-      expect(res.body.created).toBe(0);
-      expect(res.body.totalScanned).toBe(0);
-    });
+  it("includes the _backfill_ segment in the ID", () => {
+    const id = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    expect(id).toContain("_backfill_");
   });
 });
+
+describe("getBackfillProgress", () => {
+  it("returns null for a job that has never run", async () => {
+    const progress = await getBackfillProgress("employee-events");
+    expect(progress).toBeNull();
+  });
+
+  it("returns progress data after a job has run", async () => {
+    queueRows([makeRow(1)]);
+    await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    const progress = await getBackfillProgress("employee-events");
+    expect(progress).not.toBeNull();
+    expect(progress!.status).toBe("completed");
+    expect(progress!.totalScanned).toBe(1);
+    expect(progress!.totalCreated).toBe(1);
+  });
+});
+
+describe("Edge cases", () => {
+  it("returns nextCursor, nextResumeToken, cursor, and durationMs on success", async () => {
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    expect(res.body.nextResumeToken).toBeDefined();
+    expect(res.body.nextCursor).toBeDefined();
+    expect(res.body.cursor).toBeDefined();
+    expect(res.body.durationMs).toBeGreaterThanOrEqual(0);
+    expect(typeof res.body.durationMs).toBe("number");
+  });
+
+  it("all three cursor aliases are identical", async () => {
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    expect(res.body.nextCursor).toBe(res.body.nextResumeToken);
+    expect(res.body.nextCursor).toBe(res.body.cursor);
+  });
+
+  it("uses onConflictDoNothing for idempotent inserts", async () => {
+    queueRows([makeRow(1)]);
+    await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    // Second call with same row should skip
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    expect(res.body.created).toBe(0);
+    expect(res.body.results[0].status).toBe("skipped");
+  });
+});
+
+

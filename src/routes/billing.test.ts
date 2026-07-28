@@ -5,13 +5,17 @@
  * Two layers are covered:
  *
  *  1. The billing math helpers (`parseBillingAmount`, `summarizeInvoices`) as
- *     pure functions — success and boundary inputs.
+ *     pure functions — success and boundary inputs that document the contract.
  *  2. The routed behaviour end-to-end through supertest, asserting both the
- *     response body (unchanged from before this change) and the structured
- *     telemetry emitted alongside it.
+ *     response body and the structured telemetry emitted alongside it.
  *
  * `../auth/middleware.js`, `../db/index.js` and `../config.js` are mocked with
  * factories so no real session lookup, database, or env parsing is involved.
+ *
+ * Contract tests follow a consistent structure:
+ *   - success path: correct input → correct output + telemetry
+ *   - boundary path: edge-case input → safe output + telemetry warnings
+ *   - failure path: DB error → 500 + error telemetry
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -124,6 +128,15 @@ function authHeaders(address = OWNER) {
   return { "x-user-address": address, authorization: "Bearer testtoken" };
 }
 
+/**
+ * Factory for a full billing profile row as returned by the database.
+ *
+ * The returned object includes all database columns so the middleware's
+ * `db.select().from(schema.billingProfiles).where(…).limit(1)` query
+ * resolves to a realistic row that the route handlers can read fields from.
+ *
+ * Use `overrides` to simulate boundary values like null/negative amounts.
+ */
 function profileRow(overrides: Record<string, unknown> = {}) {
   return {
     id: PROFILE_ID,
@@ -166,35 +179,53 @@ function counters(): Record<string, number> {
   return getBillingMetricsSnapshot().counters;
 }
 
+// ---------------------------------------------------------------------------
+// Contract: parseBillingAmount
+// ---------------------------------------------------------------------------
+
 describe("billing math helpers", () => {
   describe("parseBillingAmount", () => {
-    it("parses a well-formed numeric string and reports no coercion", () => {
+    it("contract: parses a well-formed numeric string and reports no coercion", () => {
       expect(parseBillingAmount("2500.500000")).toEqual({ amount: 2500.5, coercion: null });
     });
 
-    it("rounds to the column's 6-decimal scale", () => {
+    it("contract: rounds to the column's 6-decimal scale to stay lossless", () => {
       expect(parseBillingAmount("0.1234567").amount).toBe(0.123457);
     });
 
-    it("reports 'missing' for null, undefined, non-strings and blank strings", () => {
+    it("contract: zero is accepted as a valid amount", () => {
+      expect(parseBillingAmount("0.000000")).toEqual({ amount: 0, coercion: null });
+    });
+
+    it("contract: reports 'missing' for null, undefined, non-strings and blank strings", () => {
       for (const value of [null, undefined, 42, {}, "", "   "]) {
         expect(parseBillingAmount(value)).toEqual({ amount: 0, coercion: "missing" });
       }
     });
 
-    it("reports 'malformed' for values that do not parse to a finite number", () => {
+    it("contract: reports 'malformed' for values that do not parse to a finite number", () => {
       for (const value of ["abc", "Infinity", "1e999"]) {
         expect(parseBillingAmount(value)).toEqual({ amount: 0, coercion: "malformed" });
       }
     });
 
-    it("reports 'negative' for a negative amount and substitutes 0", () => {
+    it("contract: reports 'negative' for a negative amount and substitutes 0", () => {
       expect(parseBillingAmount("-1.5")).toEqual({ amount: 0, coercion: "negative" });
+    });
+
+    it("contract: a very large numeric value is rounded, not coerced", () => {
+      const result = parseBillingAmount("999999999999.999999");
+      expect(result.coercion).toBeNull();
+      expect(result.amount).toBe(999999999999.999999);
     });
   });
 
+  // -------------------------------------------------------------------------
+  // Contract: summarizeInvoices
+  // -------------------------------------------------------------------------
+
   describe("summarizeInvoices", () => {
-    it("returns zeroed totals for an empty invoice list", () => {
+    it("contract: returns zeroed totals for an empty invoice list", () => {
       expect(summarizeInvoices([])).toEqual({
         invoiceCount: 0,
         totalAmount: 0,
@@ -206,7 +237,7 @@ describe("billing math helpers", () => {
       });
     });
 
-    it("splits paid from outstanding so the two always sum to the total", () => {
+    it("contract: splits paid from outstanding so the two always sum to the total", () => {
       const totals = summarizeInvoices([
         { amount: "100.000000", status: "paid" },
         { amount: "250.250000", status: "pending" },
@@ -221,13 +252,13 @@ describe("billing math helpers", () => {
       expect(totals.statusCounts).toEqual({ paid: 1, pending: 1, overdue: 1 });
     });
 
-    it("matches the paid status case-insensitively", () => {
+    it("contract: matches the paid status case-insensitively", () => {
       const totals = summarizeInvoices([{ amount: "10.000000", status: "PAID" }]);
       expect(totals.paidAmount).toBe(10);
       expect(totals.statusCounts).toEqual({ paid: 1 });
     });
 
-    it("buckets a null or blank status as 'unknown' and counts it as outstanding", () => {
+    it("contract: bucketed null or blank status as 'unknown' and count as outstanding", () => {
       const totals = summarizeInvoices([
         { amount: "10.000000", status: null },
         { amount: "5.000000", status: "  " },
@@ -238,7 +269,7 @@ describe("billing math helpers", () => {
       expect(totals.paidAmount).toBe(0);
     });
 
-    it("counts coerced rows per reason and excludes them from the totals", () => {
+    it("contract: counts coerced rows per reason and subtracts them from totals", () => {
       const totals = summarizeInvoices([
         { amount: "100.000000", status: "paid" },
         { amount: "not-a-number", status: "pending" },
@@ -251,15 +282,42 @@ describe("billing math helpers", () => {
       expect(totals.coercionReasons).toEqual({ malformed: 1, missing: 1, negative: 1 });
     });
 
-    it("keeps 6-decimal precision across many fractional rows", () => {
+    it("contract: keeps 6-decimal precision across many fractional rows", () => {
       const totals = summarizeInvoices(
         Array.from({ length: 3 }, () => ({ amount: "0.100000", status: "pending" })),
       );
       expect(totals.totalAmount).toBe(0.3);
       expect(totals.outstandingAmount).toBe(0.3);
     });
+
+    it("contract: an unrecognised status does not widen the key space with arbitrary values", () => {
+      // The status is lower-cased but not validated against a known set.
+      // This keeps the key space bounded by the actual database values.
+      const totals = summarizeInvoices([
+        { amount: "10.000000", status: "CANCELLED" },
+        { amount: "5.000000", status: "REFUNDED" },
+      ]);
+      // Both are recognised — they just aren't "paid", so they go to outstanding.
+      expect(totals.statusCounts).toEqual({ cancelled: 1, refunded: 1 });
+      expect(totals.outstandingAmount).toBe(15);
+      expect(totals.paidAmount).toBe(0);
+    });
+
+    it("contract: an invoice with missing amount fields contributes 0 but still counts toward invoiceCount", () => {
+      const totals = summarizeInvoices([
+        { amount: undefined, status: "pending" },
+        { amount: null, status: "pending" },
+      ]);
+      expect(totals.invoiceCount).toBe(2);
+      expect(totals.totalAmount).toBe(0);
+      expect(totals.coercedCount).toBe(2);
+    });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Route contract tests
+// ---------------------------------------------------------------------------
 
 describe("billing routes telemetry", () => {
   let spies: {
@@ -288,9 +346,156 @@ describe("billing routes telemetry", () => {
     clearBillingIdempotencyStore();
   });
 
+  // -------------------------------------------------------------------------
+  // GET /billing/profiles/:profileId — full profile
+  // -------------------------------------------------------------------------
+
+  describe("GET /billing/profiles/:profileId (full profile)", () => {
+    it("contract success: returns the full profile with payment methods and invoices", async () => {
+      const paymentMethods = [
+        { id: "pm-1", type: "bank_account", displayName: "Chase ****1234", isDefault: true },
+      ];
+      const invoices = [
+        { id: "inv-1", amount: "100.000000", status: "paid" },
+        { id: "inv-2", amount: "250.000000", status: "pending" },
+      ];
+
+      // Ownership middleware returns full profile row → payment methods → invoices
+      queueRows([profileRow()], paymentMethods, invoices);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.profile).toMatchObject({
+        id: PROFILE_ID,
+        profileType: "Individual",
+        firstName: "Alice",
+      });
+      // Sensitive fields must be stripped
+      expect(res.body.data.profile.taxId).toBeUndefined();
+      expect(res.body.data.profile.dateOfBirth).toBeUndefined();
+      expect(res.body.data.paymentMethods).toEqual(paymentMethods);
+      expect(res.body.data.invoices).toEqual(invoices);
+
+      const fetched = loggedEvents(spies).find((e) => e.event === "billing.profile.fetched");
+      expect(fetched).toMatchObject({
+        level: "info",
+        profileId: PROFILE_ID,
+        paymentMethodCount: 1,
+        invoiceCount: 2,
+        totalAmount: 350,
+      });
+      expect(counters()[BILLING_METRICS.PROFILE_FETCHED]).toBe(1);
+      expect(counters()[BILLING_METRICS.PROFILE_DURATION_MS]).toBeGreaterThanOrEqual(0);
+    });
+
+    it("contract boundary: handles zero payment methods and invoices", async () => {
+      queueRows([profileRow()], [], []);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.paymentMethods).toEqual([]);
+      expect(res.body.data.invoices).toEqual([]);
+      expect(
+        loggedEvents(spies).find((e) => e.event === "billing.profile.fetched"),
+      ).toMatchObject({ paymentMethodCount: 0, invoiceCount: 0 });
+    });
+
+    it("contract boundary: reports coerced invoice amounts through telemetry", async () => {
+      const invoices = [
+        { id: "inv-1", amount: "100.000000", status: "paid" },
+        { id: "inv-2", amount: "oops", status: "pending" },
+        { id: "inv-3", amount: null, status: "pending" },
+      ];
+
+      queueRows([profileRow()], [], invoices);
+
+      await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      // The response still contains all raw rows unchanged. Coercion is
+      // visible in telemetry only — exactly one consolidated event.
+      const coerced = loggedEvents(spies).filter((e) => e.event === "billing.amount.coerced");
+      expect(coerced).toHaveLength(1);
+      expect(coerced[0]).toMatchObject({
+        field: "invoices.amount",
+        affectedRows: 2,
+        reasons: { malformed: 1, missing: 1 },
+      });
+      expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
+    });
+
+    it("contract failure: logs error on DB failure during payment method fetch", async () => {
+      queueRows([profileRow()]);
+      failSelectOnCall(2, new Error("connection reset"));
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing profile" });
+
+      expect(loggedEvents(spies).find((e) => e.event === "billing.profile.failed")).toMatchObject({
+        level: "error",
+        profileId: PROFILE_ID,
+        message: "connection reset",
+      });
+      expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
+    });
+
+    it("contract failure: logs error on DB failure during invoice fetch", async () => {
+      queueRows([profileRow()], [{ id: "pm-1" }]);
+      failSelectOnCall(3, new Error("timeout"));
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing profile" });
+
+      expect(loggedEvents(spies).find((e) => e.event === "billing.profile.failed")).toMatchObject({
+        level: "error",
+        profileId: PROFILE_ID,
+        message: "timeout",
+      });
+      expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
+    });
+
+    it("contract boundary: a null profile in middleware yields ownership-denied 404", async () => {
+      // The middleware receives a null row, which means the profile does
+      // not exist. The handler never runs because requireBillingOwner
+      // denies access first.
+      queueRows([null]);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
+        .set(authHeaders());
+
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({
+        success: false,
+        error: `Billing profile '${PROFILE_ID}' not found`,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /billing/profiles/:profileId/summary — summary route contract
+  // -------------------------------------------------------------------------
+
   describe("GET /billing/profiles/:profileId/summary", () => {
-    it("success path: returns the computed summary and logs the math that produced it", async () => {
-      // Ownership check returns the full profile; handler uses res.locals.profile.
+    it("contract success: returns the computed summary and logs the math that produced it", async () => {
+      // The summary route uses res.locals.profile from the ownership middleware,
+      // so the middleware's select must return the full profile row.
       queueRows([profileRow()]);
 
       const res = await request(makeApp())
@@ -329,14 +534,14 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED]).toBeUndefined();
     });
 
-    it("boundary path: warns per coerced column when a stored amount is unusable", async () => {
+    it("contract boundary: warns per coerced column when a stored amount is unusable", async () => {
       queueRows([profileRow({ annualRewardLimit: "not-a-number", usedAmount: null })]);
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
         .set(authHeaders());
 
-      // Response contract is unchanged: coerced values still surface as 0.
+      // Response contract: coerced values surface as 0.
       expect(res.status).toBe(200);
       expect(res.body.data).toMatchObject({
         annualRewardLimit: 0,
@@ -357,7 +562,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
     });
 
-    it("boundary path: flags an over-limit profile that the response clamps to zero", async () => {
+    it("contract boundary: flags an over-limit profile that the response clamps to zero", async () => {
       queueRows([profileRow({ annualRewardLimit: "100.000000", usedAmount: "150.250000" })]);
 
       const res = await request(makeApp())
@@ -380,10 +585,8 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED]).toBe(1);
     });
 
-    it("boundary path: a zero limit yields 0% progress without a divide-by-zero", async () => {
-      queueRows([
-        profileRow({ annualRewardLimit: "0.000000", usedAmount: "0.000000" }),
-      ]);
+    it("contract boundary: a zero limit yields 0% progress without a divide-by-zero", async () => {
+      queueRows([profileRow({ annualRewardLimit: "0.000000", usedAmount: "0.000000" })]);
 
       const res = await request(makeApp())
         .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
@@ -394,8 +597,21 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_LIMIT_EXCEEDED]).toBeUndefined();
     });
 
-    it("failure path: logs one error event and bumps the shared error counter on a DB failure", async () => {
-      // The ownership check (the single select) rejects.
+    it("contract boundary: progress is NOT clamped to 100% when used > limit", async () => {
+      queueRows([profileRow({ annualRewardLimit: "100.000000", usedAmount: "200.000000" })]);
+
+      const res = await request(makeApp())
+        .get(`/api/v1/billing/profiles/${PROFILE_ID}/summary`)
+        .set(authHeaders());
+
+      // Progress correctly reports > 100% — the clamp only applies to remainingAmount.
+      expect(res.body.data.progressPercentage).toBe(200);
+      expect(res.body.data.remainingAmount).toBe(0);
+    });
+
+    it("contract failure: a DB failure in the middleware is reported as billing.ownership.failed", async () => {
+      // The summary handler uses res.locals.profile from the middleware and
+      // does not query the DB itself. A DB failure means the middleware rejects.
       failSelectOnCall(1, new Error("connection reset"));
 
       const res = await request(makeApp())
@@ -403,7 +619,10 @@ describe("billing routes telemetry", () => {
         .set(authHeaders());
 
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({ success: false, error: "Failed to verify billing profile ownership" });
+      expect(res.body).toEqual({
+        success: false,
+        error: "Failed to verify billing profile ownership",
+      });
 
       expect(loggedEvents(spies).find((e) => e.event === "billing.ownership.failed")).toMatchObject({
         level: "error",
@@ -415,7 +634,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.SUMMARY_COMPUTED]).toBeUndefined();
     });
 
-    it("failure path: a failing ownership lookup is reported as billing.ownership.failed", async () => {
+    it("contract failure: a failing ownership lookup is reported as billing.ownership.failed", async () => {
       failSelectOnCall(1, new Error("pool exhausted"));
 
       const res = await request(makeApp())
@@ -428,20 +647,22 @@ describe("billing routes telemetry", () => {
         error: "Failed to verify billing profile ownership",
       });
 
-      expect(loggedEvents(spies).find((e) => e.event === "billing.ownership.failed")).toMatchObject(
-        {
-          level: "error",
-          profileId: PROFILE_ID,
-          message: "pool exhausted",
-        },
-      );
+      expect(loggedEvents(spies).find((e) => e.event === "billing.ownership.failed")).toMatchObject({
+        level: "error",
+        profileId: PROFILE_ID,
+        message: "pool exhausted",
+      });
       expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
       expect(counters()[BILLING_METRICS.OWNERSHIP_DENIED]).toBeUndefined();
     });
   });
 
+  // -------------------------------------------------------------------------
+  // GET /billing/profiles/:profileId/invoices — invoice route contract
+  // -------------------------------------------------------------------------
+
   describe("GET /billing/profiles/:profileId/invoices", () => {
-    it("success path: returns the rows unchanged and logs the aggregate alongside them", async () => {
+    it("contract success: returns the rows unchanged and logs the aggregate alongside them", async () => {
       const invoices = [
         { id: "inv-1", amount: "100.000000", status: "paid" },
         { id: "inv-2", amount: "250.000000", status: "pending" },
@@ -473,7 +694,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.INVOICES_DURATION_MS]).toBeGreaterThanOrEqual(0);
     });
 
-    it("boundary path: an empty invoice list still emits one aggregate event", async () => {
+    it("contract boundary: an empty invoice list still emits one aggregate event", async () => {
       queueRows([{ ownerAddress: OWNER }], []);
 
       const res = await request(makeApp())
@@ -490,7 +711,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.INVOICE_ROWS]).toBe(0);
     });
 
-    it("boundary path: warns once with a per-reason breakdown when invoice amounts are unusable", async () => {
+    it("contract boundary: warns once with a per-reason breakdown when invoice amounts are unusable", async () => {
       queueRows(
         [{ ownerAddress: OWNER }],
         [
@@ -623,8 +844,12 @@ describe("billing routes telemetry", () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // Ownership denial contract
+  // -------------------------------------------------------------------------
+
   describe("ownership denial telemetry", () => {
-    it("logs reason 'not_found' when no row exists, while still answering 404", async () => {
+    it("contract: logs reason 'not_found' when no row exists, while still answering 404", async () => {
       queueRows([]);
 
       const res = await request(makeApp())
@@ -644,7 +869,7 @@ describe("billing routes telemetry", () => {
       expect(counters()[BILLING_METRICS.OWNERSHIP_DENIED_NOT_FOUND]).toBe(1);
     });
 
-    it("logs reason 'not_owner' for someone else's profile, with an identical 404 body", async () => {
+    it("contract: logs reason 'not_owner' for someone else's profile, with an identical 404 body", async () => {
       queueRows([{ ownerAddress: "0xsomeoneelse" }]);
 
       const res = await request(makeApp())
@@ -666,129 +891,6 @@ describe("billing routes telemetry", () => {
     });
   });
 
-  describe("GET /billing/profiles/:profileId (full profile)", () => {
-    it("success path: returns the full profile with payment methods and invoices", async () => {
-      const paymentMethods = [
-        {
-          id: "pm-1",
-          type: "bank_account",
-          displayName: "Chase ****1234",
-          isDefault: true,
-        },
-      ];
-      const invoices = [
-        { id: "inv-1", amount: "100.000000", status: "paid" },
-        { id: "inv-2", amount: "250.000000", status: "pending" },
-      ];
-
-      // Ownership middleware returns full profile row → payment methods → invoices
-      queueRows([profileRow()], paymentMethods, invoices);
-
-      const res = await request(makeApp())
-        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
-        .set(authHeaders());
-
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      expect(res.body.data.profile).toMatchObject({
-        id: PROFILE_ID,
-        profileType: "Individual",
-        firstName: "Alice",
-      });
-      // Sensitive fields must be stripped
-      expect(res.body.data.profile.taxId).toBeUndefined();
-      expect(res.body.data.profile.dateOfBirth).toBeUndefined();
-      expect(res.body.data.paymentMethods).toEqual(paymentMethods);
-      expect(res.body.data.invoices).toEqual(invoices);
-
-      const fetched = loggedEvents(spies).find((e) => e.event === "billing.profile.fetched");
-      expect(fetched).toMatchObject({
-        level: "info",
-        profileId: PROFILE_ID,
-        paymentMethodCount: 1,
-        invoiceCount: 2,
-        totalAmount: 350,
-      });
-      expect(counters()[BILLING_METRICS.PROFILE_FETCHED]).toBe(1);
-      expect(counters()[BILLING_METRICS.PROFILE_DURATION_MS]).toBeGreaterThanOrEqual(0);
-    });
-
-    it("success path: handles zero payment methods and invoices", async () => {
-      queueRows([profileRow()], [], []);
-
-      const res = await request(makeApp())
-        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
-        .set(authHeaders());
-
-      expect(res.status).toBe(200);
-      expect(res.body.data.paymentMethods).toEqual([]);
-      expect(res.body.data.invoices).toEqual([]);
-      expect(
-        loggedEvents(spies).find((e) => e.event === "billing.profile.fetched"),
-      ).toMatchObject({ paymentMethodCount: 0, invoiceCount: 0 });
-    });
-
-    it("boundary path: reports coerced invoice amounts through telemetry", async () => {
-      const invoices = [
-        { id: "inv-1", amount: "100.000000", status: "paid" },
-        { id: "inv-2", amount: "oops", status: "pending" },
-        { id: "inv-3", amount: null, status: "pending" },
-      ];
-
-      queueRows([profileRow()], [], invoices);
-
-      await request(makeApp())
-        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
-        .set(authHeaders());
-
-      // Response still contains all raw rows (including coerced ones unchanged).
-      // The coercion is visible in telemetry only — exactly one consolidated
-      // event covers both coerced rows.
-      const coerced = loggedEvents(spies).filter((e) => e.event === "billing.amount.coerced");
-      expect(coerced).toHaveLength(1);
-      expect(counters()[BILLING_METRICS.AMOUNT_COERCED]).toBe(2);
-    });
-
-    it("failure path: logs one error event on a DB failure during payment method fetch", async () => {
-      // Ownership succeeds (full profile row), then payment methods query fails.
-      queueRows([profileRow()]);
-      failSelectOnCall(2, new Error("connection reset"));
-
-      const res = await request(makeApp())
-        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
-        .set(authHeaders());
-
-      expect(res.status).toBe(500);
-      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing profile" });
-
-      expect(loggedEvents(spies).find((e) => e.event === "billing.profile.failed")).toMatchObject({
-        level: "error",
-        profileId: PROFILE_ID,
-        message: "connection reset",
-      });
-      expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
-    });
-
-    it("failure path: logs one error event on a DB failure during invoice fetch", async () => {
-      // Ownership succeeds (full profile row), payment methods succeed, invoices fail.
-      queueRows([profileRow()], [{ id: "pm-1" }]);
-      failSelectOnCall(3, new Error("timeout"));
-
-      const res = await request(makeApp())
-        .get(`/api/v1/billing/profiles/${PROFILE_ID}`)
-        .set(authHeaders());
-
-      expect(res.status).toBe(500);
-      expect(res.body).toEqual({ success: false, error: "Failed to fetch billing profile" });
-
-      expect(loggedEvents(spies).find((e) => e.event === "billing.profile.failed")).toMatchObject({
-        level: "error",
-        profileId: PROFILE_ID,
-        message: "timeout",
-      });
-      expect(counters()[BILLING_METRICS.ERRORS]).toBe(1);
-    });
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -830,7 +932,7 @@ describe("billing idempotency middleware", () => {
     resetBillingMetrics();
   });
 
-  it("executes the handler normally when no idempotency key is supplied", async () => {
+  it("contract: executes the handler normally when no idempotency key is supplied", async () => {
     const { app, getExecutionCount } = makeIdempotencyApp();
 
     const first = await request(app).post("/billing/test").send({ amount: 10 });
@@ -843,7 +945,7 @@ describe("billing idempotency middleware", () => {
     expect(getExecutionCount()).toBe(2);
   });
 
-  it("reuses the original response for the same idempotency key and body", async () => {
+  it("contract: reuses the original response for the same idempotency key and body", async () => {
     const { app, getExecutionCount } = makeIdempotencyApp();
 
     const first = await request(app)
@@ -863,7 +965,7 @@ describe("billing idempotency middleware", () => {
     expect(counters()[BILLING_METRICS.IDEMPOTENCY_REPLAYED]).toBe(1);
   });
 
-  it("rejects a repeated idempotency key when the body differs", async () => {
+  it("contract: rejects a repeated idempotency key when the body differs", async () => {
     const { app, getExecutionCount } = makeIdempotencyApp();
 
     const first = await request(app)
@@ -886,7 +988,7 @@ describe("billing idempotency middleware", () => {
     expect(counters()[BILLING_METRICS.IDEMPOTENCY_CONFLICT]).toBe(1);
   });
 
-  it("never logs the caller-supplied idempotency key", async () => {
+  it("contract: never logs the caller-supplied idempotency key", async () => {
     const { app } = makeIdempotencyApp();
 
     await request(app).post("/billing/test").set("Idempotency-Key", "secret-key").send({ a: 1 });

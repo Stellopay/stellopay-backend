@@ -173,6 +173,45 @@ Returns the full agreement details (employer, contributor, amounts, status).
 
 ---
 
+## Cursor-based record reads
+
+### `GET /records/cursor/:address`
+
+Returns a deterministic page of records for the requested address.
+
+**Query parameters**
+
+| Param | Type | Default | Notes |
+| ----- | ---- | ------- | ----- |
+| `cursor` | `number` | — | Exclusive cursor from the previous response's `nextCursor`. |
+| `order` | `"asc" \| "desc"` | `"desc"` | Orders by record id. |
+| `limit` | `number` | 50 | Integer between 1 and 100. |
+
+**Behavior**
+
+- Without a cursor, the route returns the first page in descending `id` order.
+- With a cursor, the route returns the next page of records strictly after the cursor in the selected order.
+- The cursor is exclusive, so a record at the cursor boundary is not returned again.
+- When the cursor is beyond the available range, the route returns an empty `records` array and `nextCursor: null`.
+- Invalid or malformed cursor input is rejected with a `500` response and an `Invalid cursor` error message.
+
+**Success response (200):**
+
+```json
+{
+  "address": "0xabc",
+  "records": [{ "id": 5, "value": "record-5" }],
+  "nextCursor": "4",
+  "order": "desc"
+}
+```
+
+**Auth**
+
+The route requires an `Authorization: Bearer <address>` header. Missing or mismatched credentials return `401` or `403` respectively.
+
+---
+
 ## Error handling
 
 All routes follow the same pattern:

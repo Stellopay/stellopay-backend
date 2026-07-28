@@ -38,6 +38,24 @@ export const RESULTS_PREVIEW_SIZE = 10;
 export const BACKFILL_CHECKPOINT_BATCH_SIZE = 100;
 
 // ---------------------------------------------------------------------------
+// Resume token freshness bounds (Issue #263)
+// ---------------------------------------------------------------------------
+
+/**
+ * Clock-skew tolerance when checking whether a resume token is in the
+ * future.  Tokens up to this far ahead of `Date.now()` are accepted so
+ * that minor differences between client and server clocks don't cause
+ * spurious rejections.
+ *
+ * Tokens beyond this tolerance are rejected with 400 to prevent an
+ * attacker from specifying a token that scans the entire table unbounded.
+ * The replay window itself is intentionally unbounded in the past —
+ * since synthetic event IDs use `ON CONFLICT DO NOTHING`, replaying
+ * old tokens is idempotent and harmless.
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000; // 60 seconds
+
+// ---------------------------------------------------------------------------
 // Job identity
 // ---------------------------------------------------------------------------
 
@@ -74,6 +92,38 @@ export function buildBackfillEventId(
 // Input validation
 // ---------------------------------------------------------------------------
 
+/**
+ * Validate a resume-token date for freshness bounds.
+ *
+ * Rejects:
+ *  - Future dates beyond {@link CLOCK_SKEW_TOLERANCE_MS} from `Date.now()`
+ *    (to prevent an attacker from specifying a token that scans the entire
+ *    table unbounded).
+ *
+ * Past dates are intentionally accepted without bound — since synthetic
+ * event IDs use `ON CONFLICT DO NOTHING`, replaying old tokens is
+ * idempotent and harmless.  The `_backfill_` segment in the event ID
+ * guarantees no collision with real on-chain events.
+ *
+ * This is the single validation entry-point for `before`, `resumeToken`,
+ * and `cursor` — the three aliases that all feed the same replay-window
+ * boundary.
+ */
+export function validateResumeTokenFreshness(date: Date): void {
+  const now = Date.now();
+  const tokenTime = date.getTime();
+
+  if (tokenTime > now + CLOCK_SKEW_TOLERANCE_MS) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        message: "Resume token is in the future beyond clock-skew tolerance",
+        path: [],
+      },
+    ]);
+  }
+}
+
 const optionalDateSchema = z.preprocess((val) => {
   if (val === undefined || val === null || val === "") return undefined;
   const d = new Date(val as string);
@@ -86,6 +136,7 @@ const optionalDateSchema = z.preprocess((val) => {
       },
     ]);
   }
+  validateResumeTokenFreshness(d);
   return d;
 }, z.date().optional());
 
@@ -153,11 +204,114 @@ export type BackfillEventType = "EmployeeAdded" | "MilestoneAdded";
 export type BackfillQueryParams = z.infer<typeof BackfillQuerySchema>;
 
 // ---------------------------------------------------------------------------
+// Progress persistence helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Upsert backfill progress for a given job. Creates a new row if none exists,
+ * or updates the existing row with the provided fields.
+ *
+ * @param tx - Database transaction to use for the upsert
+ * @param jobName - The backfill job name
+ * @param fields - Fields to upsert (partial update)
+ */
+export async function upsertBackfillProgress(
+  tx: typeof db,
+  jobName: BackfillJobName,
+  fields: {
+    status?: string;
+    lastCursor?: Date | null;
+    totalScanned?: number;
+    totalCreated?: number;
+    lastError?: string | null;
+    startedAt?: Date | null;
+    completedAt?: Date | null;
+  },
+): Promise<void> {
+  const now = new Date();
+  const existing = await tx
+    .select()
+    .from(schema.backfillProgress)
+    .where(eq(schema.backfillProgress.jobName, jobName))
+    .then((rows) => rows[0] ?? null);
+
+  if (!existing) {
+    await tx.insert(schema.backfillProgress).values({
+      jobName,
+      status: fields.status ?? "idle",
+      lastCursor: fields.lastCursor ?? null,
+      totalScanned: fields.totalScanned ?? 0,
+      totalCreated: fields.totalCreated ?? 0,
+      lastError: fields.lastError ?? null,
+      startedAt: fields.startedAt ?? null,
+      completedAt: fields.completedAt ?? null,
+      updatedAt: now,
+    });
+  } else {
+    await tx
+      .update(schema.backfillProgress)
+      .set({
+        ...fields,
+        updatedAt: now,
+      })
+      .where(eq(schema.backfillProgress.jobName, jobName));
+  }
+}
+
+/**
+ * Get backfill progress for a given job. Returns null if no progress exists.
+ *
+ * @param jobName - The backfill job name
+ * @returns The progress row or null
+ */
+export async function getBackfillProgress(
+  jobName: BackfillJobName,
+): Promise<{
+  status: string;
+  lastCursor: Date | null;
+  totalScanned: number;
+  totalCreated: number;
+  lastError: string | null;
+} | null> {
+  const rows = await db
+    .select()
+    .from(schema.backfillProgress)
+    .where(eq(schema.backfillProgress.jobName, jobName));
+
+  const row = rows[0] ?? null;
+  if (!row) return null;
+
+  return {
+    status: row.status,
+    lastCursor: row.lastCursor,
+    totalScanned: row.totalScanned,
+    totalCreated: row.totalCreated,
+    lastError: row.lastError,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Shared performance-optimized backfill executor
 // ---------------------------------------------------------------------------
 
 /**
  * Perform event backfilling for a given event type with batching and performance metrics.
+ *
+ * ## Checkpoint batching
+ *
+ * When the number of scanned rows exceeds {@link BACKFILL_CHECKPOINT_BATCH_SIZE},
+ * rows are inserted in batches of that size. Each batch runs in its own DB
+ * transaction that also persists the progress checkpoint (totalScanned,
+ * totalCreated, lastCursor). This guarantees that a crash between batches
+ * never loses committed work — the next call resumes from the last persisted
+ * checkpoint.
+ *
+ * ## Auto-resume
+ *
+ * If the caller omits the `before`, `resumeToken`, and `cursor` parameters,
+ * the function loads the persisted checkpoint for the job and uses its
+ * `lastCursor` as the resume boundary. An explicit parameter always takes
+ * precedence over the persisted checkpoint.
  */
 export async function performBackfill(
   eventType: BackfillEventType,
@@ -167,10 +321,30 @@ export async function performBackfill(
   const { limit, agreementId, before, resumeToken, cursor } = params;
 
   // Prefer before, then resumeToken, then cursor
-  const resumeDate = before ?? resumeToken ?? cursor;
+  const explicitCursor = before ?? resumeToken ?? cursor;
+
+  // Auto-resume: if no explicit cursor provided, load persisted checkpoint
+  const jobName: BackfillJobName = eventType === "EmployeeAdded"
+    ? EMPLOYEE_BACKFILL_JOB
+    : MILESTONE_BACKFILL_JOB;
 
   const isEmployee = eventType === "EmployeeAdded";
   const tableAlias = isEmployee ? "e" : "m";
+
+  // If no explicit cursor, load the persisted checkpoint
+  let resumeDate: Date | null = explicitCursor ?? null;
+  let persistedTotalScanned = 0;
+  let persistedTotalCreated = 0;
+  if (!resumeDate) {
+    const progress = await getBackfillProgress(jobName);
+    if (progress?.lastCursor) {
+      resumeDate = progress.lastCursor;
+    }
+    if (progress) {
+      persistedTotalScanned = progress.totalScanned;
+      persistedTotalCreated = progress.totalCreated;
+    }
+  }
 
   const conditions = sql`1=1`;
   if (agreementId) {
@@ -210,58 +384,110 @@ export async function performBackfill(
   let createdCount = 0;
   const results: BackfillResultEntry[] = [];
 
+  // Mark job as running at the start
+  await db.transaction(async (tx) => {
+    await upsertBackfillProgress(tx, jobName, {
+      status: "running",
+      startedAt: new Date(),
+      lastError: null,
+    });
+  });
+
   if (scannedRows.length > 0) {
-    const insertValues = scannedRows.map((row) => {
-      const eventId = buildBackfillEventId(
-        String(row.transaction_hash),
-        eventType,
-        String(row.id),
-      );
-      return {
-        id: eventId,
-        agreementId: String(row.agreement_id),
-        contractAddress: String(row.contract_address),
-        eventType,
-        blockNumber: Number(row.block_number),
-        transactionHash: String(row.transaction_hash),
-        eventIndex: BACKFILL_EVENT_INDEX,
-      };
-    });
+    // Process in batches of BACKFILL_CHECKPOINT_BATCH_SIZE
+    const batchSize = BACKFILL_CHECKPOINT_BATCH_SIZE;
+    const batches = [];
+    for (let i = 0; i < scannedRows.length; i += batchSize) {
+      batches.push(scannedRows.slice(i, i + batchSize));
+    }
 
-    let insertedRows: any[] = [];
-    await db.transaction(async (tx) => {
-      insertedRows = await tx
-        .insert(schema.agreementEvents)
-        .values(insertValues)
-        .onConflictDoNothing()
-        .returning();
-    });
+    // Start from persisted totals when resuming, otherwise start from 0
+    let batchCreatedCount = persistedTotalCreated;
+    let batchTotalScanned = persistedTotalScanned;
 
-    const insertedIds = new Set(insertedRows.map((r) => String(r.id)));
+    for (const batch of batches) {
+      const insertValues = batch.map((row) => {
+        const eventId = buildBackfillEventId(
+          String(row.transaction_hash),
+          eventType,
+          String(row.id),
+        );
+        return {
+          id: eventId,
+          agreementId: String(row.agreement_id),
+          contractAddress: String(row.contract_address),
+          eventType,
+          blockNumber: Number(row.block_number),
+          transactionHash: String(row.transaction_hash),
+          eventIndex: BACKFILL_EVENT_INDEX,
+        };
+      });
 
-    for (const row of scannedRows) {
-      const eventId = buildBackfillEventId(
-        String(row.transaction_hash),
-        eventType,
-        String(row.id),
-      );
-      const isCreated = insertedIds.has(eventId);
-      if (isCreated) {
-        createdCount++;
+      let insertedRows: any[] = [];
+      await db.transaction(async (tx) => {
+        insertedRows = await tx
+          .insert(schema.agreementEvents)
+          .values(insertValues)
+          .onConflictDoNothing()
+          .returning();
+
+        // Count created rows in this batch
+        const batchCreated = insertedRows.length;
+
+        // Update progress checkpoint atomically with the inserts
+        const lastRow = batch[batch.length - 1];
+        const batchCursor = new Date(lastRow.created_at);
+
+        await upsertBackfillProgress(tx, jobName, {
+          status: "running",
+          totalScanned: batchTotalScanned + batch.length,
+          totalCreated: batchCreatedCount + batchCreated,
+          lastCursor: batchCursor,
+        });
+
+        batchCreatedCount += batchCreated;
+        batchTotalScanned += batch.length;
+      });
+
+      const insertedIds = new Set(insertedRows.map((r) => String(r.id)));
+
+      for (const row of batch) {
+        const eventId = buildBackfillEventId(
+          String(row.transaction_hash),
+          eventType,
+          String(row.id),
+        );
+        const isCreated = insertedIds.has(eventId);
+        if (isCreated) {
+          createdCount++;
+        }
+
+        const entry: BackfillResultEntry = {
+          agreementId: String(row.agreement_id),
+          status: isCreated ? "created" : "skipped",
+        };
+        if (isEmployee) {
+          entry.employeeId = String(row.id);
+        } else {
+          entry.milestoneId = String(row.id);
+        }
+        results.push(entry);
       }
-
-      const entry: BackfillResultEntry = {
-        agreementId: String(row.agreement_id),
-        status: isCreated ? "created" : "skipped",
-      };
-      if (isEmployee) {
-        entry.employeeId = String(row.id);
-      } else {
-        entry.milestoneId = String(row.id);
-      }
-      results.push(entry);
     }
   }
+
+  // Determine final status
+  const hasMore = scannedRows.length === limit;
+  const finalStatus = hasMore ? "idle" : "completed";
+  const completedAt = hasMore ? null : new Date();
+
+  // Update final progress status
+  await db.transaction(async (tx) => {
+    await upsertBackfillProgress(tx, jobName, {
+      status: finalStatus,
+      completedAt,
+    });
+  });
 
   const lastRow = scannedRows[scannedRows.length - 1];
   const nextCursorIso = lastRow ? new Date(lastRow.created_at).toISOString() : null;
@@ -284,7 +510,7 @@ export async function performBackfill(
     nextCursor: nextCursorIso,
     nextResumeToken: nextCursorIso,
     cursor: nextCursorIso,
-    hasMore: scannedRows.length === limit,
+    hasMore,
     durationMs,
   };
 }
@@ -312,6 +538,14 @@ backfillEventsRouter.post(
       if (e instanceof z.ZodError || e?.name === "ZodError") {
         res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
+      }
+      try {
+        await upsertBackfillProgress(db, EMPLOYEE_BACKFILL_JOB, {
+          status: "failed",
+          lastError: e?.message ? String(e.message) : String(e),
+        });
+      } catch {
+        // Best-effort: don't let a failed checkpoint write mask the original error.
       }
       next(e);
     }

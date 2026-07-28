@@ -266,11 +266,10 @@ export const EnvSchema = z
           `CORS_ORIGIN must be set to an explicit comma-separated allowlist of origins ` +
           `in non-development environments (NODE_ENV=${data.NODE_ENV}). ` +
           `A wildcard ('*') is not permitted outside of development because it ` +
-          `cannot be combined with credentials and exposes authenticated endpoints ` +
-          `to cross-origin requests from any domain.`,
+          `cannot be combined with credentials and exposes authenticated endpoints.`,
       });
     }
-  });
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Startup validation

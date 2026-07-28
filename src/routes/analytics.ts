@@ -16,6 +16,10 @@ export const analyticsRouter = Router();
 
 export const ANALYTICS_ROLLUP_BATCH_SIZE = 500;
 
+export const analyticsAggregationCache = new AnalyticsCache(
+  env.ANALYTICS_CACHE_TTL_MS ?? 30_000,
+);
+
 const MONTH_NAMES = [
   "Jan",
   "Feb",
@@ -221,13 +225,29 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
   const start = process.hrtime.bigint();
   const requestId: string | undefined = res.locals.requestId;
 
+  let rollupKey: string | undefined;
+
   try {
     const userAddress = StarknetAddress.parse(req.params.user_address);
     const { year: parsedYear } = AnalyticsQuerySchema.parse(req.query);
     const year = parsedYear ?? new Date().getFullYear();
 
-    // Deduplication lock: prevent concurrent rollups for the same user & year
-    const rollupKey = `${userAddress}:${year}`;
+    const cacheKey = buildAnalyticsCacheKey(userAddress, { year });
+
+    const cached = analyticsAggregationCache.get(cacheKey);
+    if (cached) {
+      res.set("Cache-Control", "private, max-age=60");
+      const etag = computeETag(cached);
+      res.set("ETag", etag);
+      if (req.headers["if-none-match"] === etag) {
+        res.status(304).end();
+        return;
+      }
+      res.json(cached);
+      return;
+    }
+
+    rollupKey = `${userAddress}:${year}`;
     if (inflightRollups.has(rollupKey)) {
       res.status(409).json({
         error: "Duplicate rollup in progress — retry after a few seconds",
@@ -240,130 +260,132 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
       const startDate = new Date(year, 0, 1);
       const endDate = new Date(year, 11, 31, 23, 59, 59, 999);
 
-      // --- Query 1: Payments ---
-      const payments = await collectAnalyticsRollupBatches(async (cursor) => {
-        const baseFilter = and(
-          or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
-          gte(schema.payments.createdAt, startDate),
-          lte(schema.payments.createdAt, endDate),
-        );
-        const cursorFilter = cursor
-          ? or(
-              gt(schema.payments.createdAt, cursor.createdAt),
-              and(
-                eq(schema.payments.createdAt, cursor.createdAt),
-                gt(schema.payments.id, cursor.id),
-              ),
+      const [payments, escrowEvents, agreementCreations] = await Promise.all([
+        // --- Query 1: Payments ---
+        collectAnalyticsRollupBatches(async (cursor) => {
+          const baseFilter = and(
+            or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)),
+            gte(schema.payments.createdAt, startDate),
+            lte(schema.payments.createdAt, endDate),
+          );
+          const cursorFilter = cursor
+            ? or(
+                gt(schema.payments.createdAt, cursor.createdAt),
+                and(
+                  eq(schema.payments.createdAt, cursor.createdAt),
+                  gt(schema.payments.id, cursor.id),
+                ),
+              )
+            : undefined;
+
+          const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
+          const query = db
+            .select({
+              id: schema.payments.id,
+              createdAt: schema.payments.createdAt,
+              month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
+              amount: schema.payments.amount,
+              from: schema.payments.from,
+              to: schema.payments.to,
+            })
+            .from(schema.payments)
+            .where(whereCondition);
+
+          return typeof (query as any).orderBy === "function"
+            ? await (query as any)
+                .orderBy(asc(schema.payments.createdAt), asc(schema.payments.id))
+                .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
+            : await query;
+        }),
+
+        // --- Query 2: Escrow Events ---
+        collectAnalyticsRollupBatches(async (cursor) => {
+          const baseFilter = and(
+            or(
+              eq(schema.escrowEvents.employer, userAddress),
+              eq(schema.escrowEvents.to, userAddress),
+            ),
+            gte(schema.escrowEvents.createdAt, startDate),
+            lte(schema.escrowEvents.createdAt, endDate),
+          );
+          const cursorFilter = cursor
+            ? or(
+                gt(schema.escrowEvents.createdAt, cursor.createdAt),
+                and(
+                  eq(schema.escrowEvents.createdAt, cursor.createdAt),
+                  gt(schema.escrowEvents.id, cursor.id),
+                ),
+              )
+            : undefined;
+
+          const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
+          const query = db
+            .select({
+              id: schema.escrowEvents.id,
+              createdAt: schema.escrowEvents.createdAt,
+              month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
+              amount: schema.escrowEvents.amount,
+              eventType: schema.escrowEvents.eventType,
+              employer: schema.escrowEvents.employer,
+              to: schema.escrowEvents.to,
+            })
+            .from(schema.escrowEvents)
+            .where(whereCondition);
+
+          return typeof (query as any).orderBy === "function"
+            ? await (query as any)
+                .orderBy(asc(schema.escrowEvents.createdAt), asc(schema.escrowEvents.id))
+                .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
+            : await query;
+        }),
+
+        // --- Query 3: Agreement Creations ---
+        collectAnalyticsRollupBatches(async (cursor) => {
+          const baseFilter = and(
+            eq(schema.agreementEvents.eventType, "AgreementCreated"),
+            or(
+              eq(schema.agreements.employer, userAddress),
+              eq(schema.agreements.contributor, userAddress),
+            ),
+            gte(schema.agreementEvents.createdAt, startDate),
+            lte(schema.agreementEvents.createdAt, endDate),
+          );
+          const cursorFilter = cursor
+            ? or(
+                gt(schema.agreementEvents.createdAt, cursor.createdAt),
+                and(
+                  eq(schema.agreementEvents.createdAt, cursor.createdAt),
+                  gt(schema.agreementEvents.id, cursor.id),
+                ),
+              )
+            : undefined;
+
+          const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
+          const query = db
+            .select({
+              id: schema.agreementEvents.id,
+              createdAt: schema.agreementEvents.createdAt,
+              month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
+              agreementId: schema.agreementEvents.agreementId,
+            })
+            .from(schema.agreementEvents)
+            .innerJoin(
+              schema.agreements,
+              eq(schema.agreementEvents.agreementId, schema.agreements.id),
             )
-          : undefined;
+            .where(whereCondition);
 
-        const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-        const query = db
-          .select({
-            id: schema.payments.id,
-            createdAt: schema.payments.createdAt,
-            month: sql<number>`EXTRACT(MONTH FROM ${schema.payments.createdAt})`,
-            amount: schema.payments.amount,
-            from: schema.payments.from,
-            to: schema.payments.to,
-          })
-          .from(schema.payments)
-          .where(whereCondition);
+          return typeof (query as any).orderBy === "function"
+            ? await (query as any)
+                .orderBy(asc(schema.agreementEvents.createdAt), asc(schema.agreementEvents.id))
+                .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
+            : await query;
+        }),
+      ]);
 
-        return typeof (query as any).orderBy === "function"
-          ? await (query as any)
-              .orderBy(asc(schema.payments.createdAt), asc(schema.payments.id))
-              .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
-          : await query;
-      });
-
-      // --- Query 2: Escrow Events ---
-      const escrowEvents = await collectAnalyticsRollupBatches(async (cursor) => {
-        const baseFilter = and(
-          or(
-            eq(schema.escrowEvents.employer, userAddress),
-            eq(schema.escrowEvents.to, userAddress),
-          ),
-          gte(schema.escrowEvents.createdAt, startDate),
-          lte(schema.escrowEvents.createdAt, endDate),
-        );
-        const cursorFilter = cursor
-          ? or(
-              gt(schema.escrowEvents.createdAt, cursor.createdAt),
-              and(
-                eq(schema.escrowEvents.createdAt, cursor.createdAt),
-                gt(schema.escrowEvents.id, cursor.id),
-              ),
-            )
-          : undefined;
-
-        const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-        const query = db
-          .select({
-            id: schema.escrowEvents.id,
-            createdAt: schema.escrowEvents.createdAt,
-            month: sql<number>`EXTRACT(MONTH FROM ${schema.escrowEvents.createdAt})`,
-            amount: schema.escrowEvents.amount,
-            eventType: schema.escrowEvents.eventType,
-            employer: schema.escrowEvents.employer,
-            to: schema.escrowEvents.to,
-          })
-          .from(schema.escrowEvents)
-          .where(whereCondition);
-
-        return typeof (query as any).orderBy === "function"
-          ? await (query as any)
-              .orderBy(asc(schema.escrowEvents.createdAt), asc(schema.escrowEvents.id))
-              .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
-          : await query;
-      });
-
-      // --- Query 3: Agreement Creations ---
-      const agreementCreations = await collectAnalyticsRollupBatches(async (cursor) => {
-        const baseFilter = and(
-          eq(schema.agreementEvents.eventType, "AgreementCreated"),
-          or(
-            eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress),
-          ),
-          gte(schema.agreementEvents.createdAt, startDate),
-          lte(schema.agreementEvents.createdAt, endDate),
-        );
-        const cursorFilter = cursor
-          ? or(
-              gt(schema.agreementEvents.createdAt, cursor.createdAt),
-              and(
-                eq(schema.agreementEvents.createdAt, cursor.createdAt),
-                gt(schema.agreementEvents.id, cursor.id),
-              ),
-            )
-          : undefined;
-
-        const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-        const query = db
-          .select({
-            id: schema.agreementEvents.id,
-            createdAt: schema.agreementEvents.createdAt,
-            month: sql<number>`EXTRACT(MONTH FROM ${schema.agreementEvents.createdAt})`,
-            agreementId: schema.agreementEvents.agreementId,
-          })
-          .from(schema.agreementEvents)
-          .innerJoin(
-            schema.agreements,
-            eq(schema.agreementEvents.agreementId, schema.agreements.id),
-          )
-          .where(whereCondition);
-
-        return typeof (query as any).orderBy === "function"
-          ? await (query as any)
-              .orderBy(asc(schema.agreementEvents.createdAt), asc(schema.agreementEvents.id))
-              .limit(ANALYTICS_ROLLUP_BATCH_SIZE)
-          : await query;
-      });
-
-      // ---------------------------------------------------------------------
+      // -------------------------------------------------------------------
       // Aggregation — all arithmetic in BigInt space to preserve precision
-      // ---------------------------------------------------------------------
+      // -------------------------------------------------------------------
       const monthlyData: Record<number, bigint> = {};
       const monthHasFinancialActivity: Record<number, boolean> = {};
       for (let i = 1; i <= 12; i++) {
@@ -432,38 +454,56 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
       const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logAnalyticsTelemetry({
-      operation: "analytics_monthly_rollup",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "success",
-      request_id: requestId,
-      user_address: userAddress,
-      year,
-      row_counts: {
-        payments: payments.length,
-        escrow_events: escrowEvents.length,
-        agreement_creations: agreementCreations.length,
-      },
-    });
-
-    const responseBody = {
-      year,
-      data: chartData,
-      total: toDisplayNumber(totalRaw),
-    });
-  } catch (e: any) {
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    if (!(e instanceof z.ZodError)) {
+      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
       logAnalyticsTelemetry({
         operation: "analytics_monthly_rollup",
         duration_ms: Math.round(duration * 100) / 100,
-        status: "error",
+        status: "success",
         request_id: requestId,
-        user_address: req.params.user_address,
-        error: e?.message || String(e),
+        user_address: userAddress,
+        year,
+        row_counts: {
+          payments: payments.length,
+          escrow_events: escrowEvents.length,
+          agreement_creations: agreementCreations.length,
+        },
       });
+
+      const responseBody = {
+        year,
+        data: chartData,
+        total: toDisplayNumber(totalRaw),
+      };
+
+      analyticsAggregationCache.set(cacheKey, responseBody);
+
+      res.set("Cache-Control", "private, max-age=60");
+      const etag = computeETag(responseBody);
+      res.set("ETag", etag);
+
+      if (req.headers["if-none-match"] === etag) {
+        res.status(304).end();
+        return;
+      }
+
+      res.json(responseBody);
+    } catch (e: unknown) {
+      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+      if (!(e instanceof z.ZodError)) {
+        logAnalyticsTelemetry({
+          operation: "analytics_monthly_rollup",
+          duration_ms: Math.round(duration * 100) / 100,
+          status: "error",
+          request_id: requestId,
+          user_address: req.params.user_address,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+      next(e);
     }
-    next(e);
+  } finally {
+    if (rollupKey) {
+      inflightRollups.delete(rollupKey);
+    }
   }
 });

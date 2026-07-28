@@ -408,17 +408,40 @@ export function withBillingIdempotency(
   };
 }
 
-/** Zod schema for the :profileId path param – non-empty string, max 128 chars */
+/**
+ * Zod schema for the `:profileId` path param.
+ *
+ * Contract:
+ * - Must be a non-empty string (min 1 character).
+ * - Max 128 characters.
+ * - Only alphanumeric characters (`\w`) and dashes (`-`) are allowed.
+ * - Rejects slashes, dots, spaces, and other special characters.
+ *
+ * This is a standalone string schema (not wrapped in `z.object({…})`) so it
+ * can be passed directly to `.safeParse(req.params.profileId)` in the
+ * {@link validateProfileId} middleware.
+ */
 const profileIdParamSchema = z
   .string()
-  .min(1)
-  .max(128)
+  .min(1, "profileId is required")
+  .max(128, "profileId must be at most 128 characters")
   .regex(/^[\w\-]+$/, "profileId must be alphanumeric/dash");
 
 /** Convenience object schema for optional programmatic reuse. */
 const profileIdSchema = z.object({ profileId: profileIdParamSchema });
 
-/** Middleware: parse + validate :profileId, attach to res.locals */
+/**
+ * Middleware: parse + validate the `:profileId` path param.
+ *
+ * Contract:
+ * - On success: attaches the validated string to `res.locals.profileId` and
+ *   calls `next()`.
+ * - On failure: responds with HTTP 400 and a fixed error message that does
+ *   NOT echo the invalid input (preventing injection through error messages).
+ *   The Zod schema's detailed error messages are intentionally swallowed —
+ *   the caller sees only "Invalid profileId: alphanumeric and dashes only"
+ *   regardless of which rule was violated.
+ */
 function validateProfileId(req: Request, res: Response, next: NextFunction): void {
   const parsed = profileIdParamSchema.safeParse(req.params.profileId);
   if (!parsed.success) {
@@ -435,7 +458,22 @@ function requireBillingEnabled(_req: Request, res: Response, next: NextFunction)
   next();
 }
 
-/** Middleware: verify the caller owns the billing profile identified by :profileId */
+/**
+ * Middleware: verify the caller owns the billing profile identified by
+ * `:profileId` (already validated and attached to `res.locals.profileId`).
+ *
+ * Contract:
+ * - Queries the database for a billing profile with the given ID.
+ * - If the profile does not exist OR the caller is not the owner, responds
+ *   with HTTP 404 and a generic "not found" message. The two cases are
+ *   intentionally indistinguishable to the caller so attackers cannot
+ *   enumerate billing profile IDs. **The split is visible in logs only**
+ *   via the `billing.ownership.denied` event (see billing-metrics.ts).
+ * - On success: attaches the full profile row to `res.locals.profile` and
+ *   calls `next()`. Route handlers MUST use `res.locals.profile` rather than
+ *   querying the database again.
+ * - On DB failure: responds with HTTP 500 and does not call `next()`.
+ */
 async function requireBillingOwner(req: Request, res: Response, next: NextFunction): Promise<void> {
   const profileId: string = res.locals.profileId;
   const callerAddress = req.auth!.address;
@@ -505,10 +543,114 @@ function stripSensitive(profile: ProfileRow) {
 // ---------------------------------------------------------------------------
 
 /**
+ * GET /api/v1/billing/profiles/:profileId
+ *
+ * Returns the full billing profile (with sensitive fields stripped),
+ * payment methods, and invoices in a single response.
+ *
+ * Contract:
+ * - Uses `res.locals.profile` from the `requireBillingOwner` middleware —
+ *   does NOT re-query the database for the profile.
+ * - Fetches payment methods and invoices in parallel via `Promise.all`.
+ * - Strips `taxId` and `dateOfBirth` from the profile before serialisation.
+ * - Emits a `billing.profile.fetched` event on success.
+ * - Emits a `billing.amount.coerced` warning when invoice amounts are
+ *   unusable (matching the behaviour of the `/invoices` route).
+ * - On TOCTOU race (profile deleted between middleware and handler):
+ *   responds with HTTP 404 without attempting DB queries.
+ * - On DB failure: responds with HTTP 500.
+ *
+ * Response shape (200):
+ *   { success: true, data: { profile: ProfileRow, paymentMethods: [], invoices: [] } }
+ */
+billingRouter.get(
+  "/billing/profiles/:profileId",
+  validateProfileId,
+  requireBillingOwner,
+  async (req: Request, res: Response) => {
+    const profileId: string = res.locals.profileId;
+    const startedAt = Date.now();
+
+    try {
+      const profile = res.locals.profile;
+
+      // Safety net for a TOCTOU race between middleware and handler.
+      if (!profile) {
+        fail(res, 404, `Billing profile '${profileId}' not found`);
+        return;
+      }
+
+      const [paymentMethods, invoices] = await Promise.all([
+        db
+          .select()
+          .from(schema.billingPaymentMethods)
+          .where(eq(schema.billingPaymentMethods.profileId, profileId)),
+        db
+          .select()
+          .from(schema.billingInvoices)
+          .where(eq(schema.billingInvoices.profileId, profileId)),
+      ]);
+
+      // Read-side aggregate for telemetry only.
+      const totals = summarizeInvoices(invoices);
+      const durationMs = Date.now() - startedAt;
+
+      incBillingMetric(BILLING_METRICS.PROFILE_FETCHED);
+      incBillingMetric(BILLING_METRICS.PROFILE_DURATION_MS, durationMs);
+      if (totals.coercedCount > 0) {
+        incBillingMetric(BILLING_METRICS.AMOUNT_COERCED, totals.coercedCount);
+        logBillingEvent("warn", "billing.amount.coerced", {
+          profileId,
+          field: "invoices.amount",
+          affectedRows: totals.coercedCount,
+          reasons: totals.coercionReasons,
+        });
+      }
+
+      logBillingEvent("info", "billing.profile.fetched", {
+        profileId,
+        paymentMethodCount: paymentMethods.length,
+        invoiceCount: totals.invoiceCount,
+        totalAmount: totals.totalAmount,
+        paidAmount: totals.paidAmount,
+        outstandingAmount: totals.outstandingAmount,
+        coercedCount: totals.coercedCount,
+        durationMs,
+      });
+
+      ok(res, {
+        profile: stripSensitive(profile),
+        paymentMethods,
+        invoices,
+      });
+    } catch (err: any) {
+      logBillingFailure("billing.profile.failed", err, {
+        profileId,
+        durationMs: Date.now() - startedAt,
+      });
+      fail(res, 500, "Failed to fetch billing profile");
+    }
+  },
+);
+
+/**
  * GET /api/v1/billing/profiles/:profileId/general-information
  *
  * Returns identity / contact fields for the profile.
  * Sensitive fields (taxId, dateOfBirth) are excluded.
+ *
+ * Contract:
+ * - Uses `res.locals.profile` from the middleware — does NOT re-query the DB.
+ * - Strips `taxId` and `dateOfBirth` via {@link stripSensitive}.
+ * - Computes a convenience `fullAddress` string from non-null address
+ *   components (street, city, state, zipCode, country). Returns `null` when
+ *   every component is falsy.
+ * - On TOCTOU race (profile deleted between middleware and handler):
+ *   responds with HTTP 404.
+ * - On DB failure: responds with HTTP 500.
+ *
+ * Response shape (200):
+ *   { success: true, data: { id, firstName, …, fullAddress } }
  */
 billingRouter.get(
   "/billing/profiles/:profileId/general-information",
@@ -554,6 +696,15 @@ billingRouter.get(
  *
  * Returns the list of payment methods for the profile.
  * Only masked/safe representations are stored and returned (no raw account numbers).
+ *
+ * Contract:
+ * - Queries the `billingPaymentMethods` table filtered by `profileId`.
+ * - Returns an empty array when no payment methods exist (never `null`).
+ * - The response includes `profileId` for caller convenience.
+ * - On DB failure: responds with HTTP 500.
+ *
+ * Response shape (200):
+ *   { success: true, data: { profileId, paymentMethods: [] } }
  */
 billingRouter.get(
   "/billing/profiles/:profileId/payment-methods",
@@ -584,9 +735,31 @@ billingRouter.get(
 
 /**
  * GET /api/v1/billing/profiles/:profileId/invoices
+ *
+ * Returns the invoice history for the profile. Every invoice row is parsed
+ * through the safe `parseBillingAmount` helper so malformed amounts never
+ * propagate NaN into the aggregate telemetry.
+ *
  * Supports optional pagination via `limit` and `offset` query parameters.
  * When both are omitted the response envelope is unchanged (backward-compatible).
- * Hardened to validate every invoice row.
+ *
+ * Contract:
+ * - Queries the `billingInvoices` table filtered by `profileId`.
+ * - The response body contains the raw rows unchanged — existing callers see
+ *   exactly the same shape as before observability was added.
+ * - A read-side aggregate (`summarizeInvoices`) is computed for telemetry
+ *   only and is NOT written back to the database or returned in the response.
+ * - When invoice amounts are unusable (missing, malformed, or negative):
+ *   one `billing.amount.coerced` warning is emitted with a per-reason
+ *   breakdown, and the `billing_amount_coerced_total` counter is bumped.
+ * - The aggregate normalises invoice statuses to lowercase; unrecognised or
+ *   null statuses are bucketed as `"unknown"` rather than widening the log
+ *   key space with arbitrary values.
+ * - Hardened to validate every invoice row.
+ * - On DB failure: responds with HTTP 500.
+ *
+ * Response shape (200):
+ *   { success: true, data: { profileId, invoices: [] } }
  */
 billingRouter.get(
   "/billing/profiles/:profileId/invoices",
@@ -680,7 +853,35 @@ billingRouter.get(
 /**
  * GET /api/v1/billing/profiles/:profileId/summary
  *
- * Returns the reward-limit / spend summary for the profile.
+ * Returns the reward-limit / spend summary computed from the profile's
+ * `annualRewardLimit` and `usedAmount` columns.
+ *
+ * Math contract:
+ * - `limit` = `parseBillingAmountWithTelemetry(profile.annualRewardLimit,
+ *   "annualRewardLimit", …)` — coerces missing/malformed/negative to 0
+ *   and emits a `billing.amount.coerced` warning.
+ * - `used` = `parseBillingAmountWithTelemetry(profile.usedAmount,
+ *   "usedAmount", …)` — same coercion as above.
+ * - `remainingAmount` = `max(0, limit - used)` — clamped to zero so overruns
+ *   never produce a negative remainder. When `used > limit`, a
+ *   `billing.summary.limit_exceeded` warning is emitted separately.
+ * - `progressPercentage` = `(used / limit) × 100` when `limit > 0`; `0` when
+ *   `limit === 0`. Rounded to 2 decimal places. NOT clamped to 100% — a
+ *   profile that exceeds its limit correctly reports > 100% progress.
+ * - All intermediate arithmetic is rounded to 6 decimal places to stay
+ *   lossless within the column's declared `numeric(18,6)` scale.
+ *
+ * Contract:
+ * - Uses `res.locals.profile` from the middleware — does NOT re-query the DB.
+ * - Each coerced column emits its own `billing.amount.coerced` event naming
+ *   the offending field, so operators can pinpoint which column is corrupt.
+ * - On TOCTOU race (profile deleted between middleware and handler):
+ *   responds with HTTP 404.
+ * - On DB failure: responds with HTTP 500.
+ *
+ * Response shape (200):
+ *   { success: true, data: { profileId, profileType, annualRewardLimit,
+ *     usedAmount, remainingAmount, currency, progressPercentage } }
  */
 billingRouter.get(
   "/billing/profiles/:profileId/summary",
