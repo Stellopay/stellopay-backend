@@ -2,6 +2,8 @@ import { execSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { getTableConfig } from "drizzle-orm/pg-core";
+import { getTableName } from "drizzle-orm";
 import pg from "pg";
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import {
@@ -12,12 +14,371 @@ import {
   main,
   withMigrationLock,
 } from "./migrate.js";
+import { validateSchema } from "./schema-fk-indexes.js";
+import { pgTable, text } from "drizzle-orm/pg-core";
+import * as schema from "./schema.js";
+import {
+  agreements,
+  agreementEvents,
+  payments,
+  milestones,
+  employees,
+  escrowEvents,
+  billingProfiles,
+  billingPaymentMethods,
+  billingInvoices,
+  sessions,
+  U256_DECIMAL_REGEX,
+  U256_DECIMAL_PATTERN,
+  CURRENCY_CODE_REGEX,
+  isValidU256,
+  isValidCurrencyCode,
+  isValidNonNegativeInteger,
+  assertNonNegative,
+  assertValidU256,
+  clampPageLimit,
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  clampBatchSize,
+  MAX_BATCH_SIZE,
+  validateBatchSize,
+} from "./schema.js";
 
 vi.mock("drizzle-orm/node-postgres/migrator", () => ({
   migrate: vi.fn(),
 }));
 
 const describeDbMigration = process.env.RUN_DB_MIGRATION_TESTS === "1" ? describe : describe.skip;
+
+// ---------------------------------------------------------------------------
+// Helper: extract CHECK constraint names declared on a table
+// ---------------------------------------------------------------------------
+function getCheckConstraintNames(table: Parameters<typeof getTableConfig>[0]): string[] {
+  const config = getTableConfig(table);
+  // Drizzle exposes check constraints under config.checks
+  const checks = (config as { checks?: Array<{ name: string }> }).checks ?? [];
+  return checks.map((c) => c.name);
+}
+
+// ---------------------------------------------------------------------------
+// Schema CHECK constraint declarations
+// ---------------------------------------------------------------------------
+
+describe("schema check constraints", () => {
+  describe("agreements", () => {
+    it("declares check constraints for mode, paymentType, status, disputeStatus, blockNumber, and u256 amounts", () => {
+      const names = getCheckConstraintNames(agreements);
+      expect(names).toContain("agreements_mode_check");
+      expect(names).toContain("agreements_payment_type_check");
+      expect(names).toContain("agreements_status_check");
+      expect(names).toContain("agreements_dispute_status_check");
+      expect(names).toContain("agreements_block_number_check");
+      expect(names).toContain("agreements_total_amount_check");
+      expect(names).toContain("agreements_paid_amount_check");
+    });
+  });
+
+  describe("agreement_events", () => {
+    it("declares check constraints for blockNumber and eventIndex", () => {
+      const names = getCheckConstraintNames(agreementEvents);
+      expect(names).toContain("agreement_events_block_number_check");
+      expect(names).toContain("agreement_events_event_index_check");
+    });
+  });
+
+  describe("payments", () => {
+    it("declares check constraints for blockNumber, amount, and eventType", () => {
+      const names = getCheckConstraintNames(payments);
+      expect(names).toContain("payments_block_number_check");
+      expect(names).toContain("payments_amount_check");
+      expect(names).toContain("payments_event_type_check");
+    });
+  });
+
+  describe("milestones", () => {
+    it("declares check constraints for milestoneId, blockNumber, and amount", () => {
+      const names = getCheckConstraintNames(milestones);
+      expect(names).toContain("milestones_milestone_id_check");
+      expect(names).toContain("milestones_block_number_check");
+      expect(names).toContain("milestones_amount_check");
+    });
+  });
+
+  describe("employees", () => {
+    it("declares check constraints for employeeIndex, claimedPeriods, blockNumber, and salary", () => {
+      const names = getCheckConstraintNames(employees);
+      expect(names).toContain("employees_employee_index_check");
+      expect(names).toContain("employees_claimed_periods_check");
+      expect(names).toContain("employees_block_number_check");
+      expect(names).toContain("employees_salary_per_period_check");
+    });
+  });
+
+  describe("escrow_events", () => {
+    it("declares check constraints for blockNumber, amount, and eventType", () => {
+      const names = getCheckConstraintNames(escrowEvents);
+      expect(names).toContain("escrow_events_block_number_check");
+      expect(names).toContain("escrow_events_amount_check");
+      expect(names).toContain("escrow_events_event_type_check");
+    });
+  });
+
+  describe("billing_profiles", () => {
+    it("declares check constraints for profileType, currency, and reward limits", () => {
+      const names = getCheckConstraintNames(billingProfiles);
+      expect(names).toContain("billing_profiles_profile_type_check");
+      expect(names).toContain("billing_profiles_currency_check");
+      expect(names).toContain("billing_profiles_annual_reward_limit_check");
+      expect(names).toContain("billing_profiles_used_amount_check");
+    });
+  });
+
+  describe("billing_payment_methods", () => {
+    it("declares a check constraint for type", () => {
+      const names = getCheckConstraintNames(billingPaymentMethods);
+      expect(names).toContain("billing_payment_methods_type_check");
+    });
+  });
+
+  describe("billing_invoices", () => {
+    it("declares check constraints for status, currency, and amount", () => {
+      const names = getCheckConstraintNames(billingInvoices);
+      expect(names).toContain("billing_invoices_status_check");
+      expect(names).toContain("billing_invoices_currency_check");
+      expect(names).toContain("billing_invoices_amount_check");
+    });
+  });
+
+  describe("u256 decimal format validation", () => {
+    // Documents and tests the regex used in CHECK constraints for u256 columns.
+    // The pattern is: ^(0|[1-9][0-9]{0,77})$
+    // – accepts "0" and positive integers up to 78 digits (the max decimal
+    //   width of 2^256 - 1); rejects leading zeros, negatives, decimals, etc.
+
+    const validU256Values = [
+      ["zero", "0"],
+      ["one", "1"],
+      ["large number", "123456789"],
+      ["78-digit max", "1" + "0".repeat(77)],
+    ] as const;
+
+    const invalidU256Values = [
+      ["empty string", ""],
+      ["negative", "-1"],
+      ["leading zero", "01"],
+      ["decimal point", "1.5"],
+      ["non-numeric", "abc"],
+      ["leading space", " 1"],
+      ["trailing space", "1 "],
+      ["79 digits", "1" + "0".repeat(78)],
+    ] as const;
+
+    it("exports the regex constant with the correct pattern", () => {
+      expect(U256_DECIMAL_REGEX).toBe("^(0|[1-9][0-9]{0,77})$");
+    });
+
+    it("compiled pattern matches the string constant", () => {
+      expect(U256_DECIMAL_PATTERN.source).toBe(U256_DECIMAL_REGEX);
+    });
+
+    it.each(validU256Values)("accepts valid u256 value (%s): %s", (_label, value) => {
+      expect(U256_DECIMAL_PATTERN.test(value)).toBe(true);
+    });
+
+    it.each(invalidU256Values)("rejects invalid u256 value (%s): %s", (_label, value) => {
+      expect(U256_DECIMAL_PATTERN.test(value)).toBe(false);
+    });
+  });
+
+  describe("currency code format validation", () => {
+    // Documents the regex used in CHECK constraints for currency columns.
+    // Accepts exactly three uppercase ASCII letters (ISO 4217 style).
+
+    const validCurrencies = [
+      ["USD", "USD"],
+      ["EUR", "EUR"],
+      ["GBP", "GBP"],
+      ["JPY", "JPY"],
+    ] as const;
+
+    const invalidCurrencies = [
+      ["empty string", ""],
+      ["lowercase", "usd"],
+      ["too short", "US"],
+      ["too long", "USDD"],
+      ["digits", "123"],
+    ] as const;
+
+    it.each(validCurrencies)("accepts valid currency code (%s)", (_label, code) => {
+      expect(CURRENCY_CODE_REGEX.test(code)).toBe(true);
+    });
+
+    it.each(invalidCurrencies)("rejects invalid currency code (%s)", (_label, code) => {
+      expect(CURRENCY_CODE_REGEX.test(code)).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Runtime validation helpers
+  // -------------------------------------------------------------------------
+
+  describe("runtime validation helpers", () => {
+    describe("isValidU256", () => {
+      it("returns true for valid u256 values", () => {
+        expect(isValidU256("0")).toBe(true);
+        expect(isValidU256("1")).toBe(true);
+        expect(isValidU256("123456789")).toBe(true);
+        expect(isValidU256("1" + "0".repeat(77))).toBe(true);
+      });
+
+      it("returns false for invalid u256 values", () => {
+        expect(isValidU256("")).toBe(false);
+        expect(isValidU256("-1")).toBe(false);
+        expect(isValidU256("01")).toBe(false);
+        expect(isValidU256("1.5")).toBe(false);
+        expect(isValidU256("abc")).toBe(false);
+        expect(isValidU256("1" + "0".repeat(78))).toBe(false);
+      });
+    });
+
+    describe("isValidCurrencyCode", () => {
+      it("returns true for valid currency codes", () => {
+        expect(isValidCurrencyCode("USD")).toBe(true);
+        expect(isValidCurrencyCode("EUR")).toBe(true);
+        expect(isValidCurrencyCode("GBP")).toBe(true);
+      });
+
+      it("returns false for invalid currency codes", () => {
+        expect(isValidCurrencyCode("")).toBe(false);
+        expect(isValidCurrencyCode("usd")).toBe(false);
+        expect(isValidCurrencyCode("US")).toBe(false);
+        expect(isValidCurrencyCode("USDD")).toBe(false);
+        expect(isValidCurrencyCode("123")).toBe(false);
+      });
+    });
+
+    describe("isValidNonNegativeInteger", () => {
+      it("returns true for non-negative integers", () => {
+        expect(isValidNonNegativeInteger(0)).toBe(true);
+        expect(isValidNonNegativeInteger(1)).toBe(true);
+        expect(isValidNonNegativeInteger(100)).toBe(true);
+      });
+
+      it("returns false for negative numbers", () => {
+        expect(isValidNonNegativeInteger(-1)).toBe(false);
+        expect(isValidNonNegativeInteger(-100)).toBe(false);
+      });
+
+      it("returns false for non-integer values", () => {
+        expect(isValidNonNegativeInteger(1.5)).toBe(false);
+        expect(isValidNonNegativeInteger(NaN)).toBe(false);
+        expect(isValidNonNegativeInteger(Infinity)).toBe(false);
+      });
+    });
+
+    describe("assertNonNegative", () => {
+      it("passes for non-negative integers", () => {
+        expect(() => assertNonNegative(0, "blockNumber")).not.toThrow();
+        expect(() => assertNonNegative(1, "blockNumber")).not.toThrow();
+        expect(() => assertNonNegative(100, "blockNumber")).not.toThrow();
+      });
+
+      it("throws RangeError for negative values", () => {
+        expect(() => assertNonNegative(-1, "blockNumber")).toThrow(RangeError);
+        expect(() => assertNonNegative(-1, "blockNumber")).toThrow("blockNumber must be non-negative");
+      });
+
+      it("throws RangeError for non-integer values", () => {
+        expect(() => assertNonNegative(1.5, "eventIndex")).toThrow(RangeError);
+        expect(() => assertNonNegative(NaN, "eventIndex")).toThrow(RangeError);
+      });
+
+      it("includes the field name in the error message", () => {
+        expect(() => assertNonNegative(-5, "customField")).toThrow("customField");
+      });
+    });
+
+    describe("assertValidU256", () => {
+      it("passes for valid u256 strings", () => {
+        expect(() => assertValidU256("0", "amount")).not.toThrow();
+        expect(() => assertValidU256("12345", "amount")).not.toThrow();
+      });
+
+      it("throws RangeError for invalid u256 strings", () => {
+        expect(() => assertValidU256("-1", "amount")).toThrow(RangeError);
+        expect(() => assertValidU256("abc", "amount")).toThrow(RangeError);
+        expect(() => assertValidU256("01", "amount")).toThrow(RangeError);
+        expect(() => assertValidU256("", "amount")).toThrow(RangeError);
+      });
+
+      it("includes the field name and value in the error message", () => {
+        expect(() => assertValidU256("-1", "totalAmount")).toThrow("totalAmount");
+        expect(() => assertValidU256("-1", "totalAmount")).toThrow('"-1"');
+      });
+    });
+
+    describe("clampPageLimit", () => {
+      it("returns DEFAULT_PAGE_SIZE for values <= 0", () => {
+        expect(clampPageLimit(0)).toBe(DEFAULT_PAGE_SIZE);
+        expect(clampPageLimit(-1)).toBe(DEFAULT_PAGE_SIZE);
+      });
+
+      it("returns the requested value when within range", () => {
+        expect(clampPageLimit(1)).toBe(1);
+        expect(clampPageLimit(DEFAULT_PAGE_SIZE)).toBe(DEFAULT_PAGE_SIZE);
+        expect(clampPageLimit(MAX_PAGE_SIZE)).toBe(MAX_PAGE_SIZE);
+      });
+
+      it("caps values above MAX_PAGE_SIZE", () => {
+        expect(clampPageLimit(MAX_PAGE_SIZE + 1)).toBe(MAX_PAGE_SIZE);
+        expect(clampPageLimit(1000)).toBe(MAX_PAGE_SIZE);
+      });
+    });
+
+    describe("clampBatchSize (legacy)", () => {
+      it("returns 0 for invalid input", () => {
+        expect(clampBatchSize(0)).toBe(0);
+        expect(clampBatchSize(-1)).toBe(0);
+        expect(clampBatchSize(MAX_BATCH_SIZE + 1)).toBe(0);
+      });
+
+      it("returns the requested value when within range", () => {
+        expect(clampBatchSize(1)).toBe(1);
+        expect(clampBatchSize(MAX_BATCH_SIZE)).toBe(MAX_BATCH_SIZE);
+        expect(clampBatchSize(50)).toBe(50);
+      });
+    });
+
+    describe("validateBatchSize", () => {
+      it("returns the requested value when within range", () => {
+        expect(validateBatchSize(1)).toBe(1);
+        expect(validateBatchSize(MAX_BATCH_SIZE)).toBe(MAX_BATCH_SIZE);
+        expect(validateBatchSize(50)).toBe(50);
+      });
+
+      it("throws RangeError for values <= 0", () => {
+        expect(() => validateBatchSize(0)).toThrow(RangeError);
+        expect(() => validateBatchSize(-1)).toThrow(RangeError);
+      });
+
+      it("throws RangeError for values above MAX_BATCH_SIZE", () => {
+        expect(() => validateBatchSize(MAX_BATCH_SIZE + 1)).toThrow(RangeError);
+      });
+
+      it("throws RangeError for non-integer values", () => {
+        expect(() => validateBatchSize(1.5)).toThrow(RangeError);
+      });
+
+      it("includes a custom name in the error when provided", () => {
+        expect(() => validateBatchSize(0, "customBatch")).toThrow("customBatch");
+      });
+
+      it("includes the invalid value in the error message", () => {
+        expect(() => validateBatchSize(999)).toThrow("999");
+      });
+    });
+  });
+});
 
 describe("migration dry-run helpers", () => {
   it("lists migrations newer than the last applied migration timestamp", () => {
@@ -57,6 +418,23 @@ describe("migration dry-run helpers", () => {
   });
 });
 
+describe("schema contract validation", () => {
+  it("validateSchema succeeds on the production schema", () => {
+    expect(() => validateSchema(schema as Record<string, unknown>)).not.toThrow();
+  });
+
+  it("validateSchema throws with FK-level detail when an indexed column is missing", () => {
+    const gapTable = pgTable("schema_consistency_gap_fixture", {
+      id: text("id").primaryKey(),
+      agreementId: text("agreement_id").notNull(),
+    });
+
+    expect(() => validateSchema({ gapTable } as Record<string, unknown>)).toThrow(
+      /schema_consistency_gap_fixture\.agreement_id \(agreementId\)/,
+    );
+  });
+});
+
 describe("migration CLI", () => {
   const connectionString = "postgresql://postgres:postgres@localhost:5432/stellopay_test";
 
@@ -86,8 +464,10 @@ describe("migration CLI", () => {
     );
     expect(vi.mocked(migrate)).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith("Pending migrations:");
-    expect(log).toHaveBeenCalledWith("0000_faulty_mole_man.sql");
-    expect(log).toHaveBeenCalledWith("0001_faulty_blue_blade.sql");
+    expect(log).toHaveBeenCalledWith("20240101000000_faulty_mole_man.sql");
+    expect(log).toHaveBeenCalledWith("20240102000000_faulty_blue_blade.sql");
+    expect(log).toHaveBeenCalledWith("20240103000000_hard_onslaught.sql");
+    expect(log).toHaveBeenCalledWith("20240104000000_schema_check_constraints.sql");
     expect(end).toHaveBeenCalledOnce();
   });
 
@@ -249,6 +629,53 @@ describe("migration CLI", () => {
   });
 });
 
+describe("schema foreign key constraints", () => {
+  it("defines agreementId references for agreement child tables", () => {
+    const childTables = [
+      schema.agreementEvents,
+      schema.payments,
+      schema.milestones,
+      schema.employees,
+      schema.escrowEvents,
+    ];
+
+    for (const table of childTables) {
+      const fks = getTableConfig(table).foreignKeys;
+      expect(fks).toHaveLength(1);
+      const ref = fks[0].reference();
+      expect(getTableName(ref.foreignTable)).toBe("agreements");
+      expect(ref.columns.map((c: any) => c.name)).toEqual(["agreement_id"]);
+      expect(ref.foreignColumns.map((c: any) => c.name)).toEqual(["id"]);
+      expect(fks[0].onDelete).toBe("no action");
+      expect(fks[0].onUpdate).toBe("no action");
+    }
+  });
+
+  it("defines profileId cascade references for billing child tables", () => {
+    const childTables = [
+      schema.billingPaymentMethods,
+      schema.billingInvoices,
+    ];
+
+    for (const table of childTables) {
+      const fks = getTableConfig(table).foreignKeys;
+      expect(fks).toHaveLength(1);
+      const ref = fks[0].reference();
+      expect(getTableName(ref.foreignTable)).toBe("billing_profiles");
+      expect(ref.columns.map((c: any) => c.name)).toEqual(["profile_id"]);
+      expect(ref.foreignColumns.map((c: any) => c.name)).toEqual(["id"]);
+      expect(fks[0].onDelete).toBe("cascade");
+      expect(fks[0].onUpdate).toBe("no action");
+    }
+  });
+
+  it("does not define foreign keys for standalone tables", () => {
+    expect(getTableConfig(schema.agreements).foreignKeys).toEqual([]);
+    expect(getTableConfig(schema.billingProfiles).foreignKeys).toEqual([]);
+    expect(getTableConfig(schema.sessions).foreignKeys).toEqual([]);
+  });
+});
+
 describeDbMigration("Database migration integration test", () => {
   let containerId: string;
   const connectionString = "postgresql://postgres:postgres@localhost:54321/stellopay_test";
@@ -308,6 +735,8 @@ describeDbMigration("Database migration integration test", () => {
     expect(output).toContain("Pending migrations:");
     expect(output).toContain("0000_faulty_mole_man.sql");
     expect(output).toContain("0001_faulty_blue_blade.sql");
+    expect(output).toContain("0002_hard_onslaught.sql");
+    expect(output).toContain("0003_schema_check_constraints.sql");
 
     const client = new pg.Client({ connectionString });
     await client.connect();
@@ -369,6 +798,70 @@ describeDbMigration("Database migration integration test", () => {
     }
 
     await client.end();
+  });
+
+  it("verifies foreign key constraints exist after migration", async () => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+
+    const res = await client.query(`
+      SELECT tc.table_name, tc.constraint_name
+      FROM information_schema.table_constraints tc
+      WHERE tc.table_schema = 'public'
+        AND tc.constraint_type = 'FOREIGN KEY'
+      ORDER BY tc.table_name, tc.constraint_name
+    `);
+
+    const fkTables = new Set(res.rows.map((row) => row.table_name));
+    expect(fkTables.has("agreement_events")).toBe(true);
+    expect(fkTables.has("payments")).toBe(true);
+    expect(fkTables.has("milestones")).toBe(true);
+    expect(fkTables.has("employees")).toBe(true);
+    expect(fkTables.has("escrow_events")).toBe(true);
+    expect(fkTables.has("billing_payment_methods")).toBe(true);
+    expect(fkTables.has("billing_invoices")).toBe(true);
+
+    await client.end();
+  });
+
+  it("rejects inserts that violate foreign key constraints", async () => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+
+    try {
+      await client.query(
+        `INSERT INTO agreement_events (id, agreement_id, contract_address, event_type, block_number, transaction_hash, event_index, created_at)
+         VALUES ('fk-test-event', 'non-existent-id', '0x0', 'AgreementCreated', 1, '0x0', 0, NOW())`,
+      );
+      expect(true).toBe(false);
+    } catch (error: any) {
+      expect(error.code).toBe("23503");
+    } finally {
+      await client.end();
+    }
+  });
+
+  it("cascades delete from billing_profiles to billing_payment_methods", async () => {
+    const client = new pg.Client({ connectionString });
+    await client.connect();
+
+    try {
+      await client.query(
+        `INSERT INTO billing_profiles (id, owner_address) VALUES ('fk-cascade-test', '0xOwner')`,
+      );
+      await client.query(
+        `INSERT INTO billing_payment_methods (id, profile_id, type) VALUES ('fk-cascade-pm', 'fk-cascade-test', 'bank_account')`,
+      );
+
+      await client.query(`DELETE FROM billing_profiles WHERE id = 'fk-cascade-test'`);
+
+      const res = await client.query(
+        `SELECT COUNT(*) FROM billing_payment_methods WHERE id = 'fk-cascade-pm'`,
+      );
+      expect(res.rows[0].count).toBe("0");
+    } finally {
+      await client.end();
+    }
   });
 
   it("exits non-zero when the migrations table cannot be read", async () => {

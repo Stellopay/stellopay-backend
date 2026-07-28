@@ -10,6 +10,8 @@ const { envMock, sendMail } = vi.hoisted(() => ({
     EMAIL_USER: undefined as string | undefined,
     EMAIL_PASSWORD: undefined as string | undefined,
     CONTACT_RECIPIENT_EMAIL: undefined as string | undefined,
+    RATE_LIMIT_CONTACT_WINDOW_MS: 60_000,
+    RATE_LIMIT_CONTACT_MAX: 3,
   },
   sendMail: vi.fn(),
 }));
@@ -19,11 +21,20 @@ vi.mock("nodemailer", () => ({
   default: { createTransport: () => ({ sendMail }) },
 }));
 
+import { makeLimiter } from "../middleware/rate-limit";
 import { contactRouter } from "./contact";
 
 function makeApp() {
   const app = express();
+  app.set("trust proxy", 1);
   app.use(express.json());
+  const contactLimiter = makeLimiter({
+    name: "contact",
+    windowMs: envMock.RATE_LIMIT_CONTACT_WINDOW_MS,
+    max: envMock.RATE_LIMIT_CONTACT_MAX,
+    message: "Too many contact form submissions. Please try again later.",
+  });
+  app.use("/api/v1/contact", contactLimiter);
   app.use("/api/v1", contactRouter);
   return app;
 }
@@ -128,5 +139,70 @@ describe("POST /contact/send-message", () => {
     sendMail.mockRejectedValueOnce("smtp exploded"); // a thrown string, not an Error
     const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
     expect(res.status).toBe(500);
+  });
+});
+
+describe("Contact endpoint rate limiting", () => {
+  it("allows requests up to the configured limit", async () => {
+    envMock.RATE_LIMIT_CONTACT_MAX = 3;
+    const app = makeApp();
+
+    // First 3 requests should succeed
+    for (let i = 0; i < 3; i++) {
+      const res = await request(app).post("/api/v1/contact/send-message").send(valid);
+      expect(res.status).toBe(200);
+    }
+  });
+
+  it("returns 429 with standard error envelope when limit is exceeded", async () => {
+    envMock.RATE_LIMIT_CONTACT_MAX = 2;
+    const app = makeApp();
+
+    // First 2 requests succeed
+    await request(app).post("/api/v1/contact/send-message").send(valid).expect(200);
+    await request(app).post("/api/v1/contact/send-message").send(valid).expect(200);
+
+    // Third request exceeds limit
+    const res = await request(app).post("/api/v1/contact/send-message").send(valid);
+    expect(res.status).toBe(429);
+    expect(res.body).toEqual({
+      error: "Too many contact form submissions. Please try again later.",
+    });
+    expect(res.headers["content-type"]).toMatch(/application\/json/);
+  });
+
+  it("enforces rate limiting per IP address", async () => {
+    envMock.RATE_LIMIT_CONTACT_MAX = 1;
+    const app = makeApp();
+
+    // Client A exhausts their single request
+    await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "198.51.100.1")
+      .send(valid)
+      .expect(200);
+
+    const resA = await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "198.51.100.1")
+      .send(valid);
+    expect(resA.status).toBe(429);
+
+    // Client B (different IP) is unaffected
+    const resB = await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "198.51.100.2")
+      .send(valid);
+    expect(resB.status).toBe(200);
+  });
+
+  it("preserves existing contact endpoint behaviour for valid requests", async () => {
+    envMock.RATE_LIMIT_CONTACT_MAX = 10;
+    const app = makeApp();
+
+    // Valid request should still succeed with rate limiter applied
+    const res = await request(app).post("/api/v1/contact/send-message").send(valid);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
   });
 });
