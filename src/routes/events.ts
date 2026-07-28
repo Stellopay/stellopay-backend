@@ -3,17 +3,12 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
-import { provider } from "../starknet/client.js";
-import { toHexString, u256ToString } from "../utils/codec.js";
+import { provider, agreementContract, escrowContract } from "../starknet/client.js";
+import { toHexString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
-import { shortString, Contract } from "starknet";
-import { defaults, abiPaths } from "../config.js";
-import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { agreementContract } from "../starknet/client.js";
+import { defaults } from "../config.js";
 import { notFoundResponse } from "./not-found.js";
 import { parsePagination } from "../utils/validation.js";
-
-const AddressParam = z.string().min(3);
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
@@ -28,6 +23,20 @@ export const TxHashSchema = z
   .min(3)
   .max(66)
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
+
+/**
+ * Envelope schema for batch processing of Starknet transaction receipts.
+ * Validates a non-empty array of Starknet transaction hashes bounded by MAX_BATCH_SIZE.
+ */
+export const BatchProcessEnvelopeSchema = z.object({
+  tx_hashes: z
+    .array(TxHashSchema)
+    .min(1, "tx_hashes must contain at least one hash")
+    .max(
+      MAX_BATCH_SIZE,
+      `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+    ),
+});
 
 export const eventsRouter = Router();
 
@@ -54,29 +63,6 @@ export function normalizeTransactionHash(hash: string): string {
   return `0x${paddedHex}`;
 }
 
-// Load contract ABIs (lazy-cached singletons)
-let workAgreementAbi: any[] | null = null;
-let payrollEscrowAbi: any[] | null = null;
-
-async function getWorkAgreementAbi(): Promise<any[]> {
-  if (!workAgreementAbi) {
-    if (!abiPaths.agreement) {
-      throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
-    }
-    workAgreementAbi = loadAbiFromContractClassJsonPath(abiPaths.agreement);
-  }
-  return workAgreementAbi;
-}
-
-async function getPayrollEscrowAbi(): Promise<any[]> {
-  if (!payrollEscrowAbi) {
-    if (!abiPaths.escrow) {
-      throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");
-    }
-    payrollEscrowAbi = loadAbiFromContractClassJsonPath(abiPaths.escrow);
-  }
-  return payrollEscrowAbi;
-}
 
 // ---------------------------------------------------------------------------
 // Shared per-receipt processor
@@ -207,15 +193,13 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
   }
 
   // ------------------------------------------------------------------
-  // 3. Prepare ABI contract instances for event parsing
+  // 3. Prepare ABI contract instances for event parsing (cached singletons)
   // ------------------------------------------------------------------
-  const wAgreementAbi = await getWorkAgreementAbi();
-  const pEscrowAbi = await getPayrollEscrowAbi();
   const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
   const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-  const workAgreementContract = new Contract(wAgreementAbi, workAgreementAddress, provider);
-  const payrollEscrowContract = new Contract(pEscrowAbi, payrollEscrowAddress, provider);
+  const workAgreementContract = agreementContract(workAgreementAddress);
+  const payrollEscrowContract = escrowContract(payrollEscrowAddress);
 
   const eventLabels: string[] = [];
 
@@ -594,59 +578,62 @@ eventsRouter.post(
   requireAdmin,
   async (req, res, next) => {
     try {
-      const { tx_hashes } = z
-        .object({
-          tx_hashes: z
-            .array(TxHashSchema)
-            .min(1, "tx_hashes must contain at least one hash")
-            .max(
-              MAX_BATCH_SIZE,
-              `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
-            ),
-        })
-        .parse(req.body);
+      const { tx_hashes } = BatchProcessEnvelopeSchema.parse(req.body);
 
-      const results: TxProcessResult[] = [];
-      const resultsByNormalizedHash = new Map<string, TxProcessResult>();
-      let duplicates = 0;
-
-      for (const txHash of tx_hashes) {
-        const normalized = normalizeTransactionHash(txHash);
-        const existing = resultsByNormalizedHash.get(normalized);
-
-        if (existing) {
-          duplicates++;
-          results.push(existing);
-          continue;
-        }
-
-        try {
-          const result = await processTxReceipt(txHash);
-          resultsByNormalizedHash.set(normalized, result);
-          results.push(result);
-        } catch (e: any) {
-          const errorResult: TxProcessResult = {
-            txHash,
-            status: "error",
-            eventsProcessed: 0,
-            eventLabels: [],
-            error: e?.message ?? String(e),
-          };
-          resultsByNormalizedHash.set(normalized, errorResult);
-          results.push(errorResult);
+      // Deduplicate unique hashes while preserving the first raw hash representation
+      const uniqueEntriesMap = new Map<string, string>();
+      for (const rawHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(rawHash);
+        if (!uniqueEntriesMap.has(normalized)) {
+          uniqueEntriesMap.set(normalized, rawHash);
         }
       }
 
-      const uniqueResults = Array.from(resultsByNormalizedHash.values());
-      const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
+      // Concurrent fan-out processing across unique receipts to eliminate sequential bottlenecks
+      const uniqueResults = await Promise.all(
+        Array.from(uniqueEntriesMap.entries()).map(async ([normalized, rawHash]) => {
+          try {
+            const result = await processTxReceipt(rawHash);
+            return [normalized, result] as const;
+          } catch (e: any) {
+            const errorResult: TxProcessResult = {
+              txHash: rawHash,
+              status: "error",
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: e?.message ?? String(e),
+            };
+            return [normalized, errorResult] as const;
+          }
+        }),
+      );
+
+      const resultsByNormalizedHash = new Map<string, TxProcessResult>(uniqueResults);
+
+      const results: TxProcessResult[] = [];
+      let duplicates = 0;
+      const seenHashes = new Set<string>();
+
+      for (const txHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(txHash);
+        if (seenHashes.has(normalized)) {
+          duplicates++;
+        } else {
+          seenHashes.add(normalized);
+        }
+        results.push(resultsByNormalizedHash.get(normalized)!);
+      }
+
+      const uniqueResultsList = Array.from(resultsByNormalizedHash.values());
+      const totalProcessed = uniqueResultsList.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
       res.json({
         summary: {
           total: results.length,
-          processed: uniqueResults.filter((r) => r.status === "processed").length,
-          noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
-          notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-          errors: uniqueResults.filter((r) => r.status === "error").length,
+          processed: uniqueResultsList.filter((r) => r.status === "processed").length,
+          noEvents: uniqueResultsList.filter((r) => r.status === "no_events").length,
+          notFound: uniqueResultsList.filter((r) => r.status === "not_found").length,
+          errors: uniqueResultsList.filter((r) => r.status === "error").length,
           duplicates,
           totalEventsProcessed: totalProcessed,
         },
@@ -687,7 +674,7 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 
   let date: Date;
   if (typeof raw === "number") {
-    date = new Date(raw);
+    date = new Date(raw < 10000000000 ? raw * 1000 : raw);
   } else if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (!trimmed) return undefined;
