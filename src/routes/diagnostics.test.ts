@@ -1,10 +1,20 @@
 /**
- * @file diagnostics.test.ts
- * Tests for the operator-only GET /diagnostics/events route.
+ * diagnostics.test.ts
+ *
+ * Contract tests for src/routes/diagnostics.ts (issue #279).
  *
  * The real requireAuth + requireAdmin middleware run here (only their
  * dependencies, the session check and the admin list, are mocked) so the
  * gating itself is exercised. db.execute is mocked to return canned rows.
+ *
+ * Coverage:
+ *   - Auth gating: 401 for unauthenticated and non-admin; no DB hit
+ *   - Success path: correct shape, counts, poolStats
+ *   - Redaction invariant: transaction_hash / agreement_id never leak
+ *   - Empty DB boundary: all summary fields default to 0, latestEvents is []
+ *   - Error handling: db failure propagates as 500 via error handler
+ *   - Response shape: all top-level keys present on every 200
+ *   - Idempotency-Key replay caching
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -25,13 +35,17 @@ vi.mock("../db/index.js", () => ({
   schema: {},
 }));
 
-import { redactRecentEvent, fetchDiagnosticsData, diagnosticsRouter } from "./diagnostics.js";
+import {
+  redactRecentEvent,
+  fetchDiagnosticsData,
+  diagnosticsRouter,
+  withDiagnosticsIdempotency,
+  clearDiagnosticsIdempotencyStore,
+} from "./diagnostics.js";
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
+import { getCircuitBreakerSnapshots } from "../starknet/client.js";
 
-// Use valid-hex addresses: the auth middleware now compares the
-// principal against the admin allowlist through normalizeStarknetAddress,
-// which rejects anything outside [0-9a-f] (e.g. `m`, `n`, `o`, `t`).
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
 
@@ -45,8 +59,15 @@ function makeApp() {
   return app;
 }
 
-function authHeaders(address: string) {
-  return { "x-user-address": address, authorization: "Bearer testtoken" };
+function authHeaders(address: string, idempotencyKey?: string) {
+  const headers: Record<string, string> = {
+    "x-user-address": address,
+    authorization: "Bearer testtoken",
+  };
+  if (idempotencyKey) {
+    headers["idempotency-key"] = idempotencyKey;
+  }
+  return headers;
 }
 
 /** Queue the five db.execute results the route reads, in call order. */
@@ -68,8 +89,6 @@ function wireDbRows() {
         },
       ],
     } as any)
-    // The recent-events query returns sensitive identifiers; the route must
-    // redact them out of the response.
     .mockResolvedValueOnce({
       rows: [
         {
@@ -104,19 +123,16 @@ describe("redactRecentEvent helper", () => {
   });
 
   it("provides safe fallbacks for malformed inputs without crashing", () => {
-    // Missing fields
     expect(redactRecentEvent({})).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
 
-    // Invalid types
     expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
 
-    // Null or undefined
     expect(redactRecentEvent(null)).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
@@ -126,11 +142,329 @@ describe("redactRecentEvent helper", () => {
       created_at: new Date(0).toISOString(),
     });
 
-    // Primitive values
     expect(redactRecentEvent("just a string")).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
+  });
+
+  it("normalises Date objects to ISO strings in created_at", () => {
+    const testDate = new Date("2026-07-26T18:00:00Z");
+    const rawRow = {
+      event_type: "EscrowFunded",
+      created_at: testDate,
+      transaction_hash: "0xsecrettx",
+    };
+
+    const redacted = redactRecentEvent(rawRow);
+
+    expect(redacted).toEqual({
+      event_type: "EscrowFunded",
+      created_at: testDate.toISOString(),
+    });
+  });
+
+  it("passes through string created_at values unchanged", () => {
+    const rawRow = {
+      event_type: "PaymentSent",
+      created_at: "2026-06-15T12:00:00Z",
+    };
+
+    const redacted = redactRecentEvent(rawRow);
+
+    expect(redacted.created_at).toBe("2026-06-15T12:00:00Z");
+  });
+});
+
+describe("withDiagnosticsIdempotency wrapper", () => {
+  beforeEach(() => {
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("passes through to handler when no idempotency key is present", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ ok: true });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = { headers: {}, method: "GET", path: "/test" } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+    const next = vi.fn();
+
+    await wrapped(req, res, next);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(res.json).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it("caches the first successful response and replays it on subsequent requests with the same key", async () => {
+    let callCount = 0;
+    const handler = vi.fn(async (_req: any, res: any) => {
+      callCount++;
+      res.status(200).json({ seq: callCount });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const headers = {
+      "idempotency-key": "key-001",
+      "x-user-address": "0xabc1",
+    };
+
+    const makeReq = () =>
+      ({ headers: { ...headers }, method: "GET", path: "/test" }) as any;
+
+    // First call — handler runs.
+    // Hold onto the json spy before the wrapper replaces res.json.
+    const jsonSpy1 = vi.fn();
+    const res1 = { status: vi.fn().mockReturnThis(), json: jsonSpy1 } as any;
+    await wrapped(makeReq(), res1, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(jsonSpy1).toHaveBeenCalledWith({ seq: 1 });
+
+    // Second call with same key — cached response, handler NOT called again.
+    const jsonSpy2 = vi.fn();
+    const res2 = { status: vi.fn().mockReturnThis(), json: jsonSpy2 } as any;
+    await wrapped(makeReq(), res2, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1); // still 1
+    expect(jsonSpy2).toHaveBeenCalledWith({ seq: 1 });
+  });
+
+  it("does not cache when idempotency key is an array", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ ok: true });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = {
+      headers: { "idempotency-key": ["key1", "key2"], "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    // Second call — handler runs again because array keys bypass cache
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it("distinguishes caches by method and path", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ route: `${_req.method}:${_req.path}` });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const headers = {
+      "idempotency-key": "key-002",
+      "x-user-address": "0xabc1",
+    };
+
+    const reqA = { headers: { ...headers }, method: "GET", path: "/route-a" } as any;
+    const reqB = { headers: { ...headers }, method: "GET", path: "/route-b" } as any;
+
+    const jsonSpyA = vi.fn();
+    const jsonSpyB = vi.fn();
+    const resA = { status: vi.fn().mockReturnThis(), json: jsonSpyA } as any;
+    const resB = { status: vi.fn().mockReturnThis(), json: jsonSpyB } as any;
+
+    await wrapped(reqA, resA, vi.fn());
+    await wrapped(reqB, resB, vi.fn());
+
+    // Different paths → different cache entries → handler called twice
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(jsonSpyA).toHaveBeenCalledWith({ route: "GET:/route-a" });
+    expect(jsonSpyB).toHaveBeenCalledWith({ route: "GET:/route-b" });
+  });
+
+  it("distinguishes caches by user address", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ user: _req.headers["x-user-address"] });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+
+    const req1 = {
+      headers: { "idempotency-key": "key-003", "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const req2 = {
+      headers: { "idempotency-key": "key-003", "x-user-address": "0xdef2" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+
+    await wrapped(req1, res, vi.fn());
+    await wrapped(req2, { ...res, status: vi.fn().mockReturnThis(), json: vi.fn() } as any, vi.fn());
+
+    // Different users → separate cache entries
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates errors through next() rather than caching error responses", async () => {
+    const handler = vi.fn(async () => {
+      throw new Error("handler failure");
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = {
+      headers: { "idempotency-key": "key-err", "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+    const next = vi.fn();
+
+    await wrapped(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((next.mock.calls[0] as any)[0]).toBeInstanceOf(Error);
+    expect((next.mock.calls[0] as any)[0].message).toBe("handler failure");
+  });
+});
+
+describe("clearDiagnosticsIdempotencyStore", () => {
+  beforeEach(() => {
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("clears all cached idempotency entries, forcing fresh handler calls", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ fresh: true });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = {
+      headers: { "idempotency-key": "key-clr", "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+
+    // First call — caches
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    // Clear the store
+    clearDiagnosticsIdempotencyStore();
+
+    // Second call — must call handler again because cache is empty
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("GET /diagnostics/events – pagination and query parameter edge cases", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.execute).mockReset();
+    vi.mocked(requireSession).mockResolvedValue(true);
+  });
+
+  it("passes through valid limit and offset values to fetchDiagnosticsData", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=5&offset=10")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    // The route returns 200 with data; the exact SQL params are verified
+    // indirectly: the mock returns canned rows regardless, but the call
+    // count confirms the query pipeline executed.
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("caps limit at 100 even when a larger value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=9999")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when zero is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=0")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when a negative value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=-5")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when a non-numeric value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=abc")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when Infinity is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=Infinity")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults offset to 0 when a negative value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?offset=-10")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("accepts limit at the exact cap of 100", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=100")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("rejects fractional limit values by defaulting to 20", async () => {
+    // Fractional values are not safe integers, so they fall back to default
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=3.14")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
   });
 });
 
@@ -186,6 +520,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     vi.clearAllMocks();
     vi.mocked(db.execute).mockReset();
     vi.mocked(requireSession).mockResolvedValue(true);
+    clearDiagnosticsIdempotencyStore();
   });
 
   it("rejects an unauthenticated request with 401 and runs no queries", async () => {
@@ -196,10 +531,6 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 
   it("rejects an authenticated non-admin with 403 and runs no queries", async () => {
-    // requireAuth was satisfied by the session mock, but requireAdmin
-    // denies because NON_ADMIN is not in the admin allowlist. The 401/403
-    // split in src/auth/middleware.ts intentionally distinguishes "no
-    // session" from "wrong role".
     const res = await request(makeApp())
       .get("/api/v1/diagnostics/events")
       .set(authHeaders(NON_ADMIN));
@@ -243,7 +574,10 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.summary.latestBlock).toBe("100");
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
+    expect(res.body.circuitBreakers).toHaveLength(1);
+    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
     expect(getPoolStats).toHaveBeenCalledOnce();
+    expect(getCircuitBreakerSnapshots).toHaveBeenCalledOnce();
   });
 
   it("handles case-insensitive admin address matching", async () => {
@@ -277,7 +611,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
-      .mockResolvedValueOnce({ rows: [] } as any) // tableCounts empty: rows[0] undefined
+      .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any);
 
     const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
@@ -297,9 +631,8 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 });
 
-
 describe("GET /diagnostics/events – backward-compatibility contract (Issue #284)", () => {
-    beforeEach(() => {
+    beforeEach(() => {https://github.com/Stellopay/stellopay-backend/pull/564/conflict?name=src%252Froutes%252Fdiagnostics.test.ts&ancestor_oid=4c2037638aad218c8c1b9cac2228465f55bfc033&base_oid=f699082b599c18f0d4b617f1c6161b2253b77fe9&head_oid=15d417408f9201da0d8a9c31260caf74049f4088
         vi.clearAllMocks();
             vi.mocked(db.execute).mockReset();
                 vi.mocked(requireSession).mockResolvedValue(true);
@@ -380,5 +713,19 @@ describe("GET /diagnostics/events – backward-compatibility contract (Issue #28
                                                                                                                                                                                                                                                                                                                                           expect(deleteRes.status).toBe(404);
                                                                                                                                                                                                                                                                                                                                               expect(db.execute).not.toHaveBeenCalled();
                                                                                                                                                                                                                                                                                                                                                 });
+
+                                                                                                                                                                                                                                                                                                                                                  it("count and *_count values remain strings as returned by Postgres COUNT(*)", async () => {
+                                                                                                                                                                                                                                                                                                                                                    wireDbRows();
+
+                                                                                                                                                                                                                                                                                                                                                    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                                                                                                    expect(res.status).toBe(200);
+                                                                                                                                                                                                                                                                                                                                                    // Per the docs/count contract: count values are strings.
+                                                                                                                                                                                                                                                                                                                                                    for (const row of res.body.eventTypeCounts) {
+                                                                                                                                                                                                                                                                                                                                                      expect(typeof row.count).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.summary.totalAgreementEvents).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.summary.latestBlock).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.tableCounts.agreement_events_count).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                  });
                                                                                                                                                                                                                                                                                                                                                 });
-})

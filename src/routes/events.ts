@@ -2,13 +2,21 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
-import { provider, agreementContract, escrowContract } from "../starknet/client.js";
-import { toHexString } from "../utils/codec.js";
+import { eq, and, gte, lte, inArray, desc, SQL, or, gt, sql } from "drizzle-orm";
+import { provider } from "../starknet/client.js";
+import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
-import { defaults } from "../config.js";
+import { shortString, Contract } from "starknet";
+import { defaults, abiPaths, env } from "../config.js";
+import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
+import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
-import { parsePagination } from "../utils/validation.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
+
+const AddressParam = z.string().min(3);
+
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 100;
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
@@ -40,6 +48,40 @@ export const BatchProcessEnvelopeSchema = z.object({
 
 export const eventsRouter = Router();
 
+interface EventTelemetryEntry {
+  operation: "event_ingestion" | "event_envelope_validation" | "event_fanout_delivery";
+  duration_ms: number;
+  status: "success" | "error";
+  tx_hash?: string;
+  batch_size?: number;
+  unique_transactions?: number;
+  duplicates?: number;
+  events_processed?: number;
+  result_status?: TxProcessResult["status"];
+  error?: string;
+}
+
+/** Emits one structured, low-cardinality telemetry event for the ingestion path. */
+function logEventTelemetry(entry: EventTelemetryEntry): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
+  if (env.LOG_FORMAT === "json") {
+    // eslint-disable-next-line no-console
+    (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
+    return;
+  }
+  const message =
+    `[events-telemetry] ${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+    `${logEntry.tx_hash ? ` tx=${logEntry.tx_hash}` : ""}` +
+    `${logEntry.batch_size !== undefined ? ` batch=${logEntry.batch_size}` : ""}` +
+    `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+  // eslint-disable-next-line no-console
+  (logEntry.level === "error" ? console.error : console.info)(message);
+}
+
 /**
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.
  * If the hash is already 66 chars, it is returned as-is to preserve leading
@@ -63,6 +105,29 @@ export function normalizeTransactionHash(hash: string): string {
   return `0x${paddedHex}`;
 }
 
+// Load contract ABIs (lazy-cached singletons)
+let workAgreementAbi: any[] | null = null;
+let payrollEscrowAbi: any[] | null = null;
+
+export async function getWorkAgreementAbi(): Promise<any[]> {
+  if (!workAgreementAbi) {
+    if (!abiPaths.agreement) {
+      throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
+    }
+    workAgreementAbi = loadAbiFromContractClassJsonPath(abiPaths.agreement);
+  }
+  return workAgreementAbi;
+}
+
+export async function getPayrollEscrowAbi(): Promise<any[]> {
+  if (!payrollEscrowAbi) {
+    if (!abiPaths.escrow) {
+      throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");
+    }
+    payrollEscrowAbi = loadAbiFromContractClassJsonPath(abiPaths.escrow);
+  }
+  return payrollEscrowAbi;
+}
 
 // ---------------------------------------------------------------------------
 // Shared per-receipt processor
@@ -147,6 +212,32 @@ async function verifyAndUpdateToken(
  * @returns A {@link TxProcessResult} describing what was stored.
  */
 export async function processTxReceipt(txHash: string): Promise<TxProcessResult> {
+  const start = process.hrtime.bigint();
+  const normalizedTxHash = normalizeTransactionHash(txHash);
+  try {
+    const result = await processTxReceiptUnchecked(txHash);
+    logEventTelemetry({
+      operation: "event_ingestion",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: result.txHash,
+      result_status: result.status,
+      events_processed: result.eventsProcessed,
+    });
+    return result;
+  } catch (error: any) {
+    logEventTelemetry({
+      operation: "event_ingestion",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "error",
+      tx_hash: normalizedTxHash,
+      error: error?.message ?? String(error),
+    });
+    throw error;
+  }
+}
+
+async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResult> {
   const normalizedTxHash = normalizeTransactionHash(txHash);
 
   // ------------------------------------------------------------------
@@ -493,8 +584,227 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
 }
 
 // ---------------------------------------------------------------------------
+// Cursor-based pagination for event listing
+// ---------------------------------------------------------------------------
+
+/**
+ * The decoded form of a pagination cursor. All three fields together form a
+ * total order over `agreement_events` rows that is stable even when new rows
+ * are inserted mid-pagination: `(blockNumber, eventIndex, id)` is strictly
+ * monotone per insert and the `id` (txHash_eventIndex composite) breaks any
+ * remaining ties.
+ *
+ * @internal — callers only see the opaque base64url string.
+ */
+export interface EventCursorPayload {
+  blockNumber: number;
+  eventIndex: number;
+  id: string;
+}
+
+/**
+ * Encodes a cursor payload to an opaque base64url string that is safe to
+ * include in a URL query parameter without percent-encoding.
+ *
+ * The encoding is intentionally simple (JSON → base64url) so it is easy to
+ * audit and decode in tests, but it is not "guessable" as an incrementable
+ * integer — clients cannot derive internal row IDs from it without already
+ * knowing the `id` value (txHash_eventIndex).
+ */
+export function encodeCursor(payload: EventCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload)).toString("base64url");
+}
+
+/**
+ * Decodes a cursor string produced by {@link encodeCursor}. Returns `null` on
+ * any parse or validation failure so callers can treat a bad cursor as
+ * "no cursor" (first page) rather than throwing a 500.
+ */
+export function decodeCursor(cursor: string): EventCursorPayload | null {
+  try {
+    const raw = Buffer.from(cursor, "base64url").toString("utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      typeof (parsed as any).blockNumber !== "number" ||
+      typeof (parsed as any).eventIndex !== "number" ||
+      typeof (parsed as any).id !== "string" ||
+      (parsed as any).id.length === 0
+    ) {
+      return null;
+    }
+    return parsed as EventCursorPayload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zod schema for the `GET /events/list` query parameters.
+ *
+ * - `cursor`       — opaque pagination token from a previous response; absent
+ *   on the first page.
+ * - `limit`        — page size, clamped to `[1, MAX_PAGE_LIMIT]`; defaults to
+ *   `DEFAULT_PAGE_LIMIT`.
+ * - `agreement_id` — optional filter: only return events for this agreement.
+ * - `event_type`   — optional filter: only return events of this type.
+ */
+const EventListQuerySchema = z.object({
+  // An absent or empty cursor string both mean "first page".
+  cursor: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.length > 0 ? v : undefined)),
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => {
+      const n = v === undefined ? DEFAULT_PAGE_LIMIT : parseInt(v, 10);
+      if (!Number.isFinite(n) || Number.isNaN(n)) return DEFAULT_PAGE_LIMIT;
+      return Math.min(Math.max(n, 1), MAX_PAGE_LIMIT);
+    }),
+  agreement_id: z.string().min(1).optional(),
+  event_type: z.string().min(1).optional(),
+});
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+/**
+ * GET /events/list
+ *
+ * Returns a stable, cursor-paginated page of agreement events ordered by
+ * `(blockNumber ASC, eventIndex ASC, id ASC)`. This ordering is insertion-
+ * stable: new events inserted after a client starts paginating never cause a
+ * row to appear on two pages or to be skipped.
+ *
+ * **Query parameters**
+ *
+ * | Param          | Default              | Notes                              |
+ * |----------------|----------------------|------------------------------------|
+ * | `cursor`       | _(first page)_       | Opaque token from `nextCursor`     |
+ * | `limit`        | `DEFAULT_PAGE_LIMIT` | Clamped to `[1, MAX_PAGE_LIMIT]`   |
+ * | `agreement_id` | _(all agreements)_   | Filter by agreement                |
+ * | `event_type`   | _(all types)_        | Filter by event type               |
+ *
+ * **Response**
+ * ```json
+ * {
+ *   "events":     [...],
+ *   "nextCursor": "base64url-string | null",
+ *   "hasMore":    true | false,
+ *   "count":      number
+ * }
+ * ```
+ *
+ * `nextCursor` is `null` on the last page. Pass it as `?cursor=` on the next
+ * request to retrieve the following page. The cursor is an opaque base64url
+ * string — do not parse or construct it; its internal format may change.
+ *
+ * **Security**
+ * Cursors encode `(blockNumber, eventIndex, id)` where `id` is the composite
+ * `txHash_eventIndex` primary key. A client cannot infer an internal sequence
+ * from the cursor without already knowing the `id` value. The endpoint is
+ * public (read-only, indexed on-chain data) consistent with the existing
+ * indexed reading routes.
+ */
+eventsRouter.get("/events/list", async (req, res, next) => {
+  try {
+    const query = EventListQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      res.status(400).json({
+        error: "Invalid query parameters",
+        details: query.error.issues,
+      });
+      return;
+    }
+
+    const { cursor, limit, agreement_id, event_type } = query.data;
+
+    // Decode cursor — invalid cursors restart from page 1 (fail-open on client
+    // errors; the response is always a valid first page rather than a 400).
+    const cursorPayload = cursor ? decodeCursor(cursor) : null;
+
+    // Build WHERE conditions
+    const conditions = [];
+
+    if (agreement_id) {
+      conditions.push(eq(schema.agreementEvents.agreementId, agreement_id));
+    }
+    if (event_type) {
+      conditions.push(eq(schema.agreementEvents.eventType, event_type));
+    }
+
+    // Cursor condition: fetch rows strictly after the cursor position using a
+    // tuple comparison on (blockNumber, eventIndex, id). This is the standard
+    // "keyset pagination" pattern — it is index-friendly and stable across
+    // concurrent inserts.
+    //
+    // The SQL equivalent is:
+    //   (block_number, event_index, id) > (?, ?, ?)
+    //
+    // We express it with an explicit OR expansion so Drizzle does not need to
+    // support tuple literals:
+    //   block_number > cursorBlock
+    //   OR (block_number = cursorBlock AND event_index > cursorEventIndex)
+    //   OR (block_number = cursorBlock AND event_index = cursorEventIndex AND id > cursorId)
+    if (cursorPayload) {
+      const { blockNumber: cb, eventIndex: ci, id: cid } = cursorPayload;
+      conditions.push(
+        or(
+          gt(schema.agreementEvents.blockNumber, cb),
+          and(
+            sql`${schema.agreementEvents.blockNumber} = ${cb}`,
+            gt(schema.agreementEvents.eventIndex, ci),
+          ),
+          and(
+            sql`${schema.agreementEvents.blockNumber} = ${cb}`,
+            sql`${schema.agreementEvents.eventIndex} = ${ci}`,
+            gt(schema.agreementEvents.id, cid),
+          ),
+        ),
+      );
+    }
+
+    // Fetch limit + 1 so we can detect whether there is a next page without a
+    // separate COUNT query.
+    const rows = await db
+      .select()
+      .from(schema.agreementEvents)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(
+        schema.agreementEvents.blockNumber,
+        schema.agreementEvents.eventIndex,
+        schema.agreementEvents.id,
+      )
+      .limit(limit + 1);
+
+    const hasMore = rows.length > limit;
+    const events = hasMore ? rows.slice(0, limit) : rows;
+
+    // Build the next cursor from the last row on this page.
+    let nextCursor: string | null = null;
+    if (hasMore && events.length > 0) {
+      const last = events[events.length - 1];
+      nextCursor = encodeCursor({
+        blockNumber: last.blockNumber,
+        eventIndex: last.eventIndex,
+        id: last.id,
+      });
+    }
+
+    res.json({
+      events,
+      nextCursor,
+      hasMore,
+      count: events.length,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
 
 /**
  * POST /events/process_tx/:tx_hash
@@ -510,10 +820,28 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
  * `backfill-events.ts` and `reprocess-events.ts`.
  */
 eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
+  const start = process.hrtime.bigint();
   try {
     const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
+    logEventTelemetry({
+      operation: "event_envelope_validation",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: normalizeTransactionHash(tx_hash),
+      batch_size: 1,
+    });
 
-      const result = await processTxReceipt(tx_hash);
+    const result = await processTxReceipt(tx_hash);
+    logEventTelemetry({
+      operation: "event_fanout_delivery",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: result.txHash,
+      batch_size: 1,
+      unique_transactions: 1,
+      events_processed: result.eventsProcessed,
+      result_status: result.status,
+    });
 
     if (result.status === "not_found") {
       notFoundResponse(res, "Transaction not found");
@@ -531,12 +859,19 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
       transactionHash: result.txHash,
       tokenVerified: result.tokenVerified,
     });
-  } catch (e) {
-    if (e instanceof z.ZodError) {
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "error",
+        batch_size: 1,
+        error: error.message,
+      });
       res.status(400).json({ error: "Invalid Starknet transaction hash format" });
       return;
     }
-    next(e);
+    next(error);
   }
 });
 
@@ -577,6 +912,9 @@ eventsRouter.post(
   requireAuth,
   requireAdmin,
   async (req, res, next) => {
+    const start = process.hrtime.bigint();
+    const batchSize = Array.isArray(req.body?.tx_hashes) ? req.body.tx_hashes.length : 0;
+
     try {
       const { tx_hashes } = BatchProcessEnvelopeSchema.parse(req.body);
 
@@ -610,6 +948,13 @@ eventsRouter.post(
 
       const resultsByNormalizedHash = new Map<string, TxProcessResult>(uniqueResults);
 
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+      });
+
       const results: TxProcessResult[] = [];
       let duplicates = 0;
       const seenHashes = new Set<string>();
@@ -627,6 +972,16 @@ eventsRouter.post(
       const uniqueResultsList = Array.from(resultsByNormalizedHash.values());
       const totalProcessed = uniqueResultsList.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
+      logEventTelemetry({
+        operation: "event_fanout_delivery",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+        unique_transactions: uniqueResults.length,
+        duplicates,
+        events_processed: totalProcessed,
+      });
+
       res.json({
         summary: {
           total: results.length,
@@ -640,6 +995,17 @@ eventsRouter.post(
         results,
       });
     } catch (e) {
+      if (e instanceof z.ZodError) {
+        logEventTelemetry({
+          operation: "event_envelope_validation",
+          duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+          status: "error",
+          batch_size: batchSize,
+          error: e.message,
+        });
+        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+        return;
+      }
       next(e);
     }
   },
@@ -674,6 +1040,17 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 
   let date: Date;
   if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [paramName],
+          message: `Invalid timestamp format for parameter '${paramName}'`,
+        },
+      ]);
+    }
+    // Treat numeric values the same as numeric strings: 10-digit values are
+    // assumed to be seconds, while 13-digit values are treated as milliseconds.
     date = new Date(raw < 10000000000 ? raw * 1000 : raw);
   } else if (typeof raw === "string") {
     const trimmed = raw.trim();
@@ -682,7 +1059,8 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
     if (/^\d+$/.test(trimmed)) {
       const num = parseInt(trimmed, 10);
       // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
-      date = new Date(num < 10000000000 ? num * 1000 : num);
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
     } else {
       date = new Date(trimmed);
     }
@@ -756,21 +1134,31 @@ eventsRouter.get("/events", async (req, res, next) => {
     const contractAddress = rawContractAddr ? String(rawContractAddr).trim().toLowerCase() : undefined;
 
     const conditions: SQL[] = [];
+    const agreementEventsTable = schema.agreementEvents as unknown as {
+      eventType?: unknown;
+      createdAt?: unknown;
+      agreementId?: unknown;
+      contractAddress?: unknown;
+    };
+    const eventTypeColumn = agreementEventsTable.eventType ?? "eventType";
+    const createdAtColumn = agreementEventsTable.createdAt ?? "createdAt";
+    const agreementIdColumn = agreementEventsTable.agreementId ?? "agreementId";
+    const contractAddressColumn = agreementEventsTable.contractAddress ?? "contractAddress";
 
     if (eventTypes.length > 0) {
-      conditions.push(inArray(schema.agreementEvents.eventType, eventTypes));
+      conditions.push(inArray(eventTypeColumn as any, eventTypes));
     }
     if (fromDate) {
-      conditions.push(gte(schema.agreementEvents.createdAt, fromDate));
+      conditions.push(gte(createdAtColumn as any, fromDate));
     }
     if (toDate) {
-      conditions.push(lte(schema.agreementEvents.createdAt, toDate));
+      conditions.push(lte(createdAtColumn as any, toDate));
     }
     if (agreementId) {
-      conditions.push(eq(schema.agreementEvents.agreementId, agreementId));
+      conditions.push(eq(agreementIdColumn as any, agreementId));
     }
     if (contractAddress) {
-      conditions.push(eq(schema.agreementEvents.contractAddress, contractAddress));
+      conditions.push(eq(contractAddressColumn as any, contractAddress));
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -790,6 +1178,7 @@ eventsRouter.get("/events", async (req, res, next) => {
       offset,
     });
   } catch (e) {
+    console.error("[events] GET /events failed", e);
     if (e instanceof z.ZodError) {
       res.status(400).json({
         error: "Validation failed",
