@@ -341,6 +341,47 @@ export function formatValidationError(error: unknown): ValidationErrorResponse {
 // ---------------------------------------------------------------------------
 
 /**
+ * Zod schema for a numeric pagination cursor supplied as a query parameter.
+ *
+ * Cursors in this API are opaque positive-integer strings produced by the
+ * previous page response's `nextCursor` field.  The validator:
+ *
+ *   - Accepts only strings that consist entirely of ASCII digits (`/^\d+$/`),
+ *     so hex values, floats, negative numbers, whitespace-padded values, and
+ *     SQL-injection fragments are all rejected before they reach any query
+ *     builder or database call.
+ *   - Coerces the validated string to a positive integer via `Number()` and
+ *     rejects the result if it is not a safe, positive integer — ruling out
+ *     `"0"`, `"000"` (leading zeros), and values beyond `Number.MAX_SAFE_INTEGER`.
+ *   - Is intentionally narrow: it does NOT accept base64 or any other
+ *     encoding.  If the cursor format changes, a new schema should be added
+ *     rather than broadening this one.
+ *
+ * @example
+ * NumericCursorSchema.parse("42");    // → 42
+ * NumericCursorSchema.parse("0");     // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("abc");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("1.5");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse(" 1 ");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("007");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("1; DROP TABLE agreements;--"); // throws ZodError
+ */
+export const NumericCursorSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/, "cursor must be a positive integer string with no leading zeros")
+  .transform((val, ctx) => {
+    const n = Number(val);
+    if (!Number.isInteger(n) || n <= 0 || !Number.isSafeInteger(n)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "cursor must be a positive integer",
+      });
+      return z.NEVER;
+    }
+    return n;
+  });
+
+/**
  * Zod schema for a Starknet address supplied as a path or query parameter.
  * Accepts a hex string of up to 64 hex characters (the felt width), with or
  * without a 0x prefix, and transforms it to the canonical lookup form via

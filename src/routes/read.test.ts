@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import express from "express";
+import { isValidationError } from "../utils/validation.js";
 
 const { callContract, envMock, mockEscrow, mockAgreement } = vi.hoisted(() => {
   return {
@@ -64,7 +65,13 @@ function makeApp() {
   app.use("/api/v1", readRouter);
   app.use(
     (error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      res.status(500).json({ error: error.message });
+      // Mirror the relevant parts of the global error handler in src/index.ts:
+      // honour err.status for ValidationError (4xx) so cursor-validation tests
+      // see the correct HTTP status code rather than a hardcoded 500.
+      const status = isValidationError(error)
+        ? (error as any).status
+        : 500;
+      res.status(status).json({ error: error.message });
     },
   );
   return app;
@@ -343,9 +350,89 @@ describe("GET /records/cursor/:address", () => {
       .get("/api/v1/records/cursor/0xabc")
       .set("Authorization", "Bearer 0xabc")
       .query({ cursor: "not-a-number", limit: 2 })
-      .expect(500);
+      .expect(400);
 
-    expect(res.body.error).toContain("Invalid cursor");
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a cursor with leading zeros", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "007", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a zero cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "0", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a negative cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "-5", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a float cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "3.14", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a whitespace-padded cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: " 4 ", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a SQL-injection-style cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "1; DROP TABLE agreements;--", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for an empty-string cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("returns 400 for a hex cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "0xff", limit: 2 })
+      .expect(400);
+
+    expect(res.body.error).toMatch(/cursor/i);
   });
 });
 
