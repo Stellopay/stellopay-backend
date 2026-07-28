@@ -73,6 +73,14 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
     "active": 2,
     "waiting": 0
   },
+  "circuitBreakers": [
+    {
+      "endpointUrl": "https://starknet-mainnet.example.com/rpc",
+      "state": "CLOSED",
+      "recentFailureCount": 0,
+      "openedAt": null
+    }
+  ],
   "summary": {
     "totalAgreementEvents": "15",
     "totalEscrowEvents": "8",
@@ -80,11 +88,58 @@ Returns aggregate event counts, table counts, connection pool status, and saniti
     "totalEmployees": "5",
     "totalMilestones": "10",
     "latestBlock": "104850"
+  },
+  "queryDurationMs": 12.34,
+  "diagnosticsMetrics": {
+    "counters": {
+      "diagnostics_requests_total": 42,
+      "diagnostics_success_total": 40,
+      "diagnostics_errors_total": 2,
+      "diagnostics_query_duration_ms_total": 520.5
+    },
+    "gauges": {
+      "diagnostics_last_query_duration_ms": 12.34
+    }
   }
 }
 ```
 
 ---
+
+## Structured Logging & Observability
+
+Every diagnostics request emits structured log events through the `logDiagnosticsEvent` helper (pattern-aligned with `src/starknet/client-metrics.ts` and `src/auth/session-metrics.ts`):
+
+| Event | Level | When | Payload |
+| :--- | :--- | :--- | :--- |
+| `diagnostics.request` | `info` | Route handler begins | `admin` (lowercased address), `limit`, `offset` |
+| `diagnostics.success` | `info` | All queries complete successfully | `admin`, `queryDurationMs`, `agreementEvents` |
+| `diagnostics.error` | `error` | Any query or processing failure | `error` (message), `stack` (first 3 frames) |
+| `diagnostics.query_timing` | `debug` | After parallel `Promise.all` queries | `durationMs`, `limit`, `offset` |
+
+Log output respects `LOG_FORMAT` (JSON or text) and `LOG_LEVEL` from the global
+config, consistent with every other module.
+
+Process-local metric counters (monotonically increasing) are tracked and exposed
+in the `diagnosticsMetrics` response field:
+
+| Counter | Description |
+| :--- | :--- |
+| `diagnostics_requests_total` | Total number of diagnostics endpoint hits |
+| `diagnostics_success_total` | Successful query executions |
+| `diagnostics_errors_total` | Failed query executions |
+| `diagnostics_query_duration_ms_total` | Cumulative query wall-clock time (ms) |
+
+A gauge `diagnostics_last_query_duration_ms` captures the most recent query's
+wall-clock duration for operational dashboards.
+
+### Response Timing
+
+The `queryDurationMs` field reports the wall-clock time (ms, rounded to 2
+decimal places) spent executing all five parallel read queries inside
+`fetchDiagnosticsData`. This is the same value logged in
+`diagnostics.query_timing` and accumulated in the
+`diagnostics_query_duration_ms_total` counter.
 
 ## Reliability & Retry Semantics
 
