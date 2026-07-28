@@ -3,9 +3,9 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { provider } from "../starknet/client.js";
-import { eq, and, gte, lte, asc } from "drizzle-orm";
+import { eq, and, gte, lte } from "drizzle-orm";
 import { Contract } from "starknet";
+import { provider } from "../starknet/client.js";
 import { abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE, normalizeTransactionHash } from "./events.js";
@@ -210,8 +210,26 @@ export function __resetStatusChangeRetryCounts() {
   statusChangeRetryCounts.clear();
 }
 
+function getFirstZodErrorMessage(error: z.ZodError): string {
+  return error.issues?.[0]?.message ?? error.message ?? "Validation failed";
+}
+
 /**
- * Reset in-memory quarantine set for status-changes. Exported for tests.
+ * POST /reprocess-events/tx/:tx_hash
+ *
+ * Reprocess events for a single transaction to decode event names.
+ * Delegates to the shared `processTxReceipt` which uses `ON CONFLICT DO NOTHING`
+ * keyed on `transaction_hash + event_index` — re-runs are safe no-ops.
+ *
+ * **Validation**
+ * - `:tx_hash` must be a valid Starknet transaction hash (0x-prefixed, 3–66 chars).
+ *
+ * **Authentication**
+ * - Requires a valid admin session.
+ *
+ * **Response**
+ * Returns `{ message, result }` where `result` is the shared
+ * {@link processTxReceipt} result shape (`TxProcessResult`).
  */
 export function __resetStatusChangeQuarantine() {
   statusChangeQuarantine.clear();
@@ -314,7 +332,26 @@ try {
   },
 );
 
-/** POST /reprocess-events/batch */
+/**
+ * POST /reprocess-events/batch
+ *
+ * Reprocess events for multiple transactions. Each tx hash is processed
+ * independently using the same shared `processTxReceipt` logic so the
+ * operation is fully idempotent — re-submitting the same batch produces
+ * no duplicate rows.
+ *
+ * **Validation**
+ * - `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
+ * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request.
+ *
+ * **Retry budget**
+ * - Up to {@link MAX_BATCH_SIZE} transactions per request.
+ * - Per-tx errors never abort the rest of the batch.
+ *
+ * **Response**
+ * Returns a `results` array where each entry corresponds to one tx hash.
+ * A per-tx error never aborts the rest of the batch.
+ */
 reprocessEventsRouter.post(
   "/reprocess-events/batch",
   requireAuth,
@@ -391,7 +428,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.issues[0]?.message || "Invalid request body" });
+        res.status(400).json({ error: getFirstZodErrorMessage(e) });
         return;
       }
       next(e);
@@ -401,7 +438,25 @@ reprocessEventsRouter.post(
   },
 );
 
-/** POST /reprocess-events/status-changes */
+/**
+ * POST /reprocess-events/status-changes
+ *
+ * Reprocess all AgreementStatusChange events to decode their actual names.
+ * Only processes events that still have `eventType === "AgreementStatusChange"`,
+ * so re-runs automatically skip already-updated events.  An in-memory dedup
+ * set keyed on `transaction_hash + event_index` prevents processing the same
+ * event twice within a single request.
+ *
+ * **Validation**
+ * - `limit` (query, optional, default 100, max {@link MAX_STATUS_LIMIT})
+ * - `fromBlock` / `toBlock` (query, optional) — filter by block number range.
+ *
+ * **Retry budget**
+ * - Up to {@link MAX_STATUS_LIMIT} events per request.
+ * - Unrecoverable events are returned in the `results` array with a status
+ *   such as `no_receipt`, `event_not_found`, or `error` instead of failing
+ *   the whole request.
+ */
 reprocessEventsRouter.post(
   "/reprocess-events/status-changes",
   requireAuth,
@@ -415,87 +470,21 @@ reprocessEventsRouter.post(
       const { limit, fromBlock, toBlock } = StatusChangesQuerySchema.parse(req.query);
       const evtStart = Date.now();
 
-      // Declare result accumulators up front so helpers can reference them.
-      const results: any[] = [];
-      let updated = 0;
-      const processedKeys = new Set<string>();
+      // Load ABIs (lazy-cached singletons)
+      const workAgreementAbi = await getWorkAgreementAbi();
+      const payrollEscrowAbi = await getPayrollEscrowAbi();
 
-      /** Emit a structured telemetry record for status‑changes processing. */
-      const logReprocess = (level: "info" | "error", operation: string, data: Record<string, any>) => {
-        const entry = {
-          timestamp: new Date().toISOString(),
-          level,
-          module: "reprocess",
-          operation,
-          ...data,
-        };
-        if (process.env.LOG_FORMAT === "json") {
-          (level === "error" ? console.error : console.info)(JSON.stringify(entry));
-        } else {
-          console.log(`[reprocess] ${operation} ${JSON.stringify(data)}`);
+      // In-memory contract cache keyed by address to avoid repeated instantiation.
+      const contractCache = new Map<string, Contract>();
+
+      function getContract(abi: any[], address: string): Contract {
+        let contract = contractCache.get(address);
+        if (!contract) {
+          contract = new Contract(abi, address, provider);
+          contractCache.set(address, contract);
         }
-      };
-
-      /**
-       * Record a failure for the current event, applying retry budget and
-       * quarantine logic.
-       *
-       * Uses `attempts >= RETRY_BUDGET` (quarantines on the 3rd failure when
-       * budget is 3) because status‑changes events are retried less aggressively
-       * than tx-level operations — per-event failures are common during batch
-       * reprocessing and we want to move persistently broken events out of the
-       * processing path sooner.
-       *
-       * `status` is one of "no_receipt", "event_not_found", "no_change", or
-       * "error". `no_change` is not treated as a retryable failure because it
-       * means the event was already correctly typed.
-       */
-      const handleFailure = (evt: any, status: string, error?: string) => {
-        if (status === "no_change") {
-          results.push({ eventId: evt.id, status: "no_change", eventType: "AgreementStatusChange" });
-          return;
-        }
-
-        const eventKey = `${evt.transactionHash}_${evt.eventIndex}`;
-        const attempts = (statusChangeRetryCounts.get(eventKey) ?? 0) + 1;
-        statusChangeRetryCounts.set(eventKey, attempts);
-
-        if (attempts >= RETRY_BUDGET) {
-          statusChangeQuarantine.add(eventKey);
-          results.push({ eventId: evt.id, status: "quarantined", reason: status });
-          logReprocess("error", "status_changes", {
-            eventId: evt.id,
-            outcome: "quarantined",
-            eventKey,
-            reason: status,
-            attempts,
-            retryBudget: RETRY_BUDGET,
-            elapsed_ms: Date.now() - evtStart,
-          });
-          return;
-        }
-
-        const entry: any = { eventId: evt.id, status };
-        if (error) entry.error = error;
-        results.push(entry);
-        logReprocess("info", "status_changes", {
-          eventId: evt.id,
-          outcome: status,
-          eventKey,
-          attempts,
-          elapsed_ms: Date.now() - evtStart,
-        });
-      };
-
-      const workAgreementAbiResolved = await getWorkAgreementAbi();
-      const payrollEscrowAbiResolved = await getPayrollEscrowAbi();
-      const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
-      const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
-
-      const workAgreementContract = new Contract(workAgreementAbiResolved, workAgreementAddress, provider);
-      const payrollEscrowContract = new Contract(payrollEscrowAbiResolved, payrollEscrowAddress, provider);
-      void workAgreementContract; // used for ABI loading side-effect; per-event contracts created below
-      void payrollEscrowContract;
+        return contract;
+      }
 
       const conditions = [eq(schema.agreementEvents.eventType, "AgreementStatusChange")];
       if (fromBlock !== undefined) conditions.push(gte(schema.agreementEvents.blockNumber, fromBlock));
@@ -547,12 +536,14 @@ reprocessEventsRouter.post(
           let decodedEvent: any = null;
           let eventType = "AgreementStatusChange";
           try {
-            const workContract = new Contract(workAgreementAbiResolved, eventContractAddress, provider);
+            // Try to parse with WorkAgreement contract (use event's contract address)
+            const workContract = getContract(workAgreementAbi, eventContractAddress);
             try {
               decodedEvent = workContract.parseEvent(receiptEvent);
               eventType = decodedEvent.name;
-            } catch {
-              const escrowContract = new Contract(payrollEscrowAbiResolved, eventContractAddress, provider);
+            } catch (e1) {
+              // Try with PayrollEscrow contract
+              const escrowContract = getContract(payrollEscrowAbi, eventContractAddress);
               try {
                 decodedEvent = escrowContract.parseEvent(receiptEvent);
                 eventType = decodedEvent.name;
@@ -610,7 +601,7 @@ reprocessEventsRouter.post(
       });
     } catch (e: any) {
       if (e instanceof z.ZodError) {
-        res.status(400).json({ error: e.issues[0]?.message || "Invalid request parameters" });
+        res.status(400).json({ error: getFirstZodErrorMessage(e) });
         return;
       }
       _next(e);

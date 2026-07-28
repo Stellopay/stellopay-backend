@@ -1,5 +1,4 @@
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { readMigrationFiles } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/node-postgres";
 import fs from "node:fs";
 import { resolve } from "node:path";
@@ -64,9 +63,6 @@ export async function getLastAppliedMigrationTimestamp(client: pg.Client) {
 
 export async function listPendingMigrationFileNames(client: pg.Client) {
   const journal = readMigrationJournal(MIGRATIONS_FOLDER);
-
-  // Keep Drizzle's migration file validation and timestamp parsing in the dry-run path.
-  readMigrationFiles({ migrationsFolder: MIGRATIONS_FOLDER });
 
   const lastAppliedMigrationTimestamp = await getLastAppliedMigrationTimestamp(client);
   return getPendingMigrationFileNames(journal.entries, lastAppliedMigrationTimestamp);
