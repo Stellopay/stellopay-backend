@@ -118,3 +118,31 @@ describe("formatTokenAmount", () => {
     expect(() => formatTokenAmount("")).toThrow(TypeError);
   });
 });
+
+describe("Fuzz testing round-trip (encode/decode)", () => {
+  it("maintains symmetry for random u256 values and boundary cases", () => {
+    const MAX_U256 = (1n << 256n) - 1n;
+    const MAX_U128 = (1n << 128n) - 1n;
+    const iterations = 10000;
+    
+    for (let i = 0; i < iterations; i++) {
+      let randomBigInt = 0n;
+      // Generate random up to 256 bits by appending 32 random bits at a time
+      for (let j = 0; j < 8; j++) {
+        randomBigInt = (randomBigInt << 32n) | BigInt(Math.floor(Math.random() * 0xffffffff));
+      }
+
+      // Ensure boundary cases are covered in the first few iterations
+      if (i === 0) randomBigInt = 0n;
+      if (i === 1) randomBigInt = MAX_U256;
+      if (i === 2) randomBigInt = MAX_U128;
+      if (i === 3) randomBigInt = 1n << 128n; // min value in high part
+      
+      const str = randomBigInt.toString();
+      const parsed = parseU256(str);
+      const back = u256ToString(parsed);
+      
+      expect(back).toBe(str);
+    }
+  });
+});

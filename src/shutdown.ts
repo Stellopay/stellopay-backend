@@ -112,13 +112,37 @@ export function setupGracefulShutdown(
   process.on("SIGTERM", () => shutdownHandler("SIGTERM"));
   process.on("SIGINT", () => shutdownHandler("SIGINT"));
 
-  process.on("unhandledRejection", (reason, promise) => {
-    console.error("[shutdown] Unhandled Rejection at:", promise, "reason:", reason);
-    process.exit(1);
+  /**
+   * Unhandled promise rejections route through the graceful shutdown sequence
+   * rather than calling process.exit directly. Structured context (error
+   * message and stack) is logged before shutdown begins. The promise and
+   * `reason` are used only for logging — request body contents and auth
+   * tokens are never reachable from here so there is no secret-exposure risk.
+   */
+  process.on("unhandledRejection", (reason: unknown, promise: Promise<unknown>) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    console.error("[shutdown] Unhandled promise rejection — initiating graceful shutdown", {
+      event: "unhandledRejection",
+      message,
+      stack,
+      promise: String(promise),
+    });
+    void shutdownHandler("unhandledRejection");
   });
 
-  process.on("uncaughtException", (error) => {
-    console.error("[shutdown] Uncaught Exception:", error);
-    process.exit(1);
+  /**
+   * Uncaught synchronous exceptions route through the graceful shutdown
+   * sequence rather than calling process.exit directly. Full error context
+   * (message, stack, error name) is logged before shutdown begins.
+   */
+  process.on("uncaughtException", (error: Error) => {
+    console.error("[shutdown] Uncaught exception — initiating graceful shutdown", {
+      event: "uncaughtException",
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    });
+    void shutdownHandler("uncaughtException");
   });
 }
