@@ -6,11 +6,16 @@ import {
   parsePagination,
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
+  INPUT_PREVIEW_MAX_LENGTH,
   loggedParse,
   formatValidationError,
+  isPlainObject,
+  isValidationError,
+  previewInput,
   ValidationError,
   mapZodError,
   type ValidationErrorResponse,
+  type ValidationIssue,
 } from "./validation";
 import type { ValidationErrorMetric } from "./validation";
 
@@ -816,5 +821,403 @@ describe("mapZodError", () => {
   it("returns undefined for non-ZodError", () => {
     const mapped = mapZodError(new Error("boom"));
     expect(mapped).toBeUndefined();
+  });
+
+  it("returns the first issue of a ValidationError", () => {
+    const err = new ValidationError({
+      validator: "v",
+      message: "first; second",
+      issues: [
+        { path: ["a"], message: "first", code: "custom" },
+        { path: ["b"], message: "second", code: "custom" },
+      ],
+      input: "x",
+    });
+    expect(mapZodError(err)?.message).toBe("first");
+  });
+
+  it("returns undefined for a ValidationError with no issues", () => {
+    const err = new ValidationError({
+      validator: "v",
+      message: "no issues",
+      issues: [],
+      input: "x",
+    });
+    expect(mapZodError(err)).toBeUndefined();
+  });
+});
+
+// --------------------------------------------------------------------------
+// previewInput — sanitized, bounded diagnostics
+// --------------------------------------------------------------------------
+
+describe("previewInput", () => {
+  it("returns short strings unchanged", () => {
+    expect(previewInput("0x1234")).toBe("0x1234");
+    expect(previewInput("")).toBe("");
+  });
+
+  it("truncates to INPUT_PREVIEW_MAX_LENGTH characters", () => {
+    const long = "a".repeat(500);
+    const preview = previewInput(long);
+    expect(preview).toHaveLength(INPUT_PREVIEW_MAX_LENGTH);
+    expect(preview).toBe(long.slice(0, INPUT_PREVIEW_MAX_LENGTH));
+  });
+
+  it("replaces control characters so a crafted input cannot forge a log line", () => {
+    const forged = 'a\n[validation:error] {"validator":"spoofed"}';
+    const preview = previewInput(forged);
+    expect(preview).not.toContain("\n");
+    expect(preview).not.toContain("\r");
+    expect(previewInput("a\tb")).toBe("a b");
+    expect(previewInput("a\u0000b")).toBe("a b");
+    expect(previewInput("a\u007fb")).toBe("a b");
+  });
+
+  it("renders non-string values by type tag rather than by content", () => {
+    // An object body must never have its contents echoed into the log stream.
+    expect(previewInput({ password: "hunter2" })).toBe("[object Object]");
+    expect(previewInput(12345)).toBe("12345");
+    expect(previewInput(null)).toBe("null");
+    expect(previewInput(undefined)).toBe("undefined");
+    expect(previewInput(true)).toBe("true");
+  });
+
+  it("degrades to '[unserializable]' instead of throwing on a hostile value", () => {
+    const nullProto = Object.create(null) as object;
+    expect(() => previewInput(nullProto)).not.toThrow();
+    expect(previewInput(nullProto)).toBe("[unserializable]");
+
+    const throwing = {
+      toString() {
+        throw new Error("nope");
+      },
+    };
+    expect(() => previewInput(throwing)).not.toThrow();
+    expect(previewInput(throwing)).toBe("[unserializable]");
+
+    expect(() => previewInput(Symbol("s"))).not.toThrow();
+    expect(previewInput(Symbol("s"))).toBe("Symbol(s)");
+  });
+});
+
+// --------------------------------------------------------------------------
+// ValidationError — status is pinned to the client-error range
+// --------------------------------------------------------------------------
+
+describe("ValidationError status boundary", () => {
+  const build = (status?: number) =>
+    new ValidationError({
+      validator: "statusTest",
+      message: "fail",
+      issues: [],
+      input: "",
+      status,
+    });
+
+  it("keeps an explicit 4xx status", () => {
+    expect(build(400).status).toBe(400);
+    expect(build(403).status).toBe(403);
+    expect(build(422).status).toBe(422);
+    expect(build(499).status).toBe(499);
+  });
+
+  it("never lets a validation failure be reported as a success", () => {
+    // The global error handler replays err.status verbatim; a 2xx here would
+    // turn a rejected request into a fail-open 200.
+    expect(build(200).status).toBe(400);
+    expect(build(204).status).toBe(400);
+    expect(build(302).status).toBe(400);
+    expect(build(399).status).toBe(400);
+  });
+
+  it("never lets a client error be reported as a server fault", () => {
+    expect(build(500).status).toBe(400);
+    expect(build(503).status).toBe(400);
+  });
+
+  it("collapses out-of-range, non-integer, and non-finite statuses to 400", () => {
+    expect(build(0).status).toBe(400);
+    expect(build(-1).status).toBe(400);
+    expect(build(9999).status).toBe(400);
+    expect(build(400.5).status).toBe(400);
+    expect(build(Number.NaN).status).toBe(400);
+    expect(build(Number.POSITIVE_INFINITY).status).toBe(400);
+    // @ts-expect-error: intentionally invalid input type
+    expect(build("422").status).toBe(400);
+    expect(build(undefined).status).toBe(400);
+  });
+
+  it("sanitizes the input preview stored on the error", () => {
+    const err = new ValidationError({
+      validator: "sanitize",
+      message: "fail",
+      issues: [],
+      input: `bad\ninput${"x".repeat(200)}`,
+    });
+    expect(err.input).not.toContain("\n");
+    expect(err.input.length).toBeLessThanOrEqual(INPUT_PREVIEW_MAX_LENGTH);
+    expect(err.metric.input).toBe(err.input);
+    expect(err.toJSON().input).toBe(err.input);
+  });
+
+  it("coerces a non-array issues value to an empty array", () => {
+    // @ts-expect-error: intentionally invalid input type
+    const err = new ValidationError({ validator: "v", message: "m", issues: null, input: "" });
+    expect(err.issues).toEqual([]);
+  });
+
+  it("defaults the legacy positional form to 400", () => {
+    const err = new ValidationError("legacy message", "legacyValidator", "legacyInput");
+    expect(err.status).toBe(400);
+    expect(err.validator).toBe("legacyValidator");
+    expect(err.input).toBe("legacyInput");
+    expect(err.issues).toEqual([]);
+  });
+});
+
+// --------------------------------------------------------------------------
+// isValidationError
+// --------------------------------------------------------------------------
+
+describe("isValidationError", () => {
+  it("recognizes a ValidationError instance", () => {
+    const err = new ValidationError({ validator: "v", message: "m", issues: [], input: "" });
+    expect(isValidationError(err)).toBe(true);
+  });
+
+  it("recognizes a structurally equivalent error from another module instance", () => {
+    // A duplicate copy of this module (bundling, pnpm hoisting) breaks
+    // `instanceof` but not the contract, so the guard falls back to shape.
+    const foreign = Object.assign(new Error("m"), { name: "ValidationError", issues: [] });
+    expect(isValidationError(foreign)).toBe(true);
+  });
+
+  it("rejects a ZodError, a plain Error, and non-error values", () => {
+    const parsed = z.string().safeParse(1);
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) expect(isValidationError(parsed.error)).toBe(false);
+    expect(isValidationError(new Error("boom"))).toBe(false);
+    expect(isValidationError(null)).toBe(false);
+    expect(isValidationError(undefined)).toBe(false);
+    expect(isValidationError("ValidationError")).toBe(false);
+    expect(isValidationError({ name: "ValidationError", issues: [] })).toBe(false);
+  });
+
+  it("rejects an error named ValidationError without an issues array", () => {
+    const impostor = Object.assign(new Error("m"), { name: "ValidationError" });
+    expect(isValidationError(impostor)).toBe(false);
+  });
+});
+
+// --------------------------------------------------------------------------
+// formatValidationError — ValidationError support
+// --------------------------------------------------------------------------
+
+describe("formatValidationError — ValidationError", () => {
+  it("maps a ValidationError to 'Validation failed' with its issues", () => {
+    const err = new ValidationError({
+      validator: "fmt",
+      message: "bad thing",
+      issues: [{ path: ["field"], message: "required", code: "custom" }],
+      input: "raw",
+    });
+    const result = formatValidationError(err);
+    expect(result.error).toBe("Validation failed");
+    expect(result.details).toEqual([{ path: ["field"], message: "required", code: "custom" }]);
+  });
+
+  it("maps the ValidationError thrown by loggedParse without losing issues", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let caught: unknown;
+    try {
+      loggedParse(StarknetAddress, "not-an-address", "fmtRoundTrip");
+    } catch (e) {
+      caught = e;
+    }
+    const result = formatValidationError(caught);
+    expect(result.error).toBe("Validation failed");
+    expect(result.details?.length).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+
+  it("never echoes the offending input or an internal message", () => {
+    const err = new ValidationError({
+      validator: "leak",
+      message: "internal detail",
+      issues: [],
+      input: "super-secret-token",
+    });
+    const serialized = JSON.stringify(formatValidationError(err));
+    expect(serialized).not.toContain("super-secret-token");
+    expect(serialized).not.toContain("internal detail");
+    expect(JSON.stringify(formatValidationError(new Error("db host db-1 refused")))).not.toContain(
+      "db-1",
+    );
+  });
+});
+
+// --------------------------------------------------------------------------
+// loggedParse — hostile input must not escalate a 400 into a 500
+// --------------------------------------------------------------------------
+
+describe("loggedParse — hostile input", () => {
+  it("throws a ValidationError (not a TypeError) for a null-prototype object", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const hostile = Object.create(null) as object;
+    let caught: unknown;
+    try {
+      loggedParse(z.string(), hostile, "nullProto");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ValidationError);
+    expect((caught as ValidationError).status).toBe(400);
+    expect((caught as ValidationError).input).toBe("[unserializable]");
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("throws a ValidationError for a value whose toString throws", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const hostile = {
+      toString() {
+        throw new Error("nope");
+      },
+    };
+    expect(() => loggedParse(z.string(), hostile, "throwingToString")).toThrow(ValidationError);
+    warn.mockRestore();
+  });
+
+  it("emits exactly one parseable log record for an input containing newlines", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(() =>
+      loggedParse(AgreementId, 'a\n[validation:error] {"validator":"spoofed"}', "logForge"),
+    ).toThrow(ValidationError);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const raw = warn.mock.calls[0][0] as string;
+    const parsed = JSON.parse(raw.replace("[validation:error] ", "")) as ValidationErrorMetric;
+    expect(parsed.validator).toBe("logForge");
+    expect(parsed.input).not.toContain("\n");
+    warn.mockRestore();
+  });
+
+  it("does not echo an object payload's contents into the log", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(() => loggedParse(z.string(), { password: "hunter2" }, "objectBody")).toThrow(
+      ValidationError,
+    );
+    const raw = warn.mock.calls[0][0] as string;
+    expect(raw).not.toContain("hunter2");
+    expect(raw).toContain("[object Object]");
+    warn.mockRestore();
+  });
+});
+
+// --------------------------------------------------------------------------
+// Global error handler contract
+// --------------------------------------------------------------------------
+
+describe("global error handler contract", () => {
+  // Mirrors the mapping in src/index.ts: a thrown error's `status` and
+  // `issues` are replayed verbatim. These assertions pin the invariants that
+  // handler depends on.
+  const replay = (err: { status?: unknown; issues?: unknown }) => ({
+    status: typeof err.status === "number" ? err.status : 500,
+    details: err.issues ?? undefined,
+  });
+
+  it("replays a loggedParse failure as a 400 with a structured issue list", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let caught: unknown;
+    try {
+      loggedParse(AgreementId, "not-numeric", "handlerContract");
+    } catch (e) {
+      caught = e;
+    }
+    const replayed = replay(caught as ValidationError);
+    expect(replayed.status).toBe(400);
+    expect(Array.isArray(replayed.details)).toBe(true);
+    expect((replayed.details as ValidationIssue[]).length).toBeGreaterThanOrEqual(1);
+    vi.restoreAllMocks();
+  });
+
+  it("cannot be steered out of the 4xx range by the thrower", () => {
+    for (const status of [200, 201, 302, 500, 503, -1, 0, 9999]) {
+      const err = new ValidationError({
+        validator: "steer",
+        message: "m",
+        issues: [],
+        input: "",
+        status,
+      });
+      const replayed = replay(err);
+      expect(replayed.status).toBeGreaterThanOrEqual(400);
+      expect(replayed.status).toBeLessThanOrEqual(499);
+    }
+  });
+});
+
+// --------------------------------------------------------------------------
+// parsePagination — safe-integer boundary
+// --------------------------------------------------------------------------
+
+describe("parsePagination — safe-integer boundary", () => {
+  it("falls back to defaults for magnitudes beyond Number.MAX_SAFE_INTEGER", () => {
+    // These pass Zod's .int() (no fractional part) but cannot be represented
+    // exactly, so clamping them would hand a lossy number to the query layer.
+    expect(parsePagination({ limit: "1e20" }).limit).toBe(DEFAULT_PAGE_LIMIT);
+    expect(parsePagination({ limit: "1e308" }).limit).toBe(DEFAULT_PAGE_LIMIT);
+    expect(parsePagination({ offset: "1e20" }).offset).toBe(0);
+    expect(parsePagination({ offset: "-1e20" }).offset).toBe(0);
+    expect(parsePagination({ offset: Number.MAX_SAFE_INTEGER + 2 }).offset).toBe(0);
+  });
+
+  it("accepts the exact safe-integer boundary for offset", () => {
+    expect(parsePagination({ offset: Number.MAX_SAFE_INTEGER }).offset).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
+  });
+
+  it("always returns safe integers", () => {
+    const inputs: unknown[] = [
+      { limit: "1e20", offset: "1e20" },
+      { limit: "Infinity", offset: "-Infinity" },
+      { limit: "NaN", offset: "NaN" },
+      { limit: Number.MAX_VALUE, offset: Number.MAX_VALUE },
+      { limit: -0, offset: -0 },
+      "junk",
+      null,
+    ];
+    for (const input of inputs) {
+      const out = parsePagination(input);
+      expect(Number.isSafeInteger(out.limit)).toBe(true);
+      expect(Number.isSafeInteger(out.offset)).toBe(true);
+      expect(out.limit).toBeGreaterThanOrEqual(1);
+      expect(out.limit).toBeLessThanOrEqual(MAX_PAGE_LIMIT);
+      expect(out.offset).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+// --------------------------------------------------------------------------
+// isPlainObject
+// --------------------------------------------------------------------------
+
+describe("isPlainObject", () => {
+  it("accepts plain and null-prototype objects", () => {
+    expect(isPlainObject({})).toBe(true);
+    expect(isPlainObject({ a: 1 })).toBe(true);
+    expect(isPlainObject(Object.create(null))).toBe(true);
+  });
+
+  it("rejects null, undefined, arrays, and primitives", () => {
+    expect(isPlainObject(null)).toBe(false);
+    expect(isPlainObject(undefined)).toBe(false);
+    expect(isPlainObject([])).toBe(false);
+    expect(isPlainObject([1, 2])).toBe(false);
+    expect(isPlainObject("str")).toBe(false);
+    expect(isPlainObject(42)).toBe(false);
+    expect(isPlainObject(true)).toBe(false);
   });
 });
