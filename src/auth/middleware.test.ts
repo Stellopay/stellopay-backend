@@ -191,6 +191,32 @@ describe("Auth Middleware", () => {
       expect(mockNext).not.toHaveBeenCalled();
     });
 
+    it("returns 401 if the token contains extra whitespace", async () => {
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token with spaces",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
+      expect(requireSession).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it("returns 401 if the token contains non-UTF8 bytes / invalid characters", async () => {
+      mockReq.headers = {
+        "x-user-address": "0xuser",
+        authorization: "Bearer valid_token\x00",
+      };
+      await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+      expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({ error: "Unauthorized" });
+      expect(requireSession).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
     it("returns 401 if the trimmed address header is empty", async () => {
       mockReq.headers = {
         "x-user-address": "   ",

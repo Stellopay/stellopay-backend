@@ -336,6 +336,17 @@ export const requireAuth = async (
     return;
   }
 
+  const BEARER_TOKEN_PATTERN = /^[a-zA-Z0-9\-._~+/]+=*$/;
+  if (!BEARER_TOKEN_PATTERN.test(token)) {
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED);
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED_INVALID_BEARER);
+    logAuthMiddlewareEvent("warn", "auth.principal.denied", {
+      reason: "invalid_bearer",
+    });
+    deny(res, "unauthorized");
+    return;
+  }
+
   let isValid: boolean;
   try {
     isValid = await requireSession(address, token);
