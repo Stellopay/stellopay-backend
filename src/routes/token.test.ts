@@ -164,12 +164,22 @@ describe("token metadata TTL cache", () => {
     expect(callContract).toHaveBeenCalledTimes(3);
   });
 
-  it("passes invalid metadata addresses to the route error handler", async () => {
+  it("rejects a malformed address with a 400", async () => {
     const response = await request(makeApp()).get("/api/v1/token/not-hex/metadata");
 
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(400);
     expect(response.body.error).toMatch(/hex string/);
     expect(callContract).not.toHaveBeenCalled();
+  });
+
+  it("returns a 404 for a well-formed but unknown address", async () => {
+    callContract.mockRejectedValueOnce(new Error("Contract not found"));
+
+    const response = await request(makeApp()).get("/api/v1/token/0xabcdef/metadata");
+
+    expect(response.status).toBe(404);
+    expect(response.body.error).toBe("Token not found");
+    expect(callContract).toHaveBeenCalled();
   });
 });
 
