@@ -50,7 +50,12 @@ vi.mock("starknet", async (importOriginal) => {
   };
 });
 
-import { readRouter, CursorPaginationSchema, BatchReadSchema } from "./read.js";
+import {
+  readRouter,
+  CursorPaginationSchema,
+  BatchReadSchema,
+  withReadRetry,
+} from "./read.js";
 
 function makeApp() {
   const app = express();
@@ -84,6 +89,10 @@ describe("GET /token/:token/balance/:owner", () => {
       entrypoint: "balance_of",
       calldata: ["0xdef"],
     });
+    const op = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error("transient failure"))
+      .mockResolvedValueOnce("ok");
     const onRetry = vi.fn();
 
     const result = await withReadRetry(op, { baseDelayMs: 1, maxDelayMs: 5 }, onRetry);
@@ -91,7 +100,7 @@ describe("GET /token/:token/balance/:owner", () => {
     expect(result).toBe("ok");
     expect(op).toHaveBeenCalledTimes(2);
     expect(onRetry).toHaveBeenCalledTimes(1);
-    const info = onRetry.mock.calls[0][0] as ReadRetryAttemptInfo;
+    const info = onRetry.mock.calls[0][0] as { attempt: number; maxAttempts: number; retriesSoFar: number };
     expect(info.attempt).toBe(1);
     expect(info.maxAttempts).toBe(3);
     expect(info.retriesSoFar).toBe(1);
@@ -274,6 +283,69 @@ describe("GET /agreement/:address/summary/:agreement_id", () => {
     const res = await request(makeApp()).get("/api/v1/agreement/0x5678/summary/2").expect(500);
 
     expect(res.body.error).toBe("Timeout");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cursor-based record reads
+// ---------------------------------------------------------------------------
+describe("GET /records/cursor/:address", () => {
+  it("returns records in deterministic order without a cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ limit: 2 })
+      .expect(200);
+
+    expect(res.body).toEqual({
+      address: "0xabc",
+      records: [
+        { id: 5, value: "record-5" },
+        { id: 4, value: "record-4" },
+      ],
+      nextCursor: "4",
+      order: "desc",
+    });
+  });
+
+  it("applies the cursor consistently to ordered records", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "4", order: "desc", limit: 2 })
+      .expect(200);
+
+    expect(res.body.records).toEqual([
+      { id: 3, value: "record-3" },
+      { id: 2, value: "record-2" },
+    ]);
+    expect(res.body.nextCursor).toBe("2");
+    expect(res.body.order).toBe("desc");
+  });
+
+  it("returns an empty result when the cursor is beyond the available records", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "999", limit: 2 })
+      .expect(200);
+
+    expect(res.body).toEqual({
+      address: "0xabc",
+      records: [],
+      nextCursor: null,
+      order: "desc",
+    });
+  });
+
+  it("rejects an invalid cursor", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "not-a-number", limit: 2 })
+      .expect(500);
+
+    expect(res.body.error).toContain("Invalid cursor");
   });
 });
 
