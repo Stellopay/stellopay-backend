@@ -259,6 +259,21 @@ Formatting uses BigInt arithmetic so u256 amounts are never truncated through
 
 ---
 
+## Observability
+
+Each notification-feed request emits one structured metric record with
+`metric: "notification_preferences_and_unread_count"` and
+`operation: "notification_feed"`. Success records include `notification_count`,
+`unread_count`, and `preferences_enabled`; failure records include `error`.
+Every record includes `timestamp`, `level`, `status`, and `duration_ms`, plus
+`request_id` when request-ID middleware is mounted.
+
+User addresses, transaction hashes, notification messages, and individual
+preference values are deliberately excluded. Records are sent through the
+application logger; external metrics export is out of scope.
+
+---
+
 ## Error Handling
 
 | Status | Error Message | Description |
@@ -303,3 +318,6 @@ other `/api/v1/*` routes.
 - **Cursor-based pagination**: Offset pagination is sufficient for the
   current feed size. Cursor-based pagination (stable under concurrent
   inserts) is out of scope for this issue.
+- **Persisted preference overrides and read state**: The route reports default
+  preferences and a derived unread count; storing per-user overrides or marking
+  individual notifications as read remains out of scope.

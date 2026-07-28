@@ -48,21 +48,23 @@ const { dbMock, schemaMock, queryState, USDC_TOKEN_ADDRESS } = vi.hoisted(() => 
     },
     eqValues: [] as string[],
     limitCalls: [] as number[],
+    failure: undefined as Error | undefined,
   };
 
   const db = {
     select: vi.fn(() => ({
       from: vi.fn((table: { __name: TableName }) => {
-        const rows = state.rows[table.__name] ?? [];
+        const result = () =>
+          state.failure ? Promise.reject(state.failure) : Promise.resolve(state.rows[table.__name] ?? []);
         const chainable = {
           orderBy: vi.fn(() => ({
             limit: vi.fn((limit: number) => {
               state.limitCalls.push(limit);
-              return Promise.resolve(rows);
+              return result();
             }),
           })),
           then: (resolve: (value: unknown) => void, reject: (reason?: unknown) => void) =>
-            Promise.resolve(rows).then(resolve, reject),
+            result().then(resolve, reject),
         };
         return { where: vi.fn(() => chainable) };
       }),
@@ -74,6 +76,7 @@ const { dbMock, schemaMock, queryState, USDC_TOKEN_ADDRESS } = vi.hoisted(() => 
 
 vi.mock("../config.js", () => ({
   env: {
+    LOG_FORMAT: "json",
     TOKEN_STRK: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
     TOKEN_USDC: USDC_TOKEN_ADDRESS,
     TOKEN_USDT: "0x02ab8758891e84b968ff11361789070c6b1af2df618d6d2f4a78b0757573c6eb",
@@ -163,6 +166,7 @@ function makeEscrowEvent(
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   queryState.rows.payments = [];
   queryState.rows.agreements = [];
@@ -170,6 +174,7 @@ beforeEach(() => {
   queryState.rows.escrowEvents = [];
   queryState.eqValues = [];
   queryState.limitCalls = [];
+  queryState.failure = undefined;
 });
 
 describe("notification preferences & unread count helpers", () => {
@@ -207,6 +212,38 @@ describe("notification preferences & unread count helpers", () => {
 });
 
 describe("notifications route", () => {
+  it("emits structured preference and unread-count telemetry for a successful response", async () => {
+    queryState.rows.payments = [makePayment()];
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
+
+    const telemetry = JSON.parse(info.mock.calls[0][0] as string);
+    expect(telemetry).toMatchObject({
+      metric: "notification_preferences_and_unread_count",
+      operation: "notification_feed",
+      status: "success",
+      notification_count: 1,
+      unread_count: 1,
+      preferences_enabled: 4,
+    });
+    expect(telemetry).not.toHaveProperty("user_address");
+  });
+
+  it("emits a structured failure record when notification retrieval fails", async () => {
+    queryState.failure = new Error("database unavailable");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(500);
+
+    expect(JSON.parse(error.mock.calls[0][0] as string)).toMatchObject({
+      metric: "notification_preferences_and_unread_count",
+      operation: "notification_feed",
+      status: "error",
+      error: "database unavailable",
+    });
+  });
+
   it("returns an empty aggregation when no events match the user", async () => {
     const res = await request(makeApp())
       .get("/api/v1/notifications/abc")
