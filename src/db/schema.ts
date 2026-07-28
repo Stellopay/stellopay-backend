@@ -173,6 +173,27 @@ export function assertValidU256(value: string, name: string): void {
   }
 }
 
+/**
+ * Asserts that `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters). Throws a descriptive {@link RangeError} when
+ * the assertion fails.
+ *
+ * Runtime counterpart of the DB-level CHECK constraints using
+ * {@link CURRENCY_CODE_REGEX} (e.g. `billing_profiles_currency_check`,
+ * `billing_invoices_currency_check`). Recording both a non-throwing
+ * `isValidCurrencyCode` and a throwing `assertValidCurrencyCode` mirrors the
+ * `isValidU256` / `assertValidU256` pair so callers can pick the level of
+ * strictness they need.
+ */
+export function assertValidCurrencyCode(code: string, name: string): void {
+  if (!CURRENCY_CODE_REGEX.test(code)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidCurrencyCode", name, value: code, reason: "invalid_format" });
+    throw new RangeError(
+      `${name} must be a valid ISO 4217-style currency code (exactly three uppercase ASCII letters), got "${code}"`,
+    );
+  }
+}
+
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
   "agreements",
