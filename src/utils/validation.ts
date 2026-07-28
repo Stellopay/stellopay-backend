@@ -442,6 +442,33 @@ function clampPaginationField(value: unknown, fallback: number, min: number, max
  * `undefined`, which falls back to the documented default.  Treating `null` /
  * `""` and `undefined` uniformly removes the inconsistency.
  *
+ * @param query - The request query object (req.query).  `undefined` / `null`
+ *   are treated as an empty object.
+ * @returns A clamped pair of { limit, offset } — both finite integers within
+ *   documented bounds.
+ *
+ * @example
+ * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
+ * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
+ * parsePagination(null);              // { limit: 50, offset: 0 }
+ */
+/** @see parsePagination — this exists solely to support its null/"" normalization */
+function coerceNullOrEmptyToUndefined(value: unknown): unknown {
+  if (value === null || value === "") return undefined;
+  return value;
+}
+
+/**
+ * Parses and clamps pagination query parameters. Clamping happens server-side
+ * so a client cannot request an unbounded, zero, or negative page: `limit` is
+ * forced into `[1, MAX_PAGE_LIMIT]` and `offset` to `>= 0`. Missing or
+ * non-numeric values fall back to safe defaults rather than failing the
+ * request.
+ *
+ * This function **never throws** — any input shape returns a valid, finite
+ * pair. Non-object inputs (strings, numbers, arrays, `null`, `undefined`) are
+ * treated as if no pagination params were supplied and fall back to defaults.
+ *
  * @param query - The request query object (`req.query`), or any value.
  * @returns `{ limit, offset }` — both safe integers within the documented
  *   bounds.

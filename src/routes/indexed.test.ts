@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import request from "supertest";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ZodError } from "zod";
@@ -14,7 +14,7 @@ vi.mock("../auth/session.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  env: { ADMIN_ADDRESSES: [ADMIN_ADDRESS] },
+  env: { ADMIN_ADDRESSES: [ADMIN_ADDRESS], INDEXED_CACHE_MAX_AGE_SECONDS: 12 },
   defaults: {
     workAgreementAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
     payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
@@ -208,6 +208,78 @@ describe("indexer freshness and sync checkpoint authorization boundary", () => {
   });
 });
 
+describe("/indexed/freshness vs /indexed/checkpoint differentiation", () => {
+  it("/indexed/freshness includes freshness field in the response body", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 100 }];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("freshness");
+    expect(res.body.freshness).toBe("synced");
+  });
+
+  it("/indexed/checkpoint omits freshness field in the response body", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 100 }];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/checkpoint")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty("freshness");
+    expect(res.body.source).toBe(INDEXED_DATA_SOURCE);
+    expect(res.body.checkpointBlock).toBe(100);
+  });
+
+  it("both endpoints set the x-indexer-sync-checkpoint header", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 42 }];
+
+    const [resFreshness, resCheckpoint] = await Promise.all([
+      request(makeApp())
+        .get("/api/v1/indexed/freshness")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+      request(makeApp())
+        .get("/api/v1/indexed/checkpoint")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+    ]);
+
+    expect(resFreshness.headers["x-indexer-sync-checkpoint"]).toBe("42");
+    expect(resCheckpoint.headers["x-indexer-sync-checkpoint"]).toBe("42");
+  });
+
+  it("boundary: returns freshness=empty and checkpointBlock=0 when no records exist", async () => {
+    state.rows.agreementEvents = [];
+
+    const [resFreshness, resCheckpoint] = await Promise.all([
+      request(makeApp())
+        .get("/api/v1/indexed/freshness")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+      request(makeApp())
+        .get("/api/v1/indexed/checkpoint")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+    ]);
+
+    expect(resFreshness.status).toBe(200);
+    expect(resFreshness.body.freshness).toBe("empty");
+    expect(resFreshness.body.checkpointBlock).toBe(0);
+    expect(resFreshness.headers["x-indexer-sync-checkpoint"]).toBe("0");
+
+    expect(resCheckpoint.status).toBe(200);
+    expect(resCheckpoint.body.checkpointBlock).toBe(0);
+    expect(resCheckpoint.body).not.toHaveProperty("freshness");
+    expect(resCheckpoint.headers["x-indexer-sync-checkpoint"]).toBe("0");
+  });
+});
+
 describe("indexed routes validation", () => {
   it("rejects a malformed user address with 400", async () => {
     const res = await request(makeApp()).get("/api/v1/indexed/payments/user/not-an-address");
@@ -396,6 +468,20 @@ describe("indexer freshness and sync checkpoint helpers", () => {
       ];
       expect(deriveSyncCheckpoint(records)).toBe(12345);
     });
+
+    it("idempotency: same input produces identical output on repeated calls", () => {
+      const records = [
+        { blockNumber: 10 },
+        { blockNumber: 20 },
+        { blockNumber: 30 },
+      ];
+      const first = deriveSyncCheckpoint(records);
+      const second = deriveSyncCheckpoint(records);
+      const third = deriveSyncCheckpoint([...records]);
+      expect(first).toBe(30);
+      expect(second).toBe(first);
+      expect(third).toBe(first);
+    });
   });
 
   describe("indexer freshness and sync checkpoint route headers", () => {
@@ -441,6 +527,40 @@ describe("indexer freshness and sync checkpoint helpers", () => {
       );
       expect(res.status).toBe(200);
       expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
+    });
+  });
+
+  describe("idempotency of indexed routes", () => {
+    it("idempotency: repeated GET /indexed/freshness returns identical body for same DB state", async () => {
+      state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+      const opts = () =>
+        request(makeApp())
+          .get("/api/v1/indexed/freshness")
+          .set("x-user-address", ADMIN_ADDRESS)
+          .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+
+    it("idempotency: repeated GET /indexed/checkpoint returns identical body for same DB state", async () => {
+      state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+      const opts = () =>
+        request(makeApp())
+          .get("/api/v1/indexed/checkpoint")
+          .set("x-user-address", ADMIN_ADDRESS)
+          .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
     });
   });
 });
