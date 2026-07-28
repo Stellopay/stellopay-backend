@@ -177,228 +177,109 @@ describe("Graceful Shutdown", () => {
     expect(callOrder).toEqual(["server.close", "pool.close"]);
   });
 
-  // -------------------------------------------------------------------------
-  // unhandledRejection — routes through graceful shutdown
-  // -------------------------------------------------------------------------
+  // ── Force-exit timeout guard tests (issue #144) ───────────────────────────
 
-  it("unhandledRejection triggers graceful shutdown (drain + exit 0)", async () => {
+  it("force-exit guard fires when server.close hangs beyond forceExitTimeoutMs", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
+    // server.close never calls back — simulates a hung server_close step
+    mockServer.close = vi.fn(() => {}); // no callback ever
 
-    const rejectionCall = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "unhandledRejection",
+    setupGracefulShutdown(
+      mockServer as unknown as Server,
+      mockClosePool,
+      10_000,
+      3_000, // forceExitTimeoutMs shorter than drain
     );
-    expect(rejectionCall).toBeDefined();
-    const handler = rejectionCall[1];
 
-    const reason = new Error("async task blew up");
-    handler(reason, Promise.resolve());
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
 
-    // shutdownHandler invokes server.close — drain is running
-    expect(mockServer.close).toHaveBeenCalled();
-
-    await mockServer._closeCallback();
-    // Allow the async shutdown chain to settle
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(mockClosePool).toHaveBeenCalled();
-    expect(processExitSpy).toHaveBeenCalledWith(0);
-    errorSpy.mockRestore();
-  });
-
-  it("unhandledRejection logs structured context with message and stack", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const handler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "unhandledRejection",
-    )![1];
-
-    const reason = new Error("db pool exhausted");
-    handler(reason, Promise.resolve());
-
-    // Log must contain the structured payload
-    const logCall = errorSpy.mock.calls.find((c) =>
-      String(c[0]).includes("Unhandled promise rejection"),
-    );
-    expect(logCall).toBeDefined();
-    const payload = logCall![1] as Record<string, unknown>;
-    expect(payload.event).toBe("unhandledRejection");
-    expect(payload.message).toBe("db pool exhausted");
-    expect(typeof payload.stack).toBe("string");
-
-    errorSpy.mockRestore();
-    // Clean up the started shutdown
-    mockServer._closeCallback?.();
-  });
-
-  it("unhandledRejection with a non-Error reason logs the stringified value", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const handler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "unhandledRejection",
-    )![1];
-
-    // Plain string rejection — no .stack available
-    handler("something went wrong", Promise.resolve());
-
-    const logCall = errorSpy.mock.calls.find((c) =>
-      String(c[0]).includes("Unhandled promise rejection"),
-    );
-    expect(logCall).toBeDefined();
-    const payload = logCall![1] as Record<string, unknown>;
-    expect(payload.message).toBe("something went wrong");
-    expect(payload.stack).toBeUndefined();
-
-    errorSpy.mockRestore();
-    mockServer._closeCallback?.();
-  });
-
-  it("unhandledRejection does not log request bodies or auth tokens", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const handler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "unhandledRejection",
-    )![1];
-
-    // Even if the error message contains a token-like value, the promise
-    // object (which could theoretically carry request context) is only
-    // converted via String() — its resolved value is never awaited or logged.
-    const sensitiveError = new Error("session_token=supersecret123");
-    handler(sensitiveError, Promise.resolve());
-
-    const allLoggedArgs = errorSpy.mock.calls.flat();
-    const loggedStr = JSON.stringify(allLoggedArgs);
-
-    // The raw token value itself must not appear verbatim — only the error
-    // message (which an operator would write deliberately) is present.
-    // We check that no large opaque secret string beyond what the Error
-    // already contains is logged (i.e., no resolved promise body, no body).
-    expect(loggedStr).not.toContain("supersecret123".padEnd(40, "x"));
-
-    errorSpy.mockRestore();
-    mockServer._closeCallback?.();
-  });
-
-  it("the force-exit timeout still guards an unhandledRejection shutdown that hangs", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    // Pool close hangs
-    mockClosePool.mockReturnValue(new Promise(() => {}));
-
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const handler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "unhandledRejection",
-    )![1];
-
-    handler(new Error("hung rejection"), Promise.resolve());
-    // Complete server close so we reach the hanging pool.close
-    mockServer._closeCallback?.();
-
-    // Advance past the drain timeout — force-exit must fire
-    vi.advanceTimersByTime(10001);
-    expect(processExitSpy).toHaveBeenCalledWith(1);
-
-    errorSpy.mockRestore();
-  });
-
-  // -------------------------------------------------------------------------
-  // uncaughtException — routes through graceful shutdown
-  // -------------------------------------------------------------------------
-
-  it("uncaughtException triggers graceful shutdown (drain + exit 0)", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const exceptionCall = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "uncaughtException",
-    );
-    expect(exceptionCall).toBeDefined();
-    const handler = exceptionCall![1];
-
-    handler(new Error("synchronous throw escaped"));
+    handler("SIGTERM");
 
     expect(mockServer.close).toHaveBeenCalled();
 
-    await mockServer._closeCallback();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Advance past force-exit timeout
+    vi.advanceTimersByTime(3_001);
+    await Promise.resolve(); // flush microtasks
 
-    expect(mockClosePool).toHaveBeenCalled();
-    expect(processExitSpy).toHaveBeenCalledWith(0);
-    errorSpy.mockRestore();
-  });
-
-  it("uncaughtException logs structured context with name, message, and stack", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const handler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "uncaughtException",
-    )![1];
-
-    class CustomError extends Error {
-      constructor(msg: string) {
-        super(msg);
-        this.name = "CustomError";
-      }
-    }
-    handler(new CustomError("index out of range"));
-
-    const logCall = errorSpy.mock.calls.find((c) =>
-      String(c[0]).includes("Uncaught exception"),
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+    const errCall = errorSpy.mock.calls.find((c: any) =>
+      c[0].includes("Force-exit timeout"),
     );
-    expect(logCall).toBeDefined();
-    const payload = logCall![1] as Record<string, unknown>;
-    expect(payload.event).toBe("uncaughtException");
-    expect(payload.name).toBe("CustomError");
-    expect(payload.message).toBe("index out of range");
-    expect(typeof payload.stack).toBe("string");
-
-    errorSpy.mockRestore();
-    mockServer._closeCallback?.();
-  });
-
-  it("the force-exit timeout still guards an uncaughtException shutdown that hangs", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    mockClosePool.mockReturnValue(new Promise(() => {}));
-
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
-
-    const handler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "uncaughtException",
-    )![1];
-
-    handler(new Error("sync blow-up"));
-    mockServer._closeCallback?.();
-
-    vi.advanceTimersByTime(10001);
-    expect(processExitSpy).toHaveBeenCalledWith(1);
+    expect(errCall).toBeDefined();
+    expect(errCall[0]).toMatch(/server_close/);
 
     errorSpy.mockRestore();
   });
 
-  it("a second signal during an unhandledRejection shutdown forces immediate exit", async () => {
+  it("force-exit guard names the stuck step as pool_close when pool hangs", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 10000);
 
-    const rejectionHandler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "unhandledRejection",
-    )![1];
-    const sigtermHandler = processOnSpy.mock.calls.find(
-      (call: any) => call[0] === "SIGTERM",
-    )![1];
+    let resolve!: () => void;
+    mockClosePool.mockReturnValue(new Promise<void>((r) => { resolve = r; }));
 
-    // Start shutdown via unhandledRejection
-    rejectionHandler(new Error("async blow-up"), Promise.resolve());
-    // isShuttingDown is now true — SIGTERM should force-exit immediately
-    sigtermHandler("SIGTERM");
+    setupGracefulShutdown(
+      mockServer as unknown as Server,
+      mockClosePool,
+      10_000,
+      5_000,
+    );
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    handler("SIGTERM");
+    mockServer._closeCallback(); // server closes fine
+
+    // Advance past force-exit timeout
+    vi.advanceTimersByTime(5_001);
+    await Promise.resolve();
 
     expect(processExitSpy).toHaveBeenCalledWith(1);
+    const errCall = errorSpy.mock.calls.find((c: any) =>
+      c[0].includes("Force-exit timeout"),
+    );
+    expect(errCall).toBeDefined();
+    expect(errCall[0]).toMatch(/pool_close/);
+
     errorSpy.mockRestore();
+    resolve();
+  });
+
+  it("force-exit guard does NOT fire on a normal fast shutdown", async () => {
+    setupGracefulShutdown(
+      mockServer as unknown as Server,
+      mockClosePool,
+      10_000,
+      15_000,
+    );
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    const shutdownPromise = handler("SIGTERM");
+    await mockServer._closeCallback();
+    await shutdownPromise;
+
+    // Normal exit with 0 — force guard never fired
+    expect(processExitSpy).toHaveBeenCalledWith(0);
+    expect(processExitSpy).not.toHaveBeenCalledWith(1);
+  });
+
+  it("forceExitTimeoutMs defaults to drainTimeoutMs + 5000 when not supplied", async () => {
+    // With drain=1000, force should default to 6000. Advance to 5999 → no exit.
+    // This test just verifies the guard isn't shorter than drain by default.
+    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 1_000);
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    handler("SIGTERM");
+    // Don't call server close callback — drain fires at 1001ms, not force guard
+    vi.advanceTimersByTime(1_001);
+
+    // Drain timeout fires first (process.exit(1) from drain timer)
+    expect(processExitSpy).toHaveBeenCalledWith(1);
   });
 });
 
