@@ -9,6 +9,20 @@ The read endpoint (`GET /api/v1/events`) allows consumers to query indexed event
 
 ---
 
+## Backward-Compatibility Contract
+
+This document defines the explicit backward-compatibility guarantees for the events API. All behaviors described here are **frozen** and must be preserved across future changes.
+
+### Core Guarantees
+
+1. **Idempotency**: Re-processing the same transaction hash never creates duplicate database rows
+2. **Deterministic IDs**: All persisted event rows use `{normalizedTxHash}_{eventIndex}` as the primary key format
+3. **Hash Normalization**: Transaction hashes are normalized to `0x` + exactly 64 lowercase hex characters
+4. **Error Shapes**: HTTP 400/404 error response structures are stable
+5. **Response Envelopes**: Top-level response field names and types are frozen
+
+---
+
 ## Endpoints
 
 - `GET /api/v1/events`
@@ -139,6 +153,158 @@ Both endpoints validate transaction hash format identically via the shared `TxHa
 { "error": "Invalid Starknet transaction hash format" }
 ```
 
+**Backward-compatibility guarantees:**
+- Error status code (400) is frozen for validation failures
+- Error message string is stable
+- TxHashSchema pattern (0x-prefixed, 1-64 hex chars) is frozen
+- Length constraints (3-66 total chars) are frozen
+- Valid hashes must continue to pass validation across all versions
+
+---
+
+## Fan-out Delivery Contract
+
+### TxProcessResult Interface
+
+The `TxProcessResult` interface returned by `processTxReceipt()` is frozen:
+
+```typescript
+{
+  txHash: string;              // Normalized (0x + 64 hex)
+  status: "processed" | "no_events" | "not_found" | "error";
+  eventsProcessed: number;     // Count of persisted rows
+  eventLabels: string[];       // Human-readable event labels
+  tokenVerified?: boolean;     // Present for AgreementCreated events
+  error?: string;              // Present only when status === "error"
+}
+```
+
+**Frozen fields:**
+- All six fields and their types are stable
+- Status enum values cannot change
+- Field presence rules are frozen (tokenVerified only for AgreementCreated, error only for errors)
+
+### Batch Response Contract
+
+The `process_batch` response envelope is frozen:
+
+```typescript
+{
+  summary: {
+    total: number;                 // Length of input tx_hashes array
+    processed: number;             // Count of successfully processed unique txs
+    noEvents: number;              // Count of receipts with no decodable events
+    notFound: number;              // Count of not-found receipts
+    errors: number;                // Count of error results
+    duplicates: number;            // Count of within-batch duplicate hashes
+    totalEventsProcessed: number;  // Sum of eventsProcessed across all unique txs
+  },
+  results: TxProcessResult[];      // One entry per input hash, same order
+}
+```
+
+**Invariants (frozen):**
+- `results.length === tx_hashes.length` (always true, even with duplicates)
+- `summary.total === summary.processed + summary.noEvents + summary.notFound + summary.errors + summary.duplicates`
+- `results[i]` corresponds to `tx_hashes[i]`
+- Duplicate hashes reuse the first occurrence's result
+
+---
+
+## Exported Helper Functions
+
+The following functions are exported from `src/routes/events.ts` for testing and reuse:
+
+### `normalizeTransactionHash(hash: string): string`
+
+Normalizes a Starknet transaction hash to canonical form (0x + 64 lowercase hex characters).
+
+**Backward-compatibility guarantees:**
+- Output format is frozen: `0x` + exactly 64 hex characters, lowercase
+- Padding behavior is stable: hashes shorter than 66 chars are left-padded with zeros
+- Hashes already 66 chars long are returned as-is (preserves leading zeros)
+- All existing normalized hashes produce identical output across versions
+
+### `parseEventTypeQuery(raw: unknown): string[]`
+
+Parses eventType query parameters supporting multiple input formats.
+
+**Backward-compatibility guarantees:**
+- Returns empty array for undefined/null/empty input
+- Supports single string, comma-separated, and array formats
+- Deduplicates event types
+- Function signature is frozen
+
+### `parseTimestampQuery(raw: unknown, paramName: string): Date | undefined`
+
+Parses timestamp query parameters (ISO 8601 or numeric).
+
+**Backward-compatibility guarantees:**
+- Returns undefined for undefined/null/empty input
+- Supports ISO 8601 strings and numeric timestamps (seconds or milliseconds)
+- Throws z.ZodError on malformed input
+- Error message format is stable
+- Function signature is frozen
+
+### `validateTimeRange(from?: Date, to?: Date): void`
+
+Validates that from ≤ to.
+
+**Backward-compatibility guarantees:**
+- Passes when either parameter is undefined
+- Passes when from === to (inclusive bounds)
+- Throws z.ZodError with stable error message when from > to
+- Function signature is frozen
+
+### `encodeCursor(payload: EventCursorPayload): string`
+
+Encodes pagination cursor to base64url format.
+
+**Backward-compatibility guarantees:**
+- Encoding format (JSON → base64url) is frozen
+- Output is always URL-safe
+- Cursors from older versions can be decoded by newer versions
+
+### `decodeCursor(cursor: string): EventCursorPayload | null`
+
+Decodes pagination cursor, returning null on any error.
+
+**Backward-compatibility guarantees:**
+- Gracefully handles malformed input (returns null, never throws)
+- Validates all three required fields (blockNumber, eventIndex, id)
+- Compatible with cursors from older API versions
+- Null return for invalid cursors is stable behavior
+
+---
+
 ## Known limitations / out of scope
 
 - **No cross-request idempotency-key / response-replay caching.** There is no persistent idempotency-key store (e.g. Redis, a dedup table) in this service. If a caller sends the *same* transaction hash as two **separate** HTTP requests each request still performs its own RPC fetch and call to `processTxReceipt`.
+
+---
+
+## Breaking Change Policy
+
+The following changes are considered **breaking** and will be avoided:
+
+- Removing or renaming any response field in `TxProcessResult` or batch response envelopes
+- Changing field types (e.g., `eventsProcessed` from number to string)
+- Modifying the `status` enum values ("processed", "no_events", "not_found", "error")
+- Changing the hash normalization format (must remain 0x + 64 hex chars)
+- Altering the deterministic row ID format (`{txHash}_{eventIndex}`)
+- Modifying error status codes for existing error cases (400 for validation, 404 for not found)
+- Changing the batch summary invariant (total = sum of categories)
+- Removing support for any input format (comma-separated, array, single string)
+- Breaking idempotency guarantees (allowing duplicate rows from repeated processing)
+- Changing query parameter names (eventType, from, to, agreement_id, contract_address, etc.)
+- Modifying time range validation logic (inclusive bounds, from ≤ to)
+
+The following changes are considered **non-breaking** and may occur in future:
+
+- Adding new optional fields to response envelopes
+- Adding new status values (with distinct meaning, not replacing existing ones)
+- Supporting additional timestamp formats (additive)
+- Adding new query parameters for filtering
+- Performance optimizations that don't affect response shape
+- Adding new event types to decode
+- Expanding validation to reject currently-invalid inputs more strictly (fail-fast improvements)

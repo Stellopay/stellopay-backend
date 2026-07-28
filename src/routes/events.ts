@@ -22,6 +22,11 @@ export const MAX_BATCH_SIZE = 50;
  * Zod schema for a Starknet transaction hash.
  * Accepts the canonical 0x-prefixed hex form (up to 66 chars) as well as the
  * un-padded variant emitted by some RPC providers.
+ *
+ * **Backward-compatibility contract:** This validation schema is frozen. The
+ * pattern (0x-prefixed hex, 1-64 hex characters) and length constraints (3-66
+ * total chars) must be preserved. New validation rules may be added but
+ * existing valid hashes must continue to pass.
  */
 export const TxHashSchema = z
   .string()
@@ -69,6 +74,14 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.
  * If the hash is already 66 chars, it is returned as-is to preserve leading
  * zeros; otherwise the hex part is left-padded to 64 characters.
+ *
+ * **Backward-compatibility contract:** This normalization logic is frozen. The
+ * output format (0x + exactly 64 hex characters, lowercase) and padding behavior
+ * must be preserved. All existing normalized hashes must continue to produce the
+ * same output.
+ *
+ * @param hash - Raw transaction hash (may be un-prefixed or un-padded)
+ * @returns Normalized hash in 0x + 64-hex format
  */
 export function normalizeTransactionHash(hash: string): string {
   if (!hash) return "";
@@ -118,6 +131,11 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
 
 /**
  * Result returned by {@link processTxReceipt} for a single transaction.
+ *
+ * **Backward-compatibility contract:** This interface shape is frozen. All five
+ * fields and their types must be preserved. New optional fields may be added but
+ * existing fields cannot be removed or have their types changed. The status enum
+ * values ("processed", "no_events", "not_found", "error") are stable.
  */
 export interface TxProcessResult {
   /** Normalised (0x + 64-hex) transaction hash that was processed. */
@@ -190,6 +208,13 @@ async function verifyAndUpdateToken(
  * This function is the single source of truth for event decoding and
  * persistence; both `POST /events/process_tx/:tx_hash` and
  * `POST /events/process_batch` delegate to it.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Idempotent: Re-processing the same txHash never creates duplicate rows
+ * - Deterministic row IDs: `{normalizedTxHash}_{eventIndex}` format is frozen
+ * - Status values are stable: "processed", "no_events", "not_found", "error"
+ * - All database writes use `.onConflictDoNothing()` or `.onConflictDoUpdate()`
+ * - Hash normalization behavior is preserved (see {@link normalizeTransactionHash})
  *
  * @param txHash - Raw transaction hash (will be normalised internally).
  * @returns A {@link TxProcessResult} describing what was stored.
@@ -579,6 +604,10 @@ async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResul
  * monotone per insert and the `id` (txHash_eventIndex composite) breaks any
  * remaining ties.
  *
+ * **Backward-compatibility contract:** This interface shape is frozen. All three
+ * fields and their types must be preserved for cursor decoding to work across
+ * API versions. The encoding format (JSON + base64url) is also frozen.
+ *
  * @internal — callers only see the opaque base64url string.
  */
 export interface EventCursorPayload {
@@ -595,6 +624,12 @@ export interface EventCursorPayload {
  * audit and decode in tests, but it is not "guessable" as an incrementable
  * integer — clients cannot derive internal row IDs from it without already
  * knowing the `id` value (txHash_eventIndex).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Encoding format (JSON → base64url) is frozen
+ * - Output is always URL-safe (no percent-encoding needed)
+ * - Cursors from older API versions can be decoded by newer versions
+ * - Function signature is frozen
  */
 export function encodeCursor(payload: EventCursorPayload): string {
   return Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -604,6 +639,13 @@ export function encodeCursor(payload: EventCursorPayload): string {
  * Decodes a cursor string produced by {@link encodeCursor}. Returns `null` on
  * any parse or validation failure so callers can treat a bad cursor as
  * "no cursor" (first page) rather than throwing a 500.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Gracefully handles malformed input (returns null, never throws)
+ * - Validates all three required fields (blockNumber, eventIndex, id)
+ * - Compatible with cursors from older API versions (same encoding format)
+ * - Function signature is frozen
+ * - Null return value for invalid cursors is stable behavior
  */
 export function decodeCursor(cursor: string): EventCursorPayload | null {
   try {
@@ -967,6 +1009,15 @@ eventsRouter.post(
  * Parse an `eventType` query parameter into a clean array of event type strings.
  * Supports single strings ("AgreementCreated"), comma-separated values
  * ("AgreementCreated,PaymentSent"), or multiple query parameters (`?eventType=A&eventType=B`).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Returns empty array for undefined/null/empty input
+ * - Deduplicates event types (returns unique values only)
+ * - Preserves all three input formats (single, comma-separated, array)
+ * - Function signature and return type are frozen
+ *
+ * @param raw - Query parameter value (string, string array, or undefined)
+ * @returns Array of unique event type strings
  */
 export function parseEventTypeQuery(raw: unknown): string[] {
   if (raw === undefined || raw === null || raw === "") return [];
@@ -985,6 +1036,16 @@ export function parseEventTypeQuery(raw: unknown): string[] {
  * Parse a `from` or `to` timestamp query parameter into a valid JavaScript `Date` object.
  * Accepts ISO 8601 strings or numeric timestamp strings.
  *
+ * **Backward-compatibility guarantees:**
+ * - Returns undefined for undefined/null/empty input
+ * - Supports both ISO 8601 strings and numeric timestamps (seconds or milliseconds)
+ * - Throws z.ZodError on malformed input (never returns invalid Date)
+ * - Function signature frozen: (raw: unknown, paramName: string) => Date | undefined
+ * - Error message format is stable
+ *
+ * @param raw - Query parameter value to parse
+ * @param paramName - Parameter name for error messages
+ * @returns Parsed Date object or undefined
  * @throws {z.ZodError} If the timestamp format is malformed or invalid.
  */
 export function parseTimestampQuery(raw: unknown, paramName: string): Date | undefined {
@@ -1030,6 +1091,15 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 /**
  * Validates that `from` timestamp is less than or equal to `to` timestamp.
  *
+ * **Backward-compatibility guarantees:**
+ * - Passes validation when either parameter is undefined
+ * - Passes validation when from === to (inclusive bounds)
+ * - Throws z.ZodError with stable error message when from > to
+ * - Function signature is frozen
+ * - Error structure matches project-wide Zod error format
+ *
+ * @param from - Optional start timestamp
+ * @param to - Optional end timestamp
  * @throws {z.ZodError} If `from` is strictly after `to`.
  */
 export function validateTimeRange(from?: Date, to?: Date): void {
