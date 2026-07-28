@@ -493,12 +493,6 @@ function clampPaginationField(value: unknown, fallback: number, min: number, max
  * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
  * parsePagination(null);              // { limit: 50, offset: 0 }
  */
-/** @see parsePagination — this exists solely to support its null/"" normalization */
-function coerceNullOrEmptyToUndefined(value: unknown): unknown {
-  if (value === null || value === "") return undefined;
-  return value;
-}
-
 /**
  * Parses and clamps pagination query parameters. Clamping happens server-side
  * so a client cannot request an unbounded, zero, or negative page: `limit` is
