@@ -9,6 +9,7 @@ import {
   getTokenInfo,
   type TokenInfo,
 } from "../utils/token-formatting.js";
+import { env } from "../config.js";
 
 export const notificationsRouter = Router();
 
@@ -84,6 +85,40 @@ export function calculateUnreadCount(notifications: Array<{ id?: string | number
   return count;
 }
 
+interface NotificationsTelemetryEntry {
+  operation: "notification_feed";
+  status: "success" | "error";
+  duration_ms: number;
+  request_id?: string;
+  notification_count?: number;
+  unread_count?: number;
+  preferences_enabled?: number;
+  error?: string;
+}
+
+/** Emits low-cardinality feed telemetry without user or notification data. */
+export function logNotificationsTelemetry(entry: NotificationsTelemetryEntry): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    metric: "notification_preferences_and_unread_count",
+    ...entry,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
+    return;
+  }
+
+  const message =
+    `[notifications-telemetry] ${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+    `${logEntry.notification_count !== undefined ? ` notifications=${logEntry.notification_count}` : ""}` +
+    `${logEntry.unread_count !== undefined ? ` unread=${logEntry.unread_count}` : ""}` +
+    `${logEntry.preferences_enabled !== undefined ? ` preferences_enabled=${logEntry.preferences_enabled}` : ""}` +
+    `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+  (logEntry.level === "error" ? console.error : console.info)(message);
+}
+
 /**
  * Per-request token-info cache.
  *
@@ -149,8 +184,11 @@ function createTitleCache() {
 //
 // NotificationsResponse — top-level response envelope.
 //   notifications — array of up to `limit` items, sorted newest-first.
-//   total         — length of the notifications array.
+//   total         — length of the notifications array after slicing.
 //   unreadCount   — count of items where read === false (always === total today).
+//   limit         — echoed back from request (or default).
+//   offset        — echoed back from request (or 0).
+//   hasMore       — true when there are items beyond this page.
 //
 // Backward-compatibility rules:
 //   - All fields listed above are frozen; existing callers depend on them.
@@ -182,6 +220,21 @@ export interface NotificationsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Pagination constants — frozen for backward-compatibility.
+//
+// NOTIFICATIONS_DEFAULT_LIMIT: default page size when `limit` is omitted.
+//   Intentionally 10 (not the project-wide 50) because the notifications
+//   UI was designed around a short summary card, and existing callers rely
+//   on receiving at most 10 items by default.
+//
+// NOTIFICATIONS_MAX_LIMIT: upper bound enforced server-side; requests above
+//   this value are rejected with 400 so callers discover the cap explicitly
+//   rather than silently receiving fewer items than requested.
+// ---------------------------------------------------------------------------
+export const NOTIFICATIONS_DEFAULT_LIMIT = 10;
+export const NOTIFICATIONS_MAX_LIMIT = 50;
+
+// ---------------------------------------------------------------------------
 // Authorization boundary
 //
 // The route only queries data for the address supplied in the path.  All three
@@ -198,14 +251,41 @@ export interface NotificationsResponse {
 
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId: string | undefined = res.locals.requestId;
   try {
     const userAddress = StarknetAddress.parse(req.params.user_address);
-    // Hand-rolled limit parser: default 10, max 50, must be a positive integer.
-    // Kept local rather than reusing `parsePagination` to preserve the existing
-    // /api/v1/notifications contract (default 10, max 50) that older callers
-    // and the documented OAS example rely on.
+
+    // Hand-rolled limit/offset parser. Kept local rather than reusing
+    // `parsePagination` to preserve the existing /api/v1/notifications
+    // contract (default 10, max 50) that older callers and the documented
+    // OAS example rely on. Out-of-range values are rejected with 400 so
+    // callers discover pagination mistakes immediately rather than receiving
+    // silently-clamped results.
     const limit =
-      z.coerce.number().int().positive().max(50).optional().parse(req.query.limit) || 10;
+      z.coerce
+        .number()
+        .int()
+        .positive()
+        .max(NOTIFICATIONS_MAX_LIMIT)
+        .optional()
+        .parse(req.query.limit) ?? NOTIFICATIONS_DEFAULT_LIMIT;
+
+    const offset =
+      z.coerce
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .parse(req.query.offset) ?? 0;
+
+    // queryLimit determines how many rows each data-source query fetches.
+    // Using (limit + offset) ensures the merged pool is always large enough
+    // to satisfy any page within the documented range: after merging and
+    // sorting, we slice from `offset` to `offset + limit` and the pool
+    // never runs short. The extra overhead is bounded by NOTIFICATIONS_MAX_LIMIT
+    // (50) so a single request fetches at most 100 rows per source.
+    const queryLimit = limit + offset;
 
     // Three queries depend only on `userAddress`; the fourth (agreementEvents)
     // depends on the `agreements` result so it runs as a follow-up. Run the
@@ -217,7 +297,7 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
         .from(schema.payments)
         .where(or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)))
         .orderBy(desc(schema.payments.blockNumber))
-        .limit(limit),
+        .limit(queryLimit),
       db
         .select({ id: schema.agreements.id, token: schema.agreements.token })
         .from(schema.agreements)
@@ -237,7 +317,7 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
           ),
         )
         .orderBy(desc(schema.escrowEvents.blockNumber))
-        .limit(limit),
+        .limit(queryLimit),
     ]);
 
     const agreementIds = userAgreements.map((a) => a.id);
@@ -263,13 +343,13 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
               ),
             )
             .orderBy(desc(schema.agreementEvents.blockNumber))
-            .limit(limit)
+            .limit(queryLimit)
         : [];
 
     const tokenInfoCache = createTokenInfoCache();
     const titleCache = createTitleCache();
 
-    const rawNotifications = [
+    const merged = [
       ...payments.map((p) => {
         const tokenInfo = tokenInfoCache.resolve(p.token);
         const formattedAmount = formatTokenAmount(p.amount, tokenInfo.decimals);
@@ -309,20 +389,45 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
           txHash: e.transactionHash,
         };
       }),
-    ]
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-      .slice(0, limit);
+    ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    // Determine whether more items exist beyond this page before slicing,
+    // so `hasMore` accurately reflects availability of a next page.
+    const hasMore = merged.length > offset + limit;
+    const rawNotifications = merged.slice(offset, offset + limit);
 
     // `unreadCount` flows through the exported helper so the response stays
     // in lockstep with the helper's semantics; in practice every emitted
     // notification has `read: false` set above, so the helper's filter pass
     // coincides with `rawNotifications.length`.
+    const unreadCount = calculateUnreadCount(rawNotifications);
+    const preferences = getDefaultNotificationPreferences();
+    logNotificationsTelemetry({
+      operation: "notification_feed",
+      status: "success",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      request_id: requestId,
+      notification_count: rawNotifications.length,
+      unread_count: unreadCount,
+      preferences_enabled: Object.values(preferences).filter(Boolean).length,
+    });
+
     res.json({
       notifications: rawNotifications,
       total: rawNotifications.length,
-      unreadCount: calculateUnreadCount(rawNotifications),
+      unreadCount,
+      limit,
+      offset,
+      hasMore,
     });
-  } catch (e) {
-    next(e);
+  } catch (error) {
+    logNotificationsTelemetry({
+      operation: "notification_feed",
+      status: "error",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      request_id: requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    next(error);
   }
 });

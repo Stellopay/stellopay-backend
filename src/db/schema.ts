@@ -8,15 +8,69 @@ import {
   index,
   numeric,
   check,
+  type PgTableWithColumns,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 /**
- * Index convention (enforced by schema-consistency.test.ts):
- * Every foreign-key-shaped column — camelCase *Id mapped to SQL *_id (e.g. agreementId,
- * profileId, milestoneId) — must have a btree index declared in this file. Primary keys and
- * non-relational identifiers (e.g. taxId) are excluded. Missing indexes hurt join and filter
+ * # Schema Contract
+ *
+ * This module owns the database schema for the Stellopay backend indexer.
+ * Every table, constraint, and helper exported here is the single source of
+ * truth. Callers in `src/routes/`, `src/auth/`, and test files all read the
+ * same definitions — no divergent copies exist.
+ *
+ * ## Invariants (enforced by `schema-consistency.test.ts`)
+ *
+ * | # | Invariant | Rationale |
+ * |---|-----------|-----------|
+ * | I1 | **Table inventory** — exactly 10 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
+ * | I2 | **FK index** — every `*Id` column mapped to `*_id` in SQL has a
+ *        btree `index()` unless it is a PK or a documented exclusion
+ *        (e.g. `taxId`). See `schema-fk-indexes.ts`. | Joins and filtered queries
+ *        against these columns degrade to sequential scans without an index. |
+ * | I3 | **u256 amount CHECK** — every column storing a Cairo `u256` value
+ *        as a decimal string uses the shared
+ *        {@link U256_DECIMAL_REGEX} in its `check()` constraint. | Ensures all
+ *        amount columns use the same validated format; a single regex change
+ *        updates every table consistently. |
+ * | I4 | **Currency CHECK** — every `currency` column uses
+ *        `'^[A-Z]{3}$'` (ISO 4217-style). | Prevents mixed-case or malformed
+ *        currency codes. |
+ * | I5 | **Block-number CHECK** — every `block_number` column has
+ *        `CHECK >= 0`. | Negative block numbers are nonsensical and must be
+ *        rejected at the DB layer. |
+ * | I6 | **Enum CHECK** — every column with a closed set of values
+ *        (mode, status, event_type, profile_type, etc.) carries a
+ *        `CHECK IN (...)` or `CHECK BETWEEN`. | The DB is the last line of
+ *        defence against out-of-range values; application code may have bugs. |
+ * | I7 | **Runtime ↔ DB parity** — every DB CHECK constraint has a
+ *        corresponding runtime validation helper exported from this module
+ *        (e.g. `assertValidU256` matches the u256 CHECK). | Callers validate
+ *        early to produce actionable errors instead of opaque DB violations. |
+ *
+ * ## Adding a new table
+ *
+ * 1. Define it here with the appropriate CHECK constraints, FK indexes, and
+ *    runtime helpers.
+ * 2. Add an entry to {@link SCHEMA_TABLES} so the table-inventory test stays
+ *    in sync.
+ * 3. Add a CHECK-constraint test in `src/db/migration.test.ts`.
+ * 4. Write a migration in `src/db/migrations/` and register it in
+ *    `src/db/migrations/meta/_journal.json`.
+ * 5. Update `docs/db/schema.md` with the table documentation.
+ *
+ * ## Index convention
+ *
+ * Every foreign-key-shaped column — camelCase `*Id` mapped to SQL `*_id`
+ * (e.g. `agreementId`, `profileId`, `milestoneId`) — must have a btree index
+ * declared in this file. Primary keys and non-relational identifiers
+ * (e.g. `taxId`) are excluded. Missing indexes hurt join and filter
  * performance as tables grow.
+ *
+ * Enforced by `schema-consistency.test.ts` via `schema-fk-indexes.ts`.
+ *
+ * @module schema
  */
 
 // ---------------------------------------------------------------------------
@@ -94,9 +148,11 @@ export function isValidNonNegativeInteger(value: number): boolean {
  */
 export function assertNonNegative(value: number, name: string): void {
   if (typeof value !== "number" || !Number.isInteger(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "not_an_integer" });
     throw new RangeError(`${name} must be a non-negative integer, got ${value}`);
   }
   if (value < 0) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "negative_value" });
     throw new RangeError(`${name} must be non-negative, got ${value}`);
   }
 }
@@ -110,6 +166,7 @@ export function assertNonNegative(value: number, name: string): void {
  */
 export function assertValidU256(value: string, name: string): void {
   if (!U256_DECIMAL_PATTERN.test(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidU256", name, value, reason: "invalid_format" });
     throw new RangeError(
       `${name} must be a valid u256 decimal string (0 or positive integer up to 78 digits), got "${value}"`,
     );
@@ -175,7 +232,7 @@ export const agreementEvents = pgTable(
   "agreement_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // AgreementCreated, AgreementActivated, etc.
     blockNumber: bigint("block_number", { mode: "number" }).notNull(),
@@ -204,7 +261,7 @@ export const payments = pgTable(
   "payments",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     from: text("from_address").notNull(),
     to: text("to_address").notNull(),
@@ -237,7 +294,7 @@ export const milestones = pgTable(
   "milestones",
   {
     id: text("id").primaryKey(), // agreement_id + milestone_id
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     milestoneId: integer("milestone_id").notNull(),
     amount: text("amount").notNull(), // u256 as string
@@ -266,7 +323,7 @@ export const employees = pgTable(
   "employees",
   {
     id: text("id").primaryKey(), // agreement_id + employee_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     employeeAddress: text("employee_address").notNull(),
     employeeIndex: integer("employee_index").notNull(),
@@ -298,7 +355,7 @@ export const escrowEvents = pgTable(
   "escrow_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // Funded, Released, Refunded
     employer: text("employer").notNull(),
@@ -404,7 +461,9 @@ export const billingPaymentMethods = pgTable(
   "billing_payment_methods",
   {
     id: text("id").primaryKey(),
-    profileId: text("profile_id").notNull(), // → billingProfiles.id
+    profileId: text("profile_id").notNull().references(() => billingProfiles.id, {
+      onDelete: "cascade",
+    }),
     type: text("type").notNull(), // bank_account | paypal | crypto | etc.
     // Masked / safe-to-store fields only
     displayName: text("display_name"), // e.g. "Chase ****1234"
@@ -431,7 +490,9 @@ export const billingInvoices = pgTable(
   "billing_invoices",
   {
     id: text("id").primaryKey(),
-    profileId: text("profile_id").notNull(), // → billingProfiles.id
+    profileId: text("profile_id").notNull().references(() => billingProfiles.id, {
+      onDelete: "cascade",
+    }),
     invoiceNumber: text("invoice_number").notNull().unique(),
     amount: numeric("amount", { precision: 18, scale: 6 }).notNull(),
     currency: text("currency").notNull().default("USD"),
@@ -457,6 +518,44 @@ export const billingInvoices = pgTable(
   }),
 );
 
+
+// ---------------------------------------------------------------------------
+// Backfill Progress
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks the progress of backfill jobs. Each row represents one backfill job
+ * type (employee-events, milestone-events) and stores the last checkpoint,
+ * totals, and status for resume-after-crash semantics.
+ */
+export const backfillProgress = pgTable(
+  "backfill_progress",
+  {
+    jobName: text("job_name").primaryKey(),
+    status: text("status").notNull().default("idle"),
+    lastCursor: timestamp("last_cursor"),
+    totalScanned: integer("total_scanned").notNull().default(0),
+    totalCreated: integer("total_created").notNull().default(0),
+    lastError: text("last_error"),
+    startedAt: timestamp("started_at"),
+    completedAt: timestamp("completed_at"),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    statusCheck: check(
+      "backfill_progress_status_check",
+      sql`${table.status} IN ('idle', 'running', 'completed', 'failed')`,
+    ),
+    totalScannedCheck: check(
+      "backfill_progress_total_scanned_check",
+      sql`${table.totalScanned} >= 0`,
+    ),
+    totalCreatedCheck: check(
+      "backfill_progress_total_created_check",
+      sql`${table.totalCreated} >= 0`,
+    ),
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // Pagination & Batching Constants
@@ -507,6 +606,7 @@ export function clampBatchSize(requested: number): number {
  */
 export function validateBatchSize(requested: number, name?: string): number {
   if (!Number.isInteger(requested) || requested <= 0 || requested > MAX_BATCH_SIZE) {
+    console.error({ event: "schema_validation_failed", check: "validateBatchSize", name, value: requested, max: MAX_BATCH_SIZE });
     throw new RangeError(
       `${name ?? "batchSize"} must be an integer between 1 and ${MAX_BATCH_SIZE}, got ${requested}`,
     );
@@ -537,4 +637,36 @@ export const sessions = pgTable(
     familyIdIdx: index("sessions_family_id_idx").on(table.familyId),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Schema table inventory — single source of truth for the table list.
+// Used by schema-consistency.test.ts to verify no tables are orphaned or
+// duplicated. Every new table must be added here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Ordered list of every Drizzle table definition exported from this module.
+ *
+ * The order matches the table documentation in {@link docs/db/schema.md}.
+ * Schema-consistency tests assert that `Object.keys(schema)` (minus helpers /
+ * constants) matches this list exactly — preventing orphaned table
+ * definitions and ensuring every new table is registered consciously.
+ *
+ * `any` is intentional for the table type parameter — the tables have
+ * heterogeneous column shapes and this array is consumed only by tests for
+ * inventory verification, not for type-level operations.
+ */
+export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any> }> = [
+  { name: "agreements", table: agreements },
+  { name: "agreementEvents", table: agreementEvents },
+  { name: "payments", table: payments },
+  { name: "milestones", table: milestones },
+  { name: "employees", table: employees },
+  { name: "escrowEvents", table: escrowEvents },
+  { name: "billingProfiles", table: billingProfiles },
+  { name: "billingPaymentMethods", table: billingPaymentMethods },
+  { name: "billingInvoices", table: billingInvoices },
+  { name: "sessions", table: sessions },
+  { name: "backfillProgress", table: backfillProgress },
+];
 

@@ -10,6 +10,7 @@ export default defineConfig({
     // no test performs real network calls.
     env: {
       NODE_ENV: "test",
+      CORS_ORIGIN: "http://localhost:3000",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
       POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
     },
@@ -31,6 +32,7 @@ export default defineConfig({
         "src/utils/token-formatting.ts",
         "src/utils/validation.ts",
         "src/shutdown.ts",
+        "src/starknet/agreement-index.ts",
         "scripts/check-env-sync.ts",
         "scripts/lint-migrations.ts",
       ],

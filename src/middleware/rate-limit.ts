@@ -11,6 +11,10 @@ import type { Request, Response } from "express";
 
 /** Canonical header name for the idempotency key. */
 export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+/** Header name for Retry-After on 429 responses */
+export const RETRY_AFTER_HEADER = "Retry-After";
+/** Shape of the JSON body returned on rate limit (429) */
+export interface RateLimitErrorBody { error: string; }
 
 /** Response header set to `"true"` when a request was recognized as a replay. */
 export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
@@ -25,7 +29,10 @@ export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
 export function getIdempotencyKey(req: Request): string | undefined {
   const value = req.headers[IDEMPOTENCY_KEY_HEADER.toLowerCase()];
   if (typeof value !== "string" || value.length === 0) return undefined;
-  if (value.length > 255) return undefined;
+  // Enforce a safe character set for idempotency keys: alphanumerics, hyphen, underscore.
+  // Reject keys containing whitespace or control characters to avoid injection risks.
+  const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9_-]{1,255}$/;
+  if (!IDEMPOTENCY_KEY_REGEX.test(value)) return undefined;
   return value;
 }
 
@@ -115,6 +122,15 @@ export interface MakeLimiterOptions {
    */
   store?: Store;
   /**
+   * Optional cost function to determine the weight of the request.
+   * Useful for batching or pagination where a single request consumes
+   * multiple tokens. The limiter scales the effective max requests inversely
+   * to the cost.
+   *
+   * Requests where the cost alone exceeds `max` are immediately throttled.
+   */
+  cost?: (req: Request) => number | Promise<number>;
+  /**
    * Enable idempotency-key deduplication. When `true`, requests with the same
    * `Idempotency-Key` header **and** the same client IP are deduplicated:
    * only the first occurrence counts against the rate limit; subsequent
@@ -133,6 +149,18 @@ export interface MakeLimiterOptions {
 
 /** Default message used when a caller does not supply one. */
 const DEFAULT_MESSAGE = "Too many requests, please try again later.";
+
+// ---------------------------------------------------------------------------
+// Environment-variable override helpers
+// ---------------------------------------------------------------------------
+
+const ABSURD_MAX_THRESHOLD = 1000;
+
+function getEnvOverride(name: string, suffix: string): string | undefined {
+  const safeName = name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const value = process.env[`RATE_LIMIT_${safeName}_${suffix}`];
+  return value ?? undefined;
+}
 
 /**
  * Build a named, in-memory rate limiter with the app's shared key generator,
@@ -176,6 +204,20 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  * `new RedisStore({ sendCommand })` from `rate-limit-redis`). The `store`
  * option is the single place to wire that up.
  *
+ * ## Environment-variable overrides
+ *
+ * Each option can be overridden at runtime via the environment:
+ *
+ * | Variable | Overrides | Example |
+ * |---|---|---|
+ * | `RATE_LIMIT_<NAME>_MAX` | `max` | `RATE_LIMIT_GLOBAL_MAX=50` |
+ * | `RATE_LIMIT_<NAME>_WINDOW_MS` | `windowMs` | `RATE_LIMIT_STRICT_WINDOW_MS=120000` |
+ * | `RATE_LIMIT_<NAME>_MESSAGE` | `message` | `RATE_LIMIT_CONTACT_MESSAGE="Slow down"` |
+ *
+ * `<NAME>` is the limiter `name` uppercased with non-alphanumeric characters
+ * replaced by `_`. Overrides apply at construction time only; they are read
+ * once when `makeLimiter()` is called.
+ *
  * @param options - {@link MakeLimiterOptions} controlling window, max, name,
  *   message, optional skip predicate, and optional backing store.
  * @returns A configured Express {@link RateLimitRequestHandler} middleware.
@@ -192,7 +234,56 @@ const DEFAULT_MESSAGE = "Too many requests, please try again later.";
  * ```
  */
 export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandler {
-  const { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent } = options;
+  let { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent } = options;
+
+  // ---- Input validation ---------------------------------------------------
+  if (!name || typeof name !== "string") {
+    throw new TypeError(
+      `[rate-limit] "name" is required and must be a non-empty string`,
+    );
+  }
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new TypeError(
+      `[rate-limit] limiter="${name}": windowMs must be a positive number`,
+    );
+  }
+  if (!Number.isFinite(max) || max <= 0) {
+    throw new TypeError(
+      `[rate-limit] limiter="${name}": max must be a positive number`,
+    );
+  }
+
+  // ---- Environment-variable overrides -------------------------------------
+  const envWindowMs = getEnvOverride(name, "WINDOW_MS");
+  if (envWindowMs !== undefined) {
+    const parsed = parseInt(envWindowMs, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      windowMs = parsed;
+    }
+  }
+
+  const envMax = getEnvOverride(name, "MAX");
+  if (envMax !== undefined) {
+    const parsed = parseInt(envMax, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      max = parsed;
+    }
+  }
+
+  const envMessage = getEnvOverride(name, "MESSAGE");
+  if (envMessage !== undefined) {
+    message = envMessage;
+  }
+
+  // Warn if the effective max is absurdly high (likely a config mistake).
+  if (max > ABSURD_MAX_THRESHOLD) {
+    console.warn(
+      `[rate-limit] limiter="${name}" has an absurdly high max of ${max}` +
+        (envMax !== undefined
+          ? ` (set via RATE_LIMIT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_MAX)`
+          : ""),
+    );
+  }
 
   // Pre-compute the Retry-After value; it is constant for the lifetime of the
   // limiter because the window length is fixed at construction time.
@@ -200,7 +291,20 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
 
   const baseLimiter = rateLimit({
     windowMs,
-    max,
+    limit: options.cost
+      ? async (req: Request, res: Response) => {
+          const baseMax = max;
+          try {
+            const c = await options.cost!(req);
+            if (c <= 0) return baseMax;
+            if (c > baseMax) return 0;
+            return Math.floor(baseMax / c);
+          } catch (err) {
+            console.error(`[rate-limit] cost function threw for limiter="${name}":`, err);
+            return baseMax;
+          }
+        }
+      : max,
     message,
     // Disable legacy `X-RateLimit-*` headers and the draft standard
     // `RateLimit-*` headers. Clients should rely on `Retry-After` (set
@@ -226,8 +330,9 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
     // -------------------------------------------------------------------------
     handler: (_req: Request, res: Response) => {
       console.warn(`[rate-limit] limit reached for limiter="${name}"`);
-      res.setHeader("Retry-After", retryAfter);
-      res.status(429).json({ error: message });
+      res.setHeader(RETRY_AFTER_HEADER, retryAfter);
+      const body: RateLimitErrorBody = { error: message };
+      res.status(429).json(body);
     },
   });
 

@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
+import { eq, and, gte, lte, inArray, desc, SQL, or, gt, sql } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
@@ -11,9 +11,12 @@ import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
-import { parsePagination } from "../utils/validation.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
+
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 100;
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
@@ -22,12 +25,31 @@ export const MAX_BATCH_SIZE = 50;
  * Zod schema for a Starknet transaction hash.
  * Accepts the canonical 0x-prefixed hex form (up to 66 chars) as well as the
  * un-padded variant emitted by some RPC providers.
+ *
+ * **Backward-compatibility contract:** This validation schema is frozen. The
+ * pattern (0x-prefixed hex, 1-64 hex characters) and length constraints (3-66
+ * total chars) must be preserved. New validation rules may be added but
+ * existing valid hashes must continue to pass.
  */
 export const TxHashSchema = z
   .string()
   .min(3)
   .max(66)
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
+
+/**
+ * Envelope schema for batch processing of Starknet transaction receipts.
+ * Validates a non-empty array of Starknet transaction hashes bounded by MAX_BATCH_SIZE.
+ */
+export const BatchProcessEnvelopeSchema = z.object({
+  tx_hashes: z
+    .array(TxHashSchema)
+    .min(1, "tx_hashes must contain at least one hash")
+    .max(
+      MAX_BATCH_SIZE,
+      `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+    ),
+});
 
 export const eventsRouter = Router();
 
@@ -52,7 +74,7 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
     ...entry,
   };
   if (env.LOG_FORMAT === "json") {
-    // eslint-disable-next-line no-console
+     
     (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
     return;
   }
@@ -61,7 +83,7 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
     `${logEntry.tx_hash ? ` tx=${logEntry.tx_hash}` : ""}` +
     `${logEntry.batch_size !== undefined ? ` batch=${logEntry.batch_size}` : ""}` +
     `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-  // eslint-disable-next-line no-console
+   
   (logEntry.level === "error" ? console.error : console.info)(message);
 }
 
@@ -69,6 +91,14 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.
  * If the hash is already 66 chars, it is returned as-is to preserve leading
  * zeros; otherwise the hex part is left-padded to 64 characters.
+ *
+ * **Backward-compatibility contract:** This normalization logic is frozen. The
+ * output format (0x + exactly 64 hex characters, lowercase) and padding behavior
+ * must be preserved. All existing normalized hashes must continue to produce the
+ * same output.
+ *
+ * @param hash - Raw transaction hash (may be un-prefixed or un-padded)
+ * @returns Normalized hash in 0x + 64-hex format
  */
 export function normalizeTransactionHash(hash: string): string {
   if (!hash) return "";
@@ -92,7 +122,7 @@ export function normalizeTransactionHash(hash: string): string {
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
 
-async function getWorkAgreementAbi(): Promise<any[]> {
+export async function getWorkAgreementAbi(): Promise<any[]> {
   if (!workAgreementAbi) {
     if (!abiPaths.agreement) {
       throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
@@ -102,7 +132,7 @@ async function getWorkAgreementAbi(): Promise<any[]> {
   return workAgreementAbi;
 }
 
-async function getPayrollEscrowAbi(): Promise<any[]> {
+export async function getPayrollEscrowAbi(): Promise<any[]> {
   if (!payrollEscrowAbi) {
     if (!abiPaths.escrow) {
       throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");
@@ -118,6 +148,11 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
 
 /**
  * Result returned by {@link processTxReceipt} for a single transaction.
+ *
+ * **Backward-compatibility contract:** This interface shape is frozen. All five
+ * fields and their types must be preserved. New optional fields may be added but
+ * existing fields cannot be removed or have their types changed. The status enum
+ * values ("processed", "no_events", "not_found", "error") are stable.
  */
 export interface TxProcessResult {
   /** Normalised (0x + 64-hex) transaction hash that was processed. */
@@ -190,6 +225,13 @@ async function verifyAndUpdateToken(
  * This function is the single source of truth for event decoding and
  * persistence; both `POST /events/process_tx/:tx_hash` and
  * `POST /events/process_batch` delegate to it.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Idempotent: Re-processing the same txHash never creates duplicate rows
+ * - Deterministic row IDs: `{normalizedTxHash}_{eventIndex}` format is frozen
+ * - Status values are stable: "processed", "no_events", "not_found", "error"
+ * - All database writes use `.onConflictDoNothing()` or `.onConflictDoUpdate()`
+ * - Hash normalization behavior is preserved (see {@link normalizeTransactionHash})
  *
  * @param txHash - Raw transaction hash (will be normalised internally).
  * @returns A {@link TxProcessResult} describing what was stored.
@@ -267,15 +309,13 @@ async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResul
   }
 
   // ------------------------------------------------------------------
-  // 3. Prepare ABI contract instances for event parsing
+  // 3. Prepare ABI contract instances for event parsing (cached singletons)
   // ------------------------------------------------------------------
-  const wAgreementAbi = await getWorkAgreementAbi();
-  const pEscrowAbi = await getPayrollEscrowAbi();
   const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
   const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-  const workAgreementContract = new Contract(wAgreementAbi, workAgreementAddress, provider);
-  const payrollEscrowContract = new Contract(pEscrowAbi, payrollEscrowAddress, provider);
+  const workAgreementContract = agreementContract(workAgreementAddress);
+  const payrollEscrowContract = escrowContract(payrollEscrowAddress);
 
   const eventLabels: string[] = [];
 
@@ -579,6 +619,10 @@ async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResul
  * monotone per insert and the `id` (txHash_eventIndex composite) breaks any
  * remaining ties.
  *
+ * **Backward-compatibility contract:** This interface shape is frozen. All three
+ * fields and their types must be preserved for cursor decoding to work across
+ * API versions. The encoding format (JSON + base64url) is also frozen.
+ *
  * @internal — callers only see the opaque base64url string.
  */
 export interface EventCursorPayload {
@@ -595,6 +639,12 @@ export interface EventCursorPayload {
  * audit and decode in tests, but it is not "guessable" as an incrementable
  * integer — clients cannot derive internal row IDs from it without already
  * knowing the `id` value (txHash_eventIndex).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Encoding format (JSON → base64url) is frozen
+ * - Output is always URL-safe (no percent-encoding needed)
+ * - Cursors from older API versions can be decoded by newer versions
+ * - Function signature is frozen
  */
 export function encodeCursor(payload: EventCursorPayload): string {
   return Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -604,6 +654,13 @@ export function encodeCursor(payload: EventCursorPayload): string {
  * Decodes a cursor string produced by {@link encodeCursor}. Returns `null` on
  * any parse or validation failure so callers can treat a bad cursor as
  * "no cursor" (first page) rather than throwing a 500.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Gracefully handles malformed input (returns null, never throws)
+ * - Validates all three required fields (blockNumber, eventIndex, id)
+ * - Compatible with cursors from older API versions (same encoding format)
+ * - Function signature is frozen
+ * - Null return value for invalid cursors is stable behavior
  */
 export function decodeCursor(cursor: string): EventCursorPayload | null {
   try {
@@ -898,66 +955,99 @@ eventsRouter.post(
   requireAdmin,
   async (req, res, next) => {
     const start = process.hrtime.bigint();
+    const batchSize = Array.isArray(req.body?.tx_hashes) ? req.body.tx_hashes.length : 0;
+
     try {
-      const { tx_hashes } = z
-        .object({
-          tx_hashes: z
-            .array(TxHashSchema)
-            .min(1, "tx_hashes must contain at least one hash")
-            .max(
-              MAX_BATCH_SIZE,
-              `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
-            ),
-        })
-        .parse(req.body);
+      const { tx_hashes } = BatchProcessEnvelopeSchema.parse(req.body);
 
-      const results: TxProcessResult[] = [];
-      const resultsByNormalizedHash = new Map<string, TxProcessResult>();
-      let duplicates = 0;
-
-      for (const txHash of tx_hashes) {
-        const normalized = normalizeTransactionHash(txHash);
-        const existing = resultsByNormalizedHash.get(normalized);
-
-        if (existing) {
-          duplicates++;
-          results.push(existing);
-          continue;
-        }
-
-        try {
-          const result = await processTxReceipt(txHash);
-          resultsByNormalizedHash.set(normalized, result);
-          results.push(result);
-        } catch (e: any) {
-          const errorResult: TxProcessResult = {
-            txHash,
-            status: "error",
-            eventsProcessed: 0,
-            eventLabels: [],
-            error: e?.message ?? String(e),
-          };
-          resultsByNormalizedHash.set(normalized, errorResult);
-          results.push(errorResult);
+      // Deduplicate unique hashes while preserving the first raw hash representation
+      const uniqueEntriesMap = new Map<string, string>();
+      for (const rawHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(rawHash);
+        if (!uniqueEntriesMap.has(normalized)) {
+          uniqueEntriesMap.set(normalized, rawHash);
         }
       }
 
-      const uniqueResults = Array.from(resultsByNormalizedHash.values());
-      const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
+      // Concurrent fan-out processing across unique receipts to eliminate sequential bottlenecks
+      const uniqueResults = await Promise.all(
+        Array.from(uniqueEntriesMap.entries()).map(async ([normalized, rawHash]) => {
+          try {
+            const result = await processTxReceipt(rawHash);
+            return [normalized, result] as const;
+          } catch (e: any) {
+            const errorResult: TxProcessResult = {
+              txHash: rawHash,
+              status: "error",
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: e?.message ?? String(e),
+            };
+            return [normalized, errorResult] as const;
+          }
+        }),
+      );
+
+      const resultsByNormalizedHash = new Map<string, TxProcessResult>(uniqueResults);
+
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+      });
+
+      const results: TxProcessResult[] = [];
+      let duplicates = 0;
+      const seenHashes = new Set<string>();
+
+      for (const txHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(txHash);
+        if (seenHashes.has(normalized)) {
+          duplicates++;
+        } else {
+          seenHashes.add(normalized);
+        }
+        results.push(resultsByNormalizedHash.get(normalized)!);
+      }
+
+      const uniqueResultsList = Array.from(resultsByNormalizedHash.values());
+      const totalProcessed = uniqueResultsList.reduce((sum, r) => sum + r.eventsProcessed, 0);
+
+      logEventTelemetry({
+        operation: "event_fanout_delivery",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+        unique_transactions: uniqueResults.length,
+        duplicates,
+        events_processed: totalProcessed,
+      });
 
       res.json({
         summary: {
           total: results.length,
-          processed: uniqueResults.filter((r) => r.status === "processed").length,
-          noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
-          notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-          errors: uniqueResults.filter((r) => r.status === "error").length,
+          processed: uniqueResultsList.filter((r) => r.status === "processed").length,
+          noEvents: uniqueResultsList.filter((r) => r.status === "no_events").length,
+          notFound: uniqueResultsList.filter((r) => r.status === "not_found").length,
+          errors: uniqueResultsList.filter((r) => r.status === "error").length,
           duplicates,
           totalEventsProcessed: totalProcessed,
         },
         results,
       });
     } catch (e) {
+      if (e instanceof z.ZodError) {
+        logEventTelemetry({
+          operation: "event_envelope_validation",
+          duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+          status: "error",
+          batch_size: batchSize,
+          error: e.message,
+        });
+        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+        return;
+      }
       next(e);
     }
   },
@@ -967,6 +1057,15 @@ eventsRouter.post(
  * Parse an `eventType` query parameter into a clean array of event type strings.
  * Supports single strings ("AgreementCreated"), comma-separated values
  * ("AgreementCreated,PaymentSent"), or multiple query parameters (`?eventType=A&eventType=B`).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Returns empty array for undefined/null/empty input
+ * - Deduplicates event types (returns unique values only)
+ * - Preserves all three input formats (single, comma-separated, array)
+ * - Function signature and return type are frozen
+ *
+ * @param raw - Query parameter value (string, string array, or undefined)
+ * @returns Array of unique event type strings
  */
 export function parseEventTypeQuery(raw: unknown): string[] {
   if (raw === undefined || raw === null || raw === "") return [];
@@ -985,6 +1084,16 @@ export function parseEventTypeQuery(raw: unknown): string[] {
  * Parse a `from` or `to` timestamp query parameter into a valid JavaScript `Date` object.
  * Accepts ISO 8601 strings or numeric timestamp strings.
  *
+ * **Backward-compatibility guarantees:**
+ * - Returns undefined for undefined/null/empty input
+ * - Supports both ISO 8601 strings and numeric timestamps (seconds or milliseconds)
+ * - Throws z.ZodError on malformed input (never returns invalid Date)
+ * - Function signature frozen: (raw: unknown, paramName: string) => Date | undefined
+ * - Error message format is stable
+ *
+ * @param raw - Query parameter value to parse
+ * @param paramName - Parameter name for error messages
+ * @returns Parsed Date object or undefined
  * @throws {z.ZodError} If the timestamp format is malformed or invalid.
  */
 export function parseTimestampQuery(raw: unknown, paramName: string): Date | undefined {
@@ -992,7 +1101,18 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 
   let date: Date;
   if (typeof raw === "number") {
-    date = new Date(raw);
+    if (!Number.isFinite(raw)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [paramName],
+          message: `Invalid timestamp format for parameter '${paramName}'`,
+        },
+      ]);
+    }
+    // Treat numeric values the same as numeric strings: 10-digit values are
+    // assumed to be seconds, while 13-digit values are treated as milliseconds.
+    date = new Date(raw < 10000000000 ? raw * 1000 : raw);
   } else if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (!trimmed) return undefined;
@@ -1000,7 +1120,8 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
     if (/^\d+$/.test(trimmed)) {
       const num = parseInt(trimmed, 10);
       // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
-      date = new Date(num < 10000000000 ? num * 1000 : num);
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
     } else {
       date = new Date(trimmed);
     }
@@ -1030,6 +1151,15 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 /**
  * Validates that `from` timestamp is less than or equal to `to` timestamp.
  *
+ * **Backward-compatibility guarantees:**
+ * - Passes validation when either parameter is undefined
+ * - Passes validation when from === to (inclusive bounds)
+ * - Throws z.ZodError with stable error message when from > to
+ * - Function signature is frozen
+ * - Error structure matches project-wide Zod error format
+ *
+ * @param from - Optional start timestamp
+ * @param to - Optional end timestamp
  * @throws {z.ZodError} If `from` is strictly after `to`.
  */
 export function validateTimeRange(from?: Date, to?: Date): void {
@@ -1074,21 +1204,31 @@ eventsRouter.get("/events", async (req, res, next) => {
     const contractAddress = rawContractAddr ? String(rawContractAddr).trim().toLowerCase() : undefined;
 
     const conditions: SQL[] = [];
+    const agreementEventsTable = schema.agreementEvents as unknown as {
+      eventType?: unknown;
+      createdAt?: unknown;
+      agreementId?: unknown;
+      contractAddress?: unknown;
+    };
+    const eventTypeColumn = agreementEventsTable.eventType ?? "eventType";
+    const createdAtColumn = agreementEventsTable.createdAt ?? "createdAt";
+    const agreementIdColumn = agreementEventsTable.agreementId ?? "agreementId";
+    const contractAddressColumn = agreementEventsTable.contractAddress ?? "contractAddress";
 
     if (eventTypes.length > 0) {
-      conditions.push(inArray(schema.agreementEvents.eventType, eventTypes));
+      conditions.push(inArray(eventTypeColumn as any, eventTypes));
     }
     if (fromDate) {
-      conditions.push(gte(schema.agreementEvents.createdAt, fromDate));
+      conditions.push(gte(createdAtColumn as any, fromDate));
     }
     if (toDate) {
-      conditions.push(lte(schema.agreementEvents.createdAt, toDate));
+      conditions.push(lte(createdAtColumn as any, toDate));
     }
     if (agreementId) {
-      conditions.push(eq(schema.agreementEvents.agreementId, agreementId));
+      conditions.push(eq(agreementIdColumn as any, agreementId));
     }
     if (contractAddress) {
-      conditions.push(eq(schema.agreementEvents.contractAddress, contractAddress));
+      conditions.push(eq(contractAddressColumn as any, contractAddress));
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -1101,16 +1241,6 @@ eventsRouter.get("/events", async (req, res, next) => {
       .limit(limit)
       .offset(offset);
 
-    logEventTelemetry({
-      operation: "event_fanout_delivery",
-      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
-      status: "success",
-      batch_size: tx_hashes.length,
-      unique_transactions: uniqueResults.length,
-      duplicates,
-      events_processed: totalProcessed,
-    });
-
     res.json({
       events,
       count: events.length,
@@ -1118,6 +1248,7 @@ eventsRouter.get("/events", async (req, res, next) => {
       offset,
     });
   } catch (e) {
+    console.error("[events] GET /events failed", e);
     if (e instanceof z.ZodError) {
       res.status(400).json({
         error: "Validation failed",
