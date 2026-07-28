@@ -2,6 +2,15 @@
 
 This document describes the contract and behavior of the **rate‑limit** middleware located at `src/middleware/rate-limit.ts`.
 
+## Backward-Compatible Contract
+
+To ensure future changes do not break existing callers, the rate limit middleware adheres to an explicit compatibility contract. Any modifications to this middleware **must** preserve the following:
+
+1. **Public API Surface**: The exported members (`makeLimiter`, `IDEMPOTENCY_KEY_HEADER`, `RETRY_AFTER_HEADER`, `X_IDEMPOTENT_REPLAYED_HEADER`) must remain available and backward-compatible.
+2. **Error Response Shape**: Throttled requests (429) must consistently return a JSON body matching `{ "error": "<message>" }`. Existing callers and clients depend on this shape.
+3. **Retry-After Header**: Throttled responses must always include the `Retry-After` header indicating the whole seconds remaining.
+4. **Idempotency Headers**: Idempotency features must use the defined canonical header names (`Idempotency-Key` for request, `X-Idempotent-Replayed` for response).
+
 ## Headers
 | Header | Purpose | Accepted Value |
 |--------|---------|----------------|
@@ -51,6 +60,10 @@ For example, if `max` is 100, and a request has a cost of 10, the effective limi
 2. **Zero or Negative Cost**: If the cost function evaluates to zero or a negative value, the limiter defaults back to the base `max` (effectively treating the cost as 1).
 3. **Mixed Traffic**: Because the underlying token bucket natively tracks requests rather than items, a client mixing high-cost and low-cost requests might exceed the exact item count slightly. This proportional-limit approach remains an approximation, but strictly bounds the maximum workload and remains safe for growth.
 
+## Edge Cases (Intentionally Out of Scope)
+- Distributed Idempotency: The current idempotency caching is strictly in-memory per-instance. Coordinating idempotency across distributed replicas is explicitly out of scope for this module.
+- Cost accounting precision: The inverse scaling method used for batching costs may lead to slight precision loss in high mixed-traffic scenarios, but exact token accounting is beyond the scope of this implementation.
+
 ## Usage Example
 ```ts
 import { makeLimiter } from './middleware/rate-limit';
@@ -64,6 +77,3 @@ const apiLimiter = makeLimiter({
 
 app.use('/api', apiLimiter);
 ```
-
----
-*Generated on 2026‑07‑28.*
