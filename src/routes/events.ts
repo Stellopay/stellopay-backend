@@ -32,6 +32,20 @@ export const TxHashSchema = z
   .max(66)
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
 
+/**
+ * Envelope schema for batch processing of Starknet transaction receipts.
+ * Validates a non-empty array of Starknet transaction hashes bounded by MAX_BATCH_SIZE.
+ */
+export const BatchProcessEnvelopeSchema = z.object({
+  tx_hashes: z
+    .array(TxHashSchema)
+    .min(1, "tx_hashes must contain at least one hash")
+    .max(
+      MAX_BATCH_SIZE,
+      `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+    ),
+});
+
 export const eventsRouter = Router();
 
 interface EventTelemetryEntry {
@@ -95,7 +109,7 @@ export function normalizeTransactionHash(hash: string): string {
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
 
-async function getWorkAgreementAbi(): Promise<any[]> {
+export async function getWorkAgreementAbi(): Promise<any[]> {
   if (!workAgreementAbi) {
     if (!abiPaths.agreement) {
       throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
@@ -105,7 +119,7 @@ async function getWorkAgreementAbi(): Promise<any[]> {
   return workAgreementAbi;
 }
 
-async function getPayrollEscrowAbi(): Promise<any[]> {
+export async function getPayrollEscrowAbi(): Promise<any[]> {
   if (!payrollEscrowAbi) {
     if (!abiPaths.escrow) {
       throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");
@@ -270,15 +284,13 @@ async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResul
   }
 
   // ------------------------------------------------------------------
-  // 3. Prepare ABI contract instances for event parsing
+  // 3. Prepare ABI contract instances for event parsing (cached singletons)
   // ------------------------------------------------------------------
-  const wAgreementAbi = await getWorkAgreementAbi();
-  const pEscrowAbi = await getPayrollEscrowAbi();
   const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
   const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-  const workAgreementContract = new Contract(wAgreementAbi, workAgreementAddress, provider);
-  const payrollEscrowContract = new Contract(pEscrowAbi, payrollEscrowAddress, provider);
+  const workAgreementContract = agreementContract(workAgreementAddress);
+  const payrollEscrowContract = escrowContract(payrollEscrowAddress);
 
   const eventLabels: string[] = [];
 
@@ -904,17 +916,37 @@ eventsRouter.post(
     const batchSize = Array.isArray(req.body?.tx_hashes) ? req.body.tx_hashes.length : 0;
 
     try {
-      const { tx_hashes } = z
-        .object({
-          tx_hashes: z
-            .array(TxHashSchema)
-            .min(1, "tx_hashes must contain at least one hash")
-            .max(
-              MAX_BATCH_SIZE,
-              `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
-            ),
-        })
-        .parse(req.body);
+      const { tx_hashes } = BatchProcessEnvelopeSchema.parse(req.body);
+
+      // Deduplicate unique hashes while preserving the first raw hash representation
+      const uniqueEntriesMap = new Map<string, string>();
+      for (const rawHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(rawHash);
+        if (!uniqueEntriesMap.has(normalized)) {
+          uniqueEntriesMap.set(normalized, rawHash);
+        }
+      }
+
+      // Concurrent fan-out processing across unique receipts to eliminate sequential bottlenecks
+      const uniqueResults = await Promise.all(
+        Array.from(uniqueEntriesMap.entries()).map(async ([normalized, rawHash]) => {
+          try {
+            const result = await processTxReceipt(rawHash);
+            return [normalized, result] as const;
+          } catch (e: any) {
+            const errorResult: TxProcessResult = {
+              txHash: rawHash,
+              status: "error",
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: e?.message ?? String(e),
+            };
+            return [normalized, errorResult] as const;
+          }
+        }),
+      );
+
+      const resultsByNormalizedHash = new Map<string, TxProcessResult>(uniqueResults);
 
       logEventTelemetry({
         operation: "event_envelope_validation",
@@ -924,38 +956,21 @@ eventsRouter.post(
       });
 
       const results: TxProcessResult[] = [];
-      const resultsByNormalizedHash = new Map<string, TxProcessResult>();
       let duplicates = 0;
+      const seenHashes = new Set<string>();
 
       for (const txHash of tx_hashes) {
         const normalized = normalizeTransactionHash(txHash);
-        const existing = resultsByNormalizedHash.get(normalized);
-
-        if (existing) {
+        if (seenHashes.has(normalized)) {
           duplicates++;
-          results.push(existing);
-          continue;
+        } else {
+          seenHashes.add(normalized);
         }
-
-        try {
-          const result = await processTxReceipt(txHash);
-          resultsByNormalizedHash.set(normalized, result);
-          results.push(result);
-        } catch (e: any) {
-          const errorResult: TxProcessResult = {
-            txHash,
-            status: "error",
-            eventsProcessed: 0,
-            eventLabels: [],
-            error: e?.message ?? String(e),
-          };
-          resultsByNormalizedHash.set(normalized, errorResult);
-          results.push(errorResult);
-        }
+        results.push(resultsByNormalizedHash.get(normalized)!);
       }
 
-      const uniqueResults = Array.from(resultsByNormalizedHash.values());
-      const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
+      const uniqueResultsList = Array.from(resultsByNormalizedHash.values());
+      const totalProcessed = uniqueResultsList.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
       logEventTelemetry({
         operation: "event_fanout_delivery",
@@ -970,10 +985,10 @@ eventsRouter.post(
       res.json({
         summary: {
           total: results.length,
-          processed: uniqueResults.filter((r) => r.status === "processed").length,
-          noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
-          notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-          errors: uniqueResults.filter((r) => r.status === "error").length,
+          processed: uniqueResultsList.filter((r) => r.status === "processed").length,
+          noEvents: uniqueResultsList.filter((r) => r.status === "no_events").length,
+          notFound: uniqueResultsList.filter((r) => r.status === "not_found").length,
+          errors: uniqueResultsList.filter((r) => r.status === "error").length,
           duplicates,
           totalEventsProcessed: totalProcessed,
         },

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
-import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics } from "./access-log.js";
+import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics, seenRequestIds, REDACTED_VALUE } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
 
 // ---------------------------------------------------------------------------
@@ -18,6 +18,7 @@ function makeApp() {
   app.post("/test-body", (_req, res) => res.status(201).json({ created: true }));
   app.get("/error", (_req, res) => res.status(500).json({ error: "Server Error" }));
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+  app.get("/ready", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/redirect", (_req, res) => res.redirect(302, "/test"));
   app.get("/bad-request", (_req, res) => res.status(400).json({ error: "Bad Request" }));
   app.get("/no-content", (_req, res) => res.status(204).send());
@@ -50,7 +51,7 @@ describe("redactSensitiveParams", () => {
   it("redacts 'token' param value", () => {
     const result = redactSensitiveParams("/auth?token=super-secret");
     expect(result).not.toContain("super-secret");
-    expect(result).toContain(`token=${encodeURIComponent(REDACTED_VALUE)}`);
+    expect(result).toContain(`token=${REDACTED_VALUE}`);
   });
 
   it("redacts 'access_token' param value", () => {
@@ -99,7 +100,7 @@ describe("redactSensitiveParams", () => {
   it("redacts 'account' param", () => {
     const result = redactSensitiveParams("/api?account=0x123");
     expect(result).not.toContain("0x123");
-    expect(result).toContain("account=%5Bredacted%5D");
+    expect(result).toContain(`account=${REDACTED_VALUE}`);
   });
 
   it("redacts multiple sensitive params in any order", () => {
@@ -218,8 +219,8 @@ describe("accessLogMiddleware — success path", () => {
     expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
 
-    expect(logObj.path).toContain("token=%5Bredacted%5D");
-    expect(logObj.path).toContain("signature=%5Bredacted%5D");
+    expect(logObj.path).toContain(`token=${REDACTED_VALUE}`);
+    expect(logObj.path).toContain(`signature=${REDACTED_VALUE}`);
     expect(logObj.path).toContain("normal=value");
     expect(logObj.path).not.toContain("secret123");
     expect(logObj.path).not.toContain("abc");
@@ -360,7 +361,13 @@ describe("accessLogMiddleware — failure path", () => {
 // ---------------------------------------------------------------------------
 
 describe("accessLogMiddleware — text format", () => {
+  let app: express.Express;
   let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    app = makeApp();
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+  });
 
   afterEach(() => {
     vi.restoreAllMocks();
@@ -373,9 +380,6 @@ describe("accessLogMiddleware — text format", () => {
     // @ts-expect-error — mutating env for test isolation
     env.LOG_FORMAT = "text";
 
-    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
-
-    const app = makeApp();
     const res = await request(app).get("/test");
     expect(res.status).toBe(200);
 
@@ -472,7 +476,7 @@ describe("accessLogMiddleware — standalone (no requestIdMiddleware)", () => {
 
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
     expect(logObj.path).not.toContain("my-secret");
-    expect(logObj.path).toContain("token=%5Bredacted%5D");
+    expect(logObj.path).toContain(`token=${REDACTED_VALUE}`);
   });
 });
 

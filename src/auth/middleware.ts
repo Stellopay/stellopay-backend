@@ -185,6 +185,27 @@ export function requirePrincipal(req: Request): AuthPrincipal {
   return principal;
 }
 
+let cachedRawAdminAddresses: string[] | undefined = undefined;
+let cachedNormalizedAdmins: string[] = [];
+
+function getNormalizedAdminAddresses(): string[] {
+  const currentAdmins = env.ADMIN_ADDRESSES;
+  if (currentAdmins === cachedRawAdminAddresses) {
+    return cachedNormalizedAdmins;
+  }
+  cachedRawAdminAddresses = currentAdmins;
+  cachedNormalizedAdmins = currentAdmins
+    .map((adminAddr) => {
+      try {
+        return normalizeStarknetAddress(adminAddr);
+      } catch {
+        return null;
+      }
+    })
+    .filter((addr): addr is string => addr !== null);
+  return cachedNormalizedAdmins;
+}
+
 /**
  * Whether `address` resolves to an entry in `env.ADMIN_ADDRESSES`.
  *
@@ -222,15 +243,8 @@ export function isAdminPrincipal(address: string): boolean {
     return false;
   }
 
-  return env.ADMIN_ADDRESSES.some((adminAddr) => {
-    try {
-      return normalizeStarknetAddress(adminAddr) === userCanonical;
-    } catch {
-      // A broken env entry is "not a match" — never accidentally grant
-      // access by skipping catastrophic validation.
-      return false;
-    }
-  });
+  const normalizedAdmins = getNormalizedAdminAddresses();
+  return normalizedAdmins.includes(userCanonical);
 }
 
 /**
@@ -312,14 +326,22 @@ export const requireAuth = async (
   const token = authHeader.substring(BEARER_PREFIX.length).trim();
   const address = addressHeader.trim();
 
-  // Empty after trim: token and principal are both user-controlled strings,
-  // so a missing value is indistinguishable from an empty one and gets the
-  // same response.
   if (!token || !address) {
     incAuthMetric(AUTH_METRICS.AUTH_DENIED);
     incAuthMetric(AUTH_METRICS.AUTH_DENIED_EMPTY_CREDENTIALS);
     logAuthMiddlewareEvent("warn", "auth.principal.denied", {
       reason: "empty_credentials",
+    });
+    deny(res, "unauthorized");
+    return;
+  }
+
+  const BEARER_TOKEN_PATTERN = /^[a-zA-Z0-9\-._~+/]+=*$/;
+  if (!BEARER_TOKEN_PATTERN.test(token)) {
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED);
+    incAuthMetric(AUTH_METRICS.AUTH_DENIED_INVALID_BEARER);
+    logAuthMiddlewareEvent("warn", "auth.principal.denied", {
+      reason: "invalid_bearer",
     });
     deny(res, "unauthorized");
     return;
