@@ -8,7 +8,6 @@ import {
   acquireReprocessLock,
   releaseReprocessLock,
   getReprocessingLockStatus,
-  RETRY_BUDGET,
   QUARANTINE_PATH,
 } from "./reprocess-events.js";
 import fs from "fs";
@@ -46,15 +45,41 @@ vi.mock("../db/index.js", () => {
 });
 
 // Mock Starknet provider and contracts
-const mockGetTransactionReceipt = vi.fn();
+const { mockGetTransactionReceipt, mockParseEvent } = vi.hoisted(() => ({
+  mockGetTransactionReceipt: vi.fn(),
+  mockParseEvent: vi.fn().mockImplementation((event: any) => {
+    if (event?.shouldFail) {
+      throw new Error("Failed to parse event");
+    }
+    return {
+      name: "AgreementCreated",
+      data: {
+        agreement_id: "123",
+        employer: "0x123",
+        contributor: "0x456",
+        token: "0x789",
+        mode: 0,
+        payment_type: 1,
+      },
+    };
+  }),
+}));
+
+const mockAgreementContractObj = {
+  parseEvent: mockParseEvent,
+  get_token: vi.fn().mockResolvedValue(BigInt("0x789")),
+};
+const mockEscrowContractObj = {
+  parseEvent: mockParseEvent,
+};
+
 vi.mock("../starknet/client.js", () => {
   return {
     provider: {
       getTransactionReceipt: (...args: any[]) => mockGetTransactionReceipt(...args),
     },
-    agreementContract: vi.fn().mockReturnValue({
-      get_token: vi.fn().mockResolvedValue("0x54321"),
-    }),
+    agreementContract: vi.fn(() => mockAgreementContractObj),
+    escrowContract: vi.fn(() => mockEscrowContractObj),
   };
 });
 
@@ -97,8 +122,8 @@ vi.mock("starknet", async (importOriginal) => {
 });
 
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: vi.fn((_req, _res, next) => next()),
+  requireAdmin: vi.fn((_req, _res, next) => next()),
 }));
 describe("Reprocess Events Routes", () => {
   let app: express.Express;
@@ -123,7 +148,7 @@ describe("Reprocess Events Routes", () => {
     // Add a basic error handler for express testing of catch blocks
     app.use("/api/v1", reprocessEventsRouter);
     app.use("/api/v1", eventsRouter);
-    app.use((err: any, req: any, res: any, next: any) => {
+    app.use((err: any, req: any, res: any, _next: any) => {
       res.status(err.status || 500).json({ error: err.message });
     });
   });
@@ -225,7 +250,7 @@ describe("Reprocess Events Routes", () => {
 
       // Both paths run the same shared processor, so they decode the same
       // events and tx hash even though the two routes shape their JSON differently.
-      expect(reprocessRes.body.result.eventLabels).toEqual(processRes.body.eventsProcessed);
+      expect(reprocessRes.body.result.eventsProcessed).toEqual(processRes.body.eventsProcessed);
       expect(reprocessRes.body.result.txHash).toEqual(processRes.body.transactionHash);
     });
 
@@ -949,6 +974,8 @@ it("should quarantine after exceeding retry budget", async () => {
 
       // Trigger first reprocess request (starts running and acquires lock)
       const firstReq = request(app).post(`/api/v1/reprocess-events/tx/${txHash}`);
+      // Invoke .then() to ensure supertest fires the HTTP request immediately
+      const firstReqPromise = firstReq.then((res) => res);
 
       // Wait briefly to ensure first request enters the handler and acquires the lock
       await new Promise((r) => setTimeout(r, 50));
@@ -967,7 +994,7 @@ it("should quarantine after exceeding retry budget", async () => {
         events: [],
       });
 
-      const firstRes = await firstReq;
+      const firstRes = await firstReqPromise;
       expect(firstRes.status).toBe(200);
 
       // Verify that after completion, the lock is released and a new request succeeds

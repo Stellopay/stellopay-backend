@@ -6,9 +6,9 @@ import { db, schema } from "../db/index.js";
 import { provider } from "../starknet/client.js";
 import { eq, and, gte, lte, asc } from "drizzle-orm";
 import { Contract } from "starknet";
-import { defaults, abiPaths } from "../config.js";
+import { abiPaths } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE } from "./events.js";
+import { processTxReceipt, TxHashSchema, MAX_BATCH_SIZE, normalizeTransactionHash } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 import fs from "fs";
 import path from "path";
@@ -82,8 +82,7 @@ export function __resetReprocessLocks(): void {
 
 /** Normalise a transaction hash to the canonical 0x + 64‑hex form. */
 function normaliseHash(hash: string): string {
-  const lower = hash.toLowerCase();
-  return lower.startsWith("0x") ? lower : `0x${lower}`;
+  return normalizeTransactionHash(hash);
 }
 
 /** Helper to record a failure and optionally quarantine the transaction. */
@@ -137,7 +136,7 @@ reprocessEventsRouter.post(
   "/reprocess-events/tx/:tx_hash",
   requireAuth,
   requireAdmin,
-  async (req, res, next) => {
+  async (req, res) => {
     if (!acquireReprocessLock()) {
       res.status(409).json({ error: "Reprocessing operation already in progress" });
       return;
@@ -269,11 +268,6 @@ reprocessEventsRouter.post(
 
       const workAgreementAbi = await getWorkAgreementAbi();
       const payrollEscrowAbi = await getPayrollEscrowAbi();
-      const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
-      const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
-
-      const workAgreementContract = new Contract(workAgreementAbi, workAgreementAddress, provider);
-      const payrollEscrowContract = new Contract(payrollEscrowAbi, payrollEscrowAddress, provider);
 
       const conditions = [eq(schema.agreementEvents.eventType, "AgreementStatusChange")];
       if (fromBlock !== undefined) conditions.push(gte(schema.agreementEvents.blockNumber, fromBlock));
