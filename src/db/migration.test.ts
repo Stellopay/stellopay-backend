@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import fs from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
@@ -28,6 +29,7 @@ import {
   billingPaymentMethods,
   billingInvoices,
   sessions,
+  backfillProgress,
   U256_DECIMAL_REGEX,
   U256_DECIMAL_PATTERN,
   CURRENCY_CODE_REGEX,
@@ -36,6 +38,7 @@ import {
   isValidNonNegativeInteger,
   assertNonNegative,
   assertValidU256,
+  assertValidCurrencyCode,
   clampPageLimit,
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
@@ -146,6 +149,119 @@ describe("schema check constraints", () => {
       expect(names).toContain("billing_invoices_status_check");
       expect(names).toContain("billing_invoices_currency_check");
       expect(names).toContain("billing_invoices_amount_check");
+    });
+  });
+
+  describe("backfill_progress", () => {
+    it("declares check constraints for status, totalScanned, and totalCreated", () => {
+      const names = getCheckConstraintNames(backfillProgress);
+      expect(names).toContain("backfill_progress_status_check");
+      expect(names).toContain("backfill_progress_total_scanned_check");
+      expect(names).toContain("backfill_progress_total_created_check");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Global invariants — fail if two tables share a CHECK constraint name.
+  // A name collision would cause the constraint migration to fail in
+  // production because Postgres enforces uniqueness of constraint names
+  // within a schema.
+  // -----------------------------------------------------------------------
+  describe("global CHECK constraint invariants", () => {
+    it("uses unique CHECK constraint names across every table in the schema", () => {
+      const seen = new Map<string, string>();
+      const duplicates: Array<{ name: string; tables: string[] }> = [];
+
+      for (const { name, table } of schema.SCHEMA_TABLES) {
+        for (const checkName of getCheckConstraintNames(table)) {
+          const existing = seen.get(checkName);
+          if (existing) {
+            // First duplicate found — record the conflict list.
+            if (!duplicates.find((d) => d.name === checkName)) {
+              duplicates.push({ name: checkName, tables: [existing] });
+            }
+            const entry = duplicates.find((d) => d.name === checkName);
+            entry?.tables.push(name);
+          } else {
+            seen.set(checkName, name);
+          }
+        }
+      }
+
+      expect(duplicates, "duplicate CHECK constraint names across tables").toEqual([]);
+    });
+
+    it("lists every emitted CHECK constraint in at least one schema table", () => {
+      // Guard against a CHECK declared in Drizzle but never registered in
+      // SCHEMA_TABLES — it would still build, but a later migration that
+      // touches it through the inventory could miss it.
+      const allConstraintNames = new Set<string>();
+      for (const { table } of schema.SCHEMA_TABLES) {
+        for (const name of getCheckConstraintNames(table)) {
+          allConstraintNames.add(name);
+        }
+      }
+
+      // Sanity: at least as many constraints as the production migration
+      // applies (one CHECK per ALTER TABLE line). The schema file mirrors
+      // the migration list verbatim, so any drop here is a regression.
+      expect(allConstraintNames.size).toBeGreaterThanOrEqual(28);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // SQL ↔ Drizzle parity — every CHECK in the migration SQL must be
+  // declared in schema.ts. Catches a real failure mode: a future migration
+  // generator could silently drop a CHECK from Drizzle's runtime metadata
+  // while leaving the SQL intact (or vice-versa), causing schema drift
+  // between code and database.
+  // -----------------------------------------------------------------------
+
+  // Migration files that contain `CHECK` constraint definitions. The list
+  // pins the parser fixtures so a renamed file fails the test instead of
+  // silently passing on an empty result.
+  const SQL_MIGRATION_FILES_WITH_CHECKS = [
+    "20240104000000_schema_check_constraints.sql",
+    "0004_noisy_eternals.sql",
+  ] as const;
+
+  // Extract every CHECK constraint name from a SQL migration file.
+  // Matches both `ALTER TABLE ... ADD CONSTRAINT "<name>" CHECK (...)`
+  // and the inline `CONSTRAINT "<name>" CHECK (...)` form used by
+  // `CREATE TABLE`-based migrations.
+  function readCheckConstraintNamesFromMigration(fileName: string): string[] {
+    const sqlPath = resolve(`src/db/migrations/${fileName}`);
+    const content = fs.readFileSync(sqlPath, "utf8");
+    const matches = content.matchAll(/(?:ADD\s+)?CONSTRAINT\s+"([^"]+)"\s+CHECK\b/g);
+    return Array.from(matches, (m) => m[1]);
+  }
+
+  describe("SQL migration ↔ Drizzle schema parity", () => {
+    it("every CHECK constraint in the canonical migration SQL is also declared in schema.ts", () => {
+      const declaredInDrizzle = new Set<string>();
+      for (const { table } of schema.SCHEMA_TABLES) {
+        for (const name of getCheckConstraintNames(table)) {
+          declaredInDrizzle.add(name);
+        }
+      }
+
+      const declaredInSql: string[] = [];
+      for (const file of SQL_MIGRATION_FILES_WITH_CHECKS) {
+        declaredInSql.push(...readCheckConstraintNamesFromMigration(file));
+      }
+
+      // The fixtures must produce at least one constraint — empty output
+      // means the parser is broken or the fixture paths drifted, and we
+      // want to fail loudly rather than silently pass.
+      expect(declaredInSql.length).toBeGreaterThan(0);
+
+      const missingFromDrizzle = declaredInSql.filter(
+        (n) => !declaredInDrizzle.has(n),
+      );
+      expect(
+        missingFromDrizzle,
+        "CHECK constraints defined in migration SQL must be present in schema.ts Drizzle metadata",
+      ).toEqual([]);
     });
   });
 
@@ -304,6 +420,12 @@ describe("schema check constraints", () => {
         expect(() => assertValidU256("12345", "amount")).not.toThrow();
       });
 
+      it("accepts the exact 78-digit upper boundary (2^256 − 1 decimal width)", () => {
+        const maxU256DecimalWidth = "1" + "0".repeat(77);
+        expect(maxU256DecimalWidth).toHaveLength(78);
+        expect(() => assertValidU256(maxU256DecimalWidth, "amount")).not.toThrow();
+      });
+
       it("throws RangeError for invalid u256 strings", () => {
         expect(() => assertValidU256("-1", "amount")).toThrow(RangeError);
         expect(() => assertValidU256("abc", "amount")).toThrow(RangeError);
@@ -311,9 +433,49 @@ describe("schema check constraints", () => {
         expect(() => assertValidU256("", "amount")).toThrow(RangeError);
       });
 
+      it("rejects strings that exceed the 78-digit upper boundary", () => {
+        const tooLong = "1" + "0".repeat(78);
+        expect(tooLong).toHaveLength(79);
+        expect(() => assertValidU256(tooLong, "amount")).toThrow(RangeError);
+      });
+
       it("includes the field name and value in the error message", () => {
         expect(() => assertValidU256("-1", "totalAmount")).toThrow("totalAmount");
         expect(() => assertValidU256("-1", "totalAmount")).toThrow('"-1"');
+      });
+    });
+
+    describe("assertValidCurrencyCode", () => {
+      it("passes for valid ISO 4217-style codes", () => {
+        expect(() => assertValidCurrencyCode("USD", "currency")).not.toThrow();
+        expect(() => assertValidCurrencyCode("EUR", "currency")).not.toThrow();
+        expect(() => assertValidCurrencyCode("JPY", "currency")).not.toThrow();
+      });
+
+      it("throws RangeError for malformed codes", () => {
+        expect(() => assertValidCurrencyCode("", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("usd", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("US", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("USDD", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("123", "currency")).toThrow(RangeError);
+      });
+
+      it("includes the field name and code in the error message", () => {
+        expect(() => assertValidCurrencyCode("usd", "currency")).toThrow("currency");
+        expect(() => assertValidCurrencyCode("usd", "currency")).toThrow('"usd"');
+      });
+
+      it("mirrors isValidCurrencyCode for every valid and invalid sample", () => {
+        const validCodes = ["USD", "EUR", "GBP", "JPY"];
+        const invalidCodes = ["", "usd", "US", "USDD", "123", "U$D"];
+        for (const code of validCodes) {
+          expect(isValidCurrencyCode(code), `predicate expects ${code} valid`).toBe(true);
+          expect(() => assertValidCurrencyCode(code, "currency")).not.toThrow();
+        }
+        for (const code of invalidCodes) {
+          expect(isValidCurrencyCode(code), `predicate expects ${code} invalid`).toBe(false);
+          expect(() => assertValidCurrencyCode(code, "currency")).toThrow(RangeError);
+        }
       });
     });
 
