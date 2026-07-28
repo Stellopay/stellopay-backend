@@ -4,8 +4,9 @@ import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
 import { defaults } from "../config.js";
-import { normalizeStarknetAddress as normalizeAddr } from "../utils/address.js";
+import { normalizeStarknetAddress } from "../utils/address.js";
 import { notFoundResponse } from "./not-found.js";
+import { requireAuth, requireAdmin } from "../auth/middleware.js";
 
 /**
  * Source identifier tag returned in indexed route responses.
@@ -17,6 +18,17 @@ export const INDEXED_DATA_SOURCE = "indexed";
  * to prevent unbounded database scans.
  */
 export const MAX_INTERNAL_LIMIT = 200;
+
+const indexedCacheOptions = {
+  maxAgeSeconds: env.INDEXED_CACHE_MAX_AGE_SECONDS,
+};
+
+/**
+ * Centralized authorization gate for indexer freshness and sync checkpoint operations.
+ * Requires an authenticated principal (`requireAuth`) with admin privileges (`requireAdmin`).
+ * Permission evaluation occurs before any database or internal indexer state access.
+ */
+export const authorizeIndexedFreshness = [requireAuth, requireAdmin];
 
 /**
  * Derives the indexer sync checkpoint (highest block number) from a set of
@@ -46,48 +58,71 @@ export const indexedRouter = Router();
 // Output Schemas for Contract Hardening
 const AgreementSchema = z.object({
   id: z.string(),
-  contractAddress: z.string(),
-  employer: z.string(),
+  contractAddress: z.string().optional(),
+  employer: z.string().optional(),
   contributor: z.string().nullable().optional(),
-  mode: z.number(),
-  createdAt: z.date().or(z.string()),
+  mode: z.number().optional(),
+  createdAt: z.date().or(z.string()).optional(),
 }).passthrough();
 
-const PaginatedResponse = (dataSchema: z.ZodTypeAny) => z.object({
-  count: z.number().nonnegative(),
-  source: z.string().optional(),
-}).catchall(z.any());
+/**
+ * GET /indexed/freshness
+ * GET /indexed/checkpoint
+ *
+ * Retrieves indexer sync checkpoint and freshness metrics.
+ *
+ * Authorization Contract:
+ * - Requires authenticated session (`requireAuth`) and admin privileges (`requireAdmin`).
+ * - Permission evaluation occurs BEFORE any database query or indexer state access.
+ * - Standard 401 response for unauthorized requests (`{ error: "Unauthorized" }`).
+ * - Standard 403 response for forbidden requests (`{ error: "Forbidden" }`).
+ * - Unauthorized requests receive no state information or execution timing payload.
+ */
+indexedRouter.get(
+  ["/indexed/freshness", "/indexed/checkpoint"],
+  requireAuth,
+  requireAdmin,
+  async (_req, res, next) => {
+    try {
+      const records = await db
+        .select({ blockNumber: schema.agreementEvents.blockNumber })
+        .from(schema.agreementEvents)
+        .orderBy(desc(schema.agreementEvents.blockNumber))
+        .limit(100);
+
+      const checkpointBlock = deriveSyncCheckpoint(records);
+
+      const body = {
+        source: INDEXED_DATA_SOURCE,
+        checkpointBlock,
+        freshness: records.length > 0 ? "synced" : "empty",
+      };
+
+      res.json(body);
+    } catch (e) {
+      next(e);
+    }
+  },
+);
 
 /**
  * GET /indexed/agreements/:contract_address/user/:user_address
  *
  * Retrieves all agreements associated with a specific user (as employer, contributor,
  * or payroll employee).
- *
- * Indexer Freshness & Sync Checkpoint Contract:
- * - Reads exclusively from local database tables synchronized by the Apibara indexer.
- * - Direct employer/contributor agreements and payroll employee agreements are fetched
- *   concurrently via Promise.all for minimal latency.
- * - Results are deduplicated by agreement ID, sorted by creation date descending,
- *   and capped to the requested pagination `limit`.
- * - Returned payload is tagged with `source: "indexed"`.
  */
 indexedRouter.get(
   "/indexed/agreements/:contract_address/user/:user_address",
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+      if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
         res.status(400).json({ error: "Invalid contract address for agreements" });
         return;
       }
       const userAddress = StarknetAddress.parse(req.params.user_address);
       const { limit, offset } = parsePagination(req.query);
 
-      // Find agreements where user is employer or contributor, and separately
-      // check if the user is an employee in any payroll agreements. These two
-      // queries don't depend on each other, so run them concurrently instead
-      // of paying for two sequential round trips.
       const [agreements, employeeAgreements] = await Promise.all([
         db
           .select()
@@ -115,7 +150,7 @@ indexedRouter.get(
             and(
               eq(schema.agreements.contractAddress, contractAddress),
               eq(schema.employees.employeeAddress, userAddress),
-              eq(schema.agreements.mode, 1), // Payroll mode
+              eq(schema.agreements.mode, 1),
             ),
           )
           .orderBy(desc(schema.agreements.createdAt))
@@ -123,15 +158,16 @@ indexedRouter.get(
       ]);
 
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
-      const uniqueAgreements = Array.from(
-        new Map(allAgreements.map((a) => [a.id, a])).values(),
-      ).slice(0, limit);
+      const pagedAgreements = allAgreements.slice(0, limit);
 
-      res.json({
-        agreements: z.array(AgreementSchema).parse(uniqueAgreements),
-        count: uniqueAgreements.length,
+      const body = {
+        agreements: z.array(AgreementSchema).parse(pagedAgreements),
+        count: pagedAgreements.length,
         source: INDEXED_DATA_SOURCE,
-      });
+      };
+
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
+      res.json(body);
     } catch (e) {
       next(e);
     }
@@ -143,17 +179,11 @@ indexedRouter.get(
  *
  * Retrieves full details for a single agreement including related events, payments,
  * milestones, employees, and escrow events.
- *
- * Indexer Freshness & Sync Checkpoint Contract:
- * - Validates contract address and numeric agreement ID.
- * - Returns 404 if the agreement does not exist in the indexer database.
- * - Concurrently loads up to MAX_INTERNAL_LIMIT (200) records for each related sub-resource,
- *   guaranteeing bounded query performance regardless of history depth.
  */
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
-    if (contractAddress !== normalizeAddr(defaults.workAgreementAddress)) {
+    if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
       res.status(400).json({ error: "Invalid contract address for agreement details" });
       return;
     }
@@ -175,7 +205,6 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       return;
     }
 
-    // HARDENING: We now apply .limit() to all related queries to prevent unbounded result sets
     const [events, payments, milestones, employees, escrowEvents] = await Promise.all([
       db.select().from(schema.agreementEvents)
         .where(eq(schema.agreementEvents.agreementId, agreementId))
@@ -198,14 +227,16 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
         .orderBy(desc(schema.escrowEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
     ]);
 
-    res.json({
+    const body = {
       agreement: AgreementSchema.parse(agreement[0]),
       events,
       payments,
       milestones,
       employees,
       escrowEvents,
-    });
+    };
+
+    res.json(body);
   } catch (e) {
     next(e);
   }
@@ -215,10 +246,6 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
  * GET /indexed/payments/user/:user_address
  *
  * Retrieves payments sent or received by a specific user address.
- *
- * Indexer Freshness & Sync Checkpoint Contract:
- * - Queries schema.payments populated by indexer processing of PaymentSent/PaymentReceived events.
- * - Results are ordered by block number descending and paginated with limit/offset.
  */
 indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next) => {
   try {
@@ -233,7 +260,8 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
       .limit(limit)
       .offset(offset);
 
-    res.json({ payments, count: payments.length });
+    const body = { payments, count: payments.length };
+    res.json(body);
   } catch (e) {
     next(e);
   }
@@ -242,27 +270,19 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
 /**
  * GET /indexed/escrow/:contract_address/balance/:agreement_id
  *
- * Computes agreement escrow balance by replaying indexed escrow events (Funded,
- * Released, Refunded) in ascending block order up to 500 events.
- *
- * Indexer Freshness & Sync Checkpoint Contract:
- * - Reads up to 500 escrowEvents for the contract & agreement ID.
- * - Folds balance additions (Funded) and subtractions (Released, Refunded) using BigInt.
- * - Balance calculation relies strictly on events indexed up to the database sync checkpoint.
+ * Computes agreement escrow balance by replaying indexed escrow events.
  */
 indexedRouter.get(
   "/indexed/escrow/:contract_address/balance/:agreement_id",
   async (req, res, next) => {
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress !== normalizeAddr(defaults.payrollEscrowAddress)) {
+      if (contractAddress !== normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
         res.status(400).json({ error: "Invalid contract address for escrow balance" });
         return;
       }
       const agreementId = AgreementId.parse(req.params.agreement_id);
 
-      // We bound this query to 500 events; calculating balance for more than 500 
-      // events in a single HTTP request is a performance risk.
       const escrowEvents = await db
         .select()
         .from(schema.escrowEvents)
@@ -284,13 +304,17 @@ indexedRouter.get(
         }
       }
 
-      res.json({
+      const body = {
         agreement_id: agreementId,
         balance: balance.toString(),
         events: escrowEvents,
-      });
+      };
+
+      res.json(body);
     } catch (e) {
       next(e);
     }
   },
 );
+
+export default indexedRouter;

@@ -137,7 +137,7 @@ vi.mock("../config.js", () => ({
     payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
   },
   abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
-  env: { NODE_ENV: "test" },
+  env: { NODE_ENV: "test", LOG_FORMAT: "json" },
 }));
 
 vi.mock("../utils/codec.js", () => ({
@@ -160,7 +160,8 @@ import {
   BatchProcessEnvelopeSchema,
 } from "./events.js";
 import { db } from "../db/index.js";
-import { provider, agreementContract, escrowContract } from "../starknet/client.js";
+import { provider, agreementContract } from "../starknet/client.js";
+import { env } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -275,6 +276,27 @@ describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     rewireDbInsert();
+  });
+
+  it("emits structured ingestion telemetry for a successful receipt", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    await processTxReceipt(TX_A);
+
+    const entry = infoSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_ingestion");
+    expect(entry).toMatchObject({
+      status: "success",
+      tx_hash: TX_A,
+      result_status: "processed",
+      events_processed: 1,
+    });
+    expect(entry.duration_ms).toEqual(expect.any(Number));
+    infoSpy.mockRestore();
   });
 
   it("returns not_found when provider returns null", async () => {
@@ -622,13 +644,38 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.body.results).toHaveLength(1);
   });
 
+  it("process_batch returns 400 with a clean error for malformed hashes", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, "not-a-tx-hash"] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 2 });
+    errorSpy.mockRestore();
+  });
+
   it("process_tx returns 400 with a clean error for a malformed hash", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
     const res = await request(makeApp()).post("/events/process_tx/not-a-tx-hash").send();
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("Invalid Starknet transaction hash format");
     // Never should have reached the provider with garbage input.
     expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 1 });
+    errorSpy.mockRestore();
   });
 
   it("process_tx still works for valid TX_A/TX_B-style hashes", async () => {

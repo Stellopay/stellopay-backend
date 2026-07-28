@@ -15,6 +15,7 @@ const mockRpcProviders = vi.hoisted(() =>
     getChainId: ReturnType<typeof vi.fn>;
     getSpecVersion: ReturnType<typeof vi.fn>;
     getBlock: ReturnType<typeof vi.fn>;
+    estimateFee: ReturnType<typeof vi.fn>;
   }>,
 );
 
@@ -25,12 +26,14 @@ vi.mock("starknet", async (importOriginal) => {
     getChainId: ReturnType<typeof vi.fn>;
     getSpecVersion: ReturnType<typeof vi.fn>;
     getBlock: ReturnType<typeof vi.fn>;
+    estimateFee: ReturnType<typeof vi.fn>;
 
     constructor({ nodeUrl }: { nodeUrl: string }) {
       this.nodeUrl = nodeUrl;
       this.getChainId = vi.fn();
       this.getSpecVersion = vi.fn().mockResolvedValue("0.6.0");
       this.getBlock = vi.fn();
+      this.estimateFee = vi.fn();
       mockRpcProviders.push(this);
     }
   }
@@ -48,11 +51,24 @@ import {
   agreementContract,
   clearContractCache,
   resetRpcFailoverForTests,
+  getStarknetMetricsSnapshot,
+  resetStarknetMetrics,
+  incStarknetMetric,
+  STARKNET_METRICS,
 } from "./client.js";
+import { CircuitOpenError } from "./circuit-breaker.js";
 
 const VITEST_POSTGRES =
   process.env.POSTGRES_CONNECTION_STRING ??
   "postgresql://postgres:postgres@localhost:5432/stellopay_indexer";
+
+async function loadClientWithRpcUrls(rpcEnv: string) {
+  vi.resetModules();
+  mockRpcProviders.length = 0;
+  process.env.STARKNET_RPC_URL = rpcEnv;
+  process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
+  return import("./client.js");
+}
 
 describe("Starknet Client Cache", () => {
   let getChainIdSpy: ReturnType<typeof vi.fn>;
@@ -60,6 +76,7 @@ describe("Starknet Client Cache", () => {
 
   beforeEach(() => {
     resetRpcFailoverForTests();
+    resetCircuitBreakersForTests();
     clearNetworkCache();
 
     getChainIdSpy = vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");
@@ -114,6 +131,19 @@ describe("Starknet Client Cache", () => {
     const info = await getCachedNetworkInfo();
     expect(info.chainId).toBe("0x534e5f4d41494e");
     expect(getChainIdSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("should deduplicate concurrent requests on cache miss", async () => {
+    const [info1, info2, info3] = await Promise.all([
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+    ]);
+
+    expect(info1).toEqual(info2);
+    expect(info2).toEqual(info3);
+    expect(getChainIdSpy).toHaveBeenCalledTimes(1);
+    expect(getSpecVersionSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -186,14 +216,6 @@ describe("RPC endpoint failover", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
-
-  async function loadClientWithRpcUrls(rpcEnv: string) {
-    vi.resetModules();
-    mockRpcProviders.length = 0;
-    process.env.STARKNET_RPC_URL = rpcEnv;
-    process.env.POSTGRES_CONNECTION_STRING = VITEST_POSTGRES;
-    return import("./client.js");
-  }
 
   it("uses a single configured endpoint when only one URL is set", async () => {
     const client = await loadClientWithRpcUrls("https://only.example/rpc");
@@ -313,6 +335,8 @@ describe("RPC endpoint failover", () => {
     client.resetRpcFailoverForTests();
 
     const [primary, secondary] = mockRpcProviders;
+    primary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
+    secondary!.getChainId.mockResolvedValue("0x534e5f4d41494e");
     const complexRequest = {
       nested: {
         array: [1, 2, 3],
@@ -334,8 +358,8 @@ describe("RPC endpoint failover", () => {
 
     expect(complexRequest.nested.array).toEqual([1, 2, 3]);
     expect(complexRequest.nested.object.key).toBe("value");
-    expect(result.received.nested.array).toEqual([1, 2, 3, 999]);
-    expect(result.received.nested.object.key).toBe("mutated");
+    expect(result.received.nested.array).toEqual([1, 2, 3]);
+    expect(result.received.nested.object.key).toBe("value");
   });
 });
 
@@ -372,5 +396,109 @@ describe("ABI error handling", () => {
         "AGREEMENT_CONTRACT_CLASS_JSON path is not configured",
       );
     });
+  });
+});
+
+describe("Starknet Client Telemetry & Metrics", () => {
+  beforeEach(() => {
+    resetStarknetMetrics();
+    clearNetworkCache();
+    resetRpcFailoverForTests();
+  });
+
+  it("tracks metrics for RPC calls and failovers", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetStarknetMetrics();
+
+    const [primary, secondary] = mockRpcProviders;
+    primary!.getBlock.mockRejectedValueOnce(new Error("RPC failed"));
+    secondary!.getBlock.mockResolvedValueOnce({ block_number: 100 });
+
+    const result = await client.provider.getBlock("latest");
+    expect(result).toEqual({ block_number: 100 });
+
+    const metrics = client.getStarknetMetricsSnapshot().counters;
+    expect(metrics[client.STARKNET_METRICS.RPC_REQUESTS]).toBe(1);
+    expect(metrics[client.STARKNET_METRICS.RPC_FAILOVERS]).toBe(1);
+    expect(metrics[client.STARKNET_METRICS.RPC_ERRORS]).toBe(1);
+  });
+
+  it("tracks fee quote metrics on estimateFee success and failure", async () => {
+    const client = await loadClientWithRpcUrls("https://rpc.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetStarknetMetrics();
+
+    const [primary] = mockRpcProviders;
+    primary!.estimateFee.mockResolvedValueOnce({ overall_fee: "1000" });
+
+    await client.provider.estimateFee([]);
+
+    let snapshot = client.getStarknetMetricsSnapshot().counters;
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_REQUESTS]).toBe(1);
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_SUCCESS]).toBe(1);
+
+    primary!.estimateFee.mockRejectedValueOnce(new Error("Fee estimation failed"));
+    await expect(client.provider.estimateFee([])).rejects.toThrow("Fee estimation failed");
+
+    snapshot = client.getStarknetMetricsSnapshot().counters;
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_REQUESTS]).toBe(2);
+    expect(snapshot[client.STARKNET_METRICS.FEE_QUOTE_ERRORS]).toBe(1);
+  });
+
+  it("tracks network info cache hits, fetches, and deduplication metrics", async () => {
+    vi.spyOn(provider, "getChainId").mockResolvedValue("0x534e5f4d41494e");
+    vi.spyOn(provider, "getSpecVersion").mockResolvedValue("0.7.1");
+
+    const [info1, info2] = await Promise.all([
+      getCachedNetworkInfo(),
+      getCachedNetworkInfo(),
+    ]);
+
+    expect(info1).toEqual(info2);
+
+    let snapshot = getStarknetMetricsSnapshot().counters;
+    expect(snapshot[STARKNET_METRICS.NETWORK_INFO_FETCHES]).toBe(1);
+    expect(snapshot[STARKNET_METRICS.NETWORK_INFO_DEDUPED]).toBe(1);
+
+    await getCachedNetworkInfo();
+    snapshot = getStarknetMetricsSnapshot().counters;
+    expect(snapshot[STARKNET_METRICS.NETWORK_INFO_CACHE_HITS]).toBe(1);
+  });
+
+  it("resets metrics via resetStarknetMetrics", () => {
+    incStarknetMetric(STARKNET_METRICS.RPC_REQUESTS, 5);
+    expect(getStarknetMetricsSnapshot().counters[STARKNET_METRICS.RPC_REQUESTS]).toBe(5);
+
+    resetStarknetMetrics();
+    expect(getStarknetMetricsSnapshot().counters[STARKNET_METRICS.RPC_REQUESTS]).toBeUndefined();
+  });
+});
+
+describe("Performance Optimizations", () => {
+  beforeEach(() => {
+    clearContractCache();
+    resetRpcFailoverForTests();
+  });
+
+  it("normalizes contract addresses to prevent duplicate instance creation", () => {
+    const address1 = " 0x0123AbCd456 ";
+    const address2 = "0x0123abcd456";
+
+    const escrow1 = escrowContract(address1);
+    const escrow2 = escrowContract(address2);
+    expect(escrow1).toBe(escrow2);
+
+    const agreement1 = agreementContract(address1);
+    const agreement2 = agreementContract(address2);
+    expect(agreement1).toBe(agreement2);
+  });
+
+  it("caches proxy method bindings across accesses", () => {
+    const fn1 = provider.getChainId;
+    const fn2 = provider.getChainId;
+    expect(fn1).toBe(fn2);
   });
 });

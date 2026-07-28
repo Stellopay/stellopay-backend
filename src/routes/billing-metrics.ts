@@ -190,4 +190,5 @@ export const BILLING_METRICS = {
    */
   INVOICES_DURATION_MS: "billing_invoices_duration_ms_total",
   SUMMARY_DURATION_MS: "billing_summary_duration_ms_total",
+  PROFILE_DURATION_MS: "billing_profile_duration_ms_total",
 } as const;

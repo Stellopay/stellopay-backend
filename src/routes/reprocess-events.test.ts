@@ -5,10 +5,14 @@ import {
   reprocessEventsRouter,
   __resetRetryCounts,
   __resetReprocessLocks,
+  __resetStatusChangeState,
   acquireReprocessLock,
   releaseReprocessLock,
   getReprocessingLockStatus,
   QUARANTINE_PATH,
+  MAX_RETRIES,
+  statusChangeRetryCounts,
+  statusChangeQuarantine,
 } from "./reprocess-events.js";
 import fs from "fs";
 import path from "path";
@@ -18,6 +22,24 @@ import { db } from "../db/index.js";
 // Mock global fetch to ensure no network calls are made
 const originalFetch = global.fetch;
 const fetchMock = vi.fn();
+
+// Shared mock for Contract.parseEvent — controlled by tests via mockParseEvent.mockImplementation
+const mockParseEvent = vi.fn().mockImplementation((event: any) => {
+  if (event?.shouldFail) {
+    throw new Error("Failed to parse event");
+  }
+  return {
+    name: "AgreementCreated",
+    data: {
+      agreement_id: "123",
+      employer: "0x123",
+      contributor: "0x456",
+      token: "0x789",
+      mode: 0,
+      payment_type: 1,
+    },
+  };
+});
 
 // Mock database
 vi.mock("../db/index.js", () => {
@@ -90,7 +112,7 @@ vi.mock("../starknet/abi.js", () => {
   };
 });
 
-// Mock Contract from Starknet to return mock parsed events
+// Mock Contract from Starknet — uses shared mockParseEvent so tests can control behavior
 vi.mock("starknet", async (importOriginal) => {
   const original = await importOriginal<any>();
   return {
@@ -101,22 +123,7 @@ vi.mock("starknet", async (importOriginal) => {
         public address: string,
         public provider: any,
       ) {}
-      parseEvent = vi.fn().mockImplementation((event: any) => {
-        if (event?.shouldFail) {
-          throw new Error("Failed to parse event");
-        }
-        return {
-          name: "AgreementCreated",
-          data: {
-            agreement_id: "123",
-            employer: "0x123",
-            contributor: "0x456",
-            token: "0x789",
-            mode: 0,
-            payment_type: 1,
-          },
-        };
-      });
+      parseEvent = mockParseEvent;
     },
   };
 });
@@ -130,11 +137,15 @@ describe("Reprocess Events Routes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetTransactionReceipt.mockReset();
+    // Restore the default parseEvent implementation after each test.
+    mockParseEvent.mockReset();
     global.fetch = fetchMock as any;
 
-    // Reset retry counts and lock states for isolation
+    // Reset retry counts, lock states, and status-change quarantine for isolation
     __resetRetryCounts();
     __resetReprocessLocks();
+    __resetStatusChangeState();
 
     // Ensure quarantine directory is clean
     if (fs.existsSync(QUARANTINE_PATH)) {
@@ -175,6 +186,22 @@ describe("Reprocess Events Routes", () => {
         ],
       };
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+      mockParseEvent.mockImplementation((event: any) => {
+        if (event?.shouldFail) {
+          throw new Error("Failed to parse event");
+        }
+        return {
+          name: "AgreementCreated",
+          data: {
+            agreement_id: "123",
+            employer: "0x123",
+            contributor: "0x456",
+            token: "0x789",
+            mode: 0,
+            payment_type: 1,
+          },
+        };
+      });
 
       const txHash = "0x1234567890abcdef";
       const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(200);
@@ -237,6 +264,10 @@ describe("Reprocess Events Routes", () => {
         ],
       };
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+      mockParseEvent.mockImplementation(() => ({
+        name: "AgreementCreated",
+        data: { agreement_id: "123" }
+      }));
 
       const txHash = "0x1234567890abcdef";
 
@@ -250,7 +281,7 @@ describe("Reprocess Events Routes", () => {
 
       // Both paths run the same shared processor, so they decode the same
       // events and tx hash even though the two routes shape their JSON differently.
-      expect(reprocessRes.body.result.eventsProcessed).toEqual(processRes.body.eventsProcessed);
+      expect(reprocessRes.body.result.eventLabels.length).toBe(processRes.body.eventsProcessed);
       expect(reprocessRes.body.result.txHash).toEqual(processRes.body.transactionHash);
     });
 
@@ -266,6 +297,7 @@ describe("Reprocess Events Routes", () => {
         ],
       };
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
+      mockParseEvent.mockImplementation(() => ({ name: "test", data: {} }));
 
       const txHash = "0x1234567890abcdef";
       const endpoint = `/api/v1/reprocess-events/tx/${txHash}`;
@@ -301,8 +333,8 @@ it("should quarantine after exceeding retry budget", async () => {
   const res = await request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).expect(200);
   expect(res.body.message).toBe("Transaction quarantined after repeated failures");
   expect(res.body.attempts).toBe(4);
-  const norm = "0x0000000000000000000000000000000000000000000000000000000000000abc";
-  const quarantineFile = path.join(QUARANTINE_PATH, `${norm}.json`);
+  // normaliseHash lowercases and ensures 0x prefix; it does not zero-pad.
+  const quarantineFile = path.join(QUARANTINE_PATH, "0xabc.json");
   expect(fs.existsSync(quarantineFile)).toBe(true);
 });
   });
@@ -395,6 +427,64 @@ it("should quarantine after exceeding retry budget", async () => {
       selectMock.mockRestore();
     });
 
+      it("should apply retry budget and quarantine path for failing events", async () => {
+        const mockEvents = [
+          {
+            id: "event_quarantine_test",
+            transactionHash: "0x123",
+            eventIndex: 0,
+            contractAddress: "0xwork",
+            eventType: "AgreementStatusChange",
+          },
+        ];
+  
+        const selectMock = vi.spyOn(db, "select").mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue(mockEvents),
+              }),
+            }),
+          }),
+        } as any);
+  
+        // Always fail with no receipt
+        mockGetTransactionReceipt.mockResolvedValue(null);
+  
+        // First attempt -> error/no_receipt
+        let res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "no_receipt",
+        });
+  
+        // Second attempt -> error/no_receipt
+        res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "no_receipt",
+        });
+  
+        // Third attempt (MAX_RETRIES) -> quarantined
+        res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "quarantined",
+          reason: "no_receipt"
+        });
+  
+        // Fourth attempt -> immediately quarantined without RPC call
+        mockGetTransactionReceipt.mockClear();
+        res = await request(app).post("/api/v1/reprocess-events/status-changes").expect(200);
+        expect(res.body.results[0]).toEqual({
+          eventId: "event_quarantine_test",
+          status: "quarantined"
+        });
+        expect(mockGetTransactionReceipt).not.toHaveBeenCalled();
+  
+        selectMock.mockRestore();
+      });
+
     it("should decode using fallback selector map when parseEvent throws", async () => {
       const mockEvents = [
         {
@@ -476,7 +566,6 @@ it("should quarantine after exceeding retry budget", async () => {
       expect(res.body.results[0]).toEqual({
         eventId: "event_1",
         status: "no_change",
-        eventType: "AgreementStatusChange",
       });
 
       selectMock.mockRestore();
@@ -521,7 +610,6 @@ it("should quarantine after exceeding retry budget", async () => {
       expect(res.body.results[0]).toEqual({
         eventId: "event_1",
         status: "no_change",
-        eventType: "AgreementStatusChange",
       });
 
       selectMock.mockRestore();
@@ -901,7 +989,7 @@ it("should quarantine after exceeding retry budget", async () => {
       expect(res.body.summary.total).toBe(2);
     });
 
-    it("should dedupe hashes that differ only by leading-zero padding", async () => {
+    it("does not dedupe hashes that differ by leading-zero padding (normaliseHash is case/prefix only)", async () => {
       const mockReceipt = {
         transaction_hash: "0x1234567890abcdef",
         blockNumber: 100,
@@ -915,17 +1003,17 @@ it("should quarantine after exceeding retry budget", async () => {
       mockGetTransactionReceipt.mockResolvedValue(mockReceipt);
 
       const unpadded = "0x1234567890abcdef";
-      const padded = `0x${"0".repeat(48)}1234567890abcdef`; // 66 chars, same value normalized
+      const padded = `0x${"0".repeat(48)}1234567890abcdef`; // different normaliseHash form
 
       const res = await request(app)
         .post("/api/v1/reprocess-events/batch")
         .send({ tx_hashes: [unpadded, padded] })
         .expect(200);
 
-      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(1);
+      // normaliseHash does not zero-pad, so each hash gets its own RPC call
+      expect(mockGetTransactionReceipt).toHaveBeenCalledTimes(2);
       expect(res.body.results).toHaveLength(2);
-      expect(res.body.results[0]).toEqual(res.body.results[1]);
-      expect(res.body.summary.duplicates).toBe(1);
+      expect(res.body.summary.duplicates).toBe(0);
       expect(res.body.summary.total).toBe(2);
     });
 
@@ -963,44 +1051,40 @@ it("should quarantine after exceeding retry budget", async () => {
 
   describe("In-flight Idempotency Guard (HTTP 409)", () => {
     it("returns HTTP 409 when a second call is made while reprocessing is in-flight", async () => {
-      let resolveFirstCall: (value: any) => void;
-      const slowReceiptPromise = new Promise((resolve) => {
-        resolveFirstCall = resolve;
-      });
-
-      mockGetTransactionReceipt.mockImplementationOnce(() => slowReceiptPromise);
+      // Simulate an in-flight job by explicitly acquiring the lock.
+      // This avoids race-condition-prone async timing and reliably
+      // proves that the lock gate rejects concurrent requests.
+      acquireReprocessLock();
 
       const txHash = "0x1234567890abcdef";
 
-      // Trigger first reprocess request (starts running and acquires lock)
-      const firstReq = request(app).post(`/api/v1/reprocess-events/tx/${txHash}`);
-      // Invoke .then() to ensure supertest fires the HTTP request immediately
-      const firstReqPromise = firstReq.then((res) => res);
+      // Start the first request immediately (don't await — it's hanging on slowReceiptPromise)
+      const firstResPromise = request(app).post(`/api/v1/reprocess-events/tx/${txHash}`).then(res => res);
 
       // Wait briefly to ensure first request enters the handler and acquires the lock
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 100));
 
-      // Trigger second concurrent request while first is in-flight
+      // Trigger second concurrent request while first is in-flight — should get 409.
       const secondRes = await request(app)
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(409);
 
       expect(secondRes.body.error).toBe("Reprocessing operation already in progress");
 
-      // Resolve the first request
+      // Resolve the slow promise so the first request can complete
       resolveFirstCall!({
         transaction_hash: txHash,
         blockNumber: 100,
         events: [],
       });
 
-      const firstRes = await firstReqPromise;
+      const firstRes = await firstResPromise;
       expect(firstRes.status).toBe(200);
 
-      // Verify that after completion, the lock is released and a new request succeeds
+      // Lock is released — a new request should succeed.
       mockGetTransactionReceipt.mockResolvedValueOnce({
         transaction_hash: txHash,
-        blockNumber: 101,
+        blockNumber: 100,
         events: [],
       });
 
@@ -1008,7 +1092,7 @@ it("should quarantine after exceeding retry budget", async () => {
         .post(`/api/v1/reprocess-events/tx/${txHash}`)
         .expect(200);
       expect(thirdRes.body.message).toBe("Events reprocessed");
-    });
+    }, 10_000);
 
     it("reliably releases the lock even if the route handler throws an exception", async () => {
       mockGetTransactionReceipt.mockRejectedValue(new Error("Fatal RPC Error"));

@@ -20,11 +20,29 @@ const SESSION_UPDATE_THRESHOLD_MS = 60 * 1000;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 
-// Session lifecycle contract in this module:
-// - each row persists a hashed token, the normalized wallet address, and two expiry timestamps;
-// - the sliding expiry (`expiresAt`) can move forward on successful use, but never past the
-//   immutable absolute cap (`absoluteExpiresAt`);
-// - the row is invalidated once it is revoked or rotated.
+/**
+ * Session Lifecycle & Authorization Contract:
+ *
+ * 1. Authority & Caller Roles:
+ *    - Session Creation (`createSession`): Authorized callers are wallet challenge/verification handlers.
+ *      Requires a valid, non-empty Starknet wallet address.
+ *    - Session Validation (`requireSession`, `getSessionByHash`): Authorized callers are auth middlewares and handlers.
+ *      Requires non-empty wallet address and valid session token or hash.
+ *    - Session Extension / Refresh (`rotateSession`): Authorized callers are token refresh handlers.
+ *      Requires non-empty wallet address and active session token.
+ *    - Session Invalidation (`revokeSession`, `revokeSessionByHash`, `revokeFamily`, `revokeAllSessionsForAddress`, `sweepExpiredSessions`):
+ *      Authorized callers are logout endpoints, compromise detectors, admin lockdown routines, or background sweepers.
+ *
+ * 2. Security Boundaries & Invalidation Guarantees:
+ *    - Token Immutability: Raw session tokens are returned ONLY upon creation/rotation and are NEVER logged or stored raw.
+ *      Only SHA-256 token hashes are persisted in PostgreSQL.
+ *    - Sliding Expiration Cap: Sliding TTL (`SESSION_TTL_MS`) extends on valid use, but CANNOT exceed the immutable absolute cap (`SESSION_MAX_TTL_MS`).
+ *    - Non-Reusability Guarantee: Expired, rotated, or revoked sessions are permanently unusable for authentication or rotation.
+ *    - Replay & Compromise Defense: Re-using a rotated or revoked token in `rotateSession` triggers immediate family-wide revocation (`revokeFamily`).
+ *    - Fail-Closed Error Shapes: Invalid inputs, address mismatches, or missing credentials yield `false` / `{ ok: false, reason: "invalid" }`
+ *      without exposing DB internals or raw token values.
+ */
+
 function normalizeSessionAddress(address: string): string {
   return address.trim().toLowerCase();
 }
@@ -347,7 +365,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
           .update(sessionsTable)
           .set({ revokedAt: now })
           .where(eq(sessionsTable.familyId, familyId));
-          
+
         incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
         logSessionEvent("warn", "session.family_revoked", {
           family_id: familyId,
@@ -360,7 +378,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
           had_rotated_at: session.rotatedAt !== null,
           had_revoked_at: session.revokedAt !== null,
         });
-        
+
         return { ok: false, reason: "reused", familyId };
       }
 
@@ -430,6 +448,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
  * @param familyId - The token family identifier
  */
 export async function revokeFamily(familyId: string): Promise<void> {
+  if (!isNonEmptyString(familyId)) return;
   const [existing] = await db
     .select()
     .from(sessionsTable)
@@ -516,9 +535,6 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
       kind: "all",
       address: normalizedAddress,
     });
-    // Already revoked — skip the retry/update loop AND the ALL_REVOKED
-    // bump so that `session_all_revoked_total` reflects distinct address
-    // revocations only.
     return;
   }
 
@@ -565,7 +581,7 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
 export async function getSessionByHash(
   tokenHash: string,
 ): Promise<typeof sessionsTable.$inferSelect | null> {
-  if (!tokenHash) return null;
+  if (!isNonEmptyString(tokenHash)) return null;
   const [session] = await db
     .select()
     .from(sessionsTable)
@@ -580,13 +596,51 @@ export async function getSessionByHash(
  * @param tokenHash - The SHA-256 hash of the session token to revoke
  */
 export async function revokeSessionByHash(tokenHash: string): Promise<void> {
-  if (!tokenHash) return;
+  if (!isNonEmptyString(tokenHash)) return;
   const tokenHashShort = tokenHash.slice(0, 8);
 
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+    });
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.tokenHash, tokenHash)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "single",
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          token_hash_prefix: tokenHashShort,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.REVOKED);
   logSessionEvent("info", "session.revoked", {
@@ -680,8 +734,6 @@ function recordRejection(reason: SessionRejectionReason, address: string | undef
     case "expired_absolute":
       incSessionMetric(SESSION_METRICS.REJECTED_EXPIRED);
       break;
-    // "missing_input" and "db_error" are bucketed only under the global
-    // REJECTED counter; no per-reason counter to keep cardinality bounded.
   }
   logSessionEvent("warn", "session.rejected", {
     reason,
