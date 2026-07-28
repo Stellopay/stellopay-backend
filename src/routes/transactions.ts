@@ -317,6 +317,46 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
     const offset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset) || 0;
     const queryLimit = offset + limit;
 
+    // Parse and validate from/to date-range query params
+    const fromRaw = req.query.from;
+    const toRaw = req.query.to;
+
+    let fromDate: Date | undefined;
+    let toDate: Date | undefined;
+
+    if (fromRaw !== undefined) {
+      const parsed = z.string().safeParse(fromRaw);
+      if (!parsed.success || isNaN(Date.parse(parsed.data))) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid 'from' timestamp. Must be a valid ISO 8601 date/time string.",
+        });
+        return;
+      }
+      fromDate = new Date(parsed.data);
+    }
+
+    if (toRaw !== undefined) {
+      const parsed = z.string().safeParse(toRaw);
+      if (!parsed.success || isNaN(Date.parse(parsed.data))) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid 'to' timestamp. Must be a valid ISO 8601 date/time string.",
+        });
+        return;
+      }
+      toDate = new Date(parsed.data);
+    }
+
+    // Validate from <= to
+    if (fromDate && toDate && fromDate > toDate) {
+      res.status(400).json({
+        success: false,
+        error: "'from' timestamp must be before or equal to 'to' timestamp.",
+      });
+      return;
+    }
+
     // Get filter for event types (comma-separated list)
     const eventTypesFilter = req.query.eventTypes
       ? (req.query.eventTypes as string)
@@ -342,6 +382,14 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       }
     }
 
+    // Apply date-range filter to payments
+    if (fromDate) {
+      paymentConditions.push(gte(schema.payments.createdAt, fromDate));
+    }
+    if (toDate) {
+      paymentConditions.push(lte(schema.payments.createdAt, toDate));
+    }
+
     // Get escrow events where user is employer or recipient
     const escrowConditions = [
       or(eq(schema.escrowEvents.employer, userAddress), eq(schema.escrowEvents.to, userAddress)),
@@ -358,19 +406,33 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       }
     }
 
-    const agreementEventConditions =
-      eventTypesFilter && eventTypesFilter.length > 0
-        ? and(
-            or(...eventTypesFilter.map((et) => eq(schema.agreementEvents.eventType, et))),
-            or(
-              eq(schema.agreements.employer, userAddress),
-              eq(schema.agreements.contributor, userAddress),
-            ),
-          )
-        : or(
-            eq(schema.agreements.employer, userAddress),
-            eq(schema.agreements.contributor, userAddress),
-          );
+    // Apply date-range filter to escrow events
+    if (fromDate) {
+      escrowConditions.push(gte(schema.escrowEvents.createdAt, fromDate));
+    }
+    if (toDate) {
+      escrowConditions.push(lte(schema.escrowEvents.createdAt, toDate));
+    }
+
+    const agreementEventConditions: any[] = [
+      or(
+        eq(schema.agreements.employer, userAddress),
+        eq(schema.agreements.contributor, userAddress),
+      ),
+    ];
+    // Apply event type filter if provided
+    if (eventTypesFilter && eventTypesFilter.length > 0) {
+      agreementEventConditions.push(
+        or(...eventTypesFilter.map((et) => eq(schema.agreementEvents.eventType, et))),
+      );
+    }
+    // Apply date-range filter to agreement events
+    if (fromDate) {
+      agreementEventConditions.push(gte(schema.agreementEvents.createdAt, fromDate));
+    }
+    if (toDate) {
+      agreementEventConditions.push(lte(schema.agreementEvents.createdAt, toDate));
+    }
 
     const employeeConditions = [
       or(
@@ -384,6 +446,14 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       }
     }
 
+    // Apply date-range filter to employee events
+    if (fromDate) {
+      employeeConditions.push(gte(schema.employees.createdAt, fromDate));
+    }
+    if (toDate) {
+      employeeConditions.push(lte(schema.employees.createdAt, toDate));
+    }
+
     const milestoneConditions = [
       or(
         eq(schema.agreements.employer, userAddress),
@@ -394,6 +464,14 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       if (!eventTypesFilter.includes("MilestoneAdded")) {
         milestoneConditions.push(sql`FALSE`);
       }
+    }
+
+    // Apply date-range filter to milestone events
+    if (fromDate) {
+      milestoneConditions.push(gte(schema.milestones.createdAt, fromDate));
+    }
+    if (toDate) {
+      milestoneConditions.push(lte(schema.milestones.createdAt, toDate));
     }
 
     const [paymentsCount, escrowCount, agreementEventsCount, employeesCount, milestonesCount] =
@@ -413,7 +491,7 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
             schema.agreements,
             eq(schema.agreementEvents.agreementId, schema.agreements.id),
           )
-          .where(agreementEventConditions),
+          .where(and(...agreementEventConditions)),
         db
           .select({ count: count() })
           .from(schema.employees)
@@ -462,7 +540,7 @@ transactionsRouter.get("/transactions/:user_address", async (req, res, next) => 
       })
       .from(schema.agreementEvents)
       .innerJoin(schema.agreements, eq(schema.agreementEvents.agreementId, schema.agreements.id))
-      .where(agreementEventConditions)
+      .where(and(...agreementEventConditions))
       .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
       .limit(queryLimit);
 

@@ -289,6 +289,58 @@ describe("Transaction Export Contracts - Edge Cases", () => {
     }
   });
 
+  it("should return 400 for malformed 'from' timestamp", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=not-a-date",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("from");
+  });
+
+  it("should return 400 for malformed 'to' timestamp", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?to=not-a-date",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("to");
+  });
+
+  it("should return 400 when 'from' is after 'to'", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=2025-06-01T00:00:00Z&to=2024-01-01T00:00:00Z",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("from");
+    expect(res.body.error).toContain("to");
+  });
+
+  it("should accept a valid date-range and still return transactions", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=2024-01-01T00:00:00Z&to=2025-06-01T00:00:00Z",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("should accept only a 'from' param without 'to'", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=2024-01-01T00:00:00Z",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("should accept only a 'to' param without 'from'", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?to=2025-06-01T00:00:00Z",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
   it("should handle boundary/failure path gracefully when db throws", async () => {
     const { db } = await import("../db/index.js");
     vi.mocked(db.select).mockImplementationOnce(() => {
