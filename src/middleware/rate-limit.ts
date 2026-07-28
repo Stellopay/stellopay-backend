@@ -29,7 +29,10 @@ export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
 export function getIdempotencyKey(req: Request): string | undefined {
   const value = req.headers[IDEMPOTENCY_KEY_HEADER.toLowerCase()];
   if (typeof value !== "string" || value.length === 0) return undefined;
-  if (value.length > 255) return undefined;
+  // Enforce a safe character set for idempotency keys: alphanumerics, hyphen, underscore.
+  // Reject keys containing whitespace or control characters to avoid injection risks.
+  const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9_-]{1,255}$/;
+  if (!IDEMPOTENCY_KEY_REGEX.test(value)) return undefined;
   return value;
 }
 
