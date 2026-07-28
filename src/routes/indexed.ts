@@ -20,6 +20,135 @@ export const INDEXED_DATA_SOURCE = "indexed";
  */
 export const MAX_INTERNAL_LIMIT = 200;
 
+/**
+ * Hard limit for escrow events in the balance calculation route. Calculating
+ * balance for more than this many events in a single HTTP request is a
+ * performance risk.
+ */
+export const MAX_ESCROW_EVENTS_LIMIT = 500;
+
+// ---------------------------------------------------------------------------
+// Observability: operation names
+// ---------------------------------------------------------------------------
+
+/** Stable operation names for structured logs — one per route handler. */
+export const INDEXED_OPS = {
+  /** GET /indexed/freshness */
+  FRESHNESS: "indexed.freshness",
+  /** GET /indexed/checkpoint */
+  CHECKPOINT: "indexed.checkpoint",
+  /** GET /indexed/agreements/:contract_address/user/:user_address */
+  AGREEMENTS_FOR_USER: "indexed.agreements_for_user",
+  /** GET /indexed/agreement/:contract_address/:agreement_id */
+  AGREEMENT_DETAIL: "indexed.agreement_detail",
+  /** GET /indexed/payments/user/:user_address */
+  PAYMENTS_FOR_USER: "indexed.payments_for_user",
+  /** GET /indexed/escrow/:contract_address/balance/:agreement_id */
+  ESCROW_BALANCE: "indexed.escrow_balance",
+} as const;
+
+// ---------------------------------------------------------------------------
+// Observability: metric counter names
+// ---------------------------------------------------------------------------
+
+/**
+ * Counter names for process-local metric tracking.  Use these constants (not
+ * raw strings) at every call site so renames stay in lock-step with dashboards.
+ */
+export const INDEXED_METRICS = {
+  /** Total requests received per route. */
+  REQUESTS: "indexed_requests_total",
+  /** Requests that returned at least one row. */
+  ROWS_FOUND: "indexed_rows_found_total",
+  /** Requests that observed a non-zero sync checkpoint. */
+  SYNC_CHECKPOINT_OBSERVED: "indexed_sync_checkpoint_observed_total",
+  /** Server errors (5xx) — note: 404s do NOT increment this. */
+  ERRORS: "indexed_errors_total",
+} as const;
+
+// ---------------------------------------------------------------------------
+// Observability: metric counters
+// ---------------------------------------------------------------------------
+
+const _indexedCounters: Record<string, number> = {};
+
+/** Increment a named counter by `by` (default 1). Creates it on first write. */
+export function incIndexedMetric(name: string, by = 1): void {
+  _indexedCounters[name] = (_indexedCounters[name] ?? 0) + by;
+}
+
+/**
+ * Point-in-time snapshot of every indexed counter. Suitable for an
+ * admin diagnostics endpoint. Returns a shallow copy so callers cannot
+ * mutate internal state.
+ */
+export function getIndexedMetricsSnapshot(): Record<string, number> {
+  return { ..._indexedCounters };
+}
+
+/**
+ * Reset every counter. Tests call this in `beforeEach` so each case
+ * starts from a clean slate. Not intended for production use.
+ */
+export function resetIndexedMetrics(): void {
+  for (const k of Object.keys(_indexedCounters)) delete _indexedCounters[k];
+}
+
+// ---------------------------------------------------------------------------
+// Observability: structured logging
+// ---------------------------------------------------------------------------
+
+type IndexedLogLevel = "info" | "error";
+
+/** Tag prefix for every structured log line emitted by this module. */
+const LOG_TAG = "[indexed]";
+
+/**
+ * Emit exactly one structured log line for an indexed route request.
+ *
+ * The payload is merged with `{ timestamp, level, op }` and serialised
+ * according to `env.LOG_FORMAT` (JSON when `json`, otherwise human-readable
+ * text).
+ *
+ * @param level  Log level (`info` for success, `error` for 5xx).
+ * @param op     Operation name from {@link INDEXED_OPS}.
+ * @param data   Request-scoped fields — duration, sync checkpoint, row count,
+ *               HTTP status, and optional address scoping.
+ */
+export function logIndexedEvent(
+  level: IndexedLogLevel,
+  op: string,
+  data: Record<string, unknown> = {},
+): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    op,
+    ...data,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    console[level](JSON.stringify(entry));
+    return;
+  }
+
+  const flat = Object.entries(data)
+    .map(([k, v]) => `${k}=${formatScalar(v)}`)
+    .join(" ");
+  console[level](`${LOG_TAG} ${entry.timestamp} ${level.toUpperCase()} ${op} ${flat}`);
+}
+
+function formatScalar(v: unknown): string {
+  if (v === null || v === undefined) return String(v);
+  if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return String(v);
+  if (v instanceof Date) return v.toISOString();
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return "<unserializable>";
+  }
+}
+
 const indexedCacheOptions = {
   maxAgeSeconds: env.INDEXED_CACHE_MAX_AGE_SECONDS,
 };
@@ -89,6 +218,7 @@ indexedRouter.get(
   requireAuth,
   requireAdmin,
   async (_req, res, next) => {
+    const startTime = performance.now();
     try {
       const records = await db
         .select({ blockNumber: schema.agreementEvents.blockNumber })
@@ -106,7 +236,27 @@ indexedRouter.get(
 
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
       res.json(body);
-    } catch (e) {
+
+      // Observability
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      if (records.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+      logIndexedEvent("info", INDEXED_OPS.FRESHNESS, {
+        durationMs,
+        syncCheckpoint: checkpointBlock,
+        freshness: body.freshness,
+        httpStatus: 200,
+      });
+    } catch (e: any) {
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      incIndexedMetric(INDEXED_METRICS.ERRORS);
+      logIndexedEvent("error", INDEXED_OPS.FRESHNESS, {
+        durationMs,
+        httpStatus: 500,
+        error: e?.message,
+      });
       next(e);
     }
   },
@@ -132,6 +282,7 @@ indexedRouter.get(
   requireAuth,
   requireAdmin,
   async (_req, res, next) => {
+    const startTime = performance.now();
     try {
       const records = await db
         .select({ blockNumber: schema.agreementEvents.blockNumber })
@@ -148,7 +299,26 @@ indexedRouter.get(
 
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
       res.json(body);
-    } catch (e) {
+
+      // Observability
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      if (records.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+      logIndexedEvent("info", INDEXED_OPS.CHECKPOINT, {
+        durationMs,
+        syncCheckpoint: checkpointBlock,
+        httpStatus: 200,
+      });
+    } catch (e: any) {
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      incIndexedMetric(INDEXED_METRICS.ERRORS);
+      logIndexedEvent("error", INDEXED_OPS.CHECKPOINT, {
+        durationMs,
+        httpStatus: 500,
+        error: e?.message,
+      });
       next(e);
     }
   },
@@ -163,6 +333,7 @@ indexedRouter.get(
 indexedRouter.get(
   "/indexed/agreements/:contract_address/user/:user_address",
   async (req, res, next) => {
+    const startTime = performance.now();
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
       if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
@@ -221,7 +392,31 @@ indexedRouter.get(
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
       applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
-    } catch (e) {
+
+      // Observability
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      if (pagedAgreements.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+      logIndexedEvent("info", INDEXED_OPS.AGREEMENTS_FOR_USER, {
+        durationMs,
+        syncCheckpoint: checkpointBlock,
+        count: pagedAgreements.length,
+        httpStatus: 200,
+        contractAddress,
+        userAddress,
+      });
+    } catch (e: any) {
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      incIndexedMetric(INDEXED_METRICS.ERRORS);
+      logIndexedEvent("error", INDEXED_OPS.AGREEMENTS_FOR_USER, {
+        durationMs,
+        httpStatus: 500,
+        error: e?.message,
+        contractAddress: req.params.contract_address,
+        userAddress: req.params.user_address,
+      });
       next(e);
     }
   },
@@ -234,6 +429,7 @@ indexedRouter.get(
  * milestones, employees, and escrow events.
  */
 indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
+  const startTime = performance.now();
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
     if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
@@ -296,7 +492,36 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
     res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
     applyIndexedCacheHeaders(res, body, indexedCacheOptions);
     res.json(body);
-  } catch (e) {
+
+    // Observability
+    const durationMs = Math.round(performance.now() - startTime);
+    const allRows = [...events, ...payments, ...milestones, ...employees, ...escrowEvents];
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    if (allRows.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+    if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+    logIndexedEvent("info", INDEXED_OPS.AGREEMENT_DETAIL, {
+      durationMs,
+      syncCheckpoint: checkpointBlock,
+      eventsCount: events.length,
+      paymentsCount: payments.length,
+      milestonesCount: milestones.length,
+      employeesCount: employees.length,
+      escrowEventsCount: escrowEvents.length,
+      httpStatus: 200,
+      contractAddress,
+      agreementId,
+    });
+  } catch (e: any) {
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    incIndexedMetric(INDEXED_METRICS.ERRORS);
+    logIndexedEvent("error", INDEXED_OPS.AGREEMENT_DETAIL, {
+      durationMs,
+      httpStatus: 500,
+      error: e?.message,
+      contractAddress: req.params.contract_address,
+      agreementId: req.params.agreement_id,
+    });
     next(e);
   }
 });
@@ -307,6 +532,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
  * Retrieves payments sent or received by a specific user address.
  */
 indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next) => {
+  const startTime = performance.now();
   try {
     const userAddress = StarknetAddress.parse(req.params.user_address);
     const { limit, offset } = parsePagination(req.query);
@@ -319,9 +545,33 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
       .limit(limit)
       .offset(offset);
 
+    const checkpointBlock = deriveSyncCheckpoint(payments);
     const body = { payments, count: payments.length };
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
     res.json(body);
-  } catch (e) {
+
+    // Observability
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    if (payments.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+    if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+    logIndexedEvent("info", INDEXED_OPS.PAYMENTS_FOR_USER, {
+      durationMs,
+      syncCheckpoint: checkpointBlock,
+      count: payments.length,
+      httpStatus: 200,
+      userAddress,
+    });
+  } catch (e: any) {
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    incIndexedMetric(INDEXED_METRICS.ERRORS);
+    logIndexedEvent("error", INDEXED_OPS.PAYMENTS_FOR_USER, {
+      durationMs,
+      httpStatus: 500,
+      error: e?.message,
+      userAddress: req.params.user_address,
+    });
     next(e);
   }
 });
@@ -334,6 +584,7 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
 indexedRouter.get(
   "/indexed/escrow/:contract_address/balance/:agreement_id",
   async (req, res, next) => {
+    const startTime = performance.now();
     try {
       const contractAddress = StarknetAddress.parse(req.params.contract_address);
       if (contractAddress !== normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
@@ -352,7 +603,7 @@ indexedRouter.get(
           ),
         )
         .orderBy(schema.escrowEvents.blockNumber)
-        .limit(500); 
+        .limit(MAX_ESCROW_EVENTS_LIMIT); 
 
       let balance = BigInt(0);
       for (const event of escrowEvents) {
@@ -363,14 +614,41 @@ indexedRouter.get(
         }
       }
 
+      const checkpointBlock = deriveSyncCheckpoint(escrowEvents);
       const body = {
         agreement_id: agreementId,
         balance: balance.toString(),
         events: escrowEvents,
       };
 
+      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
       res.json(body);
-    } catch (e) {
+
+      // Observability
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      if (escrowEvents.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+      logIndexedEvent("info", INDEXED_OPS.ESCROW_BALANCE, {
+        durationMs,
+        syncCheckpoint: checkpointBlock,
+        eventsCount: escrowEvents.length,
+        balance: balance.toString(),
+        httpStatus: 200,
+        contractAddress,
+        agreementId,
+      });
+    } catch (e: any) {
+      const durationMs = Math.round(performance.now() - startTime);
+      incIndexedMetric(INDEXED_METRICS.REQUESTS);
+      incIndexedMetric(INDEXED_METRICS.ERRORS);
+      logIndexedEvent("error", INDEXED_OPS.ESCROW_BALANCE, {
+        durationMs,
+        httpStatus: 500,
+        error: e?.message,
+        contractAddress: req.params.contract_address,
+        agreementId: req.params.agreement_id,
+      });
       next(e);
     }
   },
