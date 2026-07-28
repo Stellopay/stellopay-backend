@@ -287,6 +287,17 @@ diagnosticsRouter.get(
         offset,
       });
 
+      const userAddress = Array.isArray(req.headers["x-user-address"])
+        ? req.headers["x-user-address"][0]
+        : req.headers["x-user-address"];
+
+      incDiagnosticsMetric(DIAGNOSTICS_METRICS.REQUESTS);
+      logDiagnosticsEvent("info", "diagnostics.request", {
+        admin: typeof userAddress === "string" ? userAddress.toLowerCase() : "unknown",
+        limit,
+        offset,
+      });
+
       const data = await fetchDiagnosticsData(db, { limit, offset });
 
       incDiagnosticsMetric(DIAGNOSTICS_METRICS.SUCCESS);
