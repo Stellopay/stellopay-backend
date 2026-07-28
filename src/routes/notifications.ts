@@ -80,7 +80,6 @@ export function logNotificationsTelemetry(entry: NotificationsTelemetryEntry): v
   };
 
   if (env.LOG_FORMAT === "json") {
-    // eslint-disable-next-line no-console
     (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
     return;
   }
@@ -91,7 +90,6 @@ export function logNotificationsTelemetry(entry: NotificationsTelemetryEntry): v
     `${logEntry.unread_count !== undefined ? ` unread=${logEntry.unread_count}` : ""}` +
     `${logEntry.preferences_enabled !== undefined ? ` preferences_enabled=${logEntry.preferences_enabled}` : ""}` +
     `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-  // eslint-disable-next-line no-console
   (logEntry.level === "error" ? console.error : console.info)(message);
 }
 
