@@ -139,11 +139,16 @@ A per-tx error is captured into that tx's result entry (`status: "error"`) and n
 
 ## Envelope validation contract
 
-Both endpoints validate transaction hash format identically via the shared `TxHashSchema` (`0x`-prefixed hex, 3–66 characters). Both endpoints return the same `400` shape on malformed input:
+Both endpoints validate transaction hash format identically via the shared `TxHashSchema` (`0x`-prefixed hex, 3–66 characters). Batch ingestion requests are validated via `BatchProcessEnvelopeSchema`, which enforces a non-empty array up to `MAX_BATCH_SIZE` (50) hashes. Both endpoints return the same `400` shape on malformed input:
 
 ```json
 { "error": "Invalid Starknet transaction hash format" }
 ```
+
+## Performance & Fan-Out Delivery Optimizations
+
+1. **Contract Singletons Reuse**: `processTxReceipt` uses cached `Contract` singletons (`agreementContract` and `escrowContract` from `src/starknet/client.ts`) instead of instantiating new `Contract` instances on every receipt or event decoding iteration.
+2. **Parallel Fan-Out Ingestion**: `POST /events/process_batch` deduplicates input transaction hashes within the request and executes RPC receipt fetching and event decoding concurrently (`Promise.all`) across all unique transaction hashes, eliminating sequential execution bottlenecks.
 
 ## Known limitations / out of scope
 
