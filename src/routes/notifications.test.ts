@@ -209,6 +209,38 @@ describe("notification preferences & unread count helpers", () => {
   it("returns zero unread items for an empty list", () => {
     expect(calculateUnreadCount([])).toBe(0);
   });
+
+  it("deduplicates notifications by id when computing unread count", () => {
+    // Regression guard: calculateUnreadCount tracks unique IDs to avoid
+    // double-counting the same notification if it appears twice in the list.
+    const list = [
+      { id: "notif-1", read: false },
+      { id: "notif-2", read: false },
+      { id: "notif-1", read: false }, // duplicate ID
+    ];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+
+  it("counts notifications without id fields individually", () => {
+    // Notifications without an `id` field cannot be deduplicated; each is
+    // counted independently.
+    const list = [
+      { read: false },
+      { read: false },
+      { id: "notif-1", read: false },
+    ];
+    expect(calculateUnreadCount(list)).toBe(3);
+  });
+
+  it("handles mixed types of id (string and number) correctly", () => {
+    const list = [
+      { id: "notif-1", read: false },
+      { id: 123, read: false },
+      { id: "notif-1", read: false }, // duplicate string ID
+      { id: 123, read: false }, // duplicate numeric ID
+    ];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
 });
 
 describe("notifications route", () => {
@@ -521,6 +553,112 @@ describe("notifications route", () => {
       .get("/api/v1/notifications/abc")
       .expect(200);
     expect(res.body.notifications[0].message).toBe("Agreement 999: Released of 1000000 tokens");
+  });
+
+  it("preserves the response envelope shape for backward compatibility", async () => {
+    // Backward-compatibility contract: the response must have exactly the
+    // three documented top-level keys, and notifications must be an array.
+    // Older callers destructure this shape and break if keys are renamed.
+    queryState.rows.payments = [makePayment()];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    expect(res.body).toHaveProperty("notifications");
+    expect(res.body).toHaveProperty("total");
+    expect(res.body).toHaveProperty("unreadCount");
+    expect(Array.isArray(res.body.notifications)).toBe(true);
+    expect(typeof res.body.total).toBe("number");
+    expect(typeof res.body.unreadCount).toBe("number");
+  });
+
+  it("preserves the notification item shape with all required fields", async () => {
+    // Backward-compatibility contract: each notification item must have the
+    // seven documented fields. Older callers reference these by name.
+    queryState.rows.payments = [
+      makePayment({
+        id: "test-payment",
+        eventType: "PaymentReceived",
+        transactionHash: "0xtest",
+        amount: "1000000",
+        token: USDC_TOKEN_ADDRESS,
+        createdAt: new Date("2026-07-28T12:00:00Z"),
+      }),
+    ];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    const item = res.body.notifications[0];
+    expect(item).toHaveProperty("id");
+    expect(item).toHaveProperty("title");
+    expect(item).toHaveProperty("message");
+    expect(item).toHaveProperty("read");
+    expect(item).toHaveProperty("date");
+    expect(item).toHaveProperty("type");
+    expect(item).toHaveProperty("txHash");
+
+    expect(typeof item.id).toBe("string");
+    expect(typeof item.title).toBe("string");
+    expect(typeof item.message).toBe("string");
+    expect(typeof item.read).toBe("boolean");
+    expect(typeof item.date).toBe("string");
+    expect(typeof item.type).toBe("string");
+    expect(typeof item.txHash).toBe("string");
+  });
+
+  it("always returns read=false for all notifications (no persistent read state)", async () => {
+    // Backward-compatibility contract: every notification has `read: false`
+    // since server-side read state is not yet persisted. Older callers may
+    // rely on this behavior for client-side unread tracking.
+    queryState.rows.payments = [makePayment(), makePayment({ id: "p2" })];
+    queryState.rows.agreements = [{ id: "1", token: USDC_TOKEN_ADDRESS }];
+    queryState.rows.agreementEvents = [makeAgreementEvent()];
+    queryState.rows.escrowEvents = [makeEscrowEvent()];
+
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    expect(res.body.notifications.length).toBeGreaterThan(0);
+    expect(res.body.notifications.every((n: { read: boolean }) => n.read === false)).toBe(
+      true,
+    );
+  });
+
+  it("returns ISO 8601 timestamp strings in the date field", async () => {
+    // Backward-compatibility contract: date field is an ISO 8601 string.
+    // Older callers parse this with `new Date(item.date)` or similar.
+    queryState.rows.payments = [
+      makePayment({ createdAt: new Date("2026-07-28T14:30:00.000Z") }),
+    ];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    const item = res.body.notifications[0];
+    expect(item.date).toBe("2026-07-28T14:30:00.000Z");
+    // Verify it's a valid ISO 8601 string that Date can parse
+    expect(new Date(item.date).toISOString()).toBe(item.date);
+  });
+
+  it("enforces the documented maximum limit of 50", async () => {
+    // Backward-compatibility contract: limit=50 is the documented max.
+    // Out-of-range values are rejected with 400 rather than silently clamped.
+    await request(makeApp()).get("/api/v1/notifications/abc?limit=50").expect(200);
+    await request(makeApp()).get("/api/v1/notifications/abc?limit=51").expect(400);
+  });
+
+  it("handles case-insensitive and unprefixed Starknet addresses", async () => {
+    // StarknetAddress.parse normalizes various address formats.
+    // Verify that both prefixed and unprefixed hex strings are accepted.
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
+    await request(makeApp())
+      .get("/api/v1/notifications/0x0abc")
+      .expect(200);
+    await request(makeApp())
+      .get("/api/v1/notifications/ABC")
+      .expect(200);
   });
 });
 

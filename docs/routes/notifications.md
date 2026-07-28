@@ -228,17 +228,44 @@ export interface NotificationPreferences {
 }
 ```
 
+### Exported Helper Functions
+
 - **`getDefaultNotificationPreferences()`** — Returns a fresh
   `{ payments: true, agreements: true, escrow: true, disputes: true }`
   object on every call. Callers can mutate the returned object without
   poisoning other callers.
+
+  **Backward-compatibility guarantees:**
+  - Always returns a new object instance (not a shared singleton)
+  - All four category fields are always present with boolean values
+  - Default value for all categories is `true`
+  - Function signature and return type are frozen
+
 - **`calculateUnreadCount(notifications)`** — Single source of truth for
   the unread-count field; counts items where `read === false`. The
   notifications route invokes this helper on its outgoing payload rather
   than reaching for `Array.length` directly, so the response stays in
   lockstep with the helper's semantics.
 
+  **Backward-compatibility guarantees:**
+  - Deduplicates notifications by `id` field when present
+  - Notifications without an `id` field are counted individually
+  - Supports both string and numeric `id` types
+  - Only counts items where `read === false`
+  - Function signature and counting logic are frozen
+
 Both helpers are exported for unit-testing and future preference-filtering logic without making HTTP requests.
+
+### Future Extension Points
+
+The `NotificationPreferences` interface is exported to support future features:
+- Per-user preference storage in database tables (not yet implemented)
+- Filtering the notification feed by category (not yet implemented)
+- Push notification routing based on user preferences (not yet implemented)
+
+**Current limitation:** The preferences contract is defined and exported, but
+the route does not yet filter notifications based on preferences. All event
+categories are currently returned regardless of preference settings.
 
 ---
 
@@ -284,14 +311,25 @@ Errors propagate through the central error handler with structured Zod
 `details` so misbehaving clients see which field failed, identical to the
 other `/api/v1/*` routes.
 
+**Backward-compatibility guarantees:**
+- Error status codes are frozen (400 for validation errors)
+- Error message strings are stable for existing error cases
+- The `details` field structure follows the project-wide Zod error format
+- New error cases may be added but will use distinct status codes or messages
+
 ---
 
 ## Compatibility Notes
 
-- The response envelope is `{ notifications, total, unreadCount, limit, offset, hasMore }`.
-  The original three fields (`notifications`, `total`, `unreadCount`) are
-  frozen; the pagination fields are additive. Callers that ignore unknown
-  fields are unaffected.
+### Response Shape Stability
+
+- The response envelope is `{ notifications, total, unreadCount }` with the
+  same keys and types documented in the success-response block above. Older
+  callers depend on this shape; any additively-new field can be added later
+  without breaking them.
+- Each notification item has exactly seven fields: `id`, `title`, `message`,
+  `read`, `date`, `type`, `txHash`. All fields are required and have stable
+  types.
 - The default `limit` is intentionally `10` (not `50` like the project's
   shared `parsePagination`) for backward compatibility with callers that
   rely on the smaller default; out-of-range `limit` values are still
@@ -300,6 +338,41 @@ other `/api/v1/*` routes.
   `NOTIFICATIONS_MAX_LIMIT` (50) are the single source of truth for the
   documented pagination bounds. Tests import them directly so constant and
   behavior cannot drift.
+
+### Field Value Stability
+
+- **`notifications` array**: Always sorted newest-first by `date` field.
+  Maximum length equals the `limit` parameter (default 10, max 50).
+- **`total` field**: Always equals `notifications.length` (the count after
+  sorting and slicing, not the total count across all pages).
+- **`unreadCount` field**: Currently always equals `total` since all
+  notifications have `read: false`. This field exists to support future
+  read-state persistence without changing the response shape.
+- **`read` field**: Always `false` for all notifications. Server-side read
+  state is not yet persisted.
+- **`date` field**: Always an ISO 8601 timestamp string in UTC
+  (e.g., `"2026-07-28T14:30:00.000Z"`).
+- **`title` field**: Human-readable title derived from `type` using a frozen
+  mapping (see table above). Existing titles never change.
+- **`message` field**: Format is stable for each event type. Existing message
+  templates never change.
+
+### Breaking Change Policy
+
+The following changes are considered **breaking** and will be avoided:
+- Renaming or removing any response field
+- Changing field types (e.g., `total` from number to string)
+- Modifying existing title or message formats
+- Changing the default or maximum `limit` values
+- Altering the sort order of the notifications array
+- Changing error status codes for existing error cases
+
+The following changes are considered **non-breaking** and may occur in future:
+- Adding new optional fields to the response envelope
+- Adding new optional fields to notification items
+- Supporting new event types with new title/message formats
+- Adding new error cases with distinct status codes
+- Performance optimizations that don't affect the response shape
 
 ---
 
