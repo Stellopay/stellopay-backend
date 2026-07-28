@@ -1,3 +1,44 @@
+/**
+ * Escrow routes — balance resolution and fund-release preparation.
+ *
+ * This module owns the API surface for escrow operations on Starknet.  It
+ * exposes read-paths (balance, token, employer, initialization status) and
+ * write-paths (initialize, fund, release, refund) that prepare unsigned
+ * Starknet transaction payloads for client-side signing.
+ *
+ * ## Balance resolution contract
+ *
+ * The balance for an agreement is resolved through a two-tier strategy
+ * implemented by {@link getAgreementBalanceInternal}:
+ *
+ * 1. **Indexed-first** — Replays deduplicated escrow events from the local
+ *    database.  `Funded` events add to the balance; `Released` and
+ *    `Refunded` events subtract.  If the computed balance is negative (e.g.
+ *    due to out-of-order indexing) it is clamped to `0`.
+ * 2. **Contract fallback** — When indexed data is unavailable or the
+ *    database query fails, the route calls `get_agreement_balance` on the
+ *    Starknet escrow contract directly.
+ *
+ * The response always includes a `source` field (`"indexed"` or
+ * `"contract"`) so callers can distinguish the data origin.
+ *
+ * ## Release idempotency
+ *
+ * The release preparation route (`POST /prepare/escrow/:address/release`)
+ * supports optional idempotency via the `Idempotency-Key` header (see
+ * {@link withEscrowIdempotency}).  The same key + same body replays the
+ * cached response for 24 h; a different body with the same key is rejected
+ * with `409 Conflict`.
+ *
+ * ## Compatibility
+ *
+ * Existing callers depend on the shape of every response envelope
+ * (including `call`, `wallet_address`, `nonce`, `chain_id`, `balance`,
+ * and `source`).  Changes to these shapes must be backward-compatible or
+ * coordinated with all consumers.
+ *
+ * @module escrow
+ */
 import { Router, Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import { defaults } from "../config.js";
@@ -9,14 +50,24 @@ import { eq, and } from "drizzle-orm";
 
 import { normalizeStarknetAddress } from "../utils/address.js";
 
-const AddressParam = z.string().min(3).transform((val, ctx) => {
-  try {
-    return normalizeStarknetAddress(val);
-  } catch (e: any) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: e.message });
-    return z.NEVER;
-  }
-});
+/**
+ * Zod schema that normalises a Starknet address from a route parameter.
+ *
+ * Accepts any string of at least 3 characters and canonicalises it via
+ * {@link normalizeStarknetAddress}.  Used for `:address` route params
+ * throughout the escrow router.
+ */
+const AddressParam = z
+  .string()
+  .min(3)
+  .transform((val, ctx) => {
+    try {
+      return normalizeStarknetAddress(val);
+    } catch (e: any) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: e.message });
+      return z.NEVER;
+    }
+  });
 
 /**
  * Starknet address schema for request body fields.
@@ -28,39 +79,94 @@ const AddressParam = z.string().min(3).transform((val, ctx) => {
  */
 const EscrowAddress = AddressParam;
 
+/**
+ * Coerces a route parameter to a positive bigint for agreement IDs.
+ */
 const AgreementIdParam = z.coerce.bigint().positive();
 
+/**
+ * Base session schema shared by all write-path request bodies.
+ *
+ * Requires a canonical wallet address and a session token of at least
+ * 10 characters.
+ */
 const WalletSession = z.object({
   wallet_address: EscrowAddress,
   session_token: z.string().trim().min(10),
 });
+
+/**
+ * Coerces a body field (string or number) to a positive bigint for
+ * agreement IDs sent in request payloads.
+ */
 const AgreementIdBody = z
   .union([z.string().trim().regex(/^\d+$/), z.number().int().positive()])
   .transform((value) => BigInt(value));
+
+/**
+ * Coerces a body field (string or number) to a non-negative decimal string
+ * for token amounts sent in request payloads.
+ */
 const AmountBody = z
   .union([z.string().trim().regex(/^\d+$/), z.number().int().nonnegative()])
   .transform((value) => String(value));
+
+/**
+ * Request body for `POST /prepare/escrow/:address/fund_agreement`.
+ */
 const FundAgreementBody = WalletSession.extend({
   agreement_id: AgreementIdBody,
   employer: EscrowAddress,
   amount: AmountBody,
 });
+
+/**
+ * Request body for `POST /prepare/escrow/:address/release`.
+ */
 const ReleaseBody = WalletSession.extend({
   agreement_id: AgreementIdBody,
   to: EscrowAddress,
   amount: AmountBody,
 });
+
+/**
+ * Request body for `POST /prepare/escrow/:address/initialize`.
+ */
 const InitBody = WalletSession.extend({
   token: EscrowAddress,
   manager: EscrowAddress,
 });
+
+/**
+ * Request body for `POST /prepare/escrow/:address/refund_remaining`.
+ */
 const RefundBody = WalletSession.extend({
   agreement_id: AgreementIdBody,
 });
 
 // -------- Idempotency Store & Helpers --------
+
+/**
+ * Time-to-live for cached idempotency entries (24 hours in milliseconds).
+ */
 const ESCROW_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Number of escrow events fetched per batch when replaying indexed events
+ * to compute an agreement balance.  Kept small enough to avoid unbounded
+ * memory growth on long-lived agreements while large enough to minimise
+ * round-trips.
+ *
+ * @see getAgreementBalanceInternal
+ */
+const ESCROW_BALANCE_BATCH_SIZE = 100;
+
+/**
+ * An entry in the in-memory idempotency store.
+ *
+ * Stores the response body and status code for a previously completed
+ * write operation, keyed by `escrow:<address>:<idempotency-key>`.
+ */
 type EscrowIdempotencyEntry = {
   createdAt: number;
   expiresAt: number;
@@ -69,8 +175,19 @@ type EscrowIdempotencyEntry = {
   responseBody: unknown;
 };
 
+/**
+ * In-memory cache of idempotent responses.
+ *
+ * **Node-local only.**  Horizontal scaling requires a shared store (e.g.
+ * Redis); that is intentionally out of scope for the current contract.
+ */
 const escrowIdempotencyStore = new Map<string, EscrowIdempotencyEntry>();
 
+/**
+ * Produces a deterministic JSON-like string for a value, sorting object
+ * keys alphabetically so `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` produce
+ * the same fingerprint.
+ */
 function stableSerialize(value: unknown): string {
   if (typeof value === "undefined") return "undefined";
   if (value === null) return "null";
@@ -89,11 +206,17 @@ function stableSerialize(value: unknown): string {
   return String(value);
 }
 
+/**
+ * Safely reads a request header, returning `undefined` when missing or empty.
+ */
 function getHeader(req: Request, name: string): string | undefined {
   const value = req.get(name);
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Removes all expired entries from the idempotency store.
+ */
 function pruneExpiredEntries(now = Date.now()): void {
   for (const [cacheKey, entry] of escrowIdempotencyStore.entries()) {
     if (entry.expiresAt <= now) {
@@ -102,10 +225,43 @@ function pruneExpiredEntries(now = Date.now()): void {
   }
 }
 
+/**
+ * Clears the entire idempotency store.  Primarily intended for test
+ * teardown so tests start with a clean state.
+ */
 export function clearEscrowIdempotencyStore(): void {
   escrowIdempotencyStore.clear();
 }
 
+/**
+ * Wraps a route handler with idempotency-key replay protection.
+ *
+ * ## Contract
+ *
+ * - Reads the `Idempotency-Key` (case-insensitive) header from the request.
+ * - Bypasses idempotency for `GET`, `HEAD`, and `OPTIONS` requests.
+ * - When a key is present on a mutating request:
+ *   - **Cache hit (same key + same body):** The cached response (status
+ *     code and JSON body) from the first successful execution is replayed.
+ *     The handler is never called again; no new nonce is fetched.
+ *   - **Cache conflict (same key + different body):** Returns
+ *     `409 Conflict` immediately.
+ *   - **Cache miss:** Executes the handler, intercepts `res.json` /
+ *     `res.send`, and caches the response under the key.
+ * - Cache entries expire after {@link ESCROW_IDEMPOTENCY_TTL_MS} (24 h).
+ *
+ * ## Limitations (intentionally out of scope)
+ *
+ * - **Node-local.**  The store lives in process memory.  Under horizontal
+ *   scaling, idempotency is not shared across instances.
+ * - **Pre-auth caching.**  Responses with `4xx` status codes (including
+ *   auth failures and validation errors) are cached alongside successful
+ *   ones.  A subsequent replay of a previously-failed request returns the
+ *   same error.
+ *
+ * @param handler - The route handler to wrap.
+ * @returns A new handler that enforces idempotency before delegating.
+ */
 export function withEscrowIdempotency(
   handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
 ) {
@@ -132,7 +288,9 @@ export function withEscrowIdempotency(
           address,
           idempotency_key: idempotencyKey,
         });
-        res.status(409).json({ error: "Idempotency key already used with a different request body" });
+        res
+          .status(409)
+          .json({ error: "Idempotency key already used with a different request body" });
         return;
       }
 
@@ -183,26 +341,82 @@ export function withEscrowIdempotency(
   };
 }
 
+/**
+ * Resolves the current balance for a specific agreement on an escrow
+ * contract using a two-tier strategy: indexed data first, on-chain
+ * contract call as fallback.
+ *
+ * ## Indexed path (preferred)
+ *
+ * 1. Queries `escrow_events` from the local database in **batches of
+ *    {@link ESCROW_BALANCE_BATCH_SIZE}** rows, filtered by
+ *    `contractAddress` and `agreementId`, ordered by `(blockNumber, id)`
+ *    to guarantee stable pagination across batches.
+ * 2. **Deduplicates** events by their unique `id` (computed as
+ *    `transaction_hash + event_index` on insert).  The same Starknet event
+ *    may appear multiple times in the indexer output; deduplication guards
+ *    against double-counting.  The dedup set persists across batches.
+ * 3. Replays the deduplicated stream:
+ *    - `Funded` → **adds** the amount.
+ *    - `Released` or `Refunded` → **subtracts** the amount.
+ * 4. If the computed balance is **negative** (possible when releases are
+ *    indexed before their corresponding fund events), the balance is
+ *    **clamped to `0`** and a structured warning is logged.
+ * 5. Returns `{ balance, source: "indexed" }`.
+ *
+ * **Batching contract:** Each iteration fetches at most
+ * {@link ESCROW_BALANCE_BATCH_SIZE} rows via offset-based pagination.
+ * The loop continues until a page returns fewer rows than the batch size
+ * (indicating the last page).  Offset pagination is safe because new
+ * events are always appended (they won't shift earlier pages).
+ *
+ * ## Contract fallback path
+ *
+ * When indexed data is unavailable (empty result set on the **first**
+ * page) or the database query throws, the function falls through to a
+ * direct Starknet contract call (`get_agreement_balance`).  The returned
+ * value is coerced from whatever type Starknet.js provides (bigint,
+ * number, string, or `{ low, high }` U256 object) into a `bigint`.
+ *
+ * Return value is always `{ balance: bigint, source: "indexed" | "contract" }`.
+ *
+ * @param address      - Normalised Starknet address of the escrow contract.
+ * @param agreement_id - The agreement identifier.
+ * @returns The balance as a non-negative bigint and the resolution source.
+ */
 async function getAgreementBalanceInternal(
   address: string,
   agreement_id: bigint,
 ): Promise<{ balance: bigint; source: "indexed" | "contract" }> {
   try {
-    const escrowEvents = await db
-      .select()
-      .from(schema.escrowEvents)
-      .where(
-        and(
-          eq(schema.escrowEvents.contractAddress, address),
-          eq(schema.escrowEvents.agreementId, agreement_id.toString()),
-        ),
-      )
-      .orderBy(schema.escrowEvents.blockNumber);
+    let offset = 0;
+    let balance = BigInt(0);
+    const seenEventIds = new Set<string>();
+    let totalEventCount = 0;
 
-    if (Array.isArray(escrowEvents) && escrowEvents.length > 0) {
-      let balance = BigInt(0);
-      const seenEventIds = new Set<string>();
-      for (const event of escrowEvents) {
+    // Batched pagination: fetch events in pages of BATCH_SIZE to avoid
+    // unbounded memory growth on long-lived agreements.
+    while (true) {
+      const page = await db
+        .select()
+        .from(schema.escrowEvents)
+        .where(
+          and(
+            eq(schema.escrowEvents.contractAddress, address),
+            eq(schema.escrowEvents.agreementId, agreement_id.toString()),
+          ),
+        )
+        .orderBy(schema.escrowEvents.blockNumber, schema.escrowEvents.id)
+        .limit(ESCROW_BALANCE_BATCH_SIZE)
+        .offset(offset);
+
+      if (!Array.isArray(page) || page.length === 0) {
+        break;
+      }
+
+      totalEventCount += page.length;
+
+      for (const event of page) {
         if (event && event.id) {
           if (seenEventIds.has(event.id)) {
             continue;
@@ -215,6 +429,16 @@ async function getAgreementBalanceInternal(
           balance -= BigInt(event.amount);
         }
       }
+
+      // Last page: fewer rows than the batch size means no more data.
+      if (page.length < ESCROW_BALANCE_BATCH_SIZE) {
+        break;
+      }
+
+      offset += ESCROW_BALANCE_BATCH_SIZE;
+    }
+
+    if (totalEventCount > 0) {
       if (balance < 0n) {
         console.warn({
           event: "escrow_balance_clamped",
@@ -230,7 +454,7 @@ async function getAgreementBalanceInternal(
         address,
         agreement_id: agreement_id.toString(),
         balance: balance.toString(),
-        event_count: escrowEvents.length,
+        event_count: totalEventCount,
       });
       return { balance, source: "indexed" };
     }
@@ -310,15 +534,40 @@ async function checkAgreementEmployerAuth(
   try {
     const c = escrowContract(address);
     const employer = await c.get_agreement_employer(agreementId);
-    return (
-      normalizeStarknetAddress(String(employer)) ===
-      normalizeStarknetAddress(walletAddress)
-    );
+    return normalizeStarknetAddress(String(employer)) === normalizeStarknetAddress(walletAddress);
   } catch {
     return false;
   }
 }
 
+/**
+ * Express router for escrow operations.
+ *
+ * ## Read endpoints (no auth)
+ *
+ * | Method | Path | Description |
+ * | :--- | :--- | :--- |
+ * | GET | `/escrow/defaults` | Returns the configured default escrow contract address. |
+ * | GET | `/escrow/:address/get_token` | Returns the token address the escrow was initialised with. |
+ * | GET | `/escrow/:address/is_initialized` | Checks whether the escrow has been initialised (token ≠ zero). |
+ * | GET | `/escrow/:address/get_agreement_balance/:agreement_id` | Resolves the current agreement balance via {@link getAgreementBalanceInternal}. |
+ * | GET | `/escrow/:address/get_agreement_employer/:agreement_id` | Returns the employer address stored for the agreement. |
+ *
+ * ## Write endpoints (require session)
+ *
+ * | Method | Path | Description |
+ * | :--- | :--- | :--- |
+ * | POST | `/prepare/escrow/:address/initialize` | Prepares an unsigned `initialize` transaction. |
+ * | POST | `/prepare/escrow/:address/fund_agreement` | Prepares an unsigned `fund_agreement` transaction. |
+ * | POST | `/prepare/escrow/:address/release` | Prepares an unsigned `release` transaction (with idempotency). |
+ * | POST | `/prepare/escrow/:address/refund_remaining` | Prepares an unsigned `refund_remaining` transaction (employer-only). |
+ *
+ * All write endpoints require a valid session (`wallet_address` +
+ * `session_token`) and return `401` on auth failure.  The release route
+ * additionally enforces idempotency (see {@link withEscrowIdempotency}) and
+ * a pre-execution balance check that returns `400` when the agreement
+ * balance is insufficient.
+ */
 export const escrowRouter = Router();
 
 escrowRouter.get("/escrow/defaults", (_req, res) => {
@@ -326,6 +575,13 @@ escrowRouter.get("/escrow/defaults", (_req, res) => {
 });
 
 // -------- getters (view) --------
+
+/**
+ * GET /escrow/:address/get_token
+ *
+ * Returns the ERC-20 token address the escrow contract was initialised
+ * with.  Calls `get_token()` on the Starknet contract directly.
+ */
 escrowRouter.get("/escrow/:address/get_token", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
@@ -337,6 +593,17 @@ escrowRouter.get("/escrow/:address/get_token", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /escrow/:address/is_initialized
+ *
+ * Checks whether the escrow contract has been initialised by calling
+ * `get_token()` and testing whether the result is a non-zero address.
+ *
+ * Returns `{ initialized: boolean, token: string | null }`.  When the
+ * contract call itself fails (e.g. network error or uninitialised
+ * contract), the response includes `initialized: false` and an `error`
+ * field rather than throwing.
+ */
 escrowRouter.get("/escrow/:address/is_initialized", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
@@ -372,6 +639,16 @@ escrowRouter.get("/escrow/:address/is_initialized", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /escrow/:address/get_agreement_balance/:agreement_id
+ *
+ * Resolves the current balance for an agreement.  Delegates to
+ * {@link getAgreementBalanceInternal} which uses indexed data when
+ * available and falls back to a direct contract call.
+ *
+ * Response: `{ agreement_id, balance, source }` where `source` is
+ * `"indexed"` or `"contract"`.
+ */
 escrowRouter.get("/escrow/:address/get_agreement_balance/:agreement_id", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
@@ -388,6 +665,13 @@ escrowRouter.get("/escrow/:address/get_agreement_balance/:agreement_id", async (
   }
 });
 
+/**
+ * GET /escrow/:address/get_agreement_employer/:agreement_id
+ *
+ * Returns the employer address stored on the escrow contract for the
+ * given agreement.  Calls `get_agreement_employer()` on the Starknet
+ * contract directly.
+ */
 escrowRouter.get(
   "/escrow/:address/get_agreement_employer/:agreement_id",
   async (req, res, next) => {
@@ -404,6 +688,14 @@ escrowRouter.get(
 );
 
 // -------- setters (prepare to sign client-side) --------
+
+/**
+ * POST /prepare/escrow/:address/initialize
+ *
+ * Prepares an unsigned `initialize` transaction for client-side signing.
+ * Requires a valid session.  The caller provides a token address and
+ * manager address.
+ */
 escrowRouter.post("/prepare/escrow/:address/initialize", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
@@ -422,6 +714,13 @@ escrowRouter.post("/prepare/escrow/:address/initialize", async (req, res, next) 
   }
 });
 
+/**
+ * POST /prepare/escrow/:address/fund_agreement
+ *
+ * Prepares an unsigned `fund_agreement` transaction for client-side
+ * signing.  Requires a valid session.  The caller provides the agreement
+ * ID, employer address, and funding amount (as a decimal string).
+ */
 escrowRouter.post("/prepare/escrow/:address/fund_agreement", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
@@ -444,58 +743,88 @@ escrowRouter.post("/prepare/escrow/:address/fund_agreement", async (req, res, ne
   }
 });
 
-escrowRouter.post("/prepare/escrow/:address/release", withEscrowIdempotency(async (req, res, next) => {
-  try {
-    const address = AddressParam.parse(req.params.address);
-    const body = ReleaseBody.parse(req.body);
-    if (!(await requireSession(body.wallet_address, body.session_token))) {
-      console.warn({
-        event: "escrow_auth_failed",
-        route: "release",
-        address,
-        wallet_address: body.wallet_address,
-      });
-      res.status(401).json({ error: "Invalid session" });
-      return;
-    }
+/**
+ * POST /prepare/escrow/:address/release
+ *
+ * Prepares an unsigned `release` transaction for client-side signing.
+ *
+ * This is the most heavily guarded write path:
+ * 1. **Session validation** — returns `401` on invalid session.
+ * 2. **Idempotency** — wrapped by {@link withEscrowIdempotency} so retries
+ *    with the same `Idempotency-Key` replay the cached response.
+ * 3. **Pre-execution balance check** — calls
+ *    {@link getAgreementBalanceInternal} and returns `400` with
+ *    `"Insufficient agreement balance"` if the available balance is less
+ *    than the requested amount.
+ * 4. **Transaction preparation** — populates the `release` call with the
+ *    agreement ID, recipient, and parsed U256 amount, then fetches a
+ *    nonce and chain ID for the caller's wallet.
+ *
+ * Response: `{ call, wallet_address, nonce, chain_id }`.
+ */
+escrowRouter.post(
+  "/prepare/escrow/:address/release",
+  withEscrowIdempotency(async (req, res, next) => {
+    try {
+      const address = AddressParam.parse(req.params.address);
+      const body = ReleaseBody.parse(req.body);
+      if (!(await requireSession(body.wallet_address, body.session_token))) {
+        console.warn({
+          event: "escrow_auth_failed",
+          route: "release",
+          address,
+          wallet_address: body.wallet_address,
+        });
+        res.status(401).json({ error: "Invalid session" });
+        return;
+      }
 
-    // Pre-execution balance check
-    const result = await getAgreementBalanceInternal(address, body.agreement_id);
-    const reqAmount = BigInt(body.amount);
-    if (result.balance < reqAmount) {
-      console.warn({
-        event: "escrow_release_insufficient_balance",
+      // Pre-execution balance check
+      const result = await getAgreementBalanceInternal(address, body.agreement_id);
+      const reqAmount = BigInt(body.amount);
+      if (result.balance < reqAmount) {
+        console.warn({
+          event: "escrow_release_insufficient_balance",
+          address,
+          agreement_id: body.agreement_id.toString(),
+          requested: body.amount,
+          available: result.balance.toString(),
+          source: result.source,
+        });
+        res.status(400).json({ error: "Insufficient agreement balance" });
+        return;
+      }
+
+      const c = escrowContract(address);
+      const call = c.populate("release", [
+        body.agreement_id.toString(),
+        body.to,
+        parseU256(body.amount),
+      ]);
+      const { nonce, chain_id } = await prepareTransactionContext(body.wallet_address);
+      console.log({
+        event: "escrow_release_prepared",
         address,
         agreement_id: body.agreement_id.toString(),
-        requested: body.amount,
-        available: result.balance.toString(),
+        amount: body.amount,
+        balance: result.balance.toString(),
         source: result.source,
       });
-      res.status(400).json({ error: "Insufficient agreement balance" });
-      return;
+      res.json({ call, wallet_address: body.wallet_address, nonce, chain_id });
+    } catch (e) {
+      next(e);
     }
+  }),
+);
 
-    const c = escrowContract(address);
-    const call = c.populate("release", [
-      body.agreement_id.toString(),
-      body.to,
-      parseU256(body.amount),
-    ]);
-    const { nonce, chain_id } = await prepareTransactionContext(body.wallet_address);
-    console.log({
-      event: "escrow_release_prepared",
-      address,
-      agreement_id: body.agreement_id.toString(),
-      amount: body.amount,
-      balance: result.balance.toString(),
-      source: result.source,
-    });
-    res.json({ call, wallet_address: body.wallet_address, nonce, chain_id });
-  } catch (e) {
-    next(e);
-  }
-}));
-
+/**
+ * POST /prepare/escrow/:address/refund_remaining
+ *
+ * Prepares an unsigned `refund_remaining` transaction for client-side
+ * signing.  Requires a valid session **and** that the caller is the
+ * employer of the agreement (verified on-chain via
+ * {@link checkAgreementEmployerAuth}); otherwise returns `403`.
+ */
 escrowRouter.post("/prepare/escrow/:address/refund_remaining", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
@@ -505,7 +834,11 @@ escrowRouter.post("/prepare/escrow/:address/refund_remaining", async (req, res, 
       return;
     }
 
-    const isAuth = await checkAgreementEmployerAuth(address, body.agreement_id, body.wallet_address);
+    const isAuth = await checkAgreementEmployerAuth(
+      address,
+      body.agreement_id,
+      body.wallet_address,
+    );
     if (!isAuth) {
       res.status(403).json({ error: "Unauthorized" });
       return;

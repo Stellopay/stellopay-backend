@@ -9,18 +9,34 @@ import {
   getTokenInfo,
   type TokenInfo,
 } from "../utils/token-formatting.js";
+import { env } from "../config.js";
 
 export const notificationsRouter = Router();
 
+/**
+ * Notification preference categories for filtering notification types.
+ *
+ * **Backward-compatibility contract:** This interface shape is frozen. The
+ * four category fields (`payments`, `agreements`, `escrow`, `disputes`) and
+ * their boolean types are stable and must be preserved across future changes.
+ * New categories may be added as optional fields but existing fields cannot
+ * be removed or renamed.
+ */
 export interface NotificationPreferences {
-  payments: boolean;
-  agreements: boolean;
-  escrow: boolean;
-  disputes: boolean;
+  payments: boolean;   // Covers: PaymentSent, PaymentReceived
+  agreements: boolean; // Covers: AgreementCreated, AgreementActivated, AgreementCancelled
+  escrow: boolean;     // Covers: Funded, Released, Refunded
+  disputes: boolean;   // Covers: DisputeRaised, DisputeResolved
 }
 
 /**
  * Returns default notification category preferences for users (all categories enabled).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Always returns a new object instance (never a shared singleton)
+ * - All four category fields are present and set to `true`
+ * - Returned object can be safely mutated by callers
+ * - Function signature and default values are frozen
  */
 export function getDefaultNotificationPreferences(): NotificationPreferences {
   return {
@@ -39,6 +55,17 @@ export function getDefaultNotificationPreferences(): NotificationPreferences {
  * state). The notifications route also invokes this helper on its outgoing
  * payload so the unread counter stays in lockstep with the helper's
  * semantics.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Deduplicates by `id` when present (same `id` counted only once)
+ * - Notifications without `id` are counted individually
+ * - Supports both string and numeric `id` types
+ * - Only counts items where `read === false`
+ * - Function signature and counting logic are frozen
+ *
+ * @param notifications - Array of notification objects with `read` boolean
+ *                        and optional `id` field
+ * @returns Count of unique unread notifications
  */
 export function calculateUnreadCount(notifications: Array<{ id?: string | number, read: boolean }>): number {
   const uniqueIds = new Set<string | number>();
@@ -56,6 +83,40 @@ export function calculateUnreadCount(notifications: Array<{ id?: string | number
     }
   }
   return count;
+}
+
+interface NotificationsTelemetryEntry {
+  operation: "notification_feed";
+  status: "success" | "error";
+  duration_ms: number;
+  request_id?: string;
+  notification_count?: number;
+  unread_count?: number;
+  preferences_enabled?: number;
+  error?: string;
+}
+
+/** Emits low-cardinality feed telemetry without user or notification data. */
+export function logNotificationsTelemetry(entry: NotificationsTelemetryEntry): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    metric: "notification_preferences_and_unread_count",
+    ...entry,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
+    return;
+  }
+
+  const message =
+    `[notifications-telemetry] ${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+    `${logEntry.notification_count !== undefined ? ` notifications=${logEntry.notification_count}` : ""}` +
+    `${logEntry.unread_count !== undefined ? ` unread=${logEntry.unread_count}` : ""}` +
+    `${logEntry.preferences_enabled !== undefined ? ` preferences_enabled=${logEntry.preferences_enabled}` : ""}` +
+    `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+  (logEntry.level === "error" ? console.error : console.info)(message);
 }
 
 /**
@@ -130,49 +191,32 @@ function createTitleCache() {
 //   hasMore       — true when there are items beyond this page.
 //
 // Backward-compatibility rules:
-//   - All fields present in the original response (notifications, total,
-//     unreadCount) are frozen; existing callers depend on them.
-//   - limit, offset, hasMore are additive fields; callers that ignore unknown
-//     fields are unaffected.
+//   - All fields listed above are frozen; existing callers depend on them.
+//   - Field types cannot change (e.g., id is always string, read is always boolean).
+//   - New optional fields may be added to NotificationsResponse in the future.
 //   - Existing title/message strings for each eventType are stable.
 //   - The default limit (10) and the maximum (50) are frozen.
-//   - offset defaults to 0 and must be a non-negative integer; out-of-range
-//     values are rejected with 400 rather than silently clamped so callers
-//     discover pagination mistakes fast.
-//
-// Batching contract:
-//   Each data-source query fetches up to (limit + offset) rows. After the
-//   three sources are merged and sorted newest-first, the array is sliced
-//   from offset to offset+limit. This guarantees the merged pool is always
-//   large enough to satisfy any page within the documented limits without
-//   the per-source cap cutting the pool short.
+//   - Response envelope keys (notifications, total, unreadCount) cannot be renamed.
+//   - Notification item keys (id, title, message, read, date, type, txHash) cannot be renamed.
+//   - Sort order (newest-first by date) is frozen.
 // ---------------------------------------------------------------------------
 
-/** One item in the notifications payload. */
+/** One item in the notifications payload. All fields are required. */
 export interface NotificationItem {
   id: string;
   title: string;
   message: string;
   read: boolean;
-  date: string;
-  type: string;
+  date: string;     // ISO 8601 timestamp in UTC
+  type: string;     // Raw on-chain eventType
   txHash: string;
 }
 
 /** Top-level response envelope for GET /notifications/:user_address. */
 export interface NotificationsResponse {
   notifications: NotificationItem[];
-  total: number;
-  unreadCount: number;
-  /** Echoed limit (may differ from the request value if it was defaulted). */
-  limit: number;
-  /** Echoed offset (0 when omitted from the request). */
-  offset: number;
-  /**
-   * True when there are more notifications beyond this page. Clients should
-   * re-request with `offset += limit` to fetch the next page.
-   */
-  hasMore: boolean;
+  total: number;         // Length of notifications array
+  unreadCount: number;   // Count of items where read === false
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +251,8 @@ export const NOTIFICATIONS_MAX_LIMIT = 50;
 
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId: string | undefined = res.locals.requestId;
   try {
     const userAddress = StarknetAddress.parse(req.params.user_address);
 
@@ -345,24 +391,47 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       }),
     ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    // Determine whether more items exist beyond this page before slicing,
-    // so `hasMore` accurately reflects availability of a next page.
+    // Determine whether more items exist beyond this page before slicing.
+    // Strict greater-than is intentional: when `merged.length === offset + limit`
+    // the current page is exactly full but there are no further items, so
+    // `hasMore` must be `false`. Only when the pool contains at least one item
+    // beyond the current page boundary is `hasMore` set to `true`.
     const hasMore = merged.length > offset + limit;
     const rawNotifications = merged.slice(offset, offset + limit);
 
     // `unreadCount` flows through the exported helper so the response stays
-    // in lockstep with the helper's semantics; in practice every emitted
-    // notification has `read: false` set above, so the helper's filter pass
-    // coincides with `rawNotifications.length`.
+    // in lockstep with the helper's semantics. Because every notification
+    // emitted above sets `read: false`, the helper's dedup+filter pass always
+    // yields `rawNotifications.length` — the two values are kept in sync
+    // intentionally so that callers relying on either field see consistent data.
+    const unreadCount = calculateUnreadCount(rawNotifications);
+    const preferences = getDefaultNotificationPreferences();
+    logNotificationsTelemetry({
+      operation: "notification_feed",
+      status: "success",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      request_id: requestId,
+      notification_count: rawNotifications.length,
+      unread_count: unreadCount,
+      preferences_enabled: Object.values(preferences).filter(Boolean).length,
+    });
+
     res.json({
       notifications: rawNotifications,
       total: rawNotifications.length,
-      unreadCount: calculateUnreadCount(rawNotifications),
+      unreadCount,
       limit,
       offset,
       hasMore,
     });
-  } catch (e) {
-    next(e);
+  } catch (error) {
+    logNotificationsTelemetry({
+      operation: "notification_feed",
+      status: "error",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      request_id: requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    next(error);
   }
 });

@@ -140,6 +140,9 @@ vi.mock("drizzle-orm", () => ({
   or: orMock,
   lt: ltMock,
   isNotNull: isNotNullMock,
+  isNull: (col: string) => (row: any) => row[col] === null || row[col] === undefined,
+  and: (...fns: Array<(row: any) => boolean>) => (row: any) => fns.every((fn) => fn(row)),
+  inArray: (col: string, values: string[]) => (row: any) => values.includes(row[col]),
 }));
 
 import {
@@ -621,6 +624,10 @@ describe("sessions", () => {
     // would block forever waiting for the fake timer to advance. With real
     // timers the backoff is ~100ms total (2 retries × 50ms).
     vi.useRealTimers();
+    // Create + revoke a session so the sweep SELECT finds candidates;
+    // otherwise the new batched sweep short-circuits before reaching DELETE.
+    const a = await createSession("0xSweepFailA");
+    await revokeSession(a.token);
     const originalDelete = dbMock.delete;
     dbMock.delete = () => {
       throw new Error("synthetic DB failure");
@@ -1064,6 +1071,10 @@ describe("sessions", () => {
 
   it("returns 0 and emits session.sweep_failed after sweep retry exhaustion", async () => {
     vi.useRealTimers();
+    // Create + revoke a session so the sweep SELECT finds candidates;
+    // otherwise the new batched sweep short-circuits before reaching DELETE.
+    const a = await createSession("0xSweepPermA");
+    await revokeSession(a.token);
     const originalDelete = dbMock.delete;
     dbMock.delete = () => ({
       where: () => ({
@@ -1272,6 +1283,100 @@ describe("sessions", () => {
     } finally {
       dbMock.update = originalUpdate;
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Batching contract tests (issue #316): verify that large-volume operations
+  // are split across multiple bounded queries.
+  // ---------------------------------------------------------------------------
+
+  it("sweepExpiredSessions processes across multiple batches when entries exceed batch size", async () => {
+    // Create enough sessions so that sweeping requires multiple SELECT+DELETE
+    // cycles.  SESSION_SWEEP_BATCH_SIZE is 500; we create 501 revoked sessions
+    // plus 1 invalid session to stay under the "normal" COUNT.
+    const COUNT = 501;
+    for (let i = 0; i < COUNT; i++) {
+      const s = await createSession(`0xBatch${i}`);
+      await revokeSession(s.token);
+    }
+    // Also add an unreachable row (not revoked, not expired) that should
+    // survive the sweep unchanged.
+    const keep = await createSession("0xKeepAlive");
+
+    consoleInfoSpy.mockClear();
+    const deleted = await sweepExpiredSessions();
+    expect(deleted).toBe(COUNT);
+
+    // We expect at least 2 batches (501 / 500 = 2 with remainder).
+    const batchLogs = consoleInfoSpy.mock.calls.filter(([line]) =>
+      typeof line === "string" && line.includes("session.sweep_batch"),
+    );
+    expect(batchLogs.length).toBeGreaterThanOrEqual(2);
+
+    // The completed log must include a batches field.
+    const completed = consoleInfoSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("session.sweep_completed"),
+    );
+    expect(completed).toBeDefined();
+    expect(completed![0]).toContain("batches=");
+
+    // Survivor check: the unreachable row is still present in the mock store.
+    const survivor = mockState.sessions.find(
+      (r) => r.tokenHash === crypto.createHash("sha256").update(keep.token).digest("hex"),
+    );
+    expect(survivor).toBeDefined();
+    expect(survivor!.revokedAt).toBeNull();
+  });
+
+  it("revokeAllSessionsForAddress processes across multiple batches", async () => {
+    // Create more sessions for one address than SESSION_REVOKE_BATCH_SIZE (100).
+    const COUNT = 150;
+    const ADDR = "0xMultiBatchAddr";
+    const tokens: string[] = [];
+    for (let i = 0; i < COUNT; i++) {
+      const s = await createSession(ADDR);
+      tokens.push(s.token);
+    }
+
+    consoleInfoSpy.mockClear();
+    await revokeAllSessionsForAddress(ADDR);
+
+    // All sessions must be revoked.
+    for (const t of tokens) {
+      expect(await requireSession(ADDR, t)).toBe(false);
+    }
+
+    // The log must include batches > 1.
+    const revokedLog = consoleInfoSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("session.all_revoked"),
+    );
+    expect(revokedLog).toBeDefined();
+    expect(revokedLog![0]).toContain("batches=2");
+  });
+
+  it("revokeFamily processes across multiple batches", async () => {
+    // Create a family with multiple rotations to grow its size.
+    let { token, familyId } = await (async () => {
+      const s = await createSession("0xFamGrow");
+      const familyId = mockState.sessions[0].familyId;
+      return { token: s.token, familyId };
+    })();
+    // Rotate 101 times to create 102 tokens in the same family.
+    for (let i = 0; i < 101; i++) {
+      const result = await rotateSession("0xFamGrow", token);
+      if (result.ok) token = result.token;
+      else break;
+    }
+
+    consoleWarnSpy.mockClear();
+    await revokeFamily(familyId!);
+
+    const revokedLog = consoleWarnSpy.mock.calls.find(([line]) =>
+      typeof line === "string" && line.includes("session.family_revoked"),
+    );
+    expect(revokedLog).toBeDefined();
+    // Should process in at least 2 batches.
+    expect(revokedLog![0]).toContain("batches=");
   });
 
   // ---------------------------------------------------------------------------

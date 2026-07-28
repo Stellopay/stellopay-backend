@@ -902,5 +902,130 @@ describe("GET /events event-type and time-range filters", () => {
       expect(res.body.error).toBe("Validation failed");
       expect(res.body.details[0].message).toMatch(/from timestamp must be less than or equal to to timestamp/);
     });
+
+    it("accepts equal from and to timestamps (inclusive bounds)", async () => {
+      const timestamp = "2026-03-01T12:00:00Z";
+      const res = await request(makeApp()).get(`/events?from=${timestamp}&to=${timestamp}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toBeDefined();
+    });
+
+    it("supports contract_address filter (both snake_case and camelCase)", async () => {
+      const address = "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd";
+      const res1 = await request(makeApp()).get(`/events?contract_address=${address}`);
+      const res2 = await request(makeApp()).get(`/events?contractAddress=${address}`);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+    });
+
+    it("supports agreement_id filter (both snake_case and camelCase)", async () => {
+      const res1 = await request(makeApp()).get("/events?agreement_id=100");
+      const res2 = await request(makeApp()).get("/events?agreementId=100");
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – Envelope validation and error handling
+// ---------------------------------------------------------------------------
+
+describe("Envelope validation and error handling", () => {
+  function makeApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(eventsRouter);
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rewireDbInsert();
+  });
+
+  it("process_batch returns 400 when tx_hashes array is empty", async () => {
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [] });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("process_batch returns 400 when tx_hashes exceeds MAX_BATCH_SIZE", async () => {
+    const tooMany = Array.from({ length: 51 }, (_, i) => `0x${i.toString(16).padStart(4, "0")}`);
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: tooMany });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("process_batch returns 400 when tx_hashes is missing", async () => {
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({});
+
+    expect(res.status).toBe(400);
+  });
+
+  it("process_batch accepts exactly MAX_BATCH_SIZE hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const maxValid = Array.from({ length: 50 }, () => TX_A);
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: maxValid });
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary.total).toBe(50);
+  });
+
+  it("process_tx normalizes various hash formats consistently", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const variants = [
+      "0xaaaa",
+      "0xAAAA",
+      "0x000000000000000000000000000000000000000000000000000000000000aaaa",
+    ];
+
+    for (const variant of variants) {
+      const res = await request(makeApp()).post(`/events/process_tx/${variant}`).send();
+      expect(res.status).toBe(200);
+      expect(res.body.transactionHash).toBe(TX_A); // All normalize to TX_A
+    }
+  });
+
+  it("process_batch summary always satisfies: total = processed + noEvents + notFound + errors + duplicates", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any) // processed
+      .mockResolvedValueOnce(EMPTY_RECEIPT as any) // noEvents
+      .mockResolvedValueOnce(null as any); // notFound
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B, "0xcccc", TX_A] }); // last is duplicate
+
+    expect(res.status).toBe(200);
+    const { summary } = res.body;
+    expect(summary.total).toBe(
+      summary.processed + summary.noEvents + summary.notFound + summary.errors + summary.duplicates
+    );
+  });
+
+  it("process_tx returns consistent error shape on validation failure", async () => {
+    const res = await request(makeApp()).post("/events/process_tx/invalid-hash").send();
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(typeof res.body.error).toBe("string");
   });
 });

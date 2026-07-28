@@ -985,3 +985,12 @@ Redis via [`rate-limit-redis`](https://www.npmjs.com/package/rate-limit-redis)).
 to the `rateLimit` call inside the factory (see the marked `store` comment in
 [`src/middleware/rate-limit.ts`](src/middleware/rate-limit.ts)). No call sites
 change.
+
+### System Verification & Audit
+
+The codebase includes comprehensive verification patterns:
+- **Drizzle Foreign Key Index Consistency**: Automated checks in `src/db/schema-fk-indexes.ts` ensure all `*_id` foreign key columns are indexed.
+- **Address Normalization**: `normalizeStarknetAddress` enforces canonical 66-character lower-case hex format and SNIP-23 checksum validation.
+- **Starknet Failover**: `STARKNET_RPC_URL` supports comma-separated RPC endpoints with automatic failover.
+- **Auth Session Family Revocation**: Session token rotation with `familyId` revocation protects against refresh token replay attacks.
+

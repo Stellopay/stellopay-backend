@@ -1,6 +1,8 @@
 # Database Schema
 
-The database schema (`src/db/schema.ts`) is the single source of truth for tables, CHECK constraints, and FK relationships.
+> Source of truth: [`src/db/schema.ts`](../src/db/schema.ts). The Drizzle table
+> definitions, CHECK constraints, FK indexes, and runtime validation helpers
+> exported from that module drive every query, migration, and test.
 
 ## Constraints and Migration Safety
 - **Validation Handlers**: Schema check constraints are mirrored in runtime via validation helpers like `assertNonNegative` and `validateBatchSize`.

@@ -37,6 +37,7 @@ import { shortString } from "starknet";
 import { agreementContract, escrowContract, provider } from "../starknet/client.js";
 import { u256ToString, toHexString } from "../utils/codec.js";
 import { env } from "../config.js";
+import { NumericCursorSchema, loggedParse } from "../utils/validation.js";
 
 // ---------- validation ----------
 
@@ -742,14 +743,15 @@ readRouter.get("/records/cursor/:address", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
     const { cursor, order, limit } = CursorQuery.parse(req.query);
-    let parsedCursor: number | undefined;
 
+    // Validate the cursor format before it reaches any query-builder path.
+    // loggedParse throws a ValidationError (status 400) on malformed input,
+    // which the global error handler replays as a clean 400 with a structured
+    // error body — preventing a confusing 500 and blocking injection-adjacent
+    // payloads from reaching the database layer.
+    let parsedCursor: number | undefined;
     if (cursor !== undefined) {
-      const numericCursor = Number(cursor);
-      if (!Number.isInteger(numericCursor) || numericCursor <= 0) {
-        throw new Error("Invalid cursor");
-      }
-      parsedCursor = numericCursor;
+      parsedCursor = loggedParse(NumericCursorSchema, cursor, "records/cursor:cursor");
     }
 
     // explicit security boundary
@@ -778,9 +780,6 @@ readRouter.get("/records/cursor/:address", async (req, res, next) => {
       order,
     });
   } catch (e) {
-    if (e instanceof z.ZodError || (e instanceof Error && e.message === "Invalid cursor")) {
-      return res.status(500).json({ error: "Invalid cursor" });
-    }
     next(e);
   }
 });

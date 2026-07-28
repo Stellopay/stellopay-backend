@@ -39,6 +39,7 @@ import { eq, desc } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
 import { requireAuth } from "../auth/middleware.js";
+import { validateBillingRequest, isValidationError } from "../utils/validation.js";
 import {
   BILLING_METRICS,
   incBillingMetric,
@@ -249,6 +250,23 @@ function ok<T>(res: Response, data: T, status = 200): void {
 
 function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
+}
+
+/**
+ * Validates request currency and amount parameters at the start of a billing handler.
+ * Rejects invalid requests early with HTTP 400 before business logic.
+ */
+function runBillingValidation(req: Request, res: Response): boolean {
+  try {
+    validateBillingRequest(req);
+    return true;
+  } catch (err: any) {
+    if (isValidationError(err)) {
+      fail(res, err.status || 400, err.message);
+      return false;
+    }
+    throw err;
+  }
 }
 
 const BILLING_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -571,6 +589,7 @@ billingRouter.get(
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
+    if (!runBillingValidation(req, res)) return;
     const profileId: string = res.locals.profileId;
     const startedAt = Date.now();
 
@@ -660,6 +679,7 @@ billingRouter.get(
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
+    if (!runBillingValidation(req, res)) return;
     const profileId: string = res.locals.profileId;
 
     try {
@@ -714,6 +734,7 @@ billingRouter.get(
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
+    if (!runBillingValidation(req, res)) return;
     const profileId: string = res.locals.profileId;
 
     try {
@@ -769,6 +790,7 @@ billingRouter.get(
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
+    if (!runBillingValidation(req, res)) return;
     const profileId: string = res.locals.profileId;
     const startedAt = Date.now();
 
@@ -891,6 +913,7 @@ billingRouter.get(
   validateProfileId,
   requireBillingOwner,
   async (req: Request, res: Response) => {
+    if (!runBillingValidation(req, res)) return;
     const profileId: string = res.locals.profileId;
     const startedAt = Date.now();
 
