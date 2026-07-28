@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { normalizeStarknetAddress } from "./address.js";
+import { env } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -526,4 +527,165 @@ export function parsePagination(query: unknown): {
     limit: clampPaginationField(source.limit, DEFAULT_PAGE_LIMIT, 1, MAX_PAGE_LIMIT),
     offset: clampPaginationField(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Billing Request Validation
+// ---------------------------------------------------------------------------
+
+/** Supported currency codes for billing operations. */
+export const SUPPORTED_CURRENCIES = [
+  "USD",
+  "EUR",
+  "GBP",
+  "CAD",
+  "AUD",
+  "JPY",
+  "CHF",
+] as const;
+
+export type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
+
+/**
+ * Zod schema for currency code validation.
+ * Rejects unknown currencies, invalid formats, empty values, and incorrect casing.
+ */
+export const CurrencyCodeSchema = z
+  .string()
+  .trim()
+  .min(1, "Currency code is required")
+  .regex(/^[A-Z]{3}$/, "Invalid currency code format: must be 3 uppercase ASCII letters")
+  .superRefine((val, ctx) => {
+    if (!(SUPPORTED_CURRENCIES as readonly string[]).includes(val)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unsupported currency code '${val}'. Supported currencies: ${SUPPORTED_CURRENCIES.join(", ")}`,
+      });
+    }
+  });
+
+/**
+ * Factory function creating a Zod schema for billing amount validation.
+ * Rejects zero, negative values, null/undefined, NaN, and amounts exceeding maxAmount.
+ */
+export function createBillingAmountSchema(maxAmount: number = env.MAX_BILLING_AMOUNT) {
+  return z
+    .union([z.number(), z.string()])
+    .transform((val, ctx) => {
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (trimmed === "") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Billing amount is required",
+          });
+          return z.NEVER;
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Billing amount must be a valid finite number",
+          });
+          return z.NEVER;
+        }
+        return parsed;
+      }
+      if (typeof val === "number") {
+        if (!Number.isFinite(val)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Billing amount must be a valid finite number",
+          });
+          return z.NEVER;
+        }
+        return val;
+      }
+      return val;
+    })
+    .pipe(
+      z
+        .number()
+        .gt(0, "Billing amount must be greater than zero")
+        .max(maxAmount, `Billing amount exceeds maximum allowed limit of ${maxAmount}`)
+    );
+}
+
+/** Default BillingAmountSchema using configured MAX_BILLING_AMOUNT. */
+export const BillingAmountSchema = createBillingAmountSchema();
+
+export interface BillingInput {
+  currency?: unknown;
+  amount?: unknown;
+}
+
+export interface BillingValidationOptions {
+  requireCurrency?: boolean;
+  requireAmount?: boolean;
+  maxAmount?: number;
+}
+
+/**
+ * Centralized, reusable billing input validator.
+ * Validates currency code and billing amount against supported rules.
+ */
+export function validateBillingInput(
+  input: BillingInput,
+  options: BillingValidationOptions = {}
+): { currency?: string; amount?: number } {
+  const {
+    requireCurrency = false,
+    requireAmount = false,
+    maxAmount = env.MAX_BILLING_AMOUNT,
+  } = options;
+
+  const result: { currency?: string; amount?: number } = {};
+
+  // Currency validation
+  if (input.currency !== undefined && input.currency !== null && input.currency !== "") {
+    result.currency = loggedParse(
+      CurrencyCodeSchema,
+      input.currency,
+      "BillingCurrencyValidator"
+    );
+  } else if (requireCurrency) {
+    loggedParse(
+      CurrencyCodeSchema,
+      input.currency,
+      "BillingCurrencyValidator"
+    );
+  }
+
+  // Amount validation
+  if (input.amount !== undefined && input.amount !== null && input.amount !== "") {
+    const amountSchema = createBillingAmountSchema(maxAmount);
+    result.amount = loggedParse(
+      amountSchema,
+      input.amount,
+      "BillingAmountValidator"
+    );
+  } else if (requireAmount) {
+    const amountSchema = createBillingAmountSchema(maxAmount);
+    loggedParse(
+      amountSchema,
+      input.amount,
+      "BillingAmountValidator"
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Helper to extract and validate billing input from an Express Request object.
+ */
+export function validateBillingRequest(
+  req: { query?: Record<string, unknown>; body?: Record<string, unknown> },
+  options: BillingValidationOptions = {}
+): { currency?: string; amount?: number } {
+  const input: BillingInput = {
+    currency: req.query?.currency ?? req.body?.currency,
+    amount: req.query?.amount ?? req.body?.amount,
+  };
+  return validateBillingInput(input, options);
 }
