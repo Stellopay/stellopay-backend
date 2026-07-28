@@ -3,12 +3,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 /**
  * config.ts parses process.env once at import time, so each case patches
  * process.env and re-imports a fresh copy with vi.resetModules for a
- * deterministic parse. A valid STARKNET_RPC_URL is always required, so it is
- * part of the base env.
+ * deterministic parse. A valid STARKNET_RPC_URL and POSTGRES_CONNECTION_STRING
+ * are always required, so they are part of the base env.
  */
 const BASE_ENV: Record<string, string> = {
   STARKNET_RPC_URL: "https://rpc.test.invalid",
-  POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
+  POSTGRES_CONNECTION_STRING:
+    "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
 };
 
 const ORIGINAL_ENV = process.env;
@@ -31,7 +32,7 @@ async function loadConfig(extra: Record<string, string> = {}) {
 }
 
 describe("config env parsing", () => {
-  it("applies defaults and coercions when only STARKNET_RPC_URL is set", async () => {
+  it("applies defaults and coercions when only required vars are set", async () => {
     const { env } = await loadConfig();
     expect(env.PORT).toBe(4000);
     // In development (the default NODE_ENV), CORS_ORIGIN falls back to "*".
@@ -71,7 +72,9 @@ describe("config env parsing", () => {
   });
 
   it("rejects a non-positive token metadata cache TTL", async () => {
-    await expect(loadConfig({ TOKEN_METADATA_CACHE_TTL_MS: "0" })).rejects.toThrow();
+    await expect(
+      loadConfig({ TOKEN_METADATA_CACHE_TTL_MS: "0" }),
+    ).rejects.toThrow();
   });
 
   it("treats BILLING_ENABLED 'true' as true", async () => {
@@ -85,18 +88,15 @@ describe("config env parsing", () => {
   });
 
   it("rejects an invalid CONTACT_RECIPIENT_EMAIL", async () => {
-    await expect(loadConfig({ CONTACT_RECIPIENT_EMAIL: "not-an-email" })).rejects.toThrow();
-  });
-
-  it("throws when the required STARKNET_RPC_URL is missing", async () => {
-    vi.resetModules();
-    process.env = {}; // no STARKNET_RPC_URL
-    await expect(import("./config")).rejects.toThrow();
+    await expect(
+      loadConfig({ CONTACT_RECIPIENT_EMAIL: "not-an-email" }),
+    ).rejects.toThrow();
   });
 
   it("parses comma-separated Starknet RPC URLs into starknetRpcUrls", async () => {
     const { starknetRpcUrls } = await loadConfig({
-      STARKNET_RPC_URL: "https://primary.example/rpc,https://backup.example/rpc",
+      STARKNET_RPC_URL:
+        "https://primary.example/rpc,https://backup.example/rpc",
     });
     expect(starknetRpcUrls).toEqual([
       "https://primary.example/rpc",
@@ -128,9 +128,12 @@ describe("config env parsing", () => {
   });
 
   it("throws in production when ABI paths are unset, so the guard cannot be bypassed", async () => {
-    await expect(loadConfig({ NODE_ENV: "production", CORS_ORIGIN: "https://app.example.com" })).rejects.toThrow(
-      /must be set in production/i,
-    );
+    await expect(
+      loadConfig({
+        NODE_ENV: "production",
+        CORS_ORIGIN: "https://app.example.com",
+      }),
+    ).rejects.toThrow(/must be set in production/i);
   });
 
   it("uses provided escrow and agreement addresses when set", async () => {
@@ -182,8 +185,113 @@ describe("config env parsing", () => {
   });
 
   it("non-dev staging: throws when CORS_ORIGIN is absent", async () => {
-    await expect(
-      loadConfig({ NODE_ENV: "staging" }),
-    ).rejects.toThrow(/CORS_ORIGIN/i);
+    await expect(loadConfig({ NODE_ENV: "staging" })).rejects.toThrow(
+      /CORS_ORIGIN/i,
+    );
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Missing required variable validation
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("missing required variable validation", () => {
+  let originalEnv: typeof process.env;
+
+  beforeEach(() => {
+    originalEnv = process.env;
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.resetModules();
+  });
+
+  /**
+   * Helper that imports config with the given env, expecting it to throw.
+   * Returns the error message for assertion.
+   */
+  async function importAndCatch(
+    env: Record<string, string>,
+  ): Promise<string> {
+    vi.resetModules();
+    process.env = env;
+    try {
+      await import("./config");
+      throw new Error("Expected config import to throw but it did not");
+    } catch (e: unknown) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  it("throws a single error when one required var is missing and names it", async () => {
+    const msg = await importAndCatch({
+      // POSTGRES_CONNECTION_STRING present, STARKNET_RPC_URL missing
+      POSTGRES_CONNECTION_STRING:
+        "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
+    });
+
+    expect(msg).toContain("Invalid environment configuration");
+    expect(msg).toContain("STARKNET_RPC_URL");
+    expect(msg).toContain("missing (required)");
+  });
+
+  it("throws a single error listing all missing required vars when multiple are missing", async () => {
+    const msg = await importAndCatch({}); // neither required var set
+
+    expect(msg).toContain("Invalid environment configuration");
+    expect(msg).toContain("STARKNET_RPC_URL");
+    expect(msg).toContain("POSTGRES_CONNECTION_STRING");
+    // Both should be listed in one message
+    expect(msg).toContain("missing (required)");
+    // Verify both appear: count occurrences of "missing (required)"
+    const missingCount = (msg.match(/missing \(required\)/g) ?? []).length;
+    expect(missingCount).toBe(2);
+  });
+
+  it("does NOT log the values of env vars — only names", async () => {
+    const msg = await importAndCatch({
+      STARKNET_RPC_URL: "", // empty string is invalid (min 1)
+      POSTGRES_CONNECTION_STRING: "not-a-url", // invalid URL
+    });
+
+    // Should mention the variable names
+    expect(msg).toContain("STARKNET_RPC_URL");
+    expect(msg).toContain("POSTGRES_CONNECTION_STRING");
+
+    // Should NOT contain the actual values
+    expect(msg).not.toContain("not-a-url");
+    // Zod's "String must contain at least 1 character(s)" is fine — it doesn't leak the empty string
+  });
+
+  it("lists all missing required vars in a single error message", async () => {
+    const msg = await importAndCatch({
+      NODE_ENV: "production",
+      // STARKNET_RPC_URL and POSTGRES_CONNECTION_STRING both missing
+    });
+
+    expect(msg).toContain("Invalid environment configuration");
+    expect(msg).toContain("STARKNET_RPC_URL");
+    expect(msg).toContain("POSTGRES_CONNECTION_STRING");
+    // The CORS_ORIGIN superRefine only runs when the base object validation
+    // passes, so it won't appear alongside missing required vars. It will be
+    // reported separately once the operator fixes STARKNET_RPC_URL and
+    // POSTGRES_CONNECTION_STRING.
+  });
+
+  it("only the CORS_ORIGIN issue is reported when required vars are set in non-dev", async () => {
+    const msg = await importAndCatch({
+      NODE_ENV: "production",
+      STARKNET_RPC_URL: "https://rpc.test.invalid",
+      POSTGRES_CONNECTION_STRING:
+        "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
+      // CORS_ORIGIN is missing
+    });
+
+    expect(msg).toContain("Invalid environment configuration");
+    expect(msg).not.toContain("STARKNET_RPC_URL");
+    expect(msg).not.toContain("POSTGRES_CONNECTION_STRING");
+    expect(msg).toContain("CORS_ORIGIN");
   });
 });
