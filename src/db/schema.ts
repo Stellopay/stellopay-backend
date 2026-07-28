@@ -148,9 +148,11 @@ export function isValidNonNegativeInteger(value: number): boolean {
  */
 export function assertNonNegative(value: number, name: string): void {
   if (typeof value !== "number" || !Number.isInteger(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "not_an_integer" });
     throw new RangeError(`${name} must be a non-negative integer, got ${value}`);
   }
   if (value < 0) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "negative_value" });
     throw new RangeError(`${name} must be non-negative, got ${value}`);
   }
 }
@@ -164,6 +166,7 @@ export function assertNonNegative(value: number, name: string): void {
  */
 export function assertValidU256(value: string, name: string): void {
   if (!U256_DECIMAL_PATTERN.test(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidU256", name, value, reason: "invalid_format" });
     throw new RangeError(
       `${name} must be a valid u256 decimal string (0 or positive integer up to 78 digits), got "${value}"`,
     );
@@ -229,7 +232,7 @@ export const agreementEvents = pgTable(
   "agreement_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // AgreementCreated, AgreementActivated, etc.
     blockNumber: bigint("block_number", { mode: "number" }).notNull(),
@@ -258,7 +261,7 @@ export const payments = pgTable(
   "payments",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     from: text("from_address").notNull(),
     to: text("to_address").notNull(),
@@ -291,7 +294,7 @@ export const milestones = pgTable(
   "milestones",
   {
     id: text("id").primaryKey(), // agreement_id + milestone_id
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     milestoneId: integer("milestone_id").notNull(),
     amount: text("amount").notNull(), // u256 as string
@@ -320,7 +323,7 @@ export const employees = pgTable(
   "employees",
   {
     id: text("id").primaryKey(), // agreement_id + employee_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     employeeAddress: text("employee_address").notNull(),
     employeeIndex: integer("employee_index").notNull(),
@@ -352,7 +355,7 @@ export const escrowEvents = pgTable(
   "escrow_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // Funded, Released, Refunded
     employer: text("employer").notNull(),
@@ -458,7 +461,9 @@ export const billingPaymentMethods = pgTable(
   "billing_payment_methods",
   {
     id: text("id").primaryKey(),
-    profileId: text("profile_id").notNull(), // → billingProfiles.id
+    profileId: text("profile_id").notNull().references(() => billingProfiles.id, {
+      onDelete: "cascade",
+    }),
     type: text("type").notNull(), // bank_account | paypal | crypto | etc.
     // Masked / safe-to-store fields only
     displayName: text("display_name"), // e.g. "Chase ****1234"
@@ -485,7 +490,9 @@ export const billingInvoices = pgTable(
   "billing_invoices",
   {
     id: text("id").primaryKey(),
-    profileId: text("profile_id").notNull(), // → billingProfiles.id
+    profileId: text("profile_id").notNull().references(() => billingProfiles.id, {
+      onDelete: "cascade",
+    }),
     invoiceNumber: text("invoice_number").notNull().unique(),
     amount: numeric("amount", { precision: 18, scale: 6 }).notNull(),
     currency: text("currency").notNull().default("USD"),
@@ -511,6 +518,44 @@ export const billingInvoices = pgTable(
   }),
 );
 
+
+// ---------------------------------------------------------------------------
+// Backfill Progress
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks the progress of backfill jobs. Each row represents one backfill job
+ * type (employee-events, milestone-events) and stores the last checkpoint,
+ * totals, and status for resume-after-crash semantics.
+ */
+export const backfillProgress = pgTable(
+  "backfill_progress",
+  {
+    jobName: text("job_name").primaryKey(),
+    status: text("status").notNull().default("idle"),
+    lastCursor: timestamp("last_cursor"),
+    totalScanned: integer("total_scanned").notNull().default(0),
+    totalCreated: integer("total_created").notNull().default(0),
+    lastError: text("last_error"),
+    startedAt: timestamp("started_at"),
+    completedAt: timestamp("completed_at"),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    statusCheck: check(
+      "backfill_progress_status_check",
+      sql`${table.status} IN ('idle', 'running', 'completed', 'failed')`,
+    ),
+    totalScannedCheck: check(
+      "backfill_progress_total_scanned_check",
+      sql`${table.totalScanned} >= 0`,
+    ),
+    totalCreatedCheck: check(
+      "backfill_progress_total_created_check",
+      sql`${table.totalCreated} >= 0`,
+    ),
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // Pagination & Batching Constants
@@ -561,6 +606,7 @@ export function clampBatchSize(requested: number): number {
  */
 export function validateBatchSize(requested: number, name?: string): number {
   if (!Number.isInteger(requested) || requested <= 0 || requested > MAX_BATCH_SIZE) {
+    console.error({ event: "schema_validation_failed", check: "validateBatchSize", name, value: requested, max: MAX_BATCH_SIZE });
     throw new RangeError(
       `${name ?? "batchSize"} must be an integer between 1 and ${MAX_BATCH_SIZE}, got ${requested}`,
     );
@@ -621,5 +667,6 @@ export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any>
   { name: "billingPaymentMethods", table: billingPaymentMethods },
   { name: "billingInvoices", table: billingInvoices },
   { name: "sessions", table: sessions },
+  { name: "backfillProgress", table: backfillProgress },
 ];
 

@@ -118,7 +118,12 @@ function makeApp() {
   app.use(express.json());
   app.use("/api/v1", authRouter);
   app.use((err: any, _req: any, res: any, _next: any) => {
-    res.status(err.status || 500).json({ error: err.message });
+    if (err && err.name === "ZodError") {
+      res.status(400).json({ error: "Validation failed", details: err.issues });
+    } else {
+      console.error("Test Error Handler 500:", err);
+      res.status(err.status || 500).json({ error: err.message });
+    }
   });
   return app;
 }
@@ -1038,5 +1043,35 @@ describe("debug middleware body-clone guard", () => {
     expect(bodyArg.body.session_token).not.toBe("supersecrettoken1234");
 
     spy.mockRestore();
+  });
+
+  describe("Harden login input validation", () => {
+    it("rejects extremely long addresses", async () => {
+      const appInstance = makeApp();
+      
+      const longRes = await request(appInstance)
+        .post("/api/v1/auth/challenge")
+        .send({ address: "0x" + "a".repeat(200) });
+      expect(longRes.status).toBe(400);
+      expect(longRes.body.error).toBe("Validation failed");
+    });
+
+    it("rejects malformed token_hash", async () => {
+      const appInstance = makeApp();
+      const res = await request(appInstance)
+        .post("/api/v1/auth/session/revoke")
+        .set("x-user-address", "0xabc")
+        .set("Authorization", "Bearer something")
+        .send({ token_hash: "invalid-hash-length" });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects signature array with too many elements", async () => {
+      const appInstance = makeApp();
+      const res = await request(appInstance)
+        .post("/api/v1/auth/verify")
+        .send({ address: "0xabc", signature: new Array(15).fill("0x123") });
+      expect(res.status).toBe(400);
+    });
   });
 });

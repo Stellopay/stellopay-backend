@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import request from "supertest";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ZodError } from "zod";
@@ -14,7 +14,7 @@ vi.mock("../auth/session.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  env: { ADMIN_ADDRESSES: [ADMIN_ADDRESS] },
+  env: { ADMIN_ADDRESSES: [ADMIN_ADDRESS], INDEXED_CACHE_MAX_AGE_SECONDS: 12, LOG_FORMAT: "json", LOG_LEVEL: "info" },
   defaults: {
     workAgreementAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
     payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
@@ -96,6 +96,13 @@ import {
   authorizeIndexedFreshness,
   INDEXED_DATA_SOURCE,
   MAX_INTERNAL_LIMIT,
+  MAX_ESCROW_EVENTS_LIMIT,
+  INDEXED_OPS,
+  INDEXED_METRICS,
+  logIndexedEvent,
+  incIndexedMetric,
+  getIndexedMetricsSnapshot,
+  resetIndexedMetrics,
 } from "./indexed";
 import { defaults } from "../config.js";
 
@@ -127,6 +134,8 @@ beforeEach(() => {
   offsetSpy.mockClear();
   state.rows = {};
   callOrder.length = 0;
+  resetIndexedMetrics();
+  vi.restoreAllMocks();
 });
 
 describe("indexer freshness and sync checkpoint authorization boundary", () => {
@@ -205,6 +214,78 @@ describe("indexer freshness and sync checkpoint authorization boundary", () => {
   it("exports authorizeIndexedFreshness middleware array", () => {
     expect(Array.isArray(authorizeIndexedFreshness)).toBe(true);
     expect(authorizeIndexedFreshness.length).toBe(2);
+  });
+});
+
+describe("/indexed/freshness vs /indexed/checkpoint differentiation", () => {
+  it("/indexed/freshness includes freshness field in the response body", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 100 }];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("freshness");
+    expect(res.body.freshness).toBe("synced");
+  });
+
+  it("/indexed/checkpoint omits freshness field in the response body", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 100 }];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/checkpoint")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty("freshness");
+    expect(res.body.source).toBe(INDEXED_DATA_SOURCE);
+    expect(res.body.checkpointBlock).toBe(100);
+  });
+
+  it("both endpoints set the x-indexer-sync-checkpoint header", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 42 }];
+
+    const [resFreshness, resCheckpoint] = await Promise.all([
+      request(makeApp())
+        .get("/api/v1/indexed/freshness")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+      request(makeApp())
+        .get("/api/v1/indexed/checkpoint")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+    ]);
+
+    expect(resFreshness.headers["x-indexer-sync-checkpoint"]).toBe("42");
+    expect(resCheckpoint.headers["x-indexer-sync-checkpoint"]).toBe("42");
+  });
+
+  it("boundary: returns freshness=empty and checkpointBlock=0 when no records exist", async () => {
+    state.rows.agreementEvents = [];
+
+    const [resFreshness, resCheckpoint] = await Promise.all([
+      request(makeApp())
+        .get("/api/v1/indexed/freshness")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+      request(makeApp())
+        .get("/api/v1/indexed/checkpoint")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`),
+    ]);
+
+    expect(resFreshness.status).toBe(200);
+    expect(resFreshness.body.freshness).toBe("empty");
+    expect(resFreshness.body.checkpointBlock).toBe(0);
+    expect(resFreshness.headers["x-indexer-sync-checkpoint"]).toBe("0");
+
+    expect(resCheckpoint.status).toBe(200);
+    expect(resCheckpoint.body.checkpointBlock).toBe(0);
+    expect(resCheckpoint.body).not.toHaveProperty("freshness");
+    expect(resCheckpoint.headers["x-indexer-sync-checkpoint"]).toBe("0");
   });
 });
 
@@ -360,6 +441,7 @@ describe("indexer freshness and sync checkpoint helpers", () => {
   it("exposes expected indexer contract constants", () => {
     expect(INDEXED_DATA_SOURCE).toBe("indexed");
     expect(MAX_INTERNAL_LIMIT).toBe(200);
+    expect(MAX_ESCROW_EVENTS_LIMIT).toBe(500);
   });
 
   describe("deriveSyncCheckpoint", () => {
@@ -395,6 +477,20 @@ describe("indexer freshness and sync checkpoint helpers", () => {
         { blockNumber: null },
       ];
       expect(deriveSyncCheckpoint(records)).toBe(12345);
+    });
+
+    it("idempotency: same input produces identical output on repeated calls", () => {
+      const records = [
+        { blockNumber: 10 },
+        { blockNumber: 20 },
+        { blockNumber: 30 },
+      ];
+      const first = deriveSyncCheckpoint(records);
+      const second = deriveSyncCheckpoint(records);
+      const third = deriveSyncCheckpoint([...records]);
+      expect(first).toBe(30);
+      expect(second).toBe(first);
+      expect(third).toBe(first);
     });
   });
 
@@ -442,5 +538,334 @@ describe("indexer freshness and sync checkpoint helpers", () => {
       expect(res.status).toBe(200);
       expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
     });
+  });
+
+  describe("idempotency of indexed routes", () => {
+    it("idempotency: repeated GET /indexed/freshness returns identical body for same DB state", async () => {
+      state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+      const opts = () =>
+        request(makeApp())
+          .get("/api/v1/indexed/freshness")
+          .set("x-user-address", ADMIN_ADDRESS)
+          .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+
+    it("idempotency: repeated GET /indexed/checkpoint returns identical body for same DB state", async () => {
+      state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+      const opts = () =>
+        request(makeApp())
+          .get("/api/v1/indexed/checkpoint")
+          .set("x-user-address", ADMIN_ADDRESS)
+          .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Observability tests (Issue #250)
+// ---------------------------------------------------------------------------
+
+describe("logIndexedEvent", () => {
+  it("emits JSON to stdout when LOG_FORMAT is json", async () => {
+    // In the test environment, the mocked config has LOG_FORMAT: "json",
+    // so logIndexedEvent should emit JSON by default.
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    logIndexedEvent("info", "test.op", { foo: "bar" });
+
+    expect(spy).toHaveBeenCalled();
+    const logged = JSON.parse(spy.mock.calls[spy.mock.calls.length - 1][0]);
+    expect(logged.level).toBe("info");
+    expect(logged.op).toBe("test.op");
+    expect(logged.foo).toBe("bar");
+    expect(logged.timestamp).toBeDefined();
+  });
+
+  it("uses console.error for error level", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    logIndexedEvent("error", "test.op", { error: "boom" });
+
+    expect(spy).toHaveBeenCalled();
+    const logged = JSON.parse(spy.mock.calls[spy.mock.calls.length - 1][0]);
+    expect(logged.level).toBe("error");
+    expect(logged.error).toBe("boom");
+  });
+});
+
+describe("incIndexedMetric / getIndexedMetricsSnapshot / resetIndexedMetrics", () => {
+  it("increments a counter and returns snapshot", () => {
+    incIndexedMetric("my_counter");
+    incIndexedMetric("my_counter");
+    incIndexedMetric("other", 5);
+
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot.my_counter).toBe(2);
+    expect(snapshot.other).toBe(5);
+  });
+
+  it("creates counter on first write", () => {
+    const snapshot1 = getIndexedMetricsSnapshot();
+    expect(snapshot1.brand_new).toBeUndefined();
+
+    incIndexedMetric("brand_new", 3);
+    expect(getIndexedMetricsSnapshot().brand_new).toBe(3);
+  });
+
+  it("resetIndexedMetrics clears all counters", () => {
+    incIndexedMetric("a", 10);
+    incIndexedMetric("b", 20);
+    resetIndexedMetrics();
+
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot.a).toBeUndefined();
+    expect(snapshot.b).toBeUndefined();
+  });
+
+  it("returns a shallow copy (mutations do not affect internal state)", () => {
+    incIndexedMetric("protected", 1);
+    const snapshot = getIndexedMetricsSnapshot();
+    snapshot.protected = 999;
+
+    expect(getIndexedMetricsSnapshot().protected).toBe(1);
+  });
+});
+
+describe("observability constants", () => {
+  it("INDEXED_OPS covers all six route handlers", () => {
+    expect(INDEXED_OPS.FRESHNESS).toBe("indexed.freshness");
+    expect(INDEXED_OPS.CHECKPOINT).toBe("indexed.checkpoint");
+    expect(INDEXED_OPS.AGREEMENTS_FOR_USER).toBe("indexed.agreements_for_user");
+    expect(INDEXED_OPS.AGREEMENT_DETAIL).toBe("indexed.agreement_detail");
+    expect(INDEXED_OPS.PAYMENTS_FOR_USER).toBe("indexed.payments_for_user");
+    expect(INDEXED_OPS.ESCROW_BALANCE).toBe("indexed.escrow_balance");
+  });
+
+  it("INDEXED_METRICS has the expected counter names", () => {
+    expect(INDEXED_METRICS.REQUESTS).toBe("indexed_requests_total");
+    expect(INDEXED_METRICS.ROWS_FOUND).toBe("indexed_rows_found_total");
+    expect(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED).toBe("indexed_sync_checkpoint_observed_total");
+    expect(INDEXED_METRICS.ERRORS).toBe("indexed_errors_total");
+  });
+});
+
+describe("route handler metric integration", () => {
+  it("increments REQUESTS counter on agreements-for-user", async () => {
+    state.rows.agreements = [{ id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
+    await request(makeApp()).get(
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+    );
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot[INDEXED_METRICS.REQUESTS]).toBe(1);
+  });
+
+  it("increments ROWS_FOUND when agreements are returned", async () => {
+    state.rows.agreements = [{ id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
+    await request(makeApp()).get(
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+    );
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot[INDEXED_METRICS.ROWS_FOUND]).toBe(1);
+  });
+
+  it("increments REQUESTS on agreement detail", async () => {
+    state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
+    state.rows.agreementEvents = [];
+    state.rows.payments = [];
+    state.rows.milestones = [];
+    state.rows.employees = [];
+    state.rows.escrowEvents = [];
+    await request(makeApp()).get(
+      `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+    );
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot[INDEXED_METRICS.REQUESTS]).toBe(1);
+  });
+
+  it("increments REQUESTS on payments-for-user", async () => {
+    state.rows.payments = [{ blockNumber: 100 }];
+    await request(makeApp()).get(`/api/v1/indexed/payments/user/${VALID}`);
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot[INDEXED_METRICS.REQUESTS]).toBe(1);
+  });
+
+  it("increments REQUESTS on escrow-balance", async () => {
+    state.rows.escrowEvents = [{ eventType: "Funded", amount: "500" }];
+    await request(makeApp()).get(
+      `/api/v1/indexed/escrow/${defaults.payrollEscrowAddress}/balance/7`
+    );
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot[INDEXED_METRICS.REQUESTS]).toBe(1);
+  });
+});
+
+describe("sync checkpoint logging integration", () => {
+  it("emits a structured log with syncCheckpoint > 0 on agreements-for-user", async () => {
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    state.rows.agreements = [{ id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 42 }];
+
+    await request(makeApp()).get(
+      `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+    );
+
+    expect(spy).toHaveBeenCalled();
+    const lastCall = spy.mock.calls[spy.mock.calls.length - 1];
+    const logged = JSON.parse(lastCall[0]);
+    expect(logged.op).toBe(INDEXED_OPS.AGREEMENTS_FOR_USER);
+    expect(logged.syncCheckpoint).toBe(42);
+    expect(logged.durationMs).toBeGreaterThanOrEqual(0);
+    expect(logged.httpStatus).toBe(200);
+  });
+
+  it("emits a structured log with sub-resource counts on agreement detail", async () => {
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date() }];
+    state.rows.agreementEvents = [{ id: "e1", blockNumber: 300 }];
+    state.rows.payments = [{ id: "p1", blockNumber: 200 }];
+    state.rows.milestones = [{ id: "m1" }];
+    state.rows.employees = [{ id: "emp1" }];
+    state.rows.escrowEvents = [{ id: "x1", blockNumber: 250 }];
+
+    await request(makeApp()).get(
+      `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+    );
+
+    expect(spy).toHaveBeenCalled();
+    const lastCall = spy.mock.calls[spy.mock.calls.length - 1];
+    const logged = JSON.parse(lastCall[0]);
+    expect(logged.op).toBe(INDEXED_OPS.AGREEMENT_DETAIL);
+    expect(logged.syncCheckpoint).toBe(300);
+    expect(logged.eventsCount).toBe(1);
+    expect(logged.paymentsCount).toBe(1);
+    expect(logged.employeesCount).toBe(1);
+    expect(logged.escrowEventsCount).toBe(1);
+  });
+
+  it("emits a structured log on payments-for-user with sync checkpoint", async () => {
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    state.rows.payments = [{ blockNumber: 555 }];
+
+    await request(makeApp()).get(`/api/v1/indexed/payments/user/${VALID}`);
+
+    expect(spy).toHaveBeenCalled();
+    const lastCall = spy.mock.calls[spy.mock.calls.length - 1];
+    const logged = JSON.parse(lastCall[0]);
+    expect(logged.op).toBe(INDEXED_OPS.PAYMENTS_FOR_USER);
+    expect(logged.syncCheckpoint).toBe(555);
+  });
+
+  it("emits a structured log on escrow-balance with events count", async () => {
+    const spy = vi.spyOn(console, "info").mockImplementation(() => {});
+    state.rows.escrowEvents = [
+      { eventType: "Funded", amount: "1000", blockNumber: 10 },
+      { eventType: "Released", amount: "200", blockNumber: 20 },
+    ];
+
+    await request(makeApp()).get(
+      `/api/v1/indexed/escrow/${defaults.payrollEscrowAddress}/balance/7`
+    );
+
+    expect(spy).toHaveBeenCalled();
+    const lastCall = spy.mock.calls[spy.mock.calls.length - 1];
+    const logged = JSON.parse(lastCall[0]);
+    expect(logged.op).toBe(INDEXED_OPS.ESCROW_BALANCE);
+    expect(logged.syncCheckpoint).toBe(20);
+    expect(logged.eventsCount).toBe(2);
+    expect(logged.balance).toBe("800");
+  });
+});
+
+describe("error path observability", () => {
+  it("increments ERRORS counter when db query throws on payments route", async () => {
+    // Save the original select mock.
+    // NOTE: This couples to the hoisted mock's internal shape — if the mock
+    // structure changes, this test will need updating.
+    const origSelect = (dbMock as any).select;
+
+    // Make the db mock throw on the next query chain.
+    (dbMock as any).select = () => ({
+      from: () => ({
+        where: () => ({
+          orderBy: () => ({
+            limit: () => ({
+              offset: () => ({
+                then: (_resolve: any, reject: any) => reject(new Error("DB connection lost")),
+              }),
+            }),
+          }),
+        }),
+      }),
+    });
+
+    try {
+      const res = await request(makeApp()).get(`/api/v1/indexed/payments/user/${VALID}`);
+      expect(res.status).toBe(500);
+    } finally {
+      // Restore original mock
+      (dbMock as any).select = origSelect;
+    }
+
+    const snapshot = getIndexedMetricsSnapshot();
+    expect(snapshot[INDEXED_METRICS.ERRORS]).toBe(1);
+    expect(snapshot[INDEXED_METRICS.REQUESTS]).toBe(1);
+  });
+
+  it("emits an error-level log when a route throws", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Save the original select mock.
+    // NOTE: Coupled to hoisted mock shape — see note above.
+    const origSelect = (dbMock as any).select;
+
+    (dbMock as any).select = () => ({
+      from: () => ({
+        where: () => ({
+          orderBy: () => ({
+            limit: () => ({
+              offset: () => ({
+                then: (_resolve: any, reject: any) => reject(new Error("DB boom")),
+              }),
+            }),
+          }),
+        }),
+      }),
+    });
+
+    try {
+      await request(makeApp()).get(`/api/v1/indexed/payments/user/${VALID}`);
+    } finally {
+      (dbMock as any).select = origSelect;
+    }
+
+    expect(spy).toHaveBeenCalled();
+    const lastCall = spy.mock.calls[spy.mock.calls.length - 1];
+    const logged = JSON.parse(lastCall[0]);
+    expect(logged.level).toBe("error");
+    expect(logged.error).toBe("DB boom");
+    expect(logged.httpStatus).toBe(500);
+  });
+
+  it("does NOT increment ERRORS on 404 agreement-not-found", async () => {
+    state.rows.agreements = [];
+    const res = await request(makeApp()).get(
+      `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/99`
+    );
+    expect(res.status).toBe(404);
+    // 404 is not a server error — ERRORS metric must remain untouched.
+    expect(getIndexedMetricsSnapshot()[INDEXED_METRICS.ERRORS]).toBeUndefined();
   });
 });

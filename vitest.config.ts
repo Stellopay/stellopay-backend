@@ -12,9 +12,7 @@ export default defineConfig({
       NODE_ENV: "test",
       CORS_ORIGIN: "http://localhost:3000",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
-      CORS_ORIGIN: "http://localhost:3000",
       POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
-      CORS_ORIGIN: "http://localhost:3000",
     },
     coverage: {
       provider: "v8",
@@ -34,6 +32,7 @@ export default defineConfig({
         "src/utils/token-formatting.ts",
         "src/utils/validation.ts",
         "src/shutdown.ts",
+        "src/starknet/agreement-index.ts",
         "scripts/check-env-sync.ts",
         "scripts/lint-migrations.ts",
       ],
