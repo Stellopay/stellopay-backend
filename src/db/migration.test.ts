@@ -377,6 +377,48 @@ describe("schema check constraints", () => {
         expect(() => validateBatchSize(999)).toThrow("999");
       });
     });
+
+    describe("security boundary - sensitive billing fields", () => {
+      it("defines SENSITIVE_BILLING_FIELDS containing exactly taxId and dateOfBirth", () => {
+        expect(schema.SENSITIVE_BILLING_FIELDS).toEqual(["taxId", "dateOfBirth"]);
+      });
+
+      it("verifies sensitive fields exist on the billingProfiles table schema", () => {
+        const columns = getTableConfig(schema.billingProfiles).columns;
+        const columnNames = columns.map((c) => c.name);
+        expect(columnNames).toContain("tax_id");
+        expect(columnNames).toContain("date_of_birth");
+      });
+
+      it("stripSensitiveBillingFields removes sensitive fields and returns a clean object copy", () => {
+        const input = {
+          id: "profile-1",
+          ownerAddress: "0xowner",
+          taxId: "EIN-12345",
+          dateOfBirth: "1990-01-01",
+          firstName: "Alice",
+        };
+        const output = schema.stripSensitiveBillingFields(input);
+        expect(output).toEqual({
+          id: "profile-1",
+          ownerAddress: "0xowner",
+          firstName: "Alice",
+        });
+        // Ensure original object was not mutated (non-mutating copy behavior)
+        expect(input.taxId).toBe("EIN-12345");
+        expect(input.dateOfBirth).toBe("1990-01-01");
+      });
+
+      it("stripSensitiveBillingFields is a no-op for objects without sensitive fields", () => {
+        const input = {
+          id: "profile-2",
+          ownerAddress: "0xowner",
+          firstName: "Bob",
+        };
+        const output = schema.stripSensitiveBillingFields(input);
+        expect(output).toEqual(input);
+      });
+    });
   });
 });
 

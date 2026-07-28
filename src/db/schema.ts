@@ -451,6 +451,34 @@ export const billingProfiles = pgTable(
   }),
 );
 
+// ---------------------------------------------------------------------------
+// Security Boundary - Sensitive Fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields in the billing profiles schema that are sensitive and must be stripped
+ * before returning data through public API routes.
+ */
+export const SENSITIVE_BILLING_FIELDS = ["taxId", "dateOfBirth"] as const;
+
+export type SensitiveBillingFields = typeof SENSITIVE_BILLING_FIELDS[number];
+
+/**
+ * Strips sensitive fields from a billing profile object to enforce a security boundary
+ * and prevent privilege drift.
+ */
+export function stripSensitiveBillingFields<T extends Record<string, any>>(
+  profile: T,
+): Omit<T, SensitiveBillingFields> {
+  const copy = { ...profile };
+  for (const field of SENSITIVE_BILLING_FIELDS) {
+    if (field in copy) {
+      delete copy[field];
+    }
+  }
+  return copy;
+}
+
 /**
  * billing_payment_methods – payment methods attached to a billing profile.
  * Actual account/routing numbers must never be stored in plaintext; store only
