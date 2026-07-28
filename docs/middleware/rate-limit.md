@@ -1,75 +1,114 @@
-# Rate‑Limit Middleware
+# Rate-Limit Middleware — Backward-Compatible Contract
 
-This document describes the contract and behavior of the **rate‑limit** middleware located at `src/middleware/rate-limit.ts`.
+> Source: `src/middleware/rate-limit.ts`  
+> Tests:  `src/middleware/rate-limit.test.ts`
 
-## Backward-Compatible Contract
+---
 
-To ensure future changes do not break existing callers, the rate limit middleware adheres to an explicit compatibility contract. Any modifications to this middleware **must** preserve the following:
+## Overview
 
-1. **Public API Surface**: The exported members (`makeLimiter`, `IDEMPOTENCY_KEY_HEADER`, `RETRY_AFTER_HEADER`, `X_IDEMPOTENT_REPLAYED_HEADER`) must remain available and backward-compatible.
-2. **Error Response Shape**: Throttled requests (429) must consistently return a JSON body matching `{ "error": "<message>" }`. Existing callers and clients depend on this shape.
-3. **Retry-After Header**: Throttled responses must always include the `Retry-After` header indicating the whole seconds remaining.
-4. **Idempotency Headers**: Idempotency features must use the defined canonical header names (`Idempotency-Key` for request, `X-Idempotent-Replayed` for response).
+All rate limiting in the app is built through a single factory: `makeLimiter()`.
+This centralises key generation, the 429 response envelope, and header policy so
+there is one place to tune per-route limits and one seam to swap the backing store.
 
-## Headers
-| Header | Purpose | Accepted Value |
-|--------|---------|----------------|
-| **Idempotency‑Key** (`Idempotency-Key`) | Allows request deduplication when the same client repeats an operation. | **Regex**: `^[A-Za-z0-9_-]{1,255}$` – alphanumerics, hyphen, underscore, length 1‑255. Any header not matching this pattern is ignored (treated as absent).
-| **Retry‑After** | Indicates how many whole seconds the client should wait before retrying after a `429 Too Many Requests`. | Positive integer (minimum `1`). Added automatically on every throttled response.
-| **X‑Idempotent‑Replayed** | Signals that the response is a replay of a prior request with the same Idempotency‑Key. | `"true"` when a cached replay occurs.
+---
 
-## Error Response (429)
-```json
-{ "error": "<message>" }
+## Exports
+
+| Export | Type | Purpose |
+|---|---|---|
+| `makeLimiter(options)` | `(MakeLimiterOptions) => RateLimitRequestHandler` | Factory — builds a named limiter |
+| `keyByIp(req)` | `(Request) => string` | Shared key generator |
+| `DEFAULT_RATE_LIMIT_MESSAGE` | `string` | Canonical fallback 429 message |
+| `MakeLimiterOptions` | interface | Options type for `makeLimiter` |
+
+---
+
+## `makeLimiter(options)`
+
+### Options
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `name` | `string` | ✅ | — | Debug label; no runtime effect |
+| `windowMs` | `number` | ✅ | — | Sliding window length in ms |
+| `max` | `number` | ✅ | — | Max requests per window per key |
+| `message` | `string` | ❌ | `DEFAULT_RATE_LIMIT_MESSAGE` | Text in 429 body |
+| `skip` | `(req) => boolean` | ❌ | — | Return `true` to exempt a request |
+
+### Frozen contracts (issue #338)
+
+**429 response envelope**
+```jsonc
+{ "error": "<message>" }   // Content-Type: application/json
 ```
-- `<message>` defaults to `"Too many requests, please try again later."` unless overridden via options or `RATE_LIMIT_<NAME>_MESSAGE` env var.
+Shape is frozen — exactly one key (`error`). No extra fields are ever added.
+`message` defaults to `DEFAULT_RATE_LIMIT_MESSAGE` when not supplied.
 
-## Environment‑Variable Overrides
-| Variable | Overrides | Example |
-|----------|-----------|---------|
-| `RATE_LIMIT_<NAME>_MAX` | `max` (allowed requests per window) | `RATE_LIMIT_GLOBAL_MAX=50` |
-| `RATE_LIMIT_<NAME>_WINDOW_MS` | `windowMs` (window length in ms) | `RATE_LIMIT_STRICT_WINDOW_MS=120000` |
-| `RATE_LIMIT_<NAME>_MESSAGE` | `message` (429 body) | `RATE_LIMIT_CONTACT_MESSAGE="Slow down"` |
+**Rate-limit headers**  
+`standardHeaders: false` and `legacyHeaders: false` — neither `RateLimit-*`
+nor `X-RateLimit-*` headers are emitted on any response (allowed or blocked).
+This is intentional to avoid leaking internal quota state. Do not change
+without a security review.
 
-`<NAME>` is the limiter name, upper‑cased with non‑alphanumerics replaced by `_`.
+**Key generator**  
+Always `keyByIp` — `req.ip` falling back to `"unknown"`. Honoured by Express
+`trust proxy` setting. Never swapped per-limiter.
 
-## Idempotency‑Key Validation
-- The middleware extracts the header case‑insensitively.
-- Keys must match the regex `^[A-Za-z0-9_-]{1,255}$`.
-- Invalid, empty, or overly long keys are ignored, meaning the request is processed without deduplication.
+**Counter isolation**  
+Each `makeLimiter()` call produces an independent in-memory store. Two limiters
+with the same `name` do not share counters unless an explicit shared `store` is
+wired (see distributed deployments below).
 
-## Retry‑After Calculation
-`Retry‑After` is computed as `Math.max(1, Math.ceil(windowMs / 1000))` and is constant for the lifetime of a limiter.
+**skip predicate**  
+When `skip(req) === true`, the request passes through unconditionally — no
+counter increment, no 429. Skipped requests are completely transparent.
 
-## Distributed Store
-- By default an in‑memory store is used (process‑local). For multi‑instance deployments provide a shared `store` (e.g., Redis via `rate-limit-redis`).
-- Errors from the store are **fail‑open** (`passOnStoreError: true`).
+**Exact boundary**  
+- Request #`max`: allowed (200 from upstream handler)  
+- Request #`max + 1`: blocked (429)
 
-## Batching or Pagination Contract
-When exposing endpoints that accept batches of items or paginated requests, the rate limiter must scale appropriately to prevent a single request from performing unbounded work.
+---
 
-By default, the rate limiter consumes 1 token per request. For batching or pagination, you must define a `cost` function in the limiter options.
+## `keyByIp(req)`
 
-### How it works
-The `cost` function evaluates the weight of the request (e.g., the number of items in a batch). The limiter enforces this weight by scaling the window's effective maximum requests inversely to the cost.
+```
+keyByIp(req) → req.ip || "unknown"
+```
 
-For example, if `max` is 100, and a request has a cost of 10, the effective limit for that request becomes `10` (since `100 / 10 = 10`). This guarantees that a client exclusively sending requests of cost `C` cannot process more than `max` total items in a window.
+- Returns `req.ip` when truthy.
+- Returns `"unknown"` when `req.ip` is `undefined` or empty string.
+- Two requests with different IPs are keyed independently — exhausting one IP
+  never affects another.
+- IPs differing by a single octet are treated as distinct keys.
 
-### Boundaries and Failures
-1. **Cost Exceeds Max**: If a single request's cost is strictly greater than the limiter's `max`, it is immediately throttled (returns 429) without further processing. This guarantees oversized batches are rejected outright.
-2. **Zero or Negative Cost**: If the cost function evaluates to zero or a negative value, the limiter defaults back to the base `max` (effectively treating the cost as 1).
-3. **Mixed Traffic**: Because the underlying token bucket natively tracks requests rather than items, a client mixing high-cost and low-cost requests might exceed the exact item count slightly. This proportional-limit approach remains an approximation, but strictly bounds the maximum workload and remains safe for growth.
+---
 
-## Usage Example
+## Distributed Deployments
+
+The default store is **in-memory**, meaning:
+
+- Counters are **not shared** across replicas — each instance enforces its own counts.
+- Counters **reset on restart/redeploy**, briefly relaxing enforcement.
+
+To share limits across instances, wire a shared store at the `store` seam inside
+`makeLimiter`:
+
 ```ts
-import { makeLimiter } from './middleware/rate-limit';
-
-const apiLimiter = makeLimiter({
-  name: 'api',
-  windowMs: 60_000,
-  max: 100,
-  idempotent: true,
-});
-
-app.use('/api', apiLimiter);
+// Example — replace with your Redis client
+import { RedisStore } from "rate-limit-redis";
+// Pass `store: new RedisStore({ sendCommand })` to rateLimit(...)
 ```
+
+This is intentionally the **only place** to make that change.
+
+---
+
+## Out of Scope (issue #338)
+
+- Distributed shared-store implementation — the seam exists but wiring it is a
+  separate infrastructure concern.
+- Per-user or per-token rate limiting — current key is IP only.
+- Dynamic limit adjustment at runtime.
+- Rate-limit header emission — intentionally disabled; enabling requires a
+  security review.
