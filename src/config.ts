@@ -193,9 +193,6 @@ export const EnvSchema = z
     .positive()
     .optional()
     .default(60_000),
-});
-
-export const env = EnvSchema.parse(process.env);
   })
   .superRefine((data, ctx) => {
     const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
