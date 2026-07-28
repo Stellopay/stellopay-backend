@@ -1,8 +1,10 @@
 import express from "express";
+import { initLogger } from "./utils/logger.js";
 import cors from "cors";
+import { resolveCorsConfig } from "./utils/cors.js";
 import helmet from "helmet";
 import { ZodError } from "zod";
-import { env } from "./config.js";
+import { env, defaults } from "./config.js";
 import { makeLimiter } from "./middleware/rate-limit.js";
 import { escrowRouter } from "./routes/escrow.js";
 import { agreementRouter } from "./routes/agreement.js";
@@ -27,8 +29,12 @@ import { dbReadinessMiddleware, setApplicationReady } from "./middleware/db-read
 import { setupGracefulShutdown } from "./shutdown.js";
 import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
+import { verifyAbiCompatibility } from "./starknet/abi.js";
+import { provider, getEscrowAbi, getAgreementAbi } from "./starknet/client.js";
 
 export const app = express();
+initLogger();
+
 
 // eslint-disable-next-line no-console
 console.log("[config] STARKNET_RPC_URL =", env.STARKNET_RPC_URL);
@@ -43,49 +49,17 @@ app.use(accessLogMiddleware);
 // ---------------------------------------------------------------------------
 // CORS
 // ---------------------------------------------------------------------------
-// The CORS spec forbids combining credentials:true with a wildcard origin.
-// When CORS_ORIGIN="*" we serve public (credential-less) responses.
-// For an explicit allowlist we use a custom callback that rejects any origin
-// NOT on the list — no silent reflection of arbitrary origins.
+// resolveCorsConfig enforces environment-aware allow-list policy:
+//  - development (or NODE_ENV unset): permissive wildcard default when
+//    CORS_ORIGIN is not provided — a warning is logged at startup.
+//  - non-development: CORS_ORIGIN MUST be set to an explicit, non-wildcard
+//    comma-separated list of trusted origins; absence or "*" causes a fatal
+//    startup error so the API never serves authenticated routes insecurely.
 // ---------------------------------------------------------------------------
-const corsOriginValue = env.CORS_ORIGIN.trim();
-const isWildcard = corsOriginValue === "*";
-
-if (isWildcard && env.NODE_ENV === "production") {
-  // eslint-disable-next-line no-console
-  console.warn(
-    `[cors] SECURITY WARNING: CORS_ORIGIN='*' is set in production (NODE_ENV=${env.NODE_ENV}). ` +
-      `Credentials will be disabled. Set CORS_ORIGIN to an explicit comma-separated allowlist for authenticated endpoints.`,
-  );
-} else if (isWildcard) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    `[cors] Wildcard origin '*' detected — Access-Control-Allow-Credentials is disabled. ` +
-      `Never combine wildcard origins with credentials in production.`,
-  );
-}
-
-// Build the allowed-origins list (empty when wildcard).
-const allowedOrigins = isWildcard
-  ? []
-  : corsOriginValue
-      .split(",")
-      .map((o) => o.trim())
-      .filter((o) => o.length > 0);
-
-// The origin handler:
-//  - Wildcard → pass `true` to cors (no credentials attached).
-//  - Allowlist → custom callback that only approves listed origins and
-//    explicitly rejects everything else (no reflection of unknown origins).
-const corsOriginHandler: cors.CorsOptions["origin"] = isWildcard
-  ? true
-  : (origin, callback) => {
-      // Allow server-to-server / same-origin requests (no Origin header).
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      // Reject unknown origins with a clear error — do NOT reflect them.
-      callback(new Error(`[cors] Origin '${origin}' is not in the allowlist`));
-    };
+const { originHandler: corsOriginHandler, credentials: corsCredentials } = resolveCorsConfig(
+  env.CORS_ORIGIN,
+  env.NODE_ENV,
+);
 
 // Set trust proxy for correct client IP detection in rate limiting.
 // Parse TRUST_PROXY env var - can be a number, "true", or comma-separated list.
@@ -102,11 +76,10 @@ app.set("trust proxy", trustProxyValue);
 // Security: Add Helmet headers
 app.use(helmet());
 
-// Apply CORS
 app.use(
   cors({
     origin: corsOriginHandler,
-    credentials: !isWildcard, // never combine wildcard + credentials
+    credentials: corsCredentials,
   }),
 );
 app.use(express.json({ limit: "1mb" }));
@@ -128,12 +101,28 @@ const globalLimiter = makeLimiter({
   skip: (req) => req.path === "/health",
 });
 
-// Strict limiter for unauthenticated, side-effecting auth and contact endpoints.
+// Strict limiter for unauthenticated, side-effecting auth endpoints.
 const strictLimiter = makeLimiter({
   name: "strict",
   windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
   max: env.RATE_LIMIT_STRICT_MAX,
   message: "Too many requests from this IP, please try again later.",
+});
+
+// Contact form limiter (stricter) - prevents spam on the public contact form.
+const contactLimiter = makeLimiter({
+  name: "contact",
+  windowMs: env.RATE_LIMIT_CONTACT_WINDOW_MS,
+  max: env.RATE_LIMIT_CONTACT_MAX,
+  message: "Too many contact form submissions. Please try again later.",
+});
+
+// Analytics limiter - specific limit for analytics endpoints
+const analyticsLimiter = makeLimiter({
+  name: "analytics",
+  windowMs: env.RATE_LIMIT_ANALYTICS_WINDOW_MS,
+  max: env.RATE_LIMIT_ANALYTICS_MAX,
+  message: "Too many analytics requests, please try again later.",
 });
 
 // Apply global rate limiter to all API routes
@@ -156,21 +145,22 @@ app.use("/api/v1", indexedRouter);
 app.use("/api/v1", tokenRouter);
 app.use("/api/v1", transactionsRouter);
 app.use("/api/v1", notificationsRouter);
+app.use("/api/v1/analytics", analyticsLimiter);
 app.use("/api/v1", analyticsRouter);
 app.use("/api/v1", eventsRouter);
 app.use("/api/v1", indexerStatusRouter);
 app.use("/api/v1", reprocessEventsRouter);
 app.use("/api/v1", diagnosticsRouter);
 app.use("/api/v1", backfillEventsRouter);
-// Apply strict rate limiting to contact endpoint
-app.use("/api/v1/contact", strictLimiter);
+// Apply contact-specific rate limiting to contact endpoint
+app.use("/api/v1/contact", contactLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
 app.use("/api/v1", apiV1NotFoundHandler);
 
 // Basic error handler
 app.use(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   
   (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const requestId: string | undefined = res.locals.requestId;
     // eslint-disable-next-line no-console
@@ -214,8 +204,69 @@ if (process.env.NODE_ENV !== "test") {
 
   void (async () => {
     await waitForDbReadiness();
+    // eslint-disable-next-line no-console
+    console.log("[startup] Database ready");
+
+    // Verify ABI compatibility at startup unless explicitly skipped
+    if (!env.SKIP_ABI_VERIFICATION) {
+      try {
+        // eslint-disable-next-line no-console
+        console.log("[startup] Verifying ABI compatibility with deployed contracts...");
+
+        const [escrowResult, agreementResult] = await Promise.all([
+          verifyAbiCompatibility({
+            provider,
+            label: "PayrollEscrow",
+            contractAddress: defaults.payrollEscrowAddress,
+            bundledAbi: getEscrowAbi(),
+            mode: env.ABI_VERIFICATION_MODE,
+          }),
+          verifyAbiCompatibility({
+            provider,
+            label: "WorkAgreement",
+            contractAddress: defaults.workAgreementAddress,
+            bundledAbi: getAgreementAbi(),
+            mode: env.ABI_VERIFICATION_MODE,
+          }),
+        ]);
+
+        // eslint-disable-next-line no-console
+        console.log(escrowResult.message);
+        // eslint-disable-next-line no-console
+        console.log(agreementResult.message);
+
+        if (!escrowResult.match || !agreementResult.match) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[startup] ⚠  ABI verification detected mismatches — event decoding may be unreliable",
+          );
+        }
+      } catch (err) {
+        const message = (err as Error).message;
+        // eslint-disable-next-line no-console
+        console.error(`[startup] ABI verification failed: ${message}`);
+
+        // When mode is "fail" (default), verifyAbiCompatibility throws on mismatch.
+        // Re-throw to abort startup.
+        if (env.ABI_VERIFICATION_MODE === "fail") {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[startup] FATAL: ABI verification failed in fail-fast mode. " +
+              "Set SKIP_ABI_VERIFICATION=true or ABI_VERIFICATION_MODE=warn to bypass.",
+          );
+          process.exit(1);
+        }
+      }
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[startup] ⚠  ABI verification SKIPPED (SKIP_ABI_VERIFICATION=true). " +
+          "Bundled ABIs may not match deployed contracts.",
+      );
+    }
+
     setApplicationReady(true);
     // eslint-disable-next-line no-console
-    console.log("[startup] Database ready — serving traffic");
+    console.log("[startup] Application ready — serving traffic");
   })();
 }
