@@ -34,6 +34,7 @@ function makeApp() {
     next(err);
   });
 
+   
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({
       error: err.message,

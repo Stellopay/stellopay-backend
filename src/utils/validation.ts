@@ -51,16 +51,104 @@ function logValidationError(metric: ValidationErrorMetric): void {
  * // On failure logs:
  * // [validation:error] {"validator":"createAgreement","input":"0xbad...","error":"...","timestamp":"..."}
  */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export interface ValidationErrorOptions {
+  validator: string;
+  message: string;
+  issues: any[];
+  input: string;
+  status?: number;
+  cause?: unknown;
+}
+
+export class ValidationError extends Error {
+  override name = "ValidationError";
+  validator: string;
+  input: string;
+  issues: any[];
+  status: number;
+  timestamp: string;
+  override cause?: unknown;
+  metric: ValidationErrorMetric;
+
+  constructor(opts: ValidationErrorOptions | string, validator?: string, input?: string, metric?: ValidationErrorMetric) {
+    if (typeof opts === "object" && opts !== null) {
+      super(opts.message);
+      this.validator = opts.validator;
+      this.input = opts.input;
+      this.issues = opts.issues || [];
+      this.status = opts.status ?? 400;
+      this.cause = opts.cause;
+      this.timestamp = new Date().toISOString();
+      this.metric = {
+        validator: this.validator,
+        input: this.input,
+        error: opts.message,
+        timestamp: this.timestamp,
+      };
+    } else {
+      super(opts);
+      this.validator = validator || "";
+      this.input = input || "";
+      this.issues = [];
+      this.status = 400;
+      this.timestamp = metric?.timestamp || new Date().toISOString();
+      this.metric = metric || {
+        validator: this.validator,
+        input: this.input,
+        error: opts,
+        timestamp: this.timestamp,
+      };
+    }
+  }
+
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      validator: this.validator,
+      issues: this.issues,
+      input: this.input,
+      status: this.status,
+      timestamp: this.timestamp,
+    };
+  }
+
+  static fromZodError(error: z.ZodError, validator: string, input: string): ValidationError {
+    const message = error.issues.map((i) => i.message).join("; ");
+    return new ValidationError({
+      validator,
+      message,
+      issues: error.issues,
+      input,
+      cause: error,
+      status: 400,
+    });
+  }
+}
+
+export function mapZodError(error: unknown) {
+  if (!(error instanceof z.ZodError)) return undefined;
+  const issue = error.issues[0];
+  if (!issue) return undefined;
+  return issue;
+}
+
 export function loggedParse<T>(schema: z.ZodSchema<T>, value: unknown, validatorName: string): T {
   const result = schema.safeParse(value);
   if (!result.success) {
+    const inputPreview =
+      typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40);
     logValidationError({
       validator: validatorName,
-      input: typeof value === "string" ? value.slice(0, 40) : String(value).slice(0, 40),
+      input: inputPreview,
       error: result.error.issues.map((i) => i.message).join("; "),
       timestamp: new Date().toISOString(),
     });
-    throw result.error;
+    throw ValidationError.fromZodError(result.error, validatorName, inputPreview);
   }
   return result.data;
 }
@@ -128,7 +216,14 @@ export const StarknetAddress = z
     /^(0x)?[0-9a-fA-F]{1,64}$/,
     "must be a hex string of up to 64 hex characters, with an optional 0x prefix",
   )
-  .transform((value) => normalizeStarknetAddress(value));
+  .transform((value, ctx) => {
+    try {
+      return normalizeStarknetAddress(value);
+    } catch (e) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: e instanceof Error ? e.message : String(e) });
+      return z.NEVER;
+    }
+  });
 
 
 /**
@@ -149,10 +244,8 @@ export const AgreementId = z
   .trim()
   .regex(/^\d+$/, "agreement_id must be a numeric string");
 
-/** Largest page a list endpoint will return in a single response. */
 export const MAX_PAGE_LIMIT = 100;
 
-/** Page size used when the caller does not supply a usable limit. */
 export const DEFAULT_PAGE_LIMIT = 50;
 
 /**
@@ -189,11 +282,41 @@ function coerceNullOrEmptyToUndefined(value: unknown): unknown {
   return value;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value)) return false;
+  return typeof value === "object";
+}
+
+/**
+ * Parses and clamps pagination query parameters. Clamping happens server-side
+ * so a client cannot request an unbounded, zero, or negative page: `limit` is
+ * forced into `[1, MAX_PAGE_LIMIT]` and `offset` to `>= 0`. Missing or
+ * non-numeric values fall back to safe defaults rather than failing the
+ * request.
+ *
+ * This function **never throws** — any input shape returns a valid, finite
+ * pair. Non-object inputs (strings, numbers, arrays, `null`, `undefined`) are
+ * treated as if no pagination params were supplied and fall back to defaults.
+ *
+ * @param query - The request query object (`req.query`), or any value.
+ * @returns `{ limit, offset }` — both finite integers within the documented
+ *   bounds.
+ *
+ * @example
+ * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
+ * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
+ * parsePagination("not-an-object");   // { limit: 50, offset: 0 }
+ */
 export function parsePagination(query: unknown): {
   limit: number;
   offset: number;
 } {
-  const source = (query ?? {}) as Record<string, unknown>;
+  // Non-object inputs (strings, numbers, arrays, null, undefined) carry no
+  // limit/offset keys. Treat them as an empty object so the defaults engage
+  // rather than relying on a silent `as Record<string, unknown>` cast.
+  const source: Record<string, unknown> = isPlainObject(query) ? query : {};
+
   const limitRaw = z.coerce
     .number()
     .int()

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
-import { buildTypedChallenge, consumeChallenge, createChallenge } from "../auth/challenge.js";
+import { buildTypedChallenge, consumeChallenge, createChallenge, getChallenge } from "../auth/challenge.js";
 import {
   createSession,
   requireSession,
@@ -15,21 +15,21 @@ import { requireAuth } from "../auth/middleware.js";
 import { env } from "../config.js";
 import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
-const AddressBody = z.object({ address: z.string().min(3) });
+const AddressBody = z.object({ address: z.string().min(3) }).strict();
 const VerifyBody = z.object({
   address: z.string().min(3),
   // Some Starknet accounts/wallets produce variable-length signatures (not always 2 felts)
   signature: z.array(z.string().min(1)).min(2),
-});
+}).strict();
 const SessionBody = z.object({
   address: z.string().min(3),
   session_token: z.string().min(10),
-});
+}).strict();
 
 const RefreshBody = z.object({
   address: z.string().min(3),
   refresh_token: z.string().min(10),
-});
+}).strict();
 
 const RevokeSessionBody = z.object({
   token_hash: z.string().length(64),
@@ -129,8 +129,8 @@ authRouter.post("/auth/verify", async (req, res, next) => {
         .json({ error: "No active challenge (or expired). Call /auth/challenge again." });
       return;
     }
-    const { chainId } = await getCachedNetworkInfo();
 
+    const { chainId } = await getCachedNetworkInfo();
     const typedData = buildTypedChallenge(address, chainId, ch.nonce);
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);

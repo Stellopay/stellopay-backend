@@ -8,6 +8,36 @@ runtime behavior, tests, and this doc aligned — see
 [src/auth/session.test.ts](src/auth/session.test.ts) for the tests that pin
 down every rule below.
 
+## Session authorization contract & security boundaries
+
+### Caller roles & authorization requirements
+
+| Operation | Authorized Callers | Input Requirements | Failure Behavior |
+| --- | --- | --- | --- |
+| `createSession` | Wallet challenge/verify routes (`/auth/verify`) | Non-empty Starknet wallet address | Throws `TypeError` if address is empty/invalid; logs `missing_input` |
+| `requireSession` | Authentication middleware (`requireAuth`) | Non-empty wallet address & raw session token | Returns `false`; logs `session.rejected` with bounded reason |
+| `rotateSession` | Token refresh handlers (`/auth/refresh`) | Non-empty wallet address & active session token | Returns `{ ok: false, reason: "invalid" }` or `{ ok: false, reason: "reused" }` |
+| `revokeSession` | Sign-out endpoints (`/auth/logout`) | Raw session token | Idempotent no-op on empty token or already-revoked session |
+| `revokeSessionByHash` | Session management & revocation endpoints | SHA-256 token hash | Idempotent no-op on empty hash or already-revoked session |
+| `revokeFamily` | Reuse/compromise detection handlers | Token family UUID | Idempotent no-op on empty family ID or already-revoked family |
+| `revokeAllSessionsForAddress` | Global sign-out & account lockdown handlers | Non-empty wallet address | Idempotent no-op on empty address; invalidates all user tokens |
+| `sweepExpiredSessions` | Scheduled background sweeper task | Optional timestamp (default `Date.now()`) | Returns `0` on DB error; retries transient DB errors with backoff |
+
+### Security guarantees & non-reusability
+
+1. **Token Immutability**: Raw 24-byte hex tokens are returned **only** upon creation (`createSession`) or rotation (`rotateSession`). PostgreSQL stores exclusively SHA-256 digests (`tokenHash`). Raw tokens are never logged or stored.
+2. **Sliding Expiration Cap**: Active sessions extend their sliding expiry (`SESSION_TTL_MS`) upon valid access via `requireSession`, but cannot slide past the immutable absolute cap (`SESSION_MAX_TTL_MS`).
+3. **Fail-Closed Input Validation**: Blank or whitespace-only inputs are rejected before database queries are executed, preventing information disclosure or unnecessary DB load.
+4. **Replay & Compromise Defense**: Presenting a rotated or revoked session token to `rotateSession` triggers immediate family revocation (`revokeFamily`), logging `session.reuse_detected` to isolate potential token theft.
+5. **No Exposure of Secrets**: Error responses and structured logs omit sensitive session data, token hashes, and internal error stack traces.
+
+### Out of scope concerns
+
+- Global authentication framework changes (handled by standard middleware).
+- Custom token format redesigns (uses crypto-random hex strings + SHA-256 hashing).
+- Multi-device session state synchronization across distributed instances.
+- Cross-node real-time session push notifications.
+
 ## Lifecycle contract: persistence, expiration, invalidation
 
 ### Persistence
@@ -403,6 +433,7 @@ Wrapped in `withBoundedRetry` (3 attempts, 50ms backoff, see
 | `revokeSession` (UPDATE)                        | `SET revokedAt = now()` applied to the same row twice produces the same final state. |
 | `revokeFamily` (UPDATE)                         | Same as above; per-family write is idempotent.                             |
 | `revokeAllSessionsForAddress` (UPDATE)          | Same as above; per-address write is idempotent.                            |
+| `revokeSessionByHash` (UPDATE)                  | Same as above; per-token-hash write is idempotent.                         |
 | `sweepExpiredSessions` (DELETE)                 | Predicate is on `expiresAt` / `revokedAt`; the second attempt simply deletes fewer rows. |
 
 Deliberately **NOT** wrapped (throws on first DB error):
@@ -430,6 +461,7 @@ so, an **additional** `session.revoke_already` info log is emitted and an
 | `revokeSession`                  | `session_revoke_already_total`                  |
 | `revokeFamily`                   | `session_family_revoke_already_total`           |
 | `revokeAllSessionsForAddress`    | `session_all_revoke_already_total`              |
+| `revokeSessionByHash`            | `session_revoke_already_total`                  |
 
 The pre-existing `session_revoked_total` / `session_family_revoked_total`
 / `session_all_revoked_total` counters are **NOT** double-bumped on a
@@ -443,10 +475,10 @@ many were idempotent re-plays".
 
 | Event name               | Level | Bumped counter                    | Emitted by                                  |
 | ------------------------ | ----- | --------------------------------- | ------------------------------------------- |
-| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all`) |
-| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` |
+| `session.revoke_retry`   | warn  | `session_revoke_retry_total`      | `withBoundedRetry` between attempts (kind = `single` / `family` / `all` / `single-hash`) |
+| `session.revoke_failed`  | error | `session_revoke_failed_total`     | After the final retry exhausts in `revokeSession` / `revokeFamily` / `revokeAllSessionsForAddress` / `revokeSessionByHash` |
 | `session.sweep_retry`    | warn  | `session_sweep_retry_total`       | `withBoundedRetry` between attempts in `sweepExpiredSessions` |
-| `session.revoke_already` | info  | `session_revoke_already_total` (family / all variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
+| `session.revoke_already` | info  | `session_revoke_already_total` (family / all / single-hash variants) | When a revoke-family call hits a row whose `revokedAt` is already non-null |
 
 `session.revoke_failed` always rethrows the original error so the route
 handler can return a 5xx. The pre-existing `session.sweep_failed` path

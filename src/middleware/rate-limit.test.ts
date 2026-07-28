@@ -215,6 +215,90 @@ describe("makeLimiter", () => {
     );
     expect(limitWarnings).toHaveLength(0);
   });
+
+  // ---------------------------------------------------------------------------
+  // Environment overrides
+  // ---------------------------------------------------------------------------
+
+  it("allows environment variable overrides per limiter name", async () => {
+    process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_MAX = "2";
+    process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_WINDOW_MS = "60000";
+
+    const app = makeApp(makeLimiter({ name: "test_env_override", windowMs: 1000, max: 10 }));
+
+    // Should only allow 2 requests, not 10 (which is the default passed in)
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(200);
+    await request(app).get("/api/ping").expect(429);
+
+    delete process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_MAX;
+    delete process.env.RATE_LIMIT_TEST_ENV_OVERRIDE_WINDOW_MS;
+  });
+
+  it("warns on startup if an env override max is absurdly high", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.RATE_LIMIT_ABSURD_MAX = "5000";
+
+    makeLimiter({ name: "absurd", windowMs: 60000, max: 10 });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('absurdly high max of 5000')
+    );
+
+    delete process.env.RATE_LIMIT_ABSURD_MAX;
+  });
+
+  // ---------------------------------------------------------------------------
+  // Input validation
+  // ---------------------------------------------------------------------------
+
+  it("throws TypeError for an empty name", () => {
+    expect(() =>
+      makeLimiter({ name: "", windowMs: 60_000, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a non-string name", () => {
+    expect(() =>
+      makeLimiter({ name: undefined as unknown as string, windowMs: 60_000, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a negative windowMs", () => {
+    expect(() =>
+      makeLimiter({ name: "neg-window", windowMs: -1, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a zero windowMs", () => {
+    expect(() =>
+      makeLimiter({ name: "zero-window", windowMs: 0, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a non-finite windowMs", () => {
+    expect(() =>
+      makeLimiter({ name: "nan-window", windowMs: NaN, max: 10 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a negative max", () => {
+    expect(() =>
+      makeLimiter({ name: "neg-max", windowMs: 60_000, max: -5 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a zero max", () => {
+    expect(() =>
+      makeLimiter({ name: "zero-max", windowMs: 60_000, max: 0 }),
+    ).toThrow(TypeError);
+  });
+
+  it("throws TypeError for a non-finite max", () => {
+    expect(() =>
+      makeLimiter({ name: "nan-max", windowMs: 60_000, max: NaN }),
+    ).toThrow(TypeError);
+  });
 });
 
 // ---------------------------------------------------------------------------

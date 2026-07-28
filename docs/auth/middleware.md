@@ -16,6 +16,50 @@ truth and the implementation needs fixing.
 from drifting as new routers are added, and gives the test suite one place to
 exercise the boundary instead of N places.
 
+## Caller map
+
+Every route that reads `req.auth` must go through one of the middlewares in
+this module. The table below maps each consumer to what it imports and why.
+
+| Consumer file                         | Imports                              | Purpose                                         |
+| ------------------------------------- | ------------------------------------ | ----------------------------------------------- |
+| `routes/auth.ts`                      | `requireAuth`                        | Logout/revoke endpoints read `req.auth`         |
+| `routes/billing.ts`                   | `requireAuth`                        | Billing endpoints require a signed-in user      |
+| `routes/diagnostics.ts`              | `requireAuth`, `requireAdmin`        | Admin-gated diagnostics                         |
+| `routes/events.ts`                    | `requireAuth`, `requireAdmin`        | Admin-gated event inspection                    |
+| `routes/backfill-events.ts`          | `requireAuth`, `requireAdmin`        | Admin-gated backfill trigger                    |
+| `routes/reprocess-events.ts`         | `requireAuth`, `requireAdmin`        | Admin-gated reprocess trigger                   |
+| `auth/middleware.test.ts`            | All exports                          | Full contract coverage                          |
+
+Route files that import `requireAuth` without `requireAdmin` use the
+principal for user-specific operations (e.g. looking up the caller's own
+billing records). Routes that import both guard administrative operations.
+
+## Related modules
+
+This module depends on and integrates with the following:
+
+| Module                              | Relationship                                                        |
+| ----------------------------------- | ------------------------------------------------------------------- |
+| `auth/session.ts`                   | `requireAuth` calls `requireSession` to validate the bearer token   |
+| `auth/challenge.ts`                 | Session creation; the token that `requireAuth` reads is issued here |
+| `config.ts`                         | Provides `env.ADMIN_ADDRESSES` for `requireAdmin`'s allowlist check |
+| `utils/address.js`                  | Provides `normalizeStarknetAddress` used by `isAdminPrincipal`      |
+
+Request flow:
+
+```
+Request → requireAuth → requireAdmin → Route handler
+                |             |
+          reads headers    reads req.auth
+          calls session    checks allowlist
+          binds req.auth
+```
+
+`requireAuth` MUST run before `requireAdmin` because `requireAdmin` reads
+`req.auth` which `requireAuth` sets. Both are idempotent — see the
+idempotency sections below.
+
 ## Public surface
 
 Everything below is exported and covered by the compatibility guarantees at
@@ -54,25 +98,61 @@ const principal = requirePrincipal(req); // AuthPrincipal, throws if absent
 ```
 
 `getPrincipal` returns `null` under exactly the predicate `requireAdmin` has
-always used — `req.auth` missing, or `req.auth.address` empty. Using it means
-a caller does not re-implement that check, and `requirePrincipal` removes the
-need for a non-null assertion (`req.auth!`) that would silently become wrong
-if a route were ever mounted without `requireAuth`. `requirePrincipal` throws
-rather than responding, because a route reaching it without a principal is a
-wiring mistake and belongs in the 5xx bucket, not the 401 one.
+always used — `req.auth` missing, `req.auth` set to `null`, or
+`req.auth.address` empty (but NOT whitespace-only — see edge cases below).
+Using it means a caller does not re-implement that check, and
+`requirePrincipal` removes the need for a non-null assertion (`req.auth!`)
+that would silently become wrong if a route were ever mounted without
+`requireAuth`. `requirePrincipal` throws rather than responding, because a
+route reaching it without a principal is a wiring mistake and belongs in the
+5xx bucket, not the 401 one.
+
+**Edge cases for `getPrincipal`:**
+
+| Input                                      | Result                           |
+| ------------------------------------------ | -------------------------------- |
+| `req.auth` is `undefined`                  | `null`                           |
+| `req.auth` is `null`                       | `null`                           |
+| `req.auth.address` is `""` (empty string)  | `null`                           |
+| `req.auth.address` is `null`               | `null`                           |
+| `req.auth.address` is `"   "` (whitespace) | Returns the principal (not null) |
+
+A whitespace-only address is NOT treated as absent — it falls through to
+`isAdminPrincipal` and is rejected as malformed there. `requireAuth` cannot
+produce a whitespace-only address (it trims and rejects empty after trim), so
+this only arises if a downstream middleware mutates `req.auth`.
 
 ### Asking the admin question directly
 
 `isAdminPrincipal(address)` is the same decision `requireAdmin` makes,
 exported for routes that need to vary a response for admins without gating the
-whole route. `requireAdmin` delegates to it, so the two can never disagree.
-It never throws: a malformed principal, a malformed allowlist entry, and an
-empty allowlist all resolve to `false`.
+whole route. `requireAdmin` delegates to it, so the two must never disagree.
+It never throws: a malformed principal, a malformed allowlist entry, an empty
+allowlist, an empty string, and a bare `0x` prefix all resolve to `false`.
+
+**Usage example:**
+
+```ts
+import { isAdminPrincipal, getPrincipal } from "../auth/middleware.js";
+
+function handler(req: Request, res: Response) {
+  const principal = getPrincipal(req);
+  if (principal && isAdminPrincipal(principal.address)) {
+    // Include admin-only fields in the response
+  }
+}
+```
 
 ## Principal resolution — `requireAuth`
 
 `requireAuth` resolves the principal from the request headers and binds it
 to `req.auth`.
+
+**Middleware signature:**
+
+```ts
+router.get("/protected", requireAuth, handler);
+```
 
 **Inputs (read verbatim):**
 
@@ -109,11 +189,36 @@ response cannot be used to probe header validity.
   route must be caught by Express and surfaced as a 5xx, never silently
   relabeled as a 401.
 
+**Idempotency.** Once `req.auth` is set, subsequent `requireAuth` calls in
+the same request lifecycle are no-ops — they skip re-validation and preserve
+the original principal even if the request headers have changed. This is
+load-bearing for route stacks where multiple routers each apply their own
+`requireAuth`.
+
+**Edge cases for header validation:**
+
+| Input                                                                | Behaviour                                  |
+| -------------------------------------------------------------------- | ------------------------------------------ |
+| `x-user-address` is a `string[]` (multi-value header)                | 401 — type guard rejects non-string        |
+| `authorization` is a `string[]` (multi-value header)                 | 401 — type guard rejects non-string        |
+| Both headers are `string[]`                                          | 401 — type guard rejects first non-string  |
+| `authorization` has correct `Bearer ` prefix but token is whitespace | 401 — empty after trim                     |
+| `x-user-address` is all whitespace                                   | 401 — empty after trim                     |
+
 ## Route authorization — `requireAdmin`
 
 `requireAdmin` may only be used **after** `requireAuth`. It reads
 `req.auth.address` and the `ADMIN_ADDRESSES` env list (which
 `config.ts` lowercases at startup) and makes a yes-or-no decision.
+
+**Middleware signature:**
+
+```ts
+router.get("/admin-only", requireAuth, requireAdmin, handler);
+```
+
+Order matters — `requireAdmin` asserts `req.auth` is present, so it MUST
+run after `requireAuth`.
 
 **Canonical comparison.** Both the principal address and every allowlist
 entry are passed through `normalizeStarknetAddress` (which pads to 64 hex
@@ -125,33 +230,78 @@ resolve to one canonical string. This comparison lives in
 
 **Failure modes** — each with a distinct HTTP status:
 
-| Cause                                                    | Status | Body                        |
-| -------------------------------------------------------- | -----: | --------------------------- |
-| `req.auth` missing or `req.auth.address` is empty string |  `401` | `{ error: "Unauthorized" }` |
-| Principal present, but cannot be parsed as an address    |  `403` | `{ error: "Forbidden" }`    |
-| Parsed canonical ≠ every parsed allowlist entry          |  `403` | `{ error: "Forbidden" }`    |
-| Malformed entry in `ADMIN_ADDRESSES` is silently         |  `403` | `{ error: "Forbidden" }`    |
-| skipped (never matched, never crashed).                  |        |                             |
-| Principal matches the allowlist                          | (next) | (route handler response)    |
+| Cause                                                       | Status | Body                        |
+| ----------------------------------------------------------- | -----: | --------------------------- |
+| `req.auth` missing or `req.auth.address` is empty string    |  `401` | `{ error: "Unauthorized" }` |
+| `req.auth` is a non-object (e.g. a string) at runtime       |  `401` | `{ error: "Unauthorized" }` |
+| Principal present, but cannot be parsed as an address       |  `403` | `{ error: "Forbidden" }`    |
+| Parsed canonical ≠ every parsed allowlist entry             |  `403` | `{ error: "Forbidden" }`    |
+| Malformed entry in `ADMIN_ADDRESSES` silently skipped       |  `403` | `{ error: "Forbidden" }`    |
+| (never matched, never crashed)                              |        |                             |
+| Principal matches the allowlist                             | (next) | (route handler response)    |
 
 The `401`/`403` split is deliberate: callers must be able to tell "you are
 not signed in" apart from "you are signed in but not allowed". Collapsing
 them into a single 401 (the previous behaviour) made clients retry
 credentials forever on the second case.
 
+**Idempotency.** `requireAdmin` is idempotent: once the principal is
+authorized, the result is cached in `res.locals.adminAuthorized` and
+subsequent calls short-circuit to `next()` without re-checking the
+allowlist. This means allowlist changes during a request's lifecycle do
+not affect an already-authorized principal, and the middleware stack can
+be safely replayed without re-evaluating the allowlist.
+
 **Success path** — calls `next()` and lets the route handle the request.
+
+### Resilience
+
+- **Session lookup failures are observable.** When `requireSession` throws
+  (e.g. database connection issue), the error is logged via `console.warn`
+  with the full error object before the request is denied with a standard
+  401 response. The client-facing response does not leak the nature of the
+  failure, but operators can detect infrastructure issues from the log.
+- **Safe replay.** Both `requireAuth` and `requireAdmin` are idempotent,
+  so applying them multiple times in a middleware stack (e.g. router-level
+  + route-level) is safe and produces the same result as a single
+  application.
 
 ## How callers consume `req.auth`
 
-`/auth/logout` reads `req.auth.token` and passes it to
-`revokeSession(token)`. `/auth/revoke` reads `req.auth.address` and passes
-it to `revokeAllSessionsForAddress(address)`. Both downstream functions
-do their own lowercase normalization, so the middleware's
-"raw lowercase header" choice is compatible without further massaging.
+### Route handlers reading `req.auth`
 
-Diagnostic, backfill, and reprocess-event routes layer
-`requireAuth, requireAdmin` per route. Order matters — `requireAdmin`
-asserts `req.auth` is present, so it MUST run after `requireAuth`.
+Route handlers access the principal through `req.auth` (direct property read)
+or via the accessors `getPrincipal` / `requirePrincipal`. The table below
+shows how each caller uses the principal:
+
+| Caller                              | Reads               | Passes to                          |
+| ----------------------------------- | ------------------- | ---------------------------------- |
+| `routes/auth.ts` — logout           | `req.auth.token`    | `revokeSession(token)`             |
+| `routes/auth.ts` — revoke all       | `req.auth.address`  | `revokeAllSessionsForAddress(addr)` |
+| `routes/billing.ts`                 | `req.auth.address`  | (looks up caller's billing records) |
+| Admin-gated routes                  | `req.auth`          | (diagnostics, events, backfill)    |
+
+Both downstream session functions do their own lowercase normalization, so
+the middleware's "raw lowercase header" choice is compatible without
+further massaging.
+
+### Route-level middleware patterns
+
+**User-only endpoint** (requires authentication, no admin check):
+
+```ts
+router.get("/billing/invoices", requireAuth, getInvoices);
+```
+
+**Admin-only endpoint** (requires both authentication and admin role):
+
+```ts
+router.get("/diagnostics/report", requireAuth, requireAdmin, getReport);
+```
+
+Both middlewares can be applied per-route or per-router. They are idempotent,
+so applying them multiple times in a middleware stack is safe — downstream
+routers can re-apply `requireAuth` without re-validating the session.
 
 ## Compatibility guarantees
 
@@ -204,26 +354,73 @@ canonicalising `req.auth.address`, or renaming a header constant — is
 breaking, and needs a coordinated change in `routes/auth.ts`,
 `routes/billing.ts`, and every admin-gated router.
 
+## Telemetry & Observability
+
+`src/auth/middleware.ts` exposes process-local metric counters and structured event logs for principal resolution and route authorization via `src/auth/middleware-metrics.ts`:
+
+### Metric Counters (`AUTH_METRICS`)
+
+- `auth_middleware_auth_requests_total` — Total principal resolution requests received.
+- `auth_middleware_auth_resolved_total` — Total successful principal resolutions.
+- `auth_middleware_auth_denied_total` — Total principal resolution denials (401).
+- `auth_middleware_auth_denied_missing_header_total` — Denials due to missing `x-user-address` or `authorization` header.
+- `auth_middleware_auth_denied_invalid_bearer_total` — Denials due to non-Bearer format.
+- `auth_middleware_auth_denied_empty_credentials_total` — Denials due to empty address or token.
+- `auth_middleware_auth_denied_invalid_session_total` — Denials due to invalid or expired session lookup.
+- `auth_middleware_auth_idempotent_hits_total` — `requireAuth` calls that hit cached `req.auth`.
+- `auth_middleware_admin_requests_total` — Total admin route authorization checks.
+- `auth_middleware_admin_authorized_total` — Total successful admin authorizations.
+- `auth_middleware_admin_unauthorized_total` — Total admin checks denied due to missing principal (401).
+- `auth_middleware_admin_forbidden_total` — Total admin checks denied due to non-admin principal (403).
+- `auth_middleware_admin_idempotent_hits_total` — `requireAdmin` calls that hit cached `res.locals.adminAuthorized`.
+- `auth_middleware_require_principal_missing_total` — `requirePrincipal` calls invoked without a principal (5xx wiring error).
+
+### Structured Event Logs
+
+Structured event logs are emitted via `logAuthMiddlewareEvent` (JSON when `LOG_FORMAT=json`, filtered by `LOG_LEVEL`):
+- `"auth.principal.resolved"` (`info`) — Emitted on successful principal resolution with lowercased address.
+- `"auth.principal.denied"` (`warn`) — Emitted on principal resolution denial with bounded `reason` code (`missing_header`, `invalid_bearer`, `empty_credentials`, `invalid_session`).
+- `"auth.principal.cached"` (`debug`) — Emitted when `requireAuth` hits cached `req.auth`.
+- `"auth.admin.authorized"` (`info`) — Emitted on successful admin authorization.
+- `"auth.admin.unauthorized"` (`warn`) — Emitted when `requireAdmin` rejects an unauthenticated caller (401).
+- `"auth.admin.forbidden"` (`warn`) — Emitted when `requireAdmin` rejects a non-admin principal (403).
+- `"auth.admin.cached"` (`debug`) — Emitted when `requireAdmin` hits cached `res.locals.adminAuthorized`.
+- `"auth.principal.missing_error"` (`error`) — Emitted when `requirePrincipal` is called on an unauthenticated request.
+
+*SECURITY NOTE*: Telemetry functions NEVER log raw bearer tokens or authorization header contents.
+
+
 ## Tests
 
 `src/auth/middleware.test.ts` covers the full contract:
 
 - `requireAuth` failure paths (missing header, non-string array header,
   non-Bearer, empty trimmed token, empty trimmed address, invalid session,
-  throwing session lookup).
+  throwing session lookup — including console.warn observability check).
 - `requireAuth` success path (lowercased address stored, raw token
   stored, next called).
-- `requireAdmin` 401 path (missing `req.auth`, empty address).
+- `requireAuth` idempotency paths (second call skips re-validation,
+  original principal preserved when headers change between calls).
+- `requireAdmin` 401 path (missing `req.auth`, empty address,
+  non-object `req.auth`, `req.auth.address` is null).
 - `requireAdmin` 403 path (non-admin authenticated, malformed
   principal, allowlist has malformed entries).
+- `requireAdmin` idempotency paths (short-circuit when
+  `res.locals.adminAuthorized` is pre-set, second call skips re-check,
+  allowlist changes ignored after first authorization).
 - `requireAdmin` success paths including canonical padding equivalence
   between admin and principal.
+- `requireAdmin` idempotency paths (short-circuit when
+  `res.locals.adminAuthorized` is pre-set, second call skips re-check,
+  allowlist changes ignored after first authorization).
 - The exported constants (header names, statuses, frozen bodies) and the
   fresh-copy-per-response guarantee.
-- `getPrincipal` / `requirePrincipal` presence, absence, and the
-  same-object-as-`req.auth` guarantee.
-- `isAdminPrincipal` across casing, padding, malformed principal, malformed
-  and empty allowlists, plus an agreement check against `requireAdmin`.
+- `getPrincipal` presence, absence, null `req.auth`, null address,
+  whitespace-only address, and the same-object-as-`req.auth` guarantee.
+- `requirePrincipal` presence, absence, and empty-address edge case.
+- `isAdminPrincipal` across casing, padding, malformed principal, empty
+  string, bare `0x` prefix, malformed and empty allowlists, plus an
+  agreement check against `requireAdmin`.
 - The nine compatibility guarantees above, one case each.
 
 `src/routes/diagnostics.test.ts` exercises the boundary end-to-end with
@@ -249,3 +446,18 @@ The following are explicitly NOT part of this contract:
 - Rate-limiting on the principal itself (see `middleware/rate-limit.ts`).
 - Session creation, which lives in `auth/session.ts`.
 - Token refresh/rotation, which lives in `routes/auth.ts`.
+- Input format validation of the `x-user-address` header beyond
+  non-empty-after-trim. Address format validation is the responsibility of
+  `requireSession` (which checks the database) and `normalizeStarknetAddress`
+  (used by `isAdminPrincipal`). Adding address format parsing at the
+  middleware boundary would be a breaking change (see compatibility
+  guarantee #2).
+
+## Version history
+
+| Change | Description |
+| ------ | ----------- |
+| #335   | Added idempotency to both `requireAuth` and `requireAdmin` |
+| #327   | Implemented `requireAdmin` idempotency guard (was documented but not yet implemented) |
+| #328   | Added regression coverage for edge cases |
+| #329   | This document — caller map, usage examples, edge case tables, request lifecycle |
