@@ -32,6 +32,7 @@ export default defineConfig({
         "src/utils/token-formatting.ts",
         "src/utils/validation.ts",
         "src/shutdown.ts",
+        "src/starknet/agreement-index.ts",
         "scripts/check-env-sync.ts",
         "scripts/lint-migrations.ts",
       ],
