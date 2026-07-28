@@ -122,6 +122,15 @@ export interface MakeLimiterOptions {
    */
   store?: Store;
   /**
+   * Optional cost function to determine the weight of the request.
+   * Useful for batching or pagination where a single request consumes
+   * multiple tokens. The limiter scales the effective max requests inversely
+   * to the cost.
+   *
+   * Requests where the cost alone exceeds `max` are immediately throttled.
+   */
+  cost?: (req: Request) => number | Promise<number>;
+  /**
    * Enable idempotency-key deduplication. When `true`, requests with the same
    * `Idempotency-Key` header **and** the same client IP are deduplicated:
    * only the first occurrence counts against the rate limit; subsequent
@@ -282,7 +291,20 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
 
   const baseLimiter = rateLimit({
     windowMs,
-    max,
+    limit: options.cost
+      ? async (req: Request, res: Response) => {
+          const baseMax = max;
+          try {
+            const c = await options.cost!(req);
+            if (c <= 0) return baseMax;
+            if (c > baseMax) return 0;
+            return Math.floor(baseMax / c);
+          } catch (err) {
+            console.error(`[rate-limit] cost function threw for limiter="${name}":`, err);
+            return baseMax;
+          }
+        }
+      : max,
     message,
     // Disable legacy `X-RateLimit-*` headers and the draft standard
     // `RateLimit-*` headers. Clients should rely on `Retry-After` (set

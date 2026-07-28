@@ -54,5 +54,58 @@ describe('rate-limit middleware – idempotency key validation', () => {
     expect(res.status).toBe(429);
     expect(res.body).toHaveProperty('error');
     expect(res.headers['retry-after']).toBeDefined();
+});
+
+describe('rate-limit middleware – batching and pagination contract', () => {
+  test('scales limit inversely to cost (proportional limiting)', async () => {
+    const app = buildApp({
+      name: 'batch-test',
+      windowMs: 60_000,
+      max: 10,
+      cost: (req: Request) => Number(req.headers['x-cost'] || 1)
+    });
+    
+    // Cost 5 -> Limit becomes 2. 
+    // Request 1: hits=1, limit=2. Passes.
+    let res = await request(app).get('/test').set('x-cost', '5');
+    expect(res.status).toBe(200);
+    
+    // Request 2: hits=2, limit=2. Passes.
+    res = await request(app).get('/test').set('x-cost', '5');
+    expect(res.status).toBe(200);
+    
+    // Request 3: hits=3, limit=2. Throttled.
+    res = await request(app).get('/test').set('x-cost', '5');
+    expect(res.status).toBe(429);
+  });
+
+  test('immediately throttles if cost exceeds max (boundary path)', async () => {
+    const app = buildApp({
+      name: 'batch-test-2',
+      windowMs: 60_000,
+      max: 10,
+      cost: (req: Request) => 15
+    });
+    
+    // Cost 15 > Max 10 -> immediately throttled even on first request
+    const res = await request(app).get('/test');
+    expect(res.status).toBe(429);
+  });
+  
+  test('treats zero or negative cost as base max', async () => {
+    const app = buildApp({
+      name: 'batch-test-3',
+      windowMs: 60_000,
+      max: 2,
+      cost: (req: Request) => 0
+    });
+    
+    // Limit falls back to max (2)
+    let res = await request(app).get('/test');
+    expect(res.status).toBe(200);
+    res = await request(app).get('/test');
+    expect(res.status).toBe(200);
+    res = await request(app).get('/test');
+    expect(res.status).toBe(429);
   });
 });

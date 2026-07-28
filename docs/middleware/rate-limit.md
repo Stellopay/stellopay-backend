@@ -36,6 +36,21 @@ This document describes the contract and behavior of the **rate‑limit** middle
 - By default an in‑memory store is used (process‑local). For multi‑instance deployments provide a shared `store` (e.g., Redis via `rate-limit-redis`).
 - Errors from the store are **fail‑open** (`passOnStoreError: true`).
 
+## Batching or Pagination Contract
+When exposing endpoints that accept batches of items or paginated requests, the rate limiter must scale appropriately to prevent a single request from performing unbounded work.
+
+By default, the rate limiter consumes 1 token per request. For batching or pagination, you must define a `cost` function in the limiter options.
+
+### How it works
+The `cost` function evaluates the weight of the request (e.g., the number of items in a batch). The limiter enforces this weight by scaling the window's effective maximum requests inversely to the cost.
+
+For example, if `max` is 100, and a request has a cost of 10, the effective limit for that request becomes `10` (since `100 / 10 = 10`). This guarantees that a client exclusively sending requests of cost `C` cannot process more than `max` total items in a window.
+
+### Boundaries and Failures
+1. **Cost Exceeds Max**: If a single request's cost is strictly greater than the limiter's `max`, it is immediately throttled (returns 429) without further processing. This guarantees oversized batches are rejected outright.
+2. **Zero or Negative Cost**: If the cost function evaluates to zero or a negative value, the limiter defaults back to the base `max` (effectively treating the cost as 1).
+3. **Mixed Traffic**: Because the underlying token bucket natively tracks requests rather than items, a client mixing high-cost and low-cost requests might exceed the exact item count slightly. This proportional-limit approach remains an approximation, but strictly bounds the maximum workload and remains safe for growth.
+
 ## Usage Example
 ```ts
 import { makeLimiter } from './middleware/rate-limit';
