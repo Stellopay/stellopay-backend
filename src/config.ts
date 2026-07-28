@@ -197,7 +197,7 @@ export const EnvSchema = z
     .optional()
     .default(60_000),
 })
-  .superRefine((data, ctx) => {
+.superRefine((data, ctx) => {
     const isDev = !data.NODE_ENV || data.NODE_ENV === "development" || data.NODE_ENV === "test";
     const origin = data.CORS_ORIGIN;
 
