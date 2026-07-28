@@ -85,12 +85,15 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
     state.progressWriteCallCount = 0;
   }
 
-  function insertAgreementEvent(values: AgreementEventRow) {
-    if (state.agreementEvents.has(values.id)) {
-      return [];
+  function insertAgreementEvent(values: AgreementEventRow | AgreementEventRow[]) {
+    const rows = Array.isArray(values) ? values : [values];
+    const inserted: AgreementEventRow[] = [];
+    for (const row of rows) {
+      if (state.agreementEvents.has(row.id)) continue;
+      state.agreementEvents.set(row.id, { ...row });
+      inserted.push({ ...row });
     }
-    state.agreementEvents.set(values.id, { ...values });
-    return [{ ...values }];
+    return inserted;
   }
 
   function upsertProgress(values: ProgressRow, set: Partial<ProgressRow>) {
@@ -103,7 +106,13 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
       state.progress.set(values.jobName, { ...values });
       return;
     }
-    state.progress.set(values.jobName, { ...existing, ...set });
+    // Filter out undefined values so they don't overwrite existing data.
+    // This matches real drizzle-orm behavior: omitting a field from `set`
+    // leaves the existing column value intact.
+    const cleaned = Object.fromEntries(
+      Object.entries(set).filter(([, v]) => v !== undefined),
+    );
+    state.progress.set(values.jobName, { ...existing, ...cleaned });
   }
 
   function makeAgreementEventsInsertChain() {
@@ -226,7 +235,6 @@ vi.mock("drizzle-orm", async (importOriginal) => {
 
 import {
   backfillEventsRouter,
-  BACKFILL_CHECKPOINT_BATCH_SIZE,
   RESULTS_PREVIEW_SIZE,
   buildBackfillEventId,
   BackfillQuerySchema,
@@ -239,6 +247,14 @@ import { requireSession } from "../auth/session.js";
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
 
+function authHeaders(address: string) {
+  return { "x-user-address": address, Authorization: "Bearer test-token" };
+}
+
+function setupDbDefaults() {
+  store.reset();
+}
+
 function makeApp() {
   const app = express();
   app.use(express.json());
@@ -248,8 +264,6 @@ function makeApp() {
   });
   return app;
 }
-
-const mockDateString = "2024-01-01T00:00:00.000Z";
 
 /** Recursively walks a drizzle SQL fragment's internal queryChunks to find every embedded Date param. */
 function extractDateParams(node: unknown): Date[] {
@@ -357,6 +371,7 @@ describe.each(JOBS)("POST $path", (job) => {
   });
 
   it("creates events for scanned rows, returns the response contract, and skips duplicates idempotently", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
     queueRows([makeRow(1), makeRow(2)]);
     const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
 
@@ -367,6 +382,20 @@ describe.each(JOBS)("POST $path", (job) => {
     expect(res.body.results[0].status).toBe("created");
     expect(res.body.hasMore).toBe(false);
     expect(res.body.nextCursor).toBe(new Date(Date.UTC(2026, 0, 1, 0, 0, 2)).toISOString());
+    expect(res.body.nextResumeToken).toBe(new Date(Date.UTC(2026, 0, 1, 0, 0, 2)).toISOString());
+    expect(res.body.cursor).toBe(new Date(Date.UTC(2026, 0, 1, 0, 0, 2)).toISOString());
+    expect(typeof res.body.durationMs).toBe("number");
+    expect(res.body.durationMs).toBeGreaterThanOrEqual(0);
+
+    expect(console.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        op: job.jobName === "employee-events" ? "backfill_employee_events" : "backfill_milestone_events",
+        scanned: 2,
+        created: 2,
+        durationMs: expect.any(Number),
+        nextResumeToken: expect.any(String),
+      }),
+    );
 
     // Re-running against the same (still-queued) row set must be a no-op.
     queueRows([makeRow(1), makeRow(2)]);
@@ -579,7 +608,6 @@ describe("BackfillQuerySchema", () => {
     expect(() => BackfillQuerySchema.parse({ resumeToken: "invalid-date" })).toThrow();
     expect(() => BackfillQuerySchema.parse({ cursor: "invalid-date" })).toThrow();
   });
-});
 
 describe("buildBackfillEventId", () => {
   it("handles empty strings without throwing", () => {
@@ -669,3 +697,5 @@ describe("Edge cases", () => {
     expect(res.body.results[0].status).toBe("skipped");
   });
 });
+
+

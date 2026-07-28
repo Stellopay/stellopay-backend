@@ -14,6 +14,8 @@ These endpoints are used to restore a consistent indexer state safely.
 ### Authentication and Authorization
 All three routes require an active admin session (`requireAuth` + `requireAdmin`). `GET /backfill/status` is deliberately gated the same as the write endpoints — checkpoint state (row counts, error messages, timing) is an internal indexing detail, not something to expose publicly.
 
+**Authorization contract (Issue #263):** The middleware ordering (`requireAuth` → `requireAdmin` → handler) is locked by `backfill-events.middleware.test.ts`, which inspects the Express router's registered middleware stack. This test runs against the real router object — no mocking — so a future edit that drops or reorders the middleware will fail there, independent of whether other test files mock the auth layer. `backfill-events.auth.test.ts` exercises the full auth boundary end-to-end with real middleware (session lookup is stubbed, but `requireAuth`/`requireAdmin` run for real).
+
 ### Query Parameters
 
 | Parameter     | Type              | Default | Max    | Description                                                     |
@@ -29,6 +31,16 @@ All three routes require an active admin session (`requireAuth` + `requireAdmin`
 An invalid cursor or resume token value (anything that doesn't parse as a valid ISO date) is rejected with a `400 { "error": "<message>" }` response.
 
 Omitting cursor parameters entirely preserves the pre-existing behavior of these endpoints: the newest un-backfilled rows (up to `limit`) are scanned, unbounded by any cursor.
+
+### Resume Token Freshness Bounds (Issue #263)
+
+Resume tokens (`before`, `resumeToken`, `cursor`) are validated for freshness at parse time via `validateResumeTokenFreshness`:
+
+| Check                         | Constant                  | Default | Behaviour                                                        |
+| ----------------------------- | ------------------------- | ------- | ----------------------------------------------------------------|
+| Future-date rejection         | `CLOCK_SKEW_TOLERANCE_MS` | 60 s    | Tokens ahead of `Date.now()` by more than this tolerance are rejected with 400. Prevents an attacker from specifying a token that scans the entire table unbounded. |
+
+Past dates are **intentionally accepted without bound** — since synthetic event IDs use `ON CONFLICT DO NOTHING`, replaying old tokens is idempotent and harmless. The `_backfill_` segment in the event ID guarantees no collision with real on-chain events. This means operators can safely replay tokens from any point in time without restriction.
 
 ### Performance & Architecture Optimizations
 
@@ -193,7 +205,7 @@ operation begins:
 | ------------- | ----------------- | ------- | ------ | --------------------------------------------- |
 | `limit`       | number (coerced)  | `1000`  | `5000` | Must be a positive integer ≤ `MAX_BACKFILL_LIMIT`. Non-numeric or floating-point values are rejected. |
 | `agreementId` | string            | —       | —      | Passed through as-is when present.            |
-| `before`      | ISO-8601 datetime | —       | —      | Must be a parseable date. Invalid values produce the same `400 { "error" }` shape as other validation failures. |
+| `before`      | ISO-8601 datetime | —       | —      | Must be a parseable date. Must not be in the future beyond `CLOCK_SKEW_TOLERANCE_MS`. Invalid values produce the same `400 { "error" }` shape as other validation failures. |
 
 Unknown query parameters are silently ignored.
 
