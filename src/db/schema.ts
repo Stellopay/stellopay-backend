@@ -513,6 +513,44 @@ export const billingInvoices = pgTable(
 
 
 // ---------------------------------------------------------------------------
+// Backfill Progress
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks the progress of backfill jobs. Each row represents one backfill job
+ * type (employee-events, milestone-events) and stores the last checkpoint,
+ * totals, and status for resume-after-crash semantics.
+ */
+export const backfillProgress = pgTable(
+  "backfill_progress",
+  {
+    jobName: text("job_name").primaryKey(),
+    status: text("status").notNull().default("idle"),
+    lastCursor: timestamp("last_cursor"),
+    totalScanned: integer("total_scanned").notNull().default(0),
+    totalCreated: integer("total_created").notNull().default(0),
+    lastError: text("last_error"),
+    startedAt: timestamp("started_at"),
+    completedAt: timestamp("completed_at"),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    statusCheck: check(
+      "backfill_progress_status_check",
+      sql`${table.status} IN ('idle', 'running', 'completed', 'failed')`,
+    ),
+    totalScannedCheck: check(
+      "backfill_progress_total_scanned_check",
+      sql`${table.totalScanned} >= 0`,
+    ),
+    totalCreatedCheck: check(
+      "backfill_progress_total_created_check",
+      sql`${table.totalCreated} >= 0`,
+    ),
+  }),
+);
+
+// ---------------------------------------------------------------------------
 // Pagination & Batching Constants
 // ---------------------------------------------------------------------------
 
@@ -621,5 +659,6 @@ export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any>
   { name: "billingPaymentMethods", table: billingPaymentMethods },
   { name: "billingInvoices", table: billingInvoices },
   { name: "sessions", table: sessions },
+  { name: "backfillProgress", table: backfillProgress },
 ];
 

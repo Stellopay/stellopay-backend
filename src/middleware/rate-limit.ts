@@ -11,6 +11,10 @@ import type { Request, Response } from "express";
 
 /** Canonical header name for the idempotency key. */
 export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+/** Header name for Retry-After on 429 responses */
+export const RETRY_AFTER_HEADER = "Retry-After";
+/** Shape of the JSON body returned on rate limit (429) */
+export interface RateLimitErrorBody { error: string; }
 
 /** Response header set to `"true"` when a request was recognized as a replay. */
 export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
@@ -25,7 +29,10 @@ export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
 export function getIdempotencyKey(req: Request): string | undefined {
   const value = req.headers[IDEMPOTENCY_KEY_HEADER.toLowerCase()];
   if (typeof value !== "string" || value.length === 0) return undefined;
-  if (value.length > 255) return undefined;
+  // Enforce a safe character set for idempotency keys: alphanumerics, hyphen, underscore.
+  // Reject keys containing whitespace or control characters to avoid injection risks.
+  const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9_-]{1,255}$/;
+  if (!IDEMPOTENCY_KEY_REGEX.test(value)) return undefined;
   return value;
 }
 
@@ -301,8 +308,9 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
     // -------------------------------------------------------------------------
     handler: (_req: Request, res: Response) => {
       console.warn(`[rate-limit] limit reached for limiter="${name}"`);
-      res.setHeader("Retry-After", retryAfter);
-      res.status(429).json({ error: message });
+      res.setHeader(RETRY_AFTER_HEADER, retryAfter);
+      const body: RateLimitErrorBody = { error: message };
+      res.status(429).json(body);
     },
   });
 

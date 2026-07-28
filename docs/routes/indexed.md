@@ -1,4 +1,4 @@
-# Indexed Routes
+﻿# Indexed Routes
 
 Source: [`src/routes/indexed.ts`](../../src/routes/indexed.ts)
 
@@ -7,6 +7,9 @@ Read-only endpoints serving data already written to Postgres by the indexer
 never call the chain directly — they query the indexed copy, which is why
 responses are tagged with `source: "indexed"` where applicable.
 
+All indexed GET endpoints are **idempotent**: repeated requests with the same
+underlying database state produce identical responses. See [Idempotency Contract](#idempotency-contract).
+
 ---
 
 ## Endpoints
@@ -14,7 +17,7 @@ responses are tagged with `source: "indexed"` where applicable.
 | Method | Path | Authorization | Description |
 |---|---|---|---|
 | GET | `/indexed/freshness` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer sync checkpoint block number and freshness state |
-| GET | `/indexed/checkpoint` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer high-water mark sync checkpoint |
+| GET | `/indexed/checkpoint` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer high-water mark sync checkpoint (no freshness) |
 | GET | `/indexed/agreements/:contract_address/user/:user_address` | Public / Standard Read | Agreements where the user is employer, contributor, or a payroll employee |
 | GET | `/indexed/agreement/:contract_address/:agreement_id` | Public / Standard Read | Full detail for one agreement (events, payments, milestones, employees, escrow events) |
 | GET | `/indexed/payments/user/:user_address` | Public / Standard Read | Payments where the user is sender or recipient |
@@ -53,6 +56,7 @@ All `:contract_address`/`:user_address` params are validated with
     "checkpointBlock": 12345
   }
   ```
+  Note: `/indexed/checkpoint` intentionally omits the `freshness` field — it is a narrower contract returning only the high-water mark.
 
 ### 3. Expected Authorization Failure Responses
 - **401 Unauthorized**:
@@ -79,7 +83,27 @@ All `:contract_address`/`:user_address` params are validated with
 - The indexer sync progress across indexed tables (`agreements`, `agreement_events`, `payments`, `escrow_events`, `milestones`, `employees`) is marked by the `block_number` stored with each event or entity.
 - The `deriveSyncCheckpoint(records)` helper calculates the highest block number (high-water mark) across a set of retrieved records.
 - If a query returns an empty result set or records without block numbers, `deriveSyncCheckpoint` returns `0`.
-- **`x-indexer-sync-checkpoint` Header**: Every successful response from the read endpoints (`GET /indexed/...`) includes the `x-indexer-sync-checkpoint` HTTP header, which exposes the derived high-water mark block number (sync checkpoint) to the client. This allows the client to inspect the freshness of the returned dataset directly.
+- This function is **pure and deterministic**: repeated calls with the same input always return the same output.
+- **`x-indexer-sync-checkpoint` Header**: Every successful response from the admin endpoints (`GET /indexed/freshness`, `GET /indexed/checkpoint`) and the read endpoints that return indexed records (`GET /indexed/agreements/...`, `GET /indexed/agreement/...`) includes the `x-indexer-sync-checkpoint` HTTP header with the derived high-water mark block number.
+
+---
+
+## Idempotency Contract
+
+All GET endpoints in `src/routes/indexed.ts` are **idempotent**:
+
+### Guarantees
+1. **No side effects**: Every endpoint is read-only. No writes, no state mutations, no cache updates.
+2. **Deterministic responses**: For the same underlying database state, repeated requests produce identical response bodies and headers.
+3. **Deterministic sync checkpoint**: `deriveSyncCheckpoint` is a pure function — same input always yields the same output.
+
+### What this means for callers
+- **Safe retry**: Callers may retry any failed GET request without risk of data corruption or ambiguous outcomes.
+- **Safe caching**: The `Cache-Control` and `ETag` headers on public read endpoints enable CDN and browser caching without coordination.
+- **Observable idempotency**: The `x-indexer-sync-checkpoint` header is stable for a given database state, so callers can verify they are seeing consistent results.
+
+### Scope
+This contract applies to all routes in `src/routes/indexed.ts`. Routes in other files (e.g. `src/routes/reprocess-events.ts`, `src/routes/backfill-events.ts`) are outside this contract.
 
 ---
 
@@ -135,6 +159,7 @@ as a decimal string to avoid precision loss over the wire.
 - **Top-level JSON response keys remain unchanged** across all read endpoints.
 - **`source: "indexed"`** is preserved in `/indexed/agreements/:contract_address/user/:user_address`.
 - **Error formats and status codes** (`400` validation/contract mismatch, `404` agreement not found, `500` server error) remain identical for existing callers.
+- **`/indexed/checkpoint`** previously returned the same body as `/indexed/freshness`, including `freshness`. It now returns only `{ source, checkpointBlock }`. The `freshness` field is still available from `/indexed/freshness`.
 - **Assumptions About Existing Callers**:
   - Callers accessing indexer operational status/freshness must supply valid admin authentication headers (`x-user-address` + Bearer token).
 
@@ -146,3 +171,4 @@ as a decimal string to avoid precision loss over the wire.
 - **Manual re-indexing / event reprocessing** — event reprocessing and backfilling are owned by `src/routes/reprocess-events.ts` and `src/routes/backfill-events.ts`.
 - **Cursor-based pagination** — these endpoints use offset/limit (`parsePagination`), not the cursor pattern documented in [`docs/routes/read.md`](./read.md).
 - **Cross-request caching** — every request re-reads from Postgres; there is no in-process or shared cache in front of these queries.
+- **Cache headers on `/indexed/payments` and `/indexed/escrow` endpoints** — these are public read endpoints but intentionally lack cache headers because response content could vary per-user address. Cache headers are applied only where response content is independent of the caller.

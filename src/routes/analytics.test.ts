@@ -82,6 +82,7 @@ import {
   _resetInflightRollups,
   ANALYTICS_ROLLUP_BATCH_SIZE,
   collectAnalyticsRollupBatches,
+  analyticsAggregationCache,
 } from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
@@ -118,6 +119,7 @@ function viewsFor(data: Array<{ month: string; views: number }>, month: string):
 beforeEach(() => {
   vi.clearAllMocks();
   _resetInflightRollups();
+  analyticsAggregationCache.clear();
   queryState.rows.payments = [];
   queryState.rows.escrowEvents = [];
   queryState.rows.agreementEvents = [];

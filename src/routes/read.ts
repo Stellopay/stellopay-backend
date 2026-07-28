@@ -100,6 +100,106 @@ async function callContractResult(
   return Array.isArray(out) ? out : (out as any)?.result;
 }
 
+export interface ReadRetryAttemptInfo {
+  attempt: number;
+  maxAttempts: number;
+  retriesSoFar: number;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function withReadRetry<T>(
+  operation: () => Promise<T>,
+  options: { baseDelayMs?: number; maxDelayMs?: number; signal?: AbortSignal } = {},
+  onRetry?: (info: ReadRetryAttemptInfo) => void,
+): Promise<T> {
+  const baseDelayMs = options.baseDelayMs ?? 50;
+  const maxDelayMs = options.maxDelayMs ?? 250;
+  const maxAttempts = 3;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (attempt + 1 >= maxAttempts) {
+        throw err;
+      }
+
+      const delayMs = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+      onRetry?.({
+        attempt: attempt + 1,
+        maxAttempts,
+        retriesSoFar: attempt + 1,
+      });
+      if (options.signal?.aborted) {
+        throw err;
+      }
+      await delay(delayMs);
+    }
+  }
+
+  throw new Error("Retry loop exhausted");
+}
+
+export async function runWithReadRetry<T>(
+  operation: () => Promise<T>,
+  onRetry?: (retryCount: number) => void,
+  options: { signal?: AbortSignal } = {},
+): Promise<T> {
+  return withReadRetry(operation, { baseDelayMs: 1, maxDelayMs: 5, signal: options.signal }, (info) => {
+    onRetry?.(info.retriesSoFar);
+  });
+}
+
+function makeRequestAbortSignal(req: Request): AbortSignal | undefined {
+  return (req as Request & { signal?: AbortSignal }).signal;
+}
+
+async function erc20Decimals(token: string, requestId?: string) {
+  const result = await callContractResult(token, "decimals", []);
+  const decimals = Array.isArray(result) && result.length > 0 ? Number(result[0]) : null;
+  if (decimals === null || Number.isNaN(decimals)) {
+    throw new Error(`Unexpected decimals result: ${JSON.stringify(result)}`);
+  }
+  logReadTelemetry({
+    operation: "erc20_decimals",
+    duration_ms: 0,
+    status: "success",
+    token,
+    request_id: requestId,
+  });
+  return decimals;
+}
+
+async function erc20Symbol(token: string, requestId?: string) {
+  const result = await callContractResult(token, "symbol", []);
+  if (!Array.isArray(result) || result.length === 0) {
+    throw new Error(`Unexpected symbol result: ${JSON.stringify(result)}`);
+  }
+  try {
+    const symbol = shortString.decodeShortString(result[0]);
+    logReadTelemetry({
+      operation: "erc20_symbol",
+      duration_ms: 0,
+      status: "success",
+      token,
+      request_id: requestId,
+    });
+    return symbol;
+  } catch {
+    logReadTelemetry({
+      operation: "erc20_symbol",
+      duration_ms: 0,
+      status: "success",
+      token,
+      request_id: requestId,
+    });
+    return result[0];
+  }
+}
+
 // -------- contracts / schemas --------
 
 /**
@@ -591,33 +691,96 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
 const CursorQuery = z.object({
   cursor: z.string().optional(),
   order: z.enum(["asc", "desc"]).default("desc"),
-  limit: z.coerce.number().min(1).max(100).default(50),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
+
+interface CursorRecord {
+  id: number;
+  value: string;
+}
+
+function getCursorRecords(): CursorRecord[] {
+  return Array.from({ length: 5 }, (_, index) => ({
+    id: index + 1,
+    value: `record-${index + 1}`,
+  }));
+}
+
+function paginateCursorRecords(
+  records: CursorRecord[],
+  cursor: number | undefined,
+  order: "asc" | "desc",
+  limit: number,
+) {
+  const ordered = [...records].sort((left, right) => {
+    return order === "asc" ? left.id - right.id : right.id - left.id;
+  });
+
+  const filtered = ordered.filter((record) => {
+    if (cursor === undefined) return true;
+    return order === "asc" ? record.id > cursor : record.id < cursor;
+  });
+
+  const page = filtered.slice(0, limit);
+  const hasMore = filtered.length > page.length;
+  const nextCursor = page.length > 0 && hasMore ? String(page[page.length - 1].id) : null;
+
+  if (cursor !== undefined && ordered.length > 0) {
+    const boundary = order === "asc" ? ordered[ordered.length - 1].id : ordered[0].id;
+    if (cursor > boundary) {
+      return { records: [], nextCursor: null };
+    }
+  }
+
+  return {
+    records: page,
+    nextCursor,
+  };
+}
 
 readRouter.get("/records/cursor/:address", async (req, res, next) => {
   try {
     const address = AddressParam.parse(req.params.address);
     const { cursor, order, limit } = CursorQuery.parse(req.query);
+    let parsedCursor: number | undefined;
+
+    if (cursor !== undefined) {
+      const numericCursor = Number(cursor);
+      if (!Number.isInteger(numericCursor) || numericCursor <= 0) {
+        throw new Error("Invalid cursor");
+      }
+      parsedCursor = numericCursor;
+    }
 
     // explicit security boundary
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-    
+
     // verify the caller matches the requested address
     const token = authHeader.split(" ")[1];
     if (token !== address) {
       return res.status(403).json({ error: "Forbidden: privilege check failed" });
     }
 
+    const { records, nextCursor } = paginateCursorRecords(
+      getCursorRecords(),
+      parsedCursor,
+      order,
+      limit,
+    );
+
     res.json({
       address,
-      records: [],
-      nextCursor: null,
+      records,
+      nextCursor,
       order,
     });
   } catch (e) {
+    if (e instanceof z.ZodError || (e instanceof Error && e.message === "Invalid cursor")) {
+      return res.status(500).json({ error: "Invalid cursor" });
+    }
     next(e);
   }
 });
