@@ -361,6 +361,56 @@ async function agreementGetSummary(
   return { employer, contributor, token, escrow, total, paid, status, mode, dispute_status };
 }
 
+// ---------- telemetry ----------
+
+interface TelemetryEntry {
+  operation: string;
+  duration_ms: number;
+  status: "success" | "error";
+  request_id?: string;
+  token?: string;
+  owner?: string;
+  escrow?: string;
+  agreement?: string;
+  agreement_id?: string;
+  /** Number of retry rounds (0 on first-try success, maxAttempts-1 at exhaustion). */
+  retries?: number;
+  error?: string;
+}
+
+function logReadTelemetry(entry: TelemetryEntry) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    if (logEntry.level === "error") {
+       
+      console.error(JSON.stringify(logEntry));
+    } else {
+       
+      console.info(JSON.stringify(logEntry));
+    }
+  } else {
+    const msg = `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [read-telemetry] ${
+      logEntry.operation
+    } ${logEntry.status} ${logEntry.duration_ms}ms${
+      logEntry.retries ? ` retries=${logEntry.retries}` : ""
+    }${logEntry.request_id ? ` [${logEntry.request_id}]` : ""}${
+      logEntry.error ? ` error=${logEntry.error}` : ""
+    }`;
+    if (logEntry.level === "error") {
+       
+      console.error(msg);
+    } else {
+       
+      console.info(msg);
+    }
+  }
+}
+
 // ---------- router ----------
 
 export const readRouter = Router();

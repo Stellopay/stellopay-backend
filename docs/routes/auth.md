@@ -470,68 +470,18 @@ extra cost to no-body requests.
 
 ## Known limitations / out of scope
 
-- **Address format is intentionally unvalidated.** All five request schemas
-  that take `address` (`AddressBody`, `VerifyBody`, `SessionBody`,
-  `RefreshBody`, plus the bearer `x-user-address` header) accept it as an
-  opaque `z.string().min(3)` with no Starknet-address / hex check. This is
-  preserved-by-design for compatibility with existing callers and tests
-  that use non-address placeholder strings (`"address"`,
-  `"0xExpiredChallenge"`, etc.). Tightening it is out of scope for this
-  change.
-- **Cross-route field redaction is per-route.** Only the auth router's
-  debug middleware redacts `session_token` and `signature`. Other routes
-  that accept session tokens in their bodies (e.g. `/api/v1/prepare/*`)
-  redact inside their own middlewares. The auth contract documented here
-  does not extend to those routes.
-- **`SESSION_MAX_TTL_MS` is enforced server-side** but is not surfaced in
-  any auth response field. Callers cannot read it from the `/auth/verify`
-  or `/auth/refresh` payload; they should treat the server as the
-  authoritative ceiling.
-- **Pre-existing broken rotation tests are out of scope.** Two rotation
-  scenarios in `src/routes/auth.test.ts` are marked `it.skip(..., TODO(lint-fix-310))`.
-  They belong to the broader session-rotation fix and are not part of this
-  docs/contract change.
-- **Address validation is split between two layers, asymmetrically across
-  endpoints.** All five request schemas accept `address` as a permissive
-  `z.string().min(3)`, but `src/auth/challenge.ts` calls into
-  `normalizeStarknetAddress` (`src/utils/address.ts`) which throws on
-  non-hex strings, addresses longer than 64 hex chars, and mixed-case
-  input that fails SNIP-23 checksum verification. The throws surface
-  asymmetrically, and only some auth routes traverse the consume path —
-  the rest resolve the address from the bearer session instead:
-  - `POST /auth/challenge` calls `createChallenge`, which **throws** on a
-    null key — the route surfaces the error via the central handler as
-    `500` with the underlying message (does NOT produce a 400 Validation
-    failed envelope).
-  - `POST /auth/verify` calls `consumeChallenge`; `normalizeAddressKey`
-    wraps `normalizeStarknetAddress` in a try/catch and returns `null` for
-    invalid input — the route surfaces that as `400 No active challenge`,
-    not `500`.
-  - `POST /auth/session/validate` uses `requireSession` (fetches the
-    session by `session_token` hash, then matches the supplied `address`
-    against `session.address`); a malformed `address` short-circuits to
-    `401 Invalid session`.
-  - `POST /auth/refresh` uses `rotateSession` (same token-hash-then-match
-    pattern); a malformed `address` short-circuits to `401 Invalid
-    refresh token`.
-  - `POST /auth/logout`, `POST /auth/revoke`, and `POST /auth/session/revoke`
-    resolve their `address` from the bearer middleware
-    (`requireAuth` → `requireSession`); the body's `address` field, if
-    any, is not the source of truth for these routes.
-  Same malformed input therefore produces three different envelopes
-  (`500`, `400 No active challenge`, `401 Invalid session / Invalid
-  refresh token`) depending on which route sees it first. **Expected
-  direction:** tighten the Zod schemas so `address` becomes
-  `StarknetAddress.parse` (reusing the canonical 0x + 64-hex form from
-  `src/utils/address.ts`) so all five request-bearing routes fail with
-  `400 Validation failed` from the central handler before reaching
-  either `createChallenge` or `consumeChallenge`. Convergence is the
-  follow-up; this PR does not change either layer.
-- **Lockout state is cleared before session creation completes.** The
-  `clearFailures(address)` call runs immediately before `await
-  createSession(address)` in `/auth/verify`. If the session-store write
-  throws after a successful signature verification, the failure counter
-  has already been reset. Repeated session-store failures from an
-  attacker therefore do not accumulate as lockout-eligible failures.
-  Deriving the right interaction (or `partial-issued` accounting) is out
-  of scope for this PR.
+- **Address format regex is intentionally loose.** All four request schemas
+  (`AddressBody`, `VerifyBody`, `SessionBody`, `RefreshBody`) restrict
+  `address` to a maximum string length of 100 characters to prevent huge
+  payloads from reaching downstream logic, but they deliberately omit a strict
+  Starknet-address/hex regex check. This is left as-is to preserve compatibility
+  with existing callers and tests (which use non-address placeholder strings such
+  as `"address"` or `"0xExpiredChallenge"`); tightening it to strictly require
+  hex digits is out of scope for this change.
+- `signature` arrays are clamped to realistic length bounds (between 2 and 10 elements, max 255 chars per element) to reject excessively large or deeply nested payloads before signature verification.
+- `getCachedNetworkInfo()` is already memoised in `src/starknet/client.ts`
+  and adds no per-request overhead beyond a Map lookup; no change was
+  needed there.
+- The `chainIdCache` inside `src/auth/challenge.ts` (`buildTypedChallenge`)
+  is likewise already memoised; the double-decode concern is already
+  handled at that layer.

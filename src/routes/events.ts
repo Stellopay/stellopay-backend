@@ -69,7 +69,7 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
     ...entry,
   };
   if (env.LOG_FORMAT === "json") {
-    // eslint-disable-next-line no-console
+     
     (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
     return;
   }
@@ -78,7 +78,7 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
     `${logEntry.tx_hash ? ` tx=${logEntry.tx_hash}` : ""}` +
     `${logEntry.batch_size !== undefined ? ` batch=${logEntry.batch_size}` : ""}` +
     `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-  // eslint-disable-next-line no-console
+   
   (logEntry.level === "error" ? console.error : console.info)(message);
 }
 

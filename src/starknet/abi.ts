@@ -188,7 +188,7 @@ export async function verifyAbiCompatibility(
     `Update the bundled ABI or set ABI_VERIFICATION_MODE=warn to suppress this error.`;
 
   if (mode === "warn") {
-    // eslint-disable-next-line no-console
+     
     console.warn(`\n${"=".repeat(72)}\n⚠  ${message}\n${"=".repeat(72)}\n`);
     return { match: false, bundledFingerprint, onChainFingerprint, message };
   }

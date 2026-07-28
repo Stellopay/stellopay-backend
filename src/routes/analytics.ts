@@ -454,7 +454,32 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
       const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
-      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logAnalyticsTelemetry({
+      operation: "analytics_monthly_rollup",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "success",
+      request_id: requestId,
+      user_address: userAddress,
+      year,
+      row_counts: {
+        payments: payments.length,
+        escrow_events: escrowEvents.length,
+        agreement_creations: agreementCreations.length,
+      },
+    });
+
+    res.json({
+      year,
+      data: chartData,
+      total: toDisplayNumber(totalRaw),
+    });
+    } finally {
+      inflightRollups.delete(rollupKey);
+    }
+  } catch (e: any) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    if (!(e instanceof z.ZodError)) {
       logAnalyticsTelemetry({
         operation: "analytics_monthly_rollup",
         duration_ms: Math.round(duration * 100) / 100,

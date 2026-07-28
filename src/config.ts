@@ -159,92 +159,36 @@ export const EnvSchema = z
       .optional()
       .default(12),
 
-    // Analytics aggregation in-process cache TTL (milliseconds).
-    // Repeated identical requests within this window hit the in-memory cache
-    // instead of re-running expensive aggregation queries. Default is 30 s
-    // (≈ 2–5 Starknet blocks) which is conservative enough that a re-fetch after
-    // a new block will see up-to-date data within a reasonable time.
-    ANALYTICS_CACHE_TTL_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(30_000),
-
-    // Session token lifetime in milliseconds (sliding expiry) — default 24 hours
-    SESSION_TTL_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(24 * 60 * 60 * 1000),
-
-    // Absolute maximum session lifetime in milliseconds — default 7 days
-    SESSION_MAX_TTL_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(7 * 24 * 60 * 60 * 1000),
-
-    // Feature flag: set to "true" to enable billing profile endpoints.
-    // When false (default) all /billing/* routes return 501 Not Implemented.
-    BILLING_ENABLED: z
-      .string()
-      .optional()
-      .default("false")
-      .transform((v) => v === "true"),
-
-    // Drain timeout for graceful shutdown (milliseconds) — default 10000 (10 seconds)
-    SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(10000),
-
-    // Comma-separated list of admin addresses
-    ADMIN_ADDRESSES: z
-      .string()
-      .optional()
-      .default("")
-      .transform((s) =>
-        s
-          .split(",")
-          .map((a) => a.trim().toLowerCase())
-          .filter((a) => a.length > 0),
-      ),
-
-    // Circuit breaker configuration for Starknet RPC calls
-    // Failure threshold: number of failures before circuit opens — default 5
-    CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(5),
-    // Success threshold: number of successes needed to close circuit from half-open — default 2
-    CIRCUIT_BREAKER_SUCCESS_THRESHOLD: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(2),
-    // Cooldown period before attempting to half-open circuit (milliseconds) — default 30 seconds
-    CIRCUIT_BREAKER_COOLDOWN_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(30_000),
-    // Time window for counting failures (milliseconds) — default 60 seconds
-    CIRCUIT_BREAKER_WINDOW_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(60_000),
-  })
+  // Circuit breaker configuration for Starknet RPC calls
+  // Failure threshold: number of failures before circuit opens - default 5
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(5),
+  // Success threshold: number of successes needed to close circuit from half-open - default 2
+  CIRCUIT_BREAKER_SUCCESS_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(2),
+  // Cooldown period before attempting to half-open circuit (milliseconds) - default 30 seconds
+  CIRCUIT_BREAKER_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(30_000),
+  // Time window for counting failures (milliseconds) - default 60 seconds
+  CIRCUIT_BREAKER_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(60_000),
+})
   .superRefine((data, ctx) => {
     const isDev =
       !data.NODE_ENV ||
