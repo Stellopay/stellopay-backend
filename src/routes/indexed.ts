@@ -167,27 +167,67 @@ export const authorizeIndexedFreshness = [requireAuth, requireAdmin];
  * This function is pure and deterministic: repeated calls with the same input
  * always produce the same output, making sync checkpoint derivation idempotent.
  *
- * @param records Array of database entities with an optional blockNumber property
- * @returns High-water mark block number, or 0 if records list is empty or lacks block numbers.
+ * Accepts records whose `blockNumber` may be a number, bigint, string, null, or
+ * undefined. Strings are coerced via `Number()` (hex prefixes like `0x` are
+ * handled natively by the JS runtime). Invalid, non-finite, or negative values
+ * are logged and skipped rather than halting the derivation.
+ *
+ * @param records Array of objects with an optional blockNumber property
+ * @returns High-water mark block number, or 0 if records list is empty or lacks valid block numbers.
  */
 export function deriveSyncCheckpoint(
-  records: Array<{ blockNumber?: number | bigint | null }>
+  records: Array<{ blockNumber?: unknown }>
 ): number {
   if (!records || !Array.isArray(records) || records.length === 0) return 0;
   let maxBlock = 0;
   for (const record of records) {
-    if (record && record.blockNumber !== undefined && record.blockNumber !== null) {
-      const bn = typeof record.blockNumber === "bigint" ? Number(record.blockNumber) : Number(record.blockNumber);
-      if (Number.isFinite(bn) && bn >= 0) {
-        if (bn > maxBlock) {
-          maxBlock = bn;
-        }
-      } else {
-        console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: record.blockNumber, reason: "invalid_format_or_negative" });
+    if (!record) continue;
+    const raw = record.blockNumber;
+    if (raw === undefined || raw === null) continue;
+
+    let bn: number;
+    if (typeof raw === "bigint") {
+      bn = Number(raw);
+    } else if (typeof raw === "string") {
+      bn = Number(raw);
+    } else if (typeof raw === "number") {
+      bn = raw;
+    } else {
+      console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: raw, reason: "unexpected_type" });
+      continue;
+    }
+
+    if (Number.isFinite(bn) && bn >= 0) {
+      if (bn > maxBlock) {
+        maxBlock = bn;
       }
+    } else {
+      console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: raw, reason: "invalid_format_or_negative" });
     }
   }
   return maxBlock;
+}
+
+/**
+ * Shared helper for /indexed/freshness and /indexed/checkpoint.
+ *
+ * Queries the latest 100 agreement event block numbers, derives the high-water
+ * mark, and returns both the raw records and the derived checkpoint so the
+ * caller can reuse them for observability without re-querying.
+ *
+ * Idempotency: this function is deterministic for the same database state.
+ */
+async function resolveCheckpoint(): Promise<{
+  checkpointBlock: number;
+  records: Array<{ blockNumber: unknown }>;
+}> {
+  const records = await db
+    .select({ blockNumber: schema.agreementEvents.blockNumber })
+    .from(schema.agreementEvents)
+    .orderBy(desc(schema.agreementEvents.blockNumber))
+    .limit(100);
+  const checkpointBlock = deriveSyncCheckpoint(records);
+  return { checkpointBlock, records };
 }
 
 export const indexedRouter = Router();
@@ -224,13 +264,7 @@ indexedRouter.get(
   async (_req, res, next) => {
     const startTime = performance.now();
     try {
-      const records = await db
-        .select({ blockNumber: schema.agreementEvents.blockNumber })
-        .from(schema.agreementEvents)
-        .orderBy(desc(schema.agreementEvents.blockNumber))
-        .limit(100);
-
-      const checkpointBlock = deriveSyncCheckpoint(records);
+      const { checkpointBlock, records } = await resolveCheckpoint();
 
       const body = {
         source: INDEXED_DATA_SOURCE,
@@ -239,6 +273,7 @@ indexedRouter.get(
       };
 
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
 
       // Observability
@@ -288,13 +323,7 @@ indexedRouter.get(
   async (_req, res, next) => {
     const startTime = performance.now();
     try {
-      const records = await db
-        .select({ blockNumber: schema.agreementEvents.blockNumber })
-        .from(schema.agreementEvents)
-        .orderBy(desc(schema.agreementEvents.blockNumber))
-        .limit(100);
-
-      const checkpointBlock = deriveSyncCheckpoint(records);
+      const { checkpointBlock, records } = await resolveCheckpoint();
 
       const body = {
         source: INDEXED_DATA_SOURCE,
@@ -302,6 +331,7 @@ indexedRouter.get(
       };
 
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
 
       // Observability
