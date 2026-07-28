@@ -38,6 +38,24 @@ export const RESULTS_PREVIEW_SIZE = 10;
 export const BACKFILL_CHECKPOINT_BATCH_SIZE = 100;
 
 // ---------------------------------------------------------------------------
+// Resume token freshness bounds (Issue #263)
+// ---------------------------------------------------------------------------
+
+/**
+ * Clock-skew tolerance when checking whether a resume token is in the
+ * future.  Tokens up to this far ahead of `Date.now()` are accepted so
+ * that minor differences between client and server clocks don't cause
+ * spurious rejections.
+ *
+ * Tokens beyond this tolerance are rejected with 400 to prevent an
+ * attacker from specifying a token that scans the entire table unbounded.
+ * The replay window itself is intentionally unbounded in the past —
+ * since synthetic event IDs use `ON CONFLICT DO NOTHING`, replaying
+ * old tokens is idempotent and harmless.
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000; // 60 seconds
+
+// ---------------------------------------------------------------------------
 // Job identity
 // ---------------------------------------------------------------------------
 
@@ -74,6 +92,38 @@ export function buildBackfillEventId(
 // Input validation
 // ---------------------------------------------------------------------------
 
+/**
+ * Validate a resume-token date for freshness bounds.
+ *
+ * Rejects:
+ *  - Future dates beyond {@link CLOCK_SKEW_TOLERANCE_MS} from `Date.now()`
+ *    (to prevent an attacker from specifying a token that scans the entire
+ *    table unbounded).
+ *
+ * Past dates are intentionally accepted without bound — since synthetic
+ * event IDs use `ON CONFLICT DO NOTHING`, replaying old tokens is
+ * idempotent and harmless.  The `_backfill_` segment in the event ID
+ * guarantees no collision with real on-chain events.
+ *
+ * This is the single validation entry-point for `before`, `resumeToken`,
+ * and `cursor` — the three aliases that all feed the same replay-window
+ * boundary.
+ */
+export function validateResumeTokenFreshness(date: Date): void {
+  const now = Date.now();
+  const tokenTime = date.getTime();
+
+  if (tokenTime > now + CLOCK_SKEW_TOLERANCE_MS) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        message: "Resume token is in the future beyond clock-skew tolerance",
+        path: [],
+      },
+    ]);
+  }
+}
+
 const optionalDateSchema = z.preprocess((val) => {
   if (val === undefined || val === null || val === "") return undefined;
   const d = new Date(val as string);
@@ -86,6 +136,7 @@ const optionalDateSchema = z.preprocess((val) => {
       },
     ]);
   }
+  validateResumeTokenFreshness(d);
   return d;
 }, z.date().optional());
 
