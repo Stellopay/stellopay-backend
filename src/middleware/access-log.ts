@@ -84,6 +84,29 @@ export function redactSensitiveParams(rawUrl: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------------
+
+/**
+ * A simple deduplication cache to prevent logging the same request ID more than once
+ * within a 60 second window.
+ */
+export const seenRequestIds = {
+  cache: new Set<string>(),
+  add(id: string): boolean {
+    if (this.cache.has(id)) {
+      return false; // Already seen
+    }
+    this.cache.add(id);
+    setTimeout(() => this.cache.delete(id), 60_000).unref();
+    return true;
+  },
+  reset(): void {
+    this.cache.clear();
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
 
@@ -173,7 +196,7 @@ export interface AccessLogEntry {
  *   `[<timestamp>] INFO <method> <path> <status> <duration>ms [<request_id>]`
  */
 export function accessLogMiddleware(req: Request, res: Response, next: NextFunction): void {
-  if (req.path === "/health") {
+  if (req.path === "/health" || req.path === "/ready") {
     return next();
   }
 
@@ -192,6 +215,10 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
         typeof res.locals.requestId === "string" && res.locals.requestId.length > 0
           ? res.locals.requestId
           : snapshotId;
+
+      if (!seenRequestIds.add(requestId)) {
+        return;
+      }
 
       metrics.totalRequests += 1;
       metrics.requestsByStatus[res.statusCode] = (metrics.requestsByStatus[res.statusCode] ?? 0) + 1;

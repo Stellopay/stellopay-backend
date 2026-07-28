@@ -4,6 +4,7 @@ import { isTable } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import {
   assertSchemaForeignKeyIndexes,
+  validateSchema,
   findUnindexedForeignKeyColumns,
   findUnindexedForeignKeyColumnsInSchema,
   getIndexedColumnSqlNames,
@@ -54,11 +55,41 @@ describe("findUnindexedForeignKeyColumns", () => {
   it("passes when the FK column is indexed", () => {
     expect(findUnindexedForeignKeyColumns(tableWithFkIndex)).toEqual([]);
   });
+});
 
-  it("assertSchemaForeignKeyIndexes fails with a clear message for gaps", () => {
-    expect(() =>
-      assertSchemaForeignKeyIndexes({ tableWithoutFkIndex } as Record<string, unknown>),
-    ).toThrow(/Foreign-key-shaped column\(s\) missing an index: schema_consistency_gap_fixture\.agreement_id \(agreementId\)/);
+describe("schema contract validation", () => {
+  it("validateSchema is the single entry point for production schema validation", () => {
+    expect(() => validateSchema(schema as Record<string, unknown>)).not.toThrow();
+  });
+
+  it("assertSchemaForeignKeyIndexes delegates to validateSchema", () => {
+    expect(() => assertSchemaForeignKeyIndexes(schema as Record<string, unknown>)).not.toThrow();
+  });
+
+  it("validateSchema throws with FK-level detail when an indexed column is missing", () => {
+    const gapTable = pgTable("schema_consistency_gap_fixture", {
+      id: text("id").primaryKey(),
+      agreementId: text("agreement_id").notNull(),
+    });
+
+    expect(() => validateSchema({ gapTable } as Record<string, unknown>)).toThrow(
+      /schema_consistency_gap_fixture\.agreement_id \(agreementId\)/,
+    );
+  });
+
+  it("returns empty for a schema where every FK column is indexed", () => {
+    const completeTable = pgTable(
+      "schema_consistency_complete_fixture",
+      {
+        id: text("id").primaryKey(),
+        agreementId: text("agreement_id").notNull(),
+      },
+      (table) => ({
+        agreementIdIdx: index("schema_consistency_complete_fixture_agreement_id_idx").on(table.agreementId),
+      }),
+    );
+
+    expect(() => validateSchema({ completeTable } as Record<string, unknown>)).not.toThrow();
   });
 });
 
@@ -108,8 +139,8 @@ describe("schema contract invariants", () => {
       expect(exportedTableNames.sort()).toEqual(schemaTableNames.sort());
     });
 
-    it("has exactly 10 tables", () => {
-      expect(schema.SCHEMA_TABLES).toHaveLength(10);
+    it("has exactly 11 tables", () => {
+      expect(schema.SCHEMA_TABLES).toHaveLength(11);
     });
 
     it("every SCHEMA_TABLES entry has a defined table reference", () => {

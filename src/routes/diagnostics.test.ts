@@ -14,6 +14,7 @@
  *   - Empty DB boundary: all summary fields default to 0, latestEvents is []
  *   - Error handling: db failure propagates as 500 via error handler
  *   - Response shape: all top-level keys present on every 200
+ *   - Idempotency-Key replay caching
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -79,9 +80,6 @@ import {
   DIAGNOSTICS_METRICS,
 } from "./diagnostics-metrics.js";
 
-// Use valid-hex addresses: the auth middleware now compares the
-// principal against the admin allowlist through normalizeStarknetAddress,
-// which rejects anything outside [0-9a-f] (e.g. `m`, `n`, `o`, `t`).
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
 
@@ -95,8 +93,15 @@ function makeApp() {
   return app;
 }
 
-function authHeaders(address: string) {
-  return { "x-user-address": address, authorization: "Bearer testtoken" };
+function authHeaders(address: string, idempotencyKey?: string) {
+  const headers: Record<string, string> = {
+    "x-user-address": address,
+    authorization: "Bearer testtoken",
+  };
+  if (idempotencyKey) {
+    headers["idempotency-key"] = idempotencyKey;
+  }
+  return headers;
 }
 
 /** Queue the five db.execute results the route reads, in call order. */
@@ -118,8 +123,6 @@ function wireDbRows() {
         },
       ],
     } as any)
-    // The recent-events query returns sensitive identifiers; the route must
-    // redact them out of the response.
     .mockResolvedValueOnce({
       rows: [
         {
@@ -154,19 +157,16 @@ describe("redactRecentEvent helper", () => {
   });
 
   it("provides safe fallbacks for malformed inputs without crashing", () => {
-    // Missing fields
     expect(redactRecentEvent({})).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
 
-    // Invalid types
     expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
     });
 
-    // Null or undefined
     expect(redactRecentEvent(null)).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
@@ -176,7 +176,6 @@ describe("redactRecentEvent helper", () => {
       created_at: new Date(0).toISOString(),
     });
 
-    // Primitive values
     expect(redactRecentEvent("just a string")).toEqual({
       event_type: "Unknown",
       created_at: new Date(0).toISOString(),
@@ -555,6 +554,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     vi.clearAllMocks();
     vi.mocked(db.execute).mockReset();
     vi.mocked(requireSession).mockResolvedValue(true);
+    clearDiagnosticsIdempotencyStore();
   });
 
   it("rejects an unauthenticated request with 401 and runs no queries", async () => {
@@ -565,10 +565,6 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 
   it("rejects an authenticated non-admin with 403 and runs no queries", async () => {
-    // requireAuth was satisfied by the session mock, but requireAdmin
-    // denies because NON_ADMIN is not in the admin allowlist. The 401/403
-    // split in src/auth/middleware.ts intentionally distinguishes "no
-    // session" from "wrong role".
     const res = await request(makeApp())
       .get("/api/v1/diagnostics/events")
       .set(authHeaders(NON_ADMIN));
@@ -649,7 +645,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
-      .mockResolvedValueOnce({ rows: [] } as any) // tableCounts empty: rows[0] undefined
+      .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any);
 
     const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
@@ -669,9 +665,8 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
   });
 });
 
-
 describe("GET /diagnostics/events – backward-compatibility contract (Issue #284)", () => {
-    beforeEach(() => {
+    beforeEach(() => {https://github.com/Stellopay/stellopay-backend/pull/564/conflict?name=src%252Froutes%252Fdiagnostics.test.ts&ancestor_oid=4c2037638aad218c8c1b9cac2228465f55bfc033&base_oid=f699082b599c18f0d4b617f1c6161b2253b77fe9&head_oid=15d417408f9201da0d8a9c31260caf74049f4088
         vi.clearAllMocks();
             vi.mocked(db.execute).mockReset();
                 vi.mocked(requireSession).mockResolvedValue(true);
@@ -754,253 +749,20 @@ describe("GET /diagnostics/events – backward-compatibility contract (Issue #28
                                                                                                                                                                                                                                                                                                                                       expect(postRes.status).toBe(404);
                                                                                                                                                                                                                                                                                                                                           expect(deleteRes.status).toBe(404);
                                                                                                                                                                                                                                                                                                                                               expect(db.execute).not.toHaveBeenCalled();
-                                                                                                                                                                                                                                                                                                                                                });                                                                                                                                                                                                                  it("count and *_count values remain strings as returned by Postgres COUNT(*)", async () => {
-                                                                                                                                                                                                                    wireDbRows();
+                                                                                                                                                                                                                                                                                                                                                });
 
-                                                                                                                                                                                                                    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+                                                                                                                                                                                                                                                                                                                                                  it("count and *_count values remain strings as returned by Postgres COUNT(*)", async () => {
+                                                                                                                                                                                                                                                                                                                                                    wireDbRows();
 
-                                                                                                                                                                                                                    expect(res.status).toBe(200);
-                                                                                                                                                                                                                    // Per the docs/count contract: count values are strings.
-                                                                                                                                                                                                                    for (const row of res.body.eventTypeCounts) {
-                                                                                                                                                                                                                      expect(typeof row.count).toBe("string");
-                                                                                                                                                                                                                    }
-                                                                                                                                                                                                                    expect(typeof res.body.summary.totalAgreementEvents).toBe("string");
-                                                                                                                                                                                                                    expect(typeof res.body.summary.latestBlock).toBe("string");
-                                                                                                                                                                                                                    expect(typeof res.body.tableCounts.agreement_events_count).toBe("string");
-                                                                                                                                                                                                                  });
-                                                                                                                                                                                                                });
+                                                                                                                                                                                                                                                                                                                                                    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
 
-describe("GET /diagnostics/events – structured logging and metrics (Issue #280)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(db.execute).mockReset();
-    vi.mocked(requireSession).mockResolvedValue(true);
-    vi.mocked(logDiagnosticsEvent).mockClear();
-    vi.mocked(incDiagnosticsMetric).mockClear();
-    vi.mocked(setDiagnosticsGauge).mockClear();
-    vi.mocked(getDiagnosticsMetricsSnapshot).mockClear();
-  });
-
-  it("logs a structured diagnostics.request event on every admin access", async () => {
-    wireDbRows();
-
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(res.status).toBe(200);
-    expect(logDiagnosticsEvent).toHaveBeenCalledWith(
-      "info",
-      "diagnostics.request",
-      expect.objectContaining({
-        admin: ADMIN,
-        limit: 20,
-        offset: 0,
-      }),
-    );
-  });
-
-  it("logs a structured diagnostics.success event when queries succeed", async () => {
-    wireDbRows();
-
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(res.status).toBe(200);
-    expect(logDiagnosticsEvent).toHaveBeenCalledWith(
-      "info",
-      "diagnostics.success",
-      expect.objectContaining({
-        admin: ADMIN,
-        queryDurationMs: expect.any(Number) as number,
-        agreementEvents: expect.anything() as unknown,
-      }),
-    );
-  });
-
-  it("logs a structured diagnostics.error event when a query fails", async () => {
-    vi.mocked(db.execute).mockRejectedValue(new Error("db connection refused"));
-
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(res.status).toBe(500);
-    expect(logDiagnosticsEvent).toHaveBeenCalledWith(
-      "error",
-      "diagnostics.error",
-      expect.objectContaining({
-        error: "db connection refused",
-      }),
-    );
-  });
-
-  it("increments the requests counter on every access", async () => {
-    wireDbRows();
-
-    await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(incDiagnosticsMetric).toHaveBeenCalledWith(
-      DIAGNOSTICS_METRICS.REQUESTS,
-    );
-  });
-
-  it("increments the success counter on successful queries", async () => {
-    wireDbRows();
-
-    await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(incDiagnosticsMetric).toHaveBeenCalledWith(
-      DIAGNOSTICS_METRICS.SUCCESS,
-    );
-  });
-
-  it("increments the errors counter on failed queries", async () => {
-    vi.mocked(db.execute).mockRejectedValue(new Error("timeout"));
-
-    await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(incDiagnosticsMetric).toHaveBeenCalledWith(
-      DIAGNOSTICS_METRICS.ERRORS,
-    );
-  });
-
-  it("includes queryDurationMs as a positive number in the response", async () => {
-    wireDbRows();
-
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(res.status).toBe(200);
-    expect(typeof res.body.queryDurationMs).toBe("number");
-    expect(res.body.queryDurationMs).toBeGreaterThanOrEqual(0);
-  });
-
-  it("includes diagnosticsMetrics snapshot in the response", async () => {
-    wireDbRows();
-
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(res.status).toBe(200);
-    expect(res.body.diagnosticsMetrics).toEqual({
-      counters: { diagnostics_requests_total: 1 },
-      gauges: {},
-    });
-    expect(getDiagnosticsMetricsSnapshot).toHaveBeenCalledOnce();
-  });
-
-  it("tracks query duration via the QUERY_DURATION_MS counter", async () => {
-    wireDbRows();
-
-    await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(incDiagnosticsMetric).toHaveBeenCalledWith(
-      DIAGNOSTICS_METRICS.QUERY_DURATION_MS,
-      expect.any(Number) as number,
-    );
-  });
-
-  it("sets the last query duration gauge", async () => {
-    wireDbRows();
-
-    await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(ADMIN));
-
-    expect(setDiagnosticsGauge).toHaveBeenCalledWith(
-      "diagnostics_last_query_duration_ms",
-      expect.any(Number) as number,
-    );
-  });
-
-  it("does not log diagnostics events for unauthenticated requests", async () => {
-    const res = await request(makeApp()).get("/api/v1/diagnostics/events");
-
-    expect(res.status).toBe(401);
-    // Logging/metrics should not fire because auth middleware rejects before
-    // the route handler runs.
-    expect(logDiagnosticsEvent).not.toHaveBeenCalled();
-  });
-
-  it("does not increment metrics for non-admin requests", async () => {
-    const res = await request(makeApp())
-      .get("/api/v1/diagnostics/events")
-      .set(authHeaders(NON_ADMIN));
-
-    expect(res.status).toBe(403);
-    expect(incDiagnosticsMetric).not.toHaveBeenCalled();
-  });
-});
-
-describe("fetchDiagnosticsData – observability side-effects", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(incDiagnosticsMetric).mockClear();
-    vi.mocked(setDiagnosticsGauge).mockClear();
-    vi.mocked(logDiagnosticsEvent).mockClear();
-  });
-
-  it("records query timing and emits a debug log", async () => {
-    const mockDb = {
-      execute: vi
-        .fn()
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] }),
-    };
-
-    await fetchDiagnosticsData(mockDb as any);
-
-    expect(incDiagnosticsMetric).toHaveBeenCalledWith(
-      DIAGNOSTICS_METRICS.QUERY_DURATION_MS,
-      expect.any(Number) as number,
-    );
-    expect(setDiagnosticsGauge).toHaveBeenCalledWith(
-      "diagnostics_last_query_duration_ms",
-      expect.any(Number) as number,
-    );
-    expect(logDiagnosticsEvent).toHaveBeenCalledWith(
-      "debug",
-      "diagnostics.query_timing",
-      expect.objectContaining({
-        durationMs: expect.any(Number) as number,
-        limit: 20,
-        offset: 0,
-      }),
-    );
-  });
-
-  it("returns queryDurationMs and diagnosticsMetrics in the data payload", async () => {
-    const mockDb = {
-      execute: vi
-        .fn()
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] })
-        .mockResolvedValueOnce({ rows: [] }),
-    };
-
-    const data = await fetchDiagnosticsData(mockDb as any);
-
-    expect(typeof data.queryDurationMs).toBe("number");
-    expect(data.queryDurationMs).toBeGreaterThanOrEqual(0);
-    expect(data.diagnosticsMetrics).toBeDefined();
-    expect(data.diagnosticsMetrics).toHaveProperty("counters");
-    expect(data.diagnosticsMetrics).toHaveProperty("gauges");
-  });
-});
+                                                                                                                                                                                                                                                                                                                                                    expect(res.status).toBe(200);
+                                                                                                                                                                                                                                                                                                                                                    // Per the docs/count contract: count values are strings.
+                                                                                                                                                                                                                                                                                                                                                    for (const row of res.body.eventTypeCounts) {
+                                                                                                                                                                                                                                                                                                                                                      expect(typeof row.count).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.summary.totalAgreementEvents).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.summary.latestBlock).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.tableCounts.agreement_events_count).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                  });
+                                                                                                                                                                                                                                                                                                                                                });

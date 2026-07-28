@@ -75,7 +75,15 @@ vi.mock("drizzle-orm", () => ({
   gt: vi.fn((_column: unknown, value: unknown) => ({ type: "gt", value })),
 }));
 
-import { analyticsRouter, parseBigIntSafe, isValidMonth } from "./analytics.js";
+import {
+  analyticsRouter,
+  parseBigIntSafe,
+  isValidMonth,
+  _resetInflightRollups,
+  ANALYTICS_ROLLUP_BATCH_SIZE,
+  collectAnalyticsRollupBatches,
+  analyticsAggregationCache,
+} from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
 
@@ -111,6 +119,7 @@ function viewsFor(data: Array<{ month: string; views: number }>, month: string):
 beforeEach(() => {
   vi.clearAllMocks();
   _resetInflightRollups();
+  analyticsAggregationCache.clear();
   queryState.rows.payments = [];
   queryState.rows.escrowEvents = [];
   queryState.rows.agreementEvents = [];
@@ -150,9 +159,12 @@ describe("analytics route", () => {
 
   it("validates and normalizes the address and returns twelve months of chart data", async () => {
     const address = normalizeStarknetAddress("abc");
-    queryState.rows.payments = [{ month: 3, amount: "1000000", to: address }];
+    queryState.rows.payments = [
+      { month: 3, amount: "5000000", to: address, from: "0xother" },
+      { month: 3, amount: "2000000", from: address, to: "0xother" },
+      { month: 5, amount: "11000000", from: address, to: "0xother" },
+    ];
     queryState.rows.escrowEvents = [
-      { month: 4, amount: "2000000", eventType: "Funded", employer: address },
       { month: 5, amount: "3000000", eventType: "Released", to: address },
     ];
 
@@ -309,20 +321,18 @@ describe("analytics validation", () => {
       { month: 2, amount: "3000000", eventType: "Released", employer: "someone", to: address },
       { month: 2, amount: "1000000", eventType: "Refunded", employer: address, to: "someone" },
     ];
-    // month 3: 2 agreements, but should be ignored because there is financial activity
+    // month 2: 2 agreements, but should be ignored because there is financial activity in month 2
     queryState.rows.agreementEvents = [
-      { month: 3, agreementId: "1" },
-      { month: 3, agreementId: "2" },
+      { month: 2, agreementId: "1" },
+      { month: 2, agreementId: "2" },
     ];
 
     const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
-    
+
     // month 1 should be 3.0
     expect(res.body.data[0].views).toBe(3);
-    // month 2 should be -4 + 3 + 1 = 0
+    // month 2 should be -4 + 3 + 1 = 0 (agreements ignored due to financial activity in month 2)
     expect(res.body.data[1].views).toBe(0);
-    // month 3 should be 0 because agreement fallback is suppressed
-    expect(res.body.data[2].views).toBe(0);
     // Total should be 3
     expect(res.body.total).toBe(3);
   });

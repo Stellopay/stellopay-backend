@@ -3,10 +3,11 @@ import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
-import { defaults } from "../config.js";
+import { defaults, env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { notFoundResponse } from "./not-found.js";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
 
 /**
  * Source identifier tag returned in indexed route responses.
@@ -25,7 +26,7 @@ const indexedCacheOptions = {
 
 /**
  * Centralized authorization gate for indexer freshness and sync checkpoint operations.
- * Requires an authenticated principal (`requireAuth`) with admin privileges (`requireAdmin`).
+ * Requires an authenticated principal (requireAuth) with admin privileges (requireAdmin).
  * Permission evaluation occurs before any database or internal indexer state access.
  */
 export const authorizeIndexedFreshness = [requireAuth, requireAdmin];
@@ -33,6 +34,9 @@ export const authorizeIndexedFreshness = [requireAuth, requireAdmin];
 /**
  * Derives the indexer sync checkpoint (highest block number) from a set of
  * database records indexed from Starknet events.
+ *
+ * This function is pure and deterministic: repeated calls with the same input
+ * always produce the same output, making sync checkpoint derivation idempotent.
  *
  * @param records Array of database entities with an optional blockNumber property
  * @returns High-water mark block number, or 0 if records list is empty or lacks block numbers.
@@ -45,8 +49,12 @@ export function deriveSyncCheckpoint(
   for (const record of records) {
     if (record && record.blockNumber !== undefined && record.blockNumber !== null) {
       const bn = typeof record.blockNumber === "bigint" ? Number(record.blockNumber) : Number(record.blockNumber);
-      if (Number.isFinite(bn) && bn > maxBlock) {
-        maxBlock = bn;
+      if (Number.isFinite(bn) && bn >= 0) {
+        if (bn > maxBlock) {
+          maxBlock = bn;
+        }
+      } else {
+        console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: record.blockNumber, reason: "invalid_format_or_negative" });
       }
     }
   }
@@ -67,19 +75,21 @@ const AgreementSchema = z.object({
 
 /**
  * GET /indexed/freshness
- * GET /indexed/checkpoint
  *
- * Retrieves indexer sync checkpoint and freshness metrics.
+ * Retrieves indexer sync checkpoint block and freshness state.
  *
  * Authorization Contract:
- * - Requires authenticated session (`requireAuth`) and admin privileges (`requireAdmin`).
+ * - Requires authenticated session (requireAuth) and admin privileges (requireAdmin).
  * - Permission evaluation occurs BEFORE any database query or indexer state access.
- * - Standard 401 response for unauthorized requests (`{ error: "Unauthorized" }`).
- * - Standard 403 response for forbidden requests (`{ error: "Forbidden" }`).
+ * - Standard 401 response for unauthorized requests ({ error: "Unauthorized" }).
+ * - Standard 403 response for forbidden requests ({ error: "Forbidden" }).
  * - Unauthorized requests receive no state information or execution timing payload.
+ *
+ * Idempotency: This endpoint is read-only. Repeated requests with the same
+ * underlying database state produce identical responses.
  */
 indexedRouter.get(
-  ["/indexed/freshness", "/indexed/checkpoint"],
+  "/indexed/freshness",
   requireAuth,
   requireAdmin,
   async (_req, res, next) => {
@@ -98,6 +108,49 @@ indexedRouter.get(
         freshness: records.length > 0 ? "synced" : "empty",
       };
 
+      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+      res.json(body);
+    } catch (e) {
+      next(e);
+    }
+  },
+);
+
+/**
+ * GET /indexed/checkpoint
+ *
+ * Retrieves indexer sync checkpoint block number.
+ *
+ * Authorization Contract:
+ * - Requires authenticated session (requireAuth) and admin privileges (requireAdmin).
+ * - Permission evaluation occurs BEFORE any database query or indexer state access.
+ * - Standard 401 response for unauthorized requests ({ error: "Unauthorized" }).
+ * - Standard 403 response for forbidden requests ({ error: "Forbidden" }).
+ * - Unauthorized requests receive no state information or execution timing payload.
+ *
+ * Idempotency: This endpoint is read-only. Repeated requests with the same
+ * underlying database state produce identical responses.
+ */
+indexedRouter.get(
+  "/indexed/checkpoint",
+  requireAuth,
+  requireAdmin,
+  async (_req, res, next) => {
+    try {
+      const records = await db
+        .select({ blockNumber: schema.agreementEvents.blockNumber })
+        .from(schema.agreementEvents)
+        .orderBy(desc(schema.agreementEvents.blockNumber))
+        .limit(100);
+
+      const checkpointBlock = deriveSyncCheckpoint(records);
+
+      const body = {
+        source: INDEXED_DATA_SOURCE,
+        checkpointBlock,
+      };
+
+      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
       res.json(body);
     } catch (e) {
       next(e);
@@ -158,7 +211,10 @@ indexedRouter.get(
       ]);
 
       const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
-      const pagedAgreements = allAgreements.slice(0, limit);
+      const uniqueAgreements = [...new Map(allAgreements.map((a) => [a.id, a])).values()];
+      const pagedAgreements = uniqueAgreements.slice(0, limit);
+
+      const checkpointBlock = deriveSyncCheckpoint(allAgreements);
 
       const body = {
         agreements: z.array(AgreementSchema).parse(pagedAgreements),
@@ -166,6 +222,7 @@ indexedRouter.get(
         source: INDEXED_DATA_SOURCE,
       };
 
+      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
       applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
     } catch (e) {
@@ -236,6 +293,12 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
       escrowEvents,
     };
 
+    const checkpointBlock = deriveSyncCheckpoint(
+      [agreement[0], ...events, ...payments, ...milestones, ...employees, ...escrowEvents],
+    );
+
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+    applyIndexedCacheHeaders(res, body, indexedCacheOptions);
     res.json(body);
   } catch (e) {
     next(e);
@@ -318,3 +381,4 @@ indexedRouter.get(
 );
 
 export default indexedRouter;
+

@@ -90,7 +90,7 @@ vi.mock("drizzle-orm", () => ({
   inArray: vi.fn(() => ({ type: "inArray" })),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import { analyticsRouter, analyticsAggregationCache } from "./analytics.js";
 
 function makeApp() {
   const app = express();
@@ -124,6 +124,7 @@ const USER = "0x0000000000000000000000000000000000000000000000000000000000000abc
 
 beforeEach(() => {
   vi.clearAllMocks();
+  analyticsAggregationCache.clear();
   queryState.rows.payments = [];
   queryState.rows.escrowEvents = [];
   queryState.rows.agreementEvents = [];
