@@ -114,6 +114,7 @@ export function validateResumeTokenFreshness(date: Date): void {
   const tokenTime = date.getTime();
 
   if (tokenTime > now + CLOCK_SKEW_TOLERANCE_MS) {
+    console.warn({ event: "backfill_resume_token_future", tokenTime, now, tolerance: CLOCK_SKEW_TOLERANCE_MS });
     throw new z.ZodError([
       {
         code: z.ZodIssueCode.custom,

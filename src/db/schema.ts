@@ -148,9 +148,11 @@ export function isValidNonNegativeInteger(value: number): boolean {
  */
 export function assertNonNegative(value: number, name: string): void {
   if (typeof value !== "number" || !Number.isInteger(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "not_an_integer" });
     throw new RangeError(`${name} must be a non-negative integer, got ${value}`);
   }
   if (value < 0) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "negative_value" });
     throw new RangeError(`${name} must be non-negative, got ${value}`);
   }
 }
@@ -164,6 +166,7 @@ export function assertNonNegative(value: number, name: string): void {
  */
 export function assertValidU256(value: string, name: string): void {
   if (!U256_DECIMAL_PATTERN.test(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidU256", name, value, reason: "invalid_format" });
     throw new RangeError(
       `${name} must be a valid u256 decimal string (0 or positive integer up to 78 digits), got "${value}"`,
     );
@@ -603,6 +606,7 @@ export function clampBatchSize(requested: number): number {
  */
 export function validateBatchSize(requested: number, name?: string): number {
   if (!Number.isInteger(requested) || requested <= 0 || requested > MAX_BATCH_SIZE) {
+    console.error({ event: "schema_validation_failed", check: "validateBatchSize", name, value: requested, max: MAX_BATCH_SIZE });
     throw new RangeError(
       `${name ?? "batchSize"} must be an integer between 1 and ${MAX_BATCH_SIZE}, got ${requested}`,
     );
