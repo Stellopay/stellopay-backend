@@ -2,6 +2,15 @@
 
 This document describes the contract and behavior of the **rate‑limit** middleware located at `src/middleware/rate-limit.ts`.
 
+## Backward-Compatible Contract
+
+To ensure future changes do not break existing callers, the rate limit middleware adheres to an explicit compatibility contract. Any modifications to this middleware **must** preserve the following:
+
+1. **Public API Surface**: The exported members (`makeLimiter`, `IDEMPOTENCY_KEY_HEADER`, `RETRY_AFTER_HEADER`, `X_IDEMPOTENT_REPLAYED_HEADER`) must remain available and backward-compatible.
+2. **Error Response Shape**: Throttled requests (429) must consistently return a JSON body matching `{ "error": "<message>" }`. Existing callers and clients depend on this shape.
+3. **Retry-After Header**: Throttled responses must always include the `Retry-After` header indicating the whole seconds remaining.
+4. **Idempotency Headers**: Idempotency features must use the defined canonical header names (`Idempotency-Key` for request, `X-Idempotent-Replayed` for response).
+
 ## Headers
 | Header | Purpose | Accepted Value |
 |--------|---------|----------------|
@@ -64,6 +73,3 @@ const apiLimiter = makeLimiter({
 
 app.use('/api', apiLimiter);
 ```
-
----
-*Generated on 2026‑07‑28.*

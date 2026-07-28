@@ -17,6 +17,32 @@ import {
 import { validateSchema } from "./schema-fk-indexes.js";
 import { pgTable, text } from "drizzle-orm/pg-core";
 import * as schema from "./schema.js";
+import {
+  agreements,
+  agreementEvents,
+  payments,
+  milestones,
+  employees,
+  escrowEvents,
+  billingProfiles,
+  billingPaymentMethods,
+  billingInvoices,
+  sessions,
+  U256_DECIMAL_REGEX,
+  U256_DECIMAL_PATTERN,
+  CURRENCY_CODE_REGEX,
+  isValidU256,
+  isValidCurrencyCode,
+  isValidNonNegativeInteger,
+  assertNonNegative,
+  assertValidU256,
+  clampPageLimit,
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  clampBatchSize,
+  MAX_BATCH_SIZE,
+  validateBatchSize,
+} from "./schema.js";
 
 vi.mock("drizzle-orm/node-postgres/migrator", () => ({
   migrate: vi.fn(),
@@ -438,10 +464,10 @@ describe("migration CLI", () => {
     );
     expect(vi.mocked(migrate)).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith("Pending migrations:");
-    expect(log).toHaveBeenCalledWith("0000_faulty_mole_man.sql");
-    expect(log).toHaveBeenCalledWith("0001_faulty_blue_blade.sql");
-    expect(log).toHaveBeenCalledWith("0002_hard_onslaught.sql");
-    expect(log).toHaveBeenCalledWith("0003_schema_check_constraints.sql");
+    expect(log).toHaveBeenCalledWith("20240101000000_faulty_mole_man.sql");
+    expect(log).toHaveBeenCalledWith("20240102000000_faulty_blue_blade.sql");
+    expect(log).toHaveBeenCalledWith("20240103000000_hard_onslaught.sql");
+    expect(log).toHaveBeenCalledWith("20240104000000_schema_check_constraints.sql");
     expect(end).toHaveBeenCalledOnce();
   });
 

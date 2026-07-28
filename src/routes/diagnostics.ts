@@ -4,6 +4,13 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import { getCircuitBreakerSnapshots } from "../starknet/client.js";
+import {
+  logDiagnosticsEvent,
+  incDiagnosticsMetric,
+  setDiagnosticsGauge,
+  getDiagnosticsMetricsSnapshot,
+  DIAGNOSTICS_METRICS,
+} from "./diagnostics-metrics.js";
 
 export const diagnosticsRouter = Router();
 
@@ -139,6 +146,9 @@ export function redactRecentEvent(row: unknown): {
  * Fetches all telemetry and diagnostic data concurrently using Promise.all.
  * Ensures read queries execute in parallel to minimize latency, eliminate sequential
  * cascade bottlenecks, and guarantee side-effect-free replay safety.
+ *
+ * Returns both the diagnostic data snapshot and a `queryDurationMs` field
+ * measuring the wall-clock time spent executing the five parallel read queries.
  */
 export async function fetchDiagnosticsData(
   dbClient = db,
@@ -146,6 +156,8 @@ export async function fetchDiagnosticsData(
 ) {
   const limit = options.limit ?? 20;
   const offset = options.offset ?? 0;
+
+  const queryStart = process.hrtime.bigint();
 
   const [
     eventTypeCountsResult,
@@ -202,6 +214,18 @@ export async function fetchDiagnosticsData(
     (latestEventsResult?.rows ?? []) as Array<Record<string, unknown>>
   ).map(redactRecentEvent);
 
+  const queryDurationMs =
+    Number(process.hrtime.bigint() - queryStart) / 1_000_000;
+
+  incDiagnosticsMetric(DIAGNOSTICS_METRICS.QUERY_DURATION_MS, queryDurationMs);
+  setDiagnosticsGauge("diagnostics_last_query_duration_ms", queryDurationMs);
+
+  logDiagnosticsEvent("debug", "diagnostics.query_timing", {
+    durationMs: Math.round(queryDurationMs * 100) / 100,
+    limit,
+    offset,
+  });
+
   const summaryRow =
     ((tableCountsResult?.rows ?? []) as Array<Record<string, unknown>>)?.[0] ?? {};
 
@@ -221,6 +245,8 @@ export async function fetchDiagnosticsData(
       totalMilestones: summaryRow.milestones_count ?? 0,
       latestBlock: summaryRow.latest_block ?? 0,
     },
+    queryDurationMs: Math.round(queryDurationMs * 100) / 100,
+    diagnosticsMetrics: getDiagnosticsMetricsSnapshot(),
   };
 }
 
@@ -250,9 +276,44 @@ diagnosticsRouter.get(
       const offset =
         Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
 
+      const userAddress = Array.isArray(req.headers["x-user-address"])
+        ? req.headers["x-user-address"][0]
+        : req.headers["x-user-address"];
+
+      incDiagnosticsMetric(DIAGNOSTICS_METRICS.REQUESTS);
+      logDiagnosticsEvent("info", "diagnostics.request", {
+        admin: typeof userAddress === "string" ? userAddress.toLowerCase() : "unknown",
+        limit,
+        offset,
+      });
+
+      const userAddress = Array.isArray(req.headers["x-user-address"])
+        ? req.headers["x-user-address"][0]
+        : req.headers["x-user-address"];
+
+      incDiagnosticsMetric(DIAGNOSTICS_METRICS.REQUESTS);
+      logDiagnosticsEvent("info", "diagnostics.request", {
+        admin: typeof userAddress === "string" ? userAddress.toLowerCase() : "unknown",
+        limit,
+        offset,
+      });
+
       const data = await fetchDiagnosticsData(db, { limit, offset });
+
+      incDiagnosticsMetric(DIAGNOSTICS_METRICS.SUCCESS);
+      logDiagnosticsEvent("info", "diagnostics.success", {
+        admin: typeof userAddress === "string" ? userAddress.toLowerCase() : "unknown",
+        queryDurationMs: data.queryDurationMs,
+        agreementEvents: data.summary.totalAgreementEvents,
+      });
+
       res.json(data);
     } catch (e) {
+      incDiagnosticsMetric(DIAGNOSTICS_METRICS.ERRORS);
+      logDiagnosticsEvent("error", "diagnostics.error", {
+        error: e instanceof Error ? e.message : String(e),
+        stack: e instanceof Error ? e.stack?.split("\n").slice(0, 3).join("\n") : undefined,
+      });
       next(e);
     }
   }

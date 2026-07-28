@@ -29,10 +29,37 @@ vi.mock("../config.js", () => ({
   env: { ADMIN_ADDRESSES: ["0xabc1"] },
 }));
 
+vi.mock("./diagnostics-metrics.js", () => ({
+  logDiagnosticsEvent: vi.fn(),
+  incDiagnosticsMetric: vi.fn(),
+  setDiagnosticsGauge: vi.fn(),
+  getDiagnosticsMetricsSnapshot: vi.fn(() => ({
+    counters: { diagnostics_requests_total: 1 },
+    gauges: {},
+  })),
+  DIAGNOSTICS_METRICS: {
+    REQUESTS: "diagnostics_requests_total",
+    SUCCESS: "diagnostics_success_total",
+    ERRORS: "diagnostics_errors_total",
+    QUERY_DURATION_MS: "diagnostics_query_duration_ms_total",
+  },
+}));
+
 vi.mock("../db/index.js", () => ({
   db: { execute: vi.fn() },
   getPoolStats: vi.fn(() => ({ total: 8, idle: 3, active: 5, waiting: 2 })),
   schema: {},
+}));
+
+vi.mock("../starknet/client.js", () => ({
+  getCircuitBreakerSnapshots: vi.fn(() => [
+    {
+      endpointUrl: "https://starknet-mainnet.example.com/rpc",
+      state: "CLOSED",
+      recentFailureCount: 0,
+      openedAt: null,
+    },
+  ]),
 }));
 
 import {
@@ -45,6 +72,13 @@ import {
 import { db, getPoolStats } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
 import { getCircuitBreakerSnapshots } from "../starknet/client.js";
+import {
+  logDiagnosticsEvent,
+  incDiagnosticsMetric,
+  setDiagnosticsGauge,
+  getDiagnosticsMetricsSnapshot,
+  DIAGNOSTICS_METRICS,
+} from "./diagnostics-metrics.js";
 
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
@@ -574,10 +608,10 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.summary.latestBlock).toBe("100");
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
-    expect(res.body.circuitBreakers).toHaveLength(1);
-    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
     expect(getPoolStats).toHaveBeenCalledOnce();
     expect(getCircuitBreakerSnapshots).toHaveBeenCalledOnce();
+    expect(res.body.circuitBreakers).toHaveLength(1);
+    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
   });
 
   it("handles case-insensitive admin address matching", async () => {
@@ -651,16 +685,19 @@ describe("GET /diagnostics/events – backward-compatibility contract (Issue #28
                                                     // silent drift.
                                                         expect(Object.keys(res.body).sort()).toEqual(
                                                               [
-                                                                      "eventTypeCounts",
-                                                                              "escrowEventCounts",
-                                                                                      "paymentEventCounts",
-                                                                                              "tableCounts",
+                                                                      "circuitBreakers",
+                                                                              "diagnosticsMetrics",
+                                                                                      "escrowEventCounts",
+                                                                                              "eventTypeCounts",
                                                                                                       "latestEvents",
-                                                                                                              "poolStats",
-                                                                                                                      "summary",
-                                                                                                                            ].sort(),
-                                                                                                                                );
-                                                                                                                                  });
+                                                                                                              "paymentEventCounts",
+                                                                                                                      "poolStats",
+                                                                                                                              "queryDurationMs",
+                                                                                                                                      "summary",
+                                                                                                                                              "tableCounts",
+                                                                                                                                                    ].sort(),
+                                                                                                                                                        );
+                                                                                                                                                          });
 
                                                                                                                                     it("summary always includes the documented six fields, even when tables are empty", async () => {
                                                                                                                                         vi.mocked(db.execute)

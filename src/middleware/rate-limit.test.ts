@@ -1,40 +1,52 @@
 // src/middleware/rate-limit.test.ts
-import request from 'supertest';
-import express, { Request, Response } from 'express';
-import { makeLimiter, IDEMPOTENCY_KEY_HEADER } from './rate-limit';
+import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
+import request from "supertest";
+import express, { type Request, type Response } from "express";
+import {
+  makeLimiter,
+  retryAfterSeconds,
+  getIdempotencyKey,
+  keyByIp,
+  IDEMPOTENCY_KEY_HEADER,
+  RETRY_AFTER_HEADER,
+  X_IDEMPOTENT_REPLAYED_HEADER,
+  type RateLimitErrorBody,
+  type MakeLimiterOptions,
+} from "./rate-limit";
 
-/** Helper to build a minimal Express app with the limiter applied. */
-function buildApp(limiterOptions: any) {
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+/** Build a minimal Express app with the given limiter options. */
+function buildApp(limiterOptions: MakeLimiterOptions) {
   const app = express();
   app.use(express.json());
   const limiter = makeLimiter(limiterOptions);
-  app.get('/test', limiter, (req: Request, res: Response) => {
+  app.get("/test", limiter, (_req: Request, res: Response) => {
     res.json({ success: true });
   });
   return app;
 }
 
-describe('rate-limit middleware – idempotency key validation', () => {
-  const baseOptions = { name: 'test', windowMs: 60_000, max: 2, idempotent: true };
+/** Default options reused across tests. */
+const defaults: MakeLimiterOptions = {
+  name: "compat-test",
+  windowMs: 60_000,
+  max: 5,
+};
 
-  test('allows request with valid idempotency key', async () => {
-    const app = buildApp(baseOptions);
-    const res = await request(app)
-      .get('/test')
-      .set(IDEMPOTENCY_KEY_HEADER, 'valid-key-123');
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true });
+// ---------------------------------------------------------------------------
+// retryAfterSeconds – pure function
+// ---------------------------------------------------------------------------
+
+describe("retryAfterSeconds", () => {
+  test("returns whole seconds from milliseconds", () => {
+    expect(retryAfterSeconds(60_000)).toBe(60);
   });
 
-  test('rejects malformed idempotency key (invalid characters)', async () => {
-    const app = buildApp(baseOptions);
-    const res = await request(app)
-      .get('/test')
-      .set(IDEMPOTENCY_KEY_HEADER, 'invalid key!'); // space and exclamation not allowed
-    // Because the key is ignored, the request proceeds normally (no replay),
-    // but the limiter still counts the request. This is the expected contract.
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true });
+  test("rounds up partial seconds", () => {
+    expect(retryAfterSeconds(1_500)).toBe(2);
   });
 
   test('rejects idempotency key longer than 255 chars', async () => {

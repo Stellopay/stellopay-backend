@@ -9,6 +9,7 @@ import {
   getTokenInfo,
   type TokenInfo,
 } from "../utils/token-formatting.js";
+import { env } from "../config.js";
 
 export const notificationsRouter = Router();
 
@@ -56,6 +57,40 @@ export function calculateUnreadCount(notifications: Array<{ id?: string | number
     }
   }
   return count;
+}
+
+interface NotificationsTelemetryEntry {
+  operation: "notification_feed";
+  status: "success" | "error";
+  duration_ms: number;
+  request_id?: string;
+  notification_count?: number;
+  unread_count?: number;
+  preferences_enabled?: number;
+  error?: string;
+}
+
+/** Emits low-cardinality feed telemetry without user or notification data. */
+export function logNotificationsTelemetry(entry: NotificationsTelemetryEntry): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    metric: "notification_preferences_and_unread_count",
+    ...entry,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
+    return;
+  }
+
+  const message =
+    `[notifications-telemetry] ${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+    `${logEntry.notification_count !== undefined ? ` notifications=${logEntry.notification_count}` : ""}` +
+    `${logEntry.unread_count !== undefined ? ` unread=${logEntry.unread_count}` : ""}` +
+    `${logEntry.preferences_enabled !== undefined ? ` preferences_enabled=${logEntry.preferences_enabled}` : ""}` +
+    `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+  (logEntry.level === "error" ? console.error : console.info)(message);
 }
 
 /**
@@ -207,6 +242,8 @@ export const NOTIFICATIONS_MAX_LIMIT = 50;
 
 // Get notifications for a user (important events)
 notificationsRouter.get("/notifications/:user_address", async (req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId: string | undefined = res.locals.requestId;
   try {
     const userAddress = StarknetAddress.parse(req.params.user_address);
 
@@ -354,15 +391,34 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
     // in lockstep with the helper's semantics; in practice every emitted
     // notification has `read: false` set above, so the helper's filter pass
     // coincides with `rawNotifications.length`.
+    const unreadCount = calculateUnreadCount(rawNotifications);
+    const preferences = getDefaultNotificationPreferences();
+    logNotificationsTelemetry({
+      operation: "notification_feed",
+      status: "success",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      request_id: requestId,
+      notification_count: rawNotifications.length,
+      unread_count: unreadCount,
+      preferences_enabled: Object.values(preferences).filter(Boolean).length,
+    });
+
     res.json({
       notifications: rawNotifications,
       total: rawNotifications.length,
-      unreadCount: calculateUnreadCount(rawNotifications),
+      unreadCount,
       limit,
       offset,
       hasMore,
     });
-  } catch (e) {
-    next(e);
+  } catch (error) {
+    logNotificationsTelemetry({
+      operation: "notification_feed",
+      status: "error",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      request_id: requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    next(error);
   }
 });
