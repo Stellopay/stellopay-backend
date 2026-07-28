@@ -1,4 +1,4 @@
-﻿import { Router } from "express";
+import { Router } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
@@ -49,8 +49,12 @@ export function deriveSyncCheckpoint(
   for (const record of records) {
     if (record && record.blockNumber !== undefined && record.blockNumber !== null) {
       const bn = typeof record.blockNumber === "bigint" ? Number(record.blockNumber) : Number(record.blockNumber);
-      if (Number.isFinite(bn) && bn > maxBlock) {
-        maxBlock = bn;
+      if (Number.isFinite(bn) && bn >= 0) {
+        if (bn > maxBlock) {
+          maxBlock = bn;
+        }
+      } else {
+        console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: record.blockNumber, reason: "invalid_format_or_negative" });
       }
     }
   }
