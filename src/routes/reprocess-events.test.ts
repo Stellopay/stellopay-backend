@@ -67,15 +67,41 @@ vi.mock("../db/index.js", () => {
 });
 
 // Mock Starknet provider and contracts
-const mockGetTransactionReceipt = vi.fn();
+const { mockGetTransactionReceipt, mockParseEvent } = vi.hoisted(() => ({
+  mockGetTransactionReceipt: vi.fn(),
+  mockParseEvent: vi.fn().mockImplementation((event: any) => {
+    if (event?.shouldFail) {
+      throw new Error("Failed to parse event");
+    }
+    return {
+      name: "AgreementCreated",
+      data: {
+        agreement_id: "123",
+        employer: "0x123",
+        contributor: "0x456",
+        token: "0x789",
+        mode: 0,
+        payment_type: 1,
+      },
+    };
+  }),
+}));
+
+const mockAgreementContractObj = {
+  parseEvent: mockParseEvent,
+  get_token: vi.fn().mockResolvedValue(BigInt("0x789")),
+};
+const mockEscrowContractObj = {
+  parseEvent: mockParseEvent,
+};
+
 vi.mock("../starknet/client.js", () => {
   return {
     provider: {
       getTransactionReceipt: (...args: any[]) => mockGetTransactionReceipt(...args),
     },
-    agreementContract: vi.fn().mockReturnValue({
-      get_token: vi.fn().mockResolvedValue("0x54321"),
-    }),
+    agreementContract: vi.fn(() => mockAgreementContractObj),
+    escrowContract: vi.fn(() => mockEscrowContractObj),
   };
 });
 
@@ -103,8 +129,8 @@ vi.mock("starknet", async (importOriginal) => {
 });
 
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: vi.fn((_req, _res, next) => next()),
+  requireAdmin: vi.fn((_req, _res, next) => next()),
 }));
 describe("Reprocess Events Routes", () => {
   let app: express.Express;

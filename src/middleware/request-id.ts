@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { requestIdContext } from "../utils/logger.js";
 
 /** Maximum length accepted for a client-supplied X-Request-Id value. */
-const MAX_REQUEST_ID_LENGTH = 128;
+export const MAX_REQUEST_ID_LENGTH = 128;
 
 /**
  * Sanitise a client-supplied request ID.
@@ -15,7 +15,7 @@ const MAX_REQUEST_ID_LENGTH = 128;
  * Returns `null` when the value is absent, empty, overlong, or contains
  * disallowed characters, causing the middleware to generate a fresh UUID.
  */
-function sanitiseClientId(raw: string | undefined): string | null {
+export function sanitiseClientId(raw: string | undefined): string | null {
   if (!raw || raw.length === 0) return null;
   if (raw.length > MAX_REQUEST_ID_LENGTH) return null;
   // Only printable ASCII — no control chars, no CR/LF

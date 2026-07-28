@@ -15,6 +15,23 @@ import { requireAuth } from "../auth/middleware.js";
 import { env } from "../config.js";
 import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
+/**
+ * Wallet-ownership auth route surface.
+ *
+ * Full runtime contract (request/response shapes, idempotency, refresh
+ * rotation security model, admin gating, and debug-middleware behaviour):
+ *   docs/routes/auth.md
+ *
+ * Surface:
+ *   POST /auth/challenge               — issue short-lived challenge + SNIP-12 typed data
+ *   POST /auth/verify                  — verify signature, consume challenge, issue session
+ *   POST /auth/session/validate        — read-only session check (sliding renews TTL)
+ *   POST /auth/refresh                 — rotate session (dual-role token)
+ *   POST /auth/logout                  (bearer)  — revoke caller’s single session
+ *   POST /auth/revoke                  (bearer)  — revoke all caller’s sessions
+ *   POST /auth/session/revoke          (bearer)  — revoke one session by token_hash (owner or admin)
+ */
+
 const AddressBody = z.object({ address: z.string().min(3) }).strict();
 const VerifyBody = z.object({
   address: z.string().min(3),
