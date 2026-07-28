@@ -552,6 +552,9 @@ billingRouter.use("/billing", (req, res, next) => {
 type ProfileRow = typeof schema.billingProfiles.$inferSelect;
 
 function stripSensitive(profile: ProfileRow) {
+  if (typeof schema.stripSensitiveBillingFields === "function") {
+    return schema.stripSensitiveBillingFields(profile);
+  }
   const { taxId: _taxId, dateOfBirth: _dob, ...safe } = profile;
   return safe;
 }
