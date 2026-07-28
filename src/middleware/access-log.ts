@@ -51,6 +51,9 @@ export const REDACTED_VALUE = "[redacted]";
  * request produces exactly one redacted log line.
  */
 export function redactSensitiveParams(rawUrl: string): string {
+  // Guard against null/undefined/missing input — never throw, never leak data.
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) return "";
+
   const qIndex = rawUrl.indexOf("?");
   if (qIndex === -1) return rawUrl;
 
@@ -169,13 +172,34 @@ export interface AccessLogEntry {
  * - **Idempotency**: the same request ID is only logged once within the
  *   deduplication window (60 s). Retries or accidental duplicate delivery
  *   with the same correlation ID produce at most one log line. See
- *   {@link SeenRequestIds} for the dedup contract.
+ *   {@link seenRequestIds} for the dedup contract.
  * - Redacts sensitive query-parameter values via {@link redactSensitiveParams}
  *   before writing to the log — wallet addresses, tokens, passwords, etc.
  * - Emits **exactly one log line per request** on the `res.finish` event,
  *   after the status code and duration are both known.
  * - Never logs request/response bodies, `Authorization` headers, or any
  *   other header — only the fields in {@link AccessLogEntry}.
+ *
+ * Security boundary
+ * -----------------
+ * This middleware enforces the following security guarantees:
+ *
+ * 1. **No header logging**: The `Authorization`, `Cookie`, `Set-Cookie`,
+ *    `X-API-Key`, and `X-Auth-Token` headers are **never** written to the
+ *    log. Only the whitelisted fields in {@link AccessLogEntry} are emitted.
+ * 2. **No body logging**: Request and response bodies are never read or
+ *    logged by this middleware.
+ * 3. **PII redaction**: Sensitive query-parameter values are redacted via
+ *    {@link redactSensitiveParams} — wallet addresses, tokens, passwords, etc.
+ * 4. **Safe fallback on malformed URLs**: {@link redactSensitiveParams}
+ *    never throws on malformed input and returns only the path portion
+ *    when parsing fails, preventing information leakage.
+ * 5. **Graceful failure**: A `try/catch` around the entire finish handler
+ *    ensures that a logging failure never crashes the process or affects
+ *    the HTTP response. Errors are reported via `console.error`.
+ * 6. **Audit trail**: The `request_id` field is always a valid,
+ *    non-empty string — either the client-supplied correlation ID or a
+ *    `crypto.randomUUID()` fallback — so every log line is traceable.
  * - All logic inside the `finish` handler is wrapped in `try/catch`. A
  *   logging failure is reported via `console.error` and **never re-thrown**,
  *   so it cannot crash the process or affect the HTTP response.
