@@ -454,32 +454,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
       const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logAnalyticsTelemetry({
-      operation: "analytics_monthly_rollup",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "success",
-      request_id: requestId,
-      user_address: userAddress,
-      year,
-      row_counts: {
-        payments: payments.length,
-        escrow_events: escrowEvents.length,
-        agreement_creations: agreementCreations.length,
-      },
-    });
-
-    res.json({
-      year,
-      data: chartData,
-      total: toDisplayNumber(totalRaw),
-    });
-    } finally {
-      inflightRollups.delete(rollupKey);
-    }
-  } catch (e: any) {
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    if (!(e instanceof z.ZodError)) {
+      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
       logAnalyticsTelemetry({
         operation: "analytics_monthly_rollup",
         duration_ms: Math.round(duration * 100) / 100,
@@ -499,36 +474,31 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         data: chartData,
         total: toDisplayNumber(totalRaw),
       };
-
       analyticsAggregationCache.set(cacheKey, responseBody);
 
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(responseBody);
       res.set("ETag", etag);
-
       if (req.headers["if-none-match"] === etag) {
         res.status(304).end();
         return;
       }
-
       res.json(responseBody);
-    } catch (e: unknown) {
-      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-      if (!(e instanceof z.ZodError)) {
-        logAnalyticsTelemetry({
-          operation: "analytics_monthly_rollup",
-          duration_ms: Math.round(duration * 100) / 100,
-          status: "error",
-          request_id: requestId,
-          user_address: req.params.user_address,
-          error: e instanceof Error ? e.message : String(e),
-        });
-      }
-      next(e);
-    }
-  } finally {
-    if (rollupKey) {
+    } finally {
       inflightRollups.delete(rollupKey);
     }
+  } catch (error: unknown) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    if (!(error instanceof z.ZodError)) {
+      logAnalyticsTelemetry({
+        operation: "analytics_monthly_rollup",
+        duration_ms: Math.round(duration * 100) / 100,
+        status: "error",
+        request_id: requestId,
+        user_address: req.params.user_address,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    next(error);
   }
 });
