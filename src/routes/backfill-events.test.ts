@@ -190,6 +190,8 @@ import {
   backfillEventsRouter,
   BACKFILL_CHECKPOINT_BATCH_SIZE,
   RESULTS_PREVIEW_SIZE,
+  CLOCK_SKEW_TOLERANCE_MS,
+  validateResumeTokenFreshness,
 } from "./backfill-events.js";
 import { requireSession } from "../auth/session.js";
 
@@ -548,6 +550,64 @@ describe("BackfillQuerySchema", () => {
     expect(() => BackfillQuerySchema.parse({ before: "invalid-date" })).toThrow();
     expect(() => BackfillQuerySchema.parse({ resumeToken: "invalid-date" })).toThrow();
     expect(() => BackfillQuerySchema.parse({ cursor: "invalid-date" })).toThrow();
+  });
+
+  describe("Resume token freshness bounds (Issue #263)", () => {
+    it("rejects a resume token in the future beyond clock-skew tolerance", () => {
+      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
+      expect(() =>
+        BackfillQuerySchema.parse({ before: futureDate.toISOString() }),
+      ).toThrow("Resume token is in the future beyond clock-skew tolerance");
+    });
+
+    it("accepts a resume token within clock-skew tolerance of now", () => {
+      const nearFuture = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS - 1_000);
+      expect(() =>
+        BackfillQuerySchema.parse({ before: nearFuture.toISOString() }),
+      ).not.toThrow();
+    });
+
+    it("accepts a resume token from the distant past (idempotent replay)", () => {
+      const oldDate = new Date("2020-01-01T00:00:00.000Z");
+      expect(() =>
+        BackfillQuerySchema.parse({ before: oldDate.toISOString() }),
+      ).not.toThrow();
+    });
+
+    it("validates resumeToken alias the same way as before", () => {
+      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
+      expect(() =>
+        BackfillQuerySchema.parse({ resumeToken: futureDate.toISOString() }),
+      ).toThrow("Resume token is in the future beyond clock-skew tolerance");
+    });
+
+    it("validates cursor alias the same way as before", () => {
+      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
+      expect(() =>
+        BackfillQuerySchema.parse({ cursor: futureDate.toISOString() }),
+      ).toThrow("Resume token is in the future beyond clock-skew tolerance");
+    });
+  });
+
+  describe("validateResumeTokenFreshness", () => {
+    it("accepts a date in the past", () => {
+      const validDate = new Date(Date.now() - 1000);
+      expect(() => validateResumeTokenFreshness(validDate)).not.toThrow();
+    });
+
+    it("accepts a date from the distant past", () => {
+      const validDate = new Date("2020-01-01T00:00:00.000Z");
+      expect(() => validateResumeTokenFreshness(validDate)).not.toThrow();
+    });
+
+    it("rejects a date in the future beyond clock-skew tolerance", () => {
+      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
+      expect(() => validateResumeTokenFreshness(futureDate)).toThrow();
+    });
+
+    it("exports CLOCK_SKEW_TOLERANCE_MS as 60 seconds in milliseconds", () => {
+      expect(CLOCK_SKEW_TOLERANCE_MS).toBe(60 * 1000);
+    });
   });
 });
 
