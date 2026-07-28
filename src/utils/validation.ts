@@ -342,6 +342,47 @@ export function formatValidationError(error: unknown): ValidationErrorResponse {
 // ---------------------------------------------------------------------------
 
 /**
+ * Zod schema for a numeric pagination cursor supplied as a query parameter.
+ *
+ * Cursors in this API are opaque positive-integer strings produced by the
+ * previous page response's `nextCursor` field.  The validator:
+ *
+ *   - Accepts only strings that consist entirely of ASCII digits (`/^\d+$/`),
+ *     so hex values, floats, negative numbers, whitespace-padded values, and
+ *     SQL-injection fragments are all rejected before they reach any query
+ *     builder or database call.
+ *   - Coerces the validated string to a positive integer via `Number()` and
+ *     rejects the result if it is not a safe, positive integer — ruling out
+ *     `"0"`, `"000"` (leading zeros), and values beyond `Number.MAX_SAFE_INTEGER`.
+ *   - Is intentionally narrow: it does NOT accept base64 or any other
+ *     encoding.  If the cursor format changes, a new schema should be added
+ *     rather than broadening this one.
+ *
+ * @example
+ * NumericCursorSchema.parse("42");    // → 42
+ * NumericCursorSchema.parse("0");     // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("abc");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("1.5");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse(" 1 ");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("007");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("1; DROP TABLE agreements;--"); // throws ZodError
+ */
+export const NumericCursorSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/, "cursor must be a positive integer string with no leading zeros")
+  .transform((val, ctx) => {
+    const n = Number(val);
+    if (!Number.isInteger(n) || n <= 0 || !Number.isSafeInteger(n)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "cursor must be a positive integer",
+      });
+      return z.NEVER;
+    }
+    return n;
+  });
+
+/**
  * Zod schema for a Starknet address supplied as a path or query parameter.
  * Accepts a hex string of up to 64 hex characters (the felt width), with or
  * without a 0x prefix, and transforms it to the canonical lookup form via
@@ -452,6 +493,26 @@ function clampPaginationField(value: unknown, fallback: number, min: number, max
  * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
  * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
  * parsePagination(null);              // { limit: 50, offset: 0 }
+ */
+/**
+ * Parses and clamps pagination query parameters. Clamping happens server-side
+ * so a client cannot request an unbounded, zero, or negative page: `limit` is
+ * forced into `[1, MAX_PAGE_LIMIT]` and `offset` to `>= 0`. Missing or
+ * non-numeric values fall back to safe defaults rather than failing the
+ * request.
+ *
+ * This function **never throws** — any input shape returns a valid, finite
+ * pair. Non-object inputs (strings, numbers, arrays, `null`, `undefined`) are
+ * treated as if no pagination params were supplied and fall back to defaults.
+ *
+ * @param query - The request query object (`req.query`), or any value.
+ * @returns `{ limit, offset }` — both safe integers within the documented
+ *   bounds.
+ *
+ * @example
+ * parsePagination({ limit: "5000" }); // { limit: 100, offset: 0 }
+ * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
+ * parsePagination("not-an-object");   // { limit: 50, offset: 0 }
  */
 export function parsePagination(query: unknown): {
   limit: number;

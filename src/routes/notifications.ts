@@ -391,15 +391,19 @@ notificationsRouter.get("/notifications/:user_address", async (req, res, next) =
       }),
     ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    // Determine whether more items exist beyond this page before slicing,
-    // so `hasMore` accurately reflects availability of a next page.
+    // Determine whether more items exist beyond this page before slicing.
+    // Strict greater-than is intentional: when `merged.length === offset + limit`
+    // the current page is exactly full but there are no further items, so
+    // `hasMore` must be `false`. Only when the pool contains at least one item
+    // beyond the current page boundary is `hasMore` set to `true`.
     const hasMore = merged.length > offset + limit;
     const rawNotifications = merged.slice(offset, offset + limit);
 
     // `unreadCount` flows through the exported helper so the response stays
-    // in lockstep with the helper's semantics; in practice every emitted
-    // notification has `read: false` set above, so the helper's filter pass
-    // coincides with `rawNotifications.length`.
+    // in lockstep with the helper's semantics. Because every notification
+    // emitted above sets `read: false`, the helper's dedup+filter pass always
+    // yields `rawNotifications.length` — the two values are kept in sync
+    // intentionally so that callers relying on either field see consistent data.
     const unreadCount = calculateUnreadCount(rawNotifications);
     const preferences = getDefaultNotificationPreferences();
     logNotificationsTelemetry({

@@ -1,396 +1,244 @@
-# User Notifications API (`/notifications/*`)
+# Notifications Route
 
-The notifications endpoint aggregates key on-chain activities (payments,
-agreement status transitions, escrow state changes, disputes) for a specified
-Starknet user address.
-
----
-
-## Backward-Compatibility Contract
-
-The response shape is **stable**. The fields and behaviors described in this
-document MUST be preserved across future changes so that existing callers
-continue to work without modification.
-
-Additive fields (`limit`, `offset`, `hasMore`) were introduced alongside the
-existing `notifications`, `total`, and `unreadCount` fields. Callers that
-ignore unknown fields are unaffected; callers that want pagination should
-use the new fields.
+**File:** `src/routes/notifications.ts`  
+**Mounted at:** `/api/v1`
 
 ---
 
-## Authorization Boundary
+## Overview
 
-The route queries data strictly scoped to the address supplied in the URL path:
-
-- All three DB queries (payments, agreement events, escrow events) filter on the
-  supplied `user_address`.
-- The address is validated by `StarknetAddress.parse` before being used as a
-  filter, preventing lookup-key injection.
-- Callers can only read notifications for the exact address they supply;
-  cross-user data access is structurally impossible from this route.
-
-**Current auth state**: This route is unauthenticated — it returns aggregated
-public on-chain data and does not expose any private state. If per-user write
-state (e.g. persistent read/unread) is added in the future, a `requireAuth`
-guard MUST be added at that point.
+The notifications route aggregates on-chain activity (payments, agreement
+lifecycle events, and escrow events) into a unified, paginated feed for a
+given Starknet address.  All data is public on-chain; the route is currently
+unauthenticated.  If per-user write state (e.g. persistent read flags) is
+added in the future, a `requireAuth` guard **must** be added at that point.
 
 ---
 
-## Endpoint Contract
+## Endpoints
 
 ### `GET /api/v1/notifications/:user_address`
 
-Returns a chronological list of recent notifications, total items, and unread
-count for a user. Supports offset-based pagination.
+Returns a paginated list of important events for the supplied Starknet address.
 
-#### Path Parameters
+#### Path parameters
 
-| Parameter | Type | Description | Required |
-| :--- | :--- | :--- | :--- |
-| `user_address` | String | Valid Starknet address (0x-prefixed or hex string). Automatically validated & normalized via `StarknetAddress.parse`. | Yes |
+| Parameter      | Type   | Description                                              |
+|----------------|--------|----------------------------------------------------------|
+| `user_address` | string | Starknet address (hex, with or without `0x` prefix).     |
 
-#### Query Parameters
+The address is validated by `StarknetAddress.parse` and canonicalized to
+`0x` + 64 lower-case hex characters before use as a DB filter.  Malformed
+addresses (non-hex, too long, invalid checksum) are rejected with **400**.
 
-| Parameter | Type | Default | Constraint | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `limit` | Integer | `10` | positive integer, max `50` | Maximum number of notifications to return per page. Out-of-range values are rejected with `400 Validation failed` before any database call. |
-| `offset` | Integer | `0` | non-negative integer | Number of notifications to skip before the returned page. Negative values are rejected with `400 Validation failed`. |
+#### Query parameters
 
----
+| Parameter | Type    | Default | Maximum | Description                                                  |
+|-----------|---------|---------|---------|--------------------------------------------------------------|
+| `limit`   | integer | `10`    | `50`    | Number of items per page. Out-of-range values return **400**.|
+| `offset`  | integer | `0`     | —       | Zero-based item offset. Negative values return **400**.      |
 
-#### Success Response (`200 OK`)
+Both defaults and the maximum are frozen — see
+[Pagination contract](#pagination-contract) below.
+
+#### Response `200 OK`
 
 ```json
 {
   "notifications": [
     {
-      "id": "event-101",
-      "title": "Agreement Created",
-      "message": "Agreement #ag-123 has been created",
-      "read": false,
-      "date": "2026-07-26T18:00:00.000Z",
-      "type": "AgreementCreated",
-      "txHash": "0x0123456789abcdef..."
-    },
-    {
-      "id": "payment-202",
-      "title": "Payment Received",
-      "message": "#0x01234567 · You received 10.5 tokens",
-      "read": false,
-      "date": "2026-07-26T17:30:00.000Z",
-      "type": "PaymentReceived",
-      "txHash": "0x0123456789abcdef..."
+      "id":      "string",
+      "title":   "string",
+      "message": "string",
+      "read":    false,
+      "date":    "2026-07-28T12:00:00.000Z",
+      "type":    "string",
+      "txHash":  "string"
     }
   ],
-  "total": 2,
-  "unreadCount": 2,
-  "limit": 10,
-  "offset": 0,
-  "hasMore": false
+  "total":       1,
+  "unreadCount": 1,
+  "limit":       10,
+  "offset":      0,
+  "hasMore":     false
 }
 ```
 
-**Frozen fields (must not change):**
+#### Response `400 Bad Request`
 
-| Field | Type | Notes |
-| :--- | :--- | :--- |
-| `notifications` | array | Up to `limit` items, sorted newest-first by `date`. |
-| `notifications[].id` | string | DB row identifier. |
-| `notifications[].title` | string | Human-readable title (see frozen title set below). |
-| `notifications[].message` | string | Detail sentence; format is stable per event type. |
-| `notifications[].read` | boolean | Always `false` (no server-side read state). |
-| `notifications[].date` | string | ISO 8601 timestamp. |
-| `notifications[].type` | string | Raw on-chain `eventType` string. |
-| `notifications[].txHash` | string | Transaction hash. |
-| `total` | integer | Length of the `notifications` array (post-slice). |
-| `unreadCount` | integer | Count of items where `read === false` (always equals `total`). |
+Returned when:
+- `user_address` is not a valid Starknet hex string.
+- `limit` is 0, negative, non-numeric, or greater than 50.
+- `offset` is negative or non-numeric.
 
-**Additive pagination fields (present in all responses):**
-
-| Field | Type | Notes |
-| :--- | :--- | :--- |
-| `limit` | integer | Echoed request limit (or the default of 10). |
-| `offset` | integer | Echoed request offset (or 0 when omitted). |
-| `hasMore` | boolean | `true` when additional notifications exist beyond this page. Clients should re-request with `offset += limit` to fetch the next page. |
-
-**Frozen event-type → title mapping:**
-
-| `type` | `title` |
-| :--- | :--- |
-| `PaymentSent` | `"Payment Sent"` |
-| `PaymentReceived` | `"Payment Received"` |
-| `DisputeRaised` | `"Dispute Raised"` |
-| `DisputeResolved` | `"Dispute Resolved"` |
-| `AgreementActivated` | `"Agreement Activated"` |
-| `AgreementCreated` | `"Agreement Created"` |
-| `AgreementCancelled` | `"Agreement Cancelled"` |
-| `Funded` | `"Agreement Funded"` |
-| `Released` | `"Funds Released"` |
-| `Refunded` | `"Funds Refunded"` |
+```json
+{ "error": "Validation failed", "details": [...] }
+```
 
 ---
 
-## Pagination Model
+## Response shape contract (stable)
 
-The endpoint uses offset-based pagination. The merged pool of all three data
-sources is sorted newest-first and then sliced:
+The following fields are **frozen**.  Existing callers depend on their names
+and types; they cannot be removed or renamed.
 
-```
-page = sorted_pool[ offset : offset + limit ]
-```
+### `NotificationItem`
 
-To iterate all notifications, callers advance the offset by `limit` until
-`hasMore` is `false`:
+| Field     | Type      | Notes                                              |
+|-----------|-----------|----------------------------------------------------|
+| `id`      | `string`  | Unique row identifier from the source table.       |
+| `title`   | `string`  | Human-readable title (see title map below).        |
+| `message` | `string`  | Detail sentence (format stable per event type).    |
+| `read`    | `boolean` | Always `false`; server-side read state not yet persisted. |
+| `date`    | `string`  | ISO 8601 UTC timestamp of the underlying event.    |
+| `type`    | `string`  | Raw on-chain `eventType` string.                   |
+| `txHash`  | `string`  | Transaction hash of the event.                     |
 
-```
-GET /api/v1/notifications/<addr>?limit=10&offset=0   → page 1, hasMore: true
-GET /api/v1/notifications/<addr>?limit=10&offset=10  → page 2, hasMore: true
-GET /api/v1/notifications/<addr>?limit=10&offset=20  → page 3, hasMore: false
-```
+### `NotificationsResponse` envelope
 
-If `offset` is beyond the available pool, an empty `notifications` array is
-returned with `hasMore: false` — this is not an error.
-
----
-
-## Backend Behavior
-
-### Data Sources
-
-The route reads from four tables and combines them into a single ordered feed
-of notifications:
-
-| Source | `eventType` filter | Notes |
-| :--- | :--- | :--- |
-| `payments` | (none) | Includes `PaymentSent` and `PaymentReceived`. Matched when the user is `from` or `to`. |
-| `agreementEvents` | `DisputeRaised`, `DisputeResolved`, `AgreementActivated`, `AgreementCancelled`, `AgreementCreated` | Only fetched when the user owns at least one agreement; an empty `agreementIds` set short-circuits the query entirely. |
-| `escrowEvents` | (none) | Matches when the user is `employer` or `to`. The token used for amount formatting is read from the joined `agreements.token`. |
-
-The merged array is sorted by `date` descending and sliced to the requested
-page (`[offset, offset+limit]`). The response's `total` and
-`notifications.length` always equal the post-slice length; `unreadCount` is
-computed from the same array via the exported `calculateUnreadCount` helper.
-
-### Batching Contract
-
-Each data-source query receives a `queryLimit` of `limit + offset` rows.
-This ensures the merged pool always contains enough rows to satisfy the
-requested page:
-
-```
-queryLimit = limit + offset
-page       = sorted_pool.slice(offset, offset + limit)
-hasMore    = sorted_pool.length > offset + limit
-```
-
-Because `NOTIFICATIONS_MAX_LIMIT = 50`, `queryLimit` is bounded to at most
-100 rows per source per request (when `limit=50` and `offset=50`).
-
-### Query Execution Order
-
-The three queries that depend only on `userAddress` (`payments`,
-`agreements`, `escrowEvents`) are fired through `Promise.all` so a slow
-payment lookup does not serialize in front of the escrow or agreements
-lookups. The dependent `agreementEvents` query runs as a single follow-up
-because its `inArray(.., agreementIds)` filter needs `agreements.id`
-values. When the user has no agreements, the dependent query is fully
-skipped (`agreementIds.length > 0` short-circuit).
-
-### Per-Request Memoization
-
-Two helpers are bound to the route handler so their caches are scoped to a
-single request:
-
-- `getTokenInfoCache` — key on the normalized token address. The escrow-event
-  mapping resolves token info once per unique token, so 10 escrow events on
-  the same agreement produce one `getTokenInfo` call, not ten.
-- `formatTitleCache` — key on `eventType`. Surfacing the same `eventType`
-  ten times re-runs the regex once.
-
-Both caches live inside the route handler and are discarded at the end of
-each request; they cannot carry stale config across env reloads or leak
-state across simultaneous requests.
+| Field           | Type                  | Notes                                                   |
+|-----------------|-----------------------|---------------------------------------------------------|
+| `notifications` | `NotificationItem[]`  | Up to `limit` items, sorted newest-first by `date`.     |
+| `total`         | `number`              | Length of the `notifications` array after slicing.      |
+| `unreadCount`   | `number`              | Count of items where `read === false` (≡ `total` today).|
+| `limit`         | `number`              | Echoed from request (or default 10).                    |
+| `offset`        | `number`              | Echoed from request (or 0).                             |
+| `hasMore`       | `boolean`             | `true` when items exist beyond the current page.        |
 
 ---
 
-## Notification Preferences Contract
+## Notification preferences contract (stable)
 
-User notification preferences are exposed as a typed contract on
-`src/routes/notifications.ts`:
+`getDefaultNotificationPreferences()` returns a fresh object on every call —
+never a shared singleton.  All four category fields default to `true`.
 
-```typescript
-export interface NotificationPreferences {
-  payments: boolean;   // PaymentSent, PaymentReceived
-  agreements: boolean; // AgreementCreated, AgreementActivated, AgreementCancelled
-  escrow: boolean;     // Funded, Released, Refunded
-  disputes: boolean;   // DisputeRaised, DisputeResolved
+```ts
+interface NotificationPreferences {
+  payments:   boolean;  // PaymentSent, PaymentReceived
+  agreements: boolean;  // AgreementCreated, AgreementActivated, AgreementCancelled
+  escrow:     boolean;  // Funded, Released, Refunded
+  disputes:   boolean;  // DisputeRaised, DisputeResolved
 }
 ```
 
-### Exported Helper Functions
-
-- **`getDefaultNotificationPreferences()`** — Returns a fresh
-  `{ payments: true, agreements: true, escrow: true, disputes: true }`
-  object on every call. Callers can mutate the returned object without
-  poisoning other callers.
-
-  **Backward-compatibility guarantees:**
-  - Always returns a new object instance (not a shared singleton)
-  - All four category fields are always present with boolean values
-  - Default value for all categories is `true`
-  - Function signature and return type are frozen
-
-- **`calculateUnreadCount(notifications)`** — Single source of truth for
-  the unread-count field; counts items where `read === false`. The
-  notifications route invokes this helper on its outgoing payload rather
-  than reaching for `Array.length` directly, so the response stays in
-  lockstep with the helper's semantics.
-
-  **Backward-compatibility guarantees:**
-  - Deduplicates notifications by `id` field when present
-  - Notifications without an `id` field are counted individually
-  - Supports both string and numeric `id` types
-  - Only counts items where `read === false`
-  - Function signature and counting logic are frozen
-
-Both helpers are exported for unit-testing and future preference-filtering logic without making HTTP requests.
-
-### Future Extension Points
-
-The `NotificationPreferences` interface is exported to support future features:
-- Per-user preference storage in database tables (not yet implemented)
-- Filtering the notification feed by category (not yet implemented)
-- Push notification routing based on user preferences (not yet implemented)
-
-**Current limitation:** The preferences contract is defined and exported, but
-the route does not yet filter notifications based on preferences. All event
-categories are currently returned regardless of preference settings.
+**Backward-compatibility rules:**
+- Existing fields cannot be removed or renamed.
+- New optional fields may be added in the future.
+- Default values (all `true`) are frozen.
 
 ---
 
-## Amount Formatting
+## Unread count contract (stable)
 
-Token amounts in notification messages are formatted by `formatTokenAmount` with
-the token's decimal precision. Token lookup is by contract address:
+`calculateUnreadCount(notifications)` is exported so callers can recompute
+unread counts independently of the HTTP handler.
 
-| Token | Decimals |
-| :--- | :--- |
-| STRK | 18 |
-| USDC | 6 |
-| USDT | 6 |
-| unknown / null | 6 (default) |
+**Guarantees:**
+- Deduplicates by `id` when present — the same `id` is counted at most once.
+- Notifications without an `id` are counted individually (no deduplication key).
+- Supports both `string` and `number` id types, including `0`.
+- Only counts items where `read === false`.
+- Returns `0` for an empty array.
 
-Formatting uses BigInt arithmetic so u256 amounts are never truncated through
-`Number` before display.
-
----
-
-## Observability
-
-Each notification-feed request emits one structured metric record with
-`metric: "notification_preferences_and_unread_count"` and
-`operation: "notification_feed"`. Success records include `notification_count`,
-`unread_count`, and `preferences_enabled`; failure records include `error`.
-Every record includes `timestamp`, `level`, `status`, and `duration_ms`, plus
-`request_id` when request-ID middleware is mounted.
-
-User addresses, transaction hashes, notification messages, and individual
-preference values are deliberately excluded. Records are sent through the
-application logger; external metrics export is out of scope.
+**Invariant in the HTTP response:** because every emitted notification has
+`read: false`, `unreadCount` always equals `total` in the current
+implementation.  Both fields are included in the response so callers can use
+whichever is more convenient.
 
 ---
 
-## Error Handling
+## Pagination contract
 
-| Status | Error Message | Description |
-| :--- | :--- | :--- |
-| `400 Bad Request` | `Validation failed` | Returned when `user_address` is not a valid Starknet address, `limit` is non-numeric / non-positive / above `50`, or `offset` is non-numeric / negative. |
+| Constant                    | Value | Notes                                      |
+|-----------------------------|-------|--------------------------------------------|
+| `NOTIFICATIONS_DEFAULT_LIMIT` | `10` | Intentionally smaller than the project-wide default of 50. |
+| `NOTIFICATIONS_MAX_LIMIT`     | `50` | Requests above this are rejected with 400. |
 
-Errors propagate through the central error handler with structured Zod
-`details` so misbehaving clients see which field failed, identical to the
-other `/api/v1/*` routes.
+`hasMore` uses strict greater-than (`merged.length > offset + limit`): a
+page that fills exactly to the limit returns `hasMore: false` because there
+are no items beyond the current boundary.
 
-**Backward-compatibility guarantees:**
-- Error status codes are frozen (400 for validation errors)
-- Error message strings are stable for existing error cases
-- The `details` field structure follows the project-wide Zod error format
-- New error cases may be added but will use distinct status codes or messages
-
----
-
-## Compatibility Notes
-
-### Response Shape Stability
-
-- The response envelope is `{ notifications, total, unreadCount }` with the
-  same keys and types documented in the success-response block above. Older
-  callers depend on this shape; any additively-new field can be added later
-  without breaking them.
-- Each notification item has exactly seven fields: `id`, `title`, `message`,
-  `read`, `date`, `type`, `txHash`. All fields are required and have stable
-  types.
-- The default `limit` is intentionally `10` (not `50` like the project's
-  shared `parsePagination`) for backward compatibility with callers that
-  rely on the smaller default; out-of-range `limit` values are still
-  rejected with `400` rather than silently clamped.
-- The exported constants `NOTIFICATIONS_DEFAULT_LIMIT` (10) and
-  `NOTIFICATIONS_MAX_LIMIT` (50) are the single source of truth for the
-  documented pagination bounds. Tests import them directly so constant and
-  behavior cannot drift.
-
-### Field Value Stability
-
-- **`notifications` array**: Always sorted newest-first by `date` field.
-  Maximum length equals the `limit` parameter (default 10, max 50).
-- **`total` field**: Always equals `notifications.length` (the count after
-  sorting and slicing, not the total count across all pages).
-- **`unreadCount` field**: Currently always equals `total` since all
-  notifications have `read: false`. This field exists to support future
-  read-state persistence without changing the response shape.
-- **`read` field**: Always `false` for all notifications. Server-side read
-  state is not yet persisted.
-- **`date` field**: Always an ISO 8601 timestamp string in UTC
-  (e.g., `"2026-07-28T14:30:00.000Z"`).
-- **`title` field**: Human-readable title derived from `type` using a frozen
-  mapping (see table above). Existing titles never change.
-- **`message` field**: Format is stable for each event type. Existing message
-  templates never change.
-
-### Breaking Change Policy
-
-The following changes are considered **breaking** and will be avoided:
-- Renaming or removing any response field
-- Changing field types (e.g., `total` from number to string)
-- Modifying existing title or message formats
-- Changing the default or maximum `limit` values
-- Altering the sort order of the notifications array
-- Changing error status codes for existing error cases
-
-The following changes are considered **non-breaking** and may occur in future:
-- Adding new optional fields to the response envelope
-- Adding new optional fields to notification items
-- Supporting new event types with new title/message formats
-- Adding new error cases with distinct status codes
-- Performance optimizations that don't affect the response shape
+`queryLimit = limit + offset` is passed to each data-source query so the
+merged pool always contains enough rows to serve any page within the
+documented range without a second round-trip.
 
 ---
 
-## Out of Scope Edge Cases
+## Event types and titles
 
-- **Persistent Preference Database Storage**: Custom per-user preference
-  overrides stored in DB tables are out of scope for this route. The
-  `NotificationPreferences` contract is exported for future work; the
-  current handler does not yet filter the merged feed against it.
-- **Push Notification Transport**: Delivery via Web Push, APNs, or
-  email webhooks is managed out-of-band.
-- **Read State Persistence**: Every emitted notification has `read: false`
-  hardcoded. `calculateUnreadCount` therefore currently matches
-  `notifications.length`; the helper exists so that future read-state
-  storage can plumb through without changing the response shape.
-- **Cursor-based pagination**: Offset pagination is sufficient for the
-  current feed size. Cursor-based pagination (stable under concurrent
-  inserts) is out of scope for this issue.
-- **Persisted preference overrides and read state**: The route reports default
-  preferences and a derived unread count; storing per-user overrides or marking
-  individual notifications as read remains out of scope.
+### Payments (`payments` table)
+
+| `eventType`       | `title`            | `message` pattern                                     |
+|-------------------|--------------------|-------------------------------------------------------|
+| `PaymentSent`     | `Payment Sent`     | `#<txHash[0:10]> · You sent <amount> tokens`          |
+| `PaymentReceived` | `Payment Received` | `#<txHash[0:10]> · You received <amount> tokens`      |
+
+### Agreement events (`agreementEvents` table)
+
+Titles are produced by inserting a space before each capital letter:
+`AgreementCreated` → `Agreement Created`.
+
+| `eventType`            | `title`                 | `message` pattern                              |
+|------------------------|-------------------------|------------------------------------------------|
+| `AgreementCreated`     | `Agreement Created`     | `Agreement #<id> has been created`             |
+| `AgreementActivated`   | `Agreement Activated`   | `Agreement <id>: AgreementActivated`           |
+| `AgreementCancelled`   | `Agreement Cancelled`   | `Agreement <id>: AgreementCancelled`           |
+| `DisputeRaised`        | `Dispute Raised`        | `Agreement <id>: DisputeRaised`                |
+| `DisputeResolved`      | `Dispute Resolved`      | `Agreement <id>: DisputeResolved`              |
+
+### Escrow events (`escrowEvents` table)
+
+| `eventType` | `title`            | `message` pattern                                      |
+|-------------|--------------------|--------------------------------------------------------|
+| `Funded`    | `Agreement Funded` | `Agreement <id>: Funded of <amount> tokens`            |
+| `Released`  | `Funds Released`   | `Agreement <id>: Released of <amount> tokens`          |
+| `Refunded`  | `Funds Refunded`   | `Agreement <id>: Refunded of <amount> tokens`          |
+
+Token amounts are formatted using the agreement's token decimals (STRK = 18,
+USDC/USDT = 6). When the escrow event references an agreement not in the
+user's agreement list, the amount is formatted with 0 decimals (integer
+count).
+
+---
+
+## Telemetry
+
+Every request emits a `notification_preferences_and_unread_count` metric via
+`logNotificationsTelemetry`.  The log entry never includes the user address
+or notification content — only low-cardinality counters.
+
+| Field                | Type     | Notes                                              |
+|----------------------|----------|----------------------------------------------------|
+| `operation`          | `string` | Always `"notification_feed"`.                      |
+| `status`             | `string` | `"success"` or `"error"`.                          |
+| `duration_ms`        | `number` | Wall-clock time for the full handler.              |
+| `notification_count` | `number` | Length of the returned page (success only).        |
+| `unread_count`       | `number` | `calculateUnreadCount` result (success only).      |
+| `preferences_enabled`| `number` | Count of `true` fields in default prefs (always 4).|
+| `error`              | `string` | Error message (error path only).                   |
+
+---
+
+## Authorization
+
+The route is **unauthenticated**.  Each DB query is filtered to the
+`user_address` path parameter so a caller cannot read another address's
+notifications by modifying the path.  The address is canonicalized before use
+as a query filter, preventing lookup-key injection.
+
+---
+
+## Out of scope
+
+The following are intentionally not implemented by this route:
+
+- **Per-user read state** — `read` is always `false`; no server-side
+  persistence exists yet.  A `requireAuth` guard and a write endpoint are
+  required before this can be added safely.
+- **Preference-filtered feeds** — `getDefaultNotificationPreferences()`
+  returns the defaults but the route does not filter the DB queries by
+  category.  Preference-aware filtering is a future extension.
+- **`/unread-count` sub-resource** — there is no separate unread-count
+  endpoint; callers use the `unreadCount` field in the main response.
+- **`PATCH /preferences`** — there is no preference-update endpoint; the
+  preferences object describes the default shape only.
