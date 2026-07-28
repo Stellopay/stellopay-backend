@@ -241,6 +241,40 @@ describe("notification preferences & unread count helpers", () => {
     ];
     expect(calculateUnreadCount(list)).toBe(2);
   });
+
+  it("returns zero when duplicate IDs are all read", () => {
+    // Regression guard: a list where every entry is read=true, including
+    // duplicates, must yield 0 — the dedup path must not accidentally count
+    // read items as unread when they appear more than once.
+    const list = [
+      { id: "notif-1", read: true },
+      { id: "notif-1", read: true },
+      { id: "notif-2", read: true },
+    ];
+    expect(calculateUnreadCount(list)).toBe(0);
+  });
+
+  it("treats numeric id 0 as a valid deduplication key", () => {
+    // Edge case: id=0 is falsy in JS but must still be tracked as a unique key.
+    const list = [
+      { id: 0, read: false },
+      { id: 0, read: false }, // duplicate of id 0
+      { id: 1, read: false },
+    ];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+
+  it("unreadCount always equals the number of items returned when all are unread", () => {
+    // Invariant: since every notification has read=false, calculateUnreadCount
+    // must equal the array length. This is the property the route depends on
+    // to keep `unreadCount` in sync with `total`.
+    const items = [
+      { id: "a", read: false as const },
+      { id: "b", read: false as const },
+      { id: "c", read: false as const },
+    ];
+    expect(calculateUnreadCount(items)).toBe(items.length);
+  });
 });
 
 describe("notifications route", () => {
@@ -659,6 +693,51 @@ describe("notifications route", () => {
     await request(makeApp())
       .get("/api/v1/notifications/ABC")
       .expect(200);
+  });
+
+  it("accepts limit=1 (the minimum documented value) without error", async () => {
+    // Boundary: limit=1 is the smallest valid page size. The Zod schema uses
+    // .positive() which accepts 1. Confirm the route accepts it and returns
+    // the correct envelope shape.
+    queryState.rows.payments = [makePayment(), makePayment({ id: "p2" })];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=1")
+      .expect(200);
+    expect(res.body.limit).toBe(1);
+    expect(res.body.notifications).toHaveLength(1);
+    expect(res.body.total).toBe(1);
+    expect(res.body.hasMore).toBe(true);
+  });
+
+  it("unreadCount always equals total in the response (read=false invariant)", async () => {
+    // Invariant: every notification emitted by the route has read=false, so
+    // unreadCount must equal total on every valid response. This is the
+    // property callers rely on when using unreadCount as a badge count.
+    queryState.rows.payments = [makePayment(), makePayment({ id: "p2" }), makePayment({ id: "p3" })];
+    queryState.rows.agreements = [{ id: "1", token: USDC_TOKEN_ADDRESS }];
+    queryState.rows.agreementEvents = [makeAgreementEvent()];
+    queryState.rows.escrowEvents = [makeEscrowEvent()];
+
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    expect(res.body.unreadCount).toBe(res.body.total);
+  });
+
+  it("telemetry preferences_enabled is always 4 (all default categories enabled)", async () => {
+    // Regression guard: logNotificationsTelemetry receives
+    // preferences_enabled = Object.values(getDefaultNotificationPreferences()).filter(Boolean).length
+    // which must be exactly 4 (payments + agreements + escrow + disputes).
+    // If getDefaultNotificationPreferences ever changed a default to false,
+    // this test would catch the unintended telemetry regression.
+    queryState.rows.payments = [makePayment()];
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
+
+    const telemetry = JSON.parse(info.mock.calls[0][0] as string);
+    expect(telemetry.preferences_enabled).toBe(4);
   });
 });
 
