@@ -3,20 +3,13 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, gte, lte, inArray, desc, SQL, or, gt, sql } from "drizzle-orm";
-import { provider } from "../starknet/client.js";
-import { toHexString, u256ToString } from "../utils/codec.js";
+import { provider, agreementContract, escrowContract } from "../starknet/client.js";
+import { toHexString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
-import { shortString, Contract } from "starknet";
 import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
 import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
-
-const AddressParam = z.string().min(3);
-
-const DEFAULT_PAGE_LIMIT = 50;
-const MAX_PAGE_LIMIT = 100;
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
