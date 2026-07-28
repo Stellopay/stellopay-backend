@@ -12,6 +12,11 @@ The response shape is **stable**. The fields and behaviors described in this
 document MUST be preserved across future changes so that existing callers
 continue to work without modification.
 
+Additive fields (`limit`, `offset`, `hasMore`) were introduced alongside the
+existing `notifications`, `total`, and `unreadCount` fields. Callers that
+ignore unknown fields are unaffected; callers that want pagination should
+use the new fields.
+
 ---
 
 ## Authorization Boundary
@@ -37,7 +42,7 @@ guard MUST be added at that point.
 ### `GET /api/v1/notifications/:user_address`
 
 Returns a chronological list of recent notifications, total items, and unread
-count for a user.
+count for a user. Supports offset-based pagination.
 
 #### Path Parameters
 
@@ -49,7 +54,8 @@ count for a user.
 
 | Parameter | Type | Default | Constraint | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `limit` | Integer | `10` | positive integer, max `50` | Maximum number of notifications to return. Out-of-range values are rejected with `400 Validation failed` before any database call. |
+| `limit` | Integer | `10` | positive integer, max `50` | Maximum number of notifications to return per page. Out-of-range values are rejected with `400 Validation failed` before any database call. |
+| `offset` | Integer | `0` | non-negative integer | Number of notifications to skip before the returned page. Negative values are rejected with `400 Validation failed`. |
 
 ---
 
@@ -78,7 +84,10 @@ count for a user.
     }
   ],
   "total": 2,
-  "unreadCount": 2
+  "unreadCount": 2,
+  "limit": 10,
+  "offset": 0,
+  "hasMore": false
 }
 ```
 
@@ -94,8 +103,16 @@ count for a user.
 | `notifications[].date` | string | ISO 8601 timestamp. |
 | `notifications[].type` | string | Raw on-chain `eventType` string. |
 | `notifications[].txHash` | string | Transaction hash. |
-| `total` | integer | Length of `notifications` array. |
+| `total` | integer | Length of the `notifications` array (post-slice). |
 | `unreadCount` | integer | Count of items where `read === false` (always equals `total`). |
+
+**Additive pagination fields (present in all responses):**
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `limit` | integer | Echoed request limit (or the default of 10). |
+| `offset` | integer | Echoed request offset (or 0 when omitted). |
+| `hasMore` | boolean | `true` when additional notifications exist beyond this page. Clients should re-request with `offset += limit` to fetch the next page. |
 
 **Frozen event-type → title mapping:**
 
@@ -114,6 +131,29 @@ count for a user.
 
 ---
 
+## Pagination Model
+
+The endpoint uses offset-based pagination. The merged pool of all three data
+sources is sorted newest-first and then sliced:
+
+```
+page = sorted_pool[ offset : offset + limit ]
+```
+
+To iterate all notifications, callers advance the offset by `limit` until
+`hasMore` is `false`:
+
+```
+GET /api/v1/notifications/<addr>?limit=10&offset=0   → page 1, hasMore: true
+GET /api/v1/notifications/<addr>?limit=10&offset=10  → page 2, hasMore: true
+GET /api/v1/notifications/<addr>?limit=10&offset=20  → page 3, hasMore: false
+```
+
+If `offset` is beyond the available pool, an empty `notifications` array is
+returned with `hasMore: false` — this is not an error.
+
+---
+
 ## Backend Behavior
 
 ### Data Sources
@@ -127,10 +167,25 @@ of notifications:
 | `agreementEvents` | `DisputeRaised`, `DisputeResolved`, `AgreementActivated`, `AgreementCancelled`, `AgreementCreated` | Only fetched when the user owns at least one agreement; an empty `agreementIds` set short-circuits the query entirely. |
 | `escrowEvents` | (none) | Matches when the user is `employer` or `to`. The token used for amount formatting is read from the joined `agreements.token`. |
 
-The merged array is sorted by `date` descending and sliced to `limit`. The
-response's `total` and `notifications.length` always equal the post-slice
-length; `unreadCount` is computed from the same array via the exported
-`calculateUnreadCount` helper.
+The merged array is sorted by `date` descending and sliced to the requested
+page (`[offset, offset+limit]`). The response's `total` and
+`notifications.length` always equal the post-slice length; `unreadCount` is
+computed from the same array via the exported `calculateUnreadCount` helper.
+
+### Batching Contract
+
+Each data-source query receives a `queryLimit` of `limit + offset` rows.
+This ensures the merged pool always contains enough rows to satisfy the
+requested page:
+
+```
+queryLimit = limit + offset
+page       = sorted_pool.slice(offset, offset + limit)
+hasMore    = sorted_pool.length > offset + limit
+```
+
+Because `NOTIFICATIONS_MAX_LIMIT = 50`, `queryLimit` is bounded to at most
+100 rows per source per request (when `limit=50` and `offset=50`).
 
 ### Query Execution Order
 
@@ -204,11 +259,26 @@ Formatting uses BigInt arithmetic so u256 amounts are never truncated through
 
 ---
 
+## Observability
+
+Each notification-feed request emits one structured metric record with
+`metric: "notification_preferences_and_unread_count"` and
+`operation: "notification_feed"`. Success records include `notification_count`,
+`unread_count`, and `preferences_enabled`; failure records include `error`.
+Every record includes `timestamp`, `level`, `status`, and `duration_ms`, plus
+`request_id` when request-ID middleware is mounted.
+
+User addresses, transaction hashes, notification messages, and individual
+preference values are deliberately excluded. Records are sent through the
+application logger; external metrics export is out of scope.
+
+---
+
 ## Error Handling
 
 | Status | Error Message | Description |
 | :--- | :--- | :--- |
-| `400 Bad Request` | `Validation failed` | Returned when `user_address` is not a valid Starknet address, or `limit` is non-numeric, non-positive, or above `50`. |
+| `400 Bad Request` | `Validation failed` | Returned when `user_address` is not a valid Starknet address, `limit` is non-numeric / non-positive / above `50`, or `offset` is non-numeric / negative. |
 
 Errors propagate through the central error handler with structured Zod
 `details` so misbehaving clients see which field failed, identical to the
@@ -218,14 +288,18 @@ other `/api/v1/*` routes.
 
 ## Compatibility Notes
 
-- The response envelope is `{ notifications, total, unreadCount }` with the
-  same keys and types documented in the success-response block above. Older
-  callers depend on this shape; any additively-new field can be added later
-  without breaking them.
+- The response envelope is `{ notifications, total, unreadCount, limit, offset, hasMore }`.
+  The original three fields (`notifications`, `total`, `unreadCount`) are
+  frozen; the pagination fields are additive. Callers that ignore unknown
+  fields are unaffected.
 - The default `limit` is intentionally `10` (not `50` like the project's
   shared `parsePagination`) for backward compatibility with callers that
   rely on the smaller default; out-of-range `limit` values are still
   rejected with `400` rather than silently clamped.
+- The exported constants `NOTIFICATIONS_DEFAULT_LIMIT` (10) and
+  `NOTIFICATIONS_MAX_LIMIT` (50) are the single source of truth for the
+  documented pagination bounds. Tests import them directly so constant and
+  behavior cannot drift.
 
 ---
 
@@ -241,3 +315,9 @@ other `/api/v1/*` routes.
   hardcoded. `calculateUnreadCount` therefore currently matches
   `notifications.length`; the helper exists so that future read-state
   storage can plumb through without changing the response shape.
+- **Cursor-based pagination**: Offset pagination is sufficient for the
+  current feed size. Cursor-based pagination (stable under concurrent
+  inserts) is out of scope for this issue.
+- **Persisted preference overrides and read state**: The route reports default
+  preferences and a derived unread count; storing per-user overrides or marking
+  individual notifications as read remains out of scope.

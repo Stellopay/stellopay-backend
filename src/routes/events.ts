@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq, and, gte, lte, inArray, desc, SQL } from "drizzle-orm";
+import { eq, and, gte, lte, inArray, desc, SQL, or, gt, sql } from "drizzle-orm";
 import { provider } from "../starknet/client.js";
 import { toHexString, u256ToString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
@@ -11,9 +11,12 @@ import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { agreementContract } from "../starknet/client.js";
 import { notFoundResponse } from "./not-found.js";
-import { parsePagination } from "../utils/validation.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
+
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 100;
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
@@ -33,6 +36,20 @@ export const TxHashSchema = z
   .min(3)
   .max(66)
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
+
+/**
+ * Envelope schema for batch processing of Starknet transaction receipts.
+ * Validates a non-empty array of Starknet transaction hashes bounded by MAX_BATCH_SIZE.
+ */
+export const BatchProcessEnvelopeSchema = z.object({
+  tx_hashes: z
+    .array(TxHashSchema)
+    .min(1, "tx_hashes must contain at least one hash")
+    .max(
+      MAX_BATCH_SIZE,
+      `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+    ),
+});
 
 export const eventsRouter = Router();
 
@@ -57,7 +74,7 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
     ...entry,
   };
   if (env.LOG_FORMAT === "json") {
-    // eslint-disable-next-line no-console
+     
     (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
     return;
   }
@@ -66,7 +83,7 @@ function logEventTelemetry(entry: EventTelemetryEntry): void {
     `${logEntry.tx_hash ? ` tx=${logEntry.tx_hash}` : ""}` +
     `${logEntry.batch_size !== undefined ? ` batch=${logEntry.batch_size}` : ""}` +
     `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-  // eslint-disable-next-line no-console
+   
   (logEntry.level === "error" ? console.error : console.info)(message);
 }
 
@@ -105,7 +122,7 @@ export function normalizeTransactionHash(hash: string): string {
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
 
-async function getWorkAgreementAbi(): Promise<any[]> {
+export async function getWorkAgreementAbi(): Promise<any[]> {
   if (!workAgreementAbi) {
     if (!abiPaths.agreement) {
       throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
@@ -115,7 +132,7 @@ async function getWorkAgreementAbi(): Promise<any[]> {
   return workAgreementAbi;
 }
 
-async function getPayrollEscrowAbi(): Promise<any[]> {
+export async function getPayrollEscrowAbi(): Promise<any[]> {
   if (!payrollEscrowAbi) {
     if (!abiPaths.escrow) {
       throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");
@@ -292,15 +309,13 @@ async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResul
   }
 
   // ------------------------------------------------------------------
-  // 3. Prepare ABI contract instances for event parsing
+  // 3. Prepare ABI contract instances for event parsing (cached singletons)
   // ------------------------------------------------------------------
-  const wAgreementAbi = await getWorkAgreementAbi();
-  const pEscrowAbi = await getPayrollEscrowAbi();
   const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
   const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-  const workAgreementContract = new Contract(wAgreementAbi, workAgreementAddress, provider);
-  const payrollEscrowContract = new Contract(pEscrowAbi, payrollEscrowAddress, provider);
+  const workAgreementContract = agreementContract(workAgreementAddress);
+  const payrollEscrowContract = escrowContract(payrollEscrowAddress);
 
   const eventLabels: string[] = [];
 
@@ -940,66 +955,99 @@ eventsRouter.post(
   requireAdmin,
   async (req, res, next) => {
     const start = process.hrtime.bigint();
+    const batchSize = Array.isArray(req.body?.tx_hashes) ? req.body.tx_hashes.length : 0;
+
     try {
-      const { tx_hashes } = z
-        .object({
-          tx_hashes: z
-            .array(TxHashSchema)
-            .min(1, "tx_hashes must contain at least one hash")
-            .max(
-              MAX_BATCH_SIZE,
-              `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
-            ),
-        })
-        .parse(req.body);
+      const { tx_hashes } = BatchProcessEnvelopeSchema.parse(req.body);
 
-      const results: TxProcessResult[] = [];
-      const resultsByNormalizedHash = new Map<string, TxProcessResult>();
-      let duplicates = 0;
-
-      for (const txHash of tx_hashes) {
-        const normalized = normalizeTransactionHash(txHash);
-        const existing = resultsByNormalizedHash.get(normalized);
-
-        if (existing) {
-          duplicates++;
-          results.push(existing);
-          continue;
-        }
-
-        try {
-          const result = await processTxReceipt(txHash);
-          resultsByNormalizedHash.set(normalized, result);
-          results.push(result);
-        } catch (e: any) {
-          const errorResult: TxProcessResult = {
-            txHash,
-            status: "error",
-            eventsProcessed: 0,
-            eventLabels: [],
-            error: e?.message ?? String(e),
-          };
-          resultsByNormalizedHash.set(normalized, errorResult);
-          results.push(errorResult);
+      // Deduplicate unique hashes while preserving the first raw hash representation
+      const uniqueEntriesMap = new Map<string, string>();
+      for (const rawHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(rawHash);
+        if (!uniqueEntriesMap.has(normalized)) {
+          uniqueEntriesMap.set(normalized, rawHash);
         }
       }
 
-      const uniqueResults = Array.from(resultsByNormalizedHash.values());
-      const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
+      // Concurrent fan-out processing across unique receipts to eliminate sequential bottlenecks
+      const uniqueResults = await Promise.all(
+        Array.from(uniqueEntriesMap.entries()).map(async ([normalized, rawHash]) => {
+          try {
+            const result = await processTxReceipt(rawHash);
+            return [normalized, result] as const;
+          } catch (e: any) {
+            const errorResult: TxProcessResult = {
+              txHash: rawHash,
+              status: "error",
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: e?.message ?? String(e),
+            };
+            return [normalized, errorResult] as const;
+          }
+        }),
+      );
+
+      const resultsByNormalizedHash = new Map<string, TxProcessResult>(uniqueResults);
+
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+      });
+
+      const results: TxProcessResult[] = [];
+      let duplicates = 0;
+      const seenHashes = new Set<string>();
+
+      for (const txHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(txHash);
+        if (seenHashes.has(normalized)) {
+          duplicates++;
+        } else {
+          seenHashes.add(normalized);
+        }
+        results.push(resultsByNormalizedHash.get(normalized)!);
+      }
+
+      const uniqueResultsList = Array.from(resultsByNormalizedHash.values());
+      const totalProcessed = uniqueResultsList.reduce((sum, r) => sum + r.eventsProcessed, 0);
+
+      logEventTelemetry({
+        operation: "event_fanout_delivery",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+        unique_transactions: uniqueResults.length,
+        duplicates,
+        events_processed: totalProcessed,
+      });
 
       res.json({
         summary: {
           total: results.length,
-          processed: uniqueResults.filter((r) => r.status === "processed").length,
-          noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
-          notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-          errors: uniqueResults.filter((r) => r.status === "error").length,
+          processed: uniqueResultsList.filter((r) => r.status === "processed").length,
+          noEvents: uniqueResultsList.filter((r) => r.status === "no_events").length,
+          notFound: uniqueResultsList.filter((r) => r.status === "not_found").length,
+          errors: uniqueResultsList.filter((r) => r.status === "error").length,
           duplicates,
           totalEventsProcessed: totalProcessed,
         },
         results,
       });
     } catch (e) {
+      if (e instanceof z.ZodError) {
+        logEventTelemetry({
+          operation: "event_envelope_validation",
+          duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+          status: "error",
+          batch_size: batchSize,
+          error: e.message,
+        });
+        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+        return;
+      }
       next(e);
     }
   },
@@ -1053,7 +1101,18 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
 
   let date: Date;
   if (typeof raw === "number") {
-    date = new Date(raw);
+    if (!Number.isFinite(raw)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [paramName],
+          message: `Invalid timestamp format for parameter '${paramName}'`,
+        },
+      ]);
+    }
+    // Treat numeric values the same as numeric strings: 10-digit values are
+    // assumed to be seconds, while 13-digit values are treated as milliseconds.
+    date = new Date(raw < 10000000000 ? raw * 1000 : raw);
   } else if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (!trimmed) return undefined;
@@ -1061,7 +1120,8 @@ export function parseTimestampQuery(raw: unknown, paramName: string): Date | und
     if (/^\d+$/.test(trimmed)) {
       const num = parseInt(trimmed, 10);
       // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
-      date = new Date(num < 10000000000 ? num * 1000 : num);
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
     } else {
       date = new Date(trimmed);
     }
@@ -1144,21 +1204,31 @@ eventsRouter.get("/events", async (req, res, next) => {
     const contractAddress = rawContractAddr ? String(rawContractAddr).trim().toLowerCase() : undefined;
 
     const conditions: SQL[] = [];
+    const agreementEventsTable = schema.agreementEvents as unknown as {
+      eventType?: unknown;
+      createdAt?: unknown;
+      agreementId?: unknown;
+      contractAddress?: unknown;
+    };
+    const eventTypeColumn = agreementEventsTable.eventType ?? "eventType";
+    const createdAtColumn = agreementEventsTable.createdAt ?? "createdAt";
+    const agreementIdColumn = agreementEventsTable.agreementId ?? "agreementId";
+    const contractAddressColumn = agreementEventsTable.contractAddress ?? "contractAddress";
 
     if (eventTypes.length > 0) {
-      conditions.push(inArray(schema.agreementEvents.eventType, eventTypes));
+      conditions.push(inArray(eventTypeColumn as any, eventTypes));
     }
     if (fromDate) {
-      conditions.push(gte(schema.agreementEvents.createdAt, fromDate));
+      conditions.push(gte(createdAtColumn as any, fromDate));
     }
     if (toDate) {
-      conditions.push(lte(schema.agreementEvents.createdAt, toDate));
+      conditions.push(lte(createdAtColumn as any, toDate));
     }
     if (agreementId) {
-      conditions.push(eq(schema.agreementEvents.agreementId, agreementId));
+      conditions.push(eq(agreementIdColumn as any, agreementId));
     }
     if (contractAddress) {
-      conditions.push(eq(schema.agreementEvents.contractAddress, contractAddress));
+      conditions.push(eq(contractAddressColumn as any, contractAddress));
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -1171,16 +1241,6 @@ eventsRouter.get("/events", async (req, res, next) => {
       .limit(limit)
       .offset(offset);
 
-    logEventTelemetry({
-      operation: "event_fanout_delivery",
-      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
-      status: "success",
-      batch_size: tx_hashes.length,
-      unique_transactions: uniqueResults.length,
-      duplicates,
-      events_processed: totalProcessed,
-    });
-
     res.json({
       events,
       count: events.length,
@@ -1188,6 +1248,7 @@ eventsRouter.get("/events", async (req, res, next) => {
       offset,
     });
   } catch (e) {
+    console.error("[events] GET /events failed", e);
     if (e instanceof z.ZodError) {
       res.status(400).json({
         error: "Validation failed",

@@ -101,6 +101,7 @@ vi.mock("drizzle-orm", () => ({
 vi.mock("../starknet/client.js", () => ({
   provider: { getTransactionReceipt: vi.fn() },
   agreementContract: vi.fn(() => ({
+    parseEvent: parseEventMock,
     // Resolves to the same token as the AgreementCreated fixture so the default
     // path verifies cleanly; the verification tests override this per case.
     get_token: vi
@@ -108,6 +109,9 @@ vi.mock("../starknet/client.js", () => ({
       .mockResolvedValue(
         BigInt("0xdeadbeef00000000000000000000000000000000000000000000000000000002"),
       ),
+  })),
+  escrowContract: vi.fn(() => ({
+    parseEvent: parseEventMock,
   })),
 }));
 
@@ -153,6 +157,7 @@ import {
   parseEventTypeQuery,
   parseTimestampQuery,
   validateTimeRange,
+  BatchProcessEnvelopeSchema,
 } from "./events.js";
 import { db } from "../db/index.js";
 import { provider, agreementContract } from "../starknet/client.js";
@@ -499,6 +504,11 @@ describe("Zod input validation schemas", () => {
   it("BatchSchema rejects a batch containing even one invalid hash", () => {
     expect(() => BatchSchema.parse({ tx_hashes: [TX_A, "not-a-hash"] })).toThrow();
   });
+
+  it("BatchProcessEnvelopeSchema validates exported envelope schema correctly", () => {
+    expect(() => BatchProcessEnvelopeSchema.parse({ tx_hashes: [TX_A, TX_B] })).not.toThrow();
+    expect(() => BatchProcessEnvelopeSchema.parse({ tx_hashes: [] })).toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -527,7 +537,10 @@ describe("processTxReceipt – on-chain token verification", () => {
   }
 
   function mockGetToken(impl: () => Promise<bigint>) {
-    vi.mocked(agreementContract).mockReturnValue({ get_token: vi.fn(impl) } as any);
+    vi.mocked(agreementContract).mockReturnValue({
+      parseEvent: parseEventMock,
+      get_token: vi.fn(impl),
+    } as any);
   }
 
   beforeEach(() => {
@@ -588,6 +601,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     rewireDbInsert();
     // Force a deterministic "token matches" path for the default route tests.
     vi.mocked(agreementContract).mockReturnValue({
+      parseEvent: parseEventMock,
       get_token: vi
         .fn()
         .mockResolvedValue(
@@ -628,6 +642,24 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.summary.total).toBe(1);
     expect(res.body.results).toHaveLength(1);
+  });
+
+  it("process_batch returns 400 with a clean error for malformed hashes", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, "not-a-tx-hash"] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 2 });
+    errorSpy.mockRestore();
   });
 
   it("process_tx returns 400 with a clean error for a malformed hash", async () => {
@@ -703,6 +735,37 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(2);
     expect(res.body.summary.duplicates).toBe(0);
     expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch processes unique receipts concurrently via fan-out delivery", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    let fetchCount = 0;
+    vi.mocked(provider.getTransactionReceipt).mockImplementation(async (hash: string) => {
+      fetchCount++;
+      await new Promise((r) => setTimeout(r, 15));
+      return makeAgreementReceipt(hash) as any;
+    });
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary.total).toBe(2);
+    expect(res.body.results).toHaveLength(2);
+    expect(fetchCount).toBe(2);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledWith(TX_A);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledWith(TX_B);
+  });
+
+  it("processTxReceipt reuses cached contract instances from starknet client", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any);
+
+    await processTxReceipt(TX_A);
+
+    expect(vi.mocked(agreementContract)).toHaveBeenCalled();
+    expect(vi.mocked(escrowContract)).toHaveBeenCalled();
   });
 });
 
