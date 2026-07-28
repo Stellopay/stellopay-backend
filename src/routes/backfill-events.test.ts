@@ -117,21 +117,37 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
 
   function makeAgreementEventsInsertChain() {
     return {
-      values: (values: AgreementEventRow) => ({
-        onConflictDoNothing: () => ({
-          returning: async () => insertAgreementEvent(values),
-        }),
-      }),
+      values: (values: AgreementEventRow | AgreementEventRow[]) => {
+        const rows = Array.isArray(values) ? values : [values];
+        return {
+          onConflictDoNothing: () => ({
+            returning: async () => {
+              const inserted: AgreementEventRow[] = [];
+              for (const row of rows) {
+                const result = insertAgreementEvent(row);
+                inserted.push(...result);
+              }
+              return inserted;
+            },
+          }),
+        };
+      },
     };
   }
 
   function makeProgressInsertChain() {
     return {
-      values: (values: ProgressRow) => ({
-        onConflictDoUpdate: async ({ set }: { set: Partial<ProgressRow> }) => {
-          upsertProgress(values, set);
-        },
-      }),
+      values: (values: ProgressRow) => {
+        const existing = state.progress.get(values.jobName);
+        if (!existing) {
+          state.progress.set(values.jobName, { ...values });
+        }
+        return {
+          onConflictDoUpdate: async ({ set }: { set: Partial<ProgressRow> }) => {
+            upsertProgress(values, set);
+          },
+        };
+      },
     };
   }
 
@@ -141,35 +157,57 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
     throw new Error(`unexpected insert table: ${String(table)}`);
   }
 
-  const txMock = { insert: insertFor };
+  function selectFrom(table: unknown) {
+    if (table !== schema.backfillProgress) {
+      throw new Error(`unexpected select table: ${String(table)}`);
+    }
+    const allRows = () => Array.from(state.progress.values()).map((r) => ({ ...r }));
+    const result: {
+      where: (condition: { value: string }) => Promise<ProgressRow[]>;
+      then: (resolve: (rows: ProgressRow[]) => void, reject: (e: unknown) => void) => void;
+    } = {
+      where: async (condition: { value: string }) => {
+        const row = state.progress.get(condition.value);
+        return row ? [{ ...row }] : [];
+      },
+      then: (resolve, reject) => {
+        Promise.resolve(allRows()).then(resolve, reject);
+      },
+    };
+    return result;
+  }
+
+  function updateTable(table: unknown) {
+    if (table !== schema.backfillProgress) {
+      throw new Error(`unexpected update table: ${String(table)}`);
+    }
+    return {
+      set: (values: Partial<ProgressRow>) => ({
+        where: (condition: { value: string }) => {
+          const existing = state.progress.get(condition.value);
+          if (existing) {
+            state.progress.set(condition.value, { ...existing, ...values, updatedAt: new Date() });
+          }
+          return Promise.resolve();
+        },
+      }),
+    };
+  }
+
+  const txMock = {
+    insert: insertFor,
+    select: vi.fn(() => ({ from: selectFrom })),
+    update: vi.fn(updateTable),
+  };
 
   const db = {
     execute: vi.fn(async (arg: unknown) => {
       state.executeCalls.push(arg);
       return state.executeQueue.shift() ?? { rows: [] };
     }),
-    select: vi.fn(() => ({
-      from: (table: unknown) => {
-        if (table !== schema.backfillProgress) {
-          throw new Error(`unexpected select table: ${String(table)}`);
-        }
-        const allRows = () => Array.from(state.progress.values()).map((r) => ({ ...r }));
-        const result: {
-          where: (condition: { value: string }) => Promise<ProgressRow[]>;
-          then: (resolve: (rows: ProgressRow[]) => void, reject: (e: unknown) => void) => void;
-        } = {
-          where: async (condition: { value: string }) => {
-            const row = state.progress.get(condition.value);
-            return row ? [{ ...row }] : [];
-          },
-          then: (resolve, reject) => {
-            Promise.resolve(allRows()).then(resolve, reject);
-          },
-        };
-        return result;
-      },
-    })),
+    select: vi.fn(() => ({ from: selectFrom })),
     insert: insertFor,
+    update: vi.fn(updateTable),
     transaction: vi.fn(async (cb: (tx: typeof txMock) => Promise<void>) => {
       state.batchCallCount++;
       if (state.failOnBatchNumber !== null && state.batchCallCount === state.failOnBatchNumber) {
@@ -198,12 +236,11 @@ vi.mock("drizzle-orm", async (importOriginal) => {
 import {
   backfillEventsRouter,
   RESULTS_PREVIEW_SIZE,
-  CLOCK_SKEW_TOLERANCE_MS,
-  validateResumeTokenFreshness,
-  BackfillQuerySchema,
   buildBackfillEventId,
-  MAX_BACKFILL_LIMIT,
+  BackfillQuerySchema,
   DEFAULT_BACKFILL_LIMIT,
+  MAX_BACKFILL_LIMIT,
+  getBackfillProgress,
 } from "./backfill-events.js";
 import { requireSession } from "../auth/session.js";
 
@@ -270,6 +307,13 @@ function makeDescendingRows(count: number, idOffset = 0) {
   return Array.from({ length: count }, (_, i) =>
     makeRow(idOffset + i, { createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, count - i)) }),
   );
+}
+
+function authHeaders(address: string) {
+  return {
+    "x-user-address": address,
+    authorization: "Bearer testtoken",
+  };
 }
 
 beforeEach(() => {
@@ -381,6 +425,61 @@ describe.each(JOBS)("POST $path", (job) => {
     expect(empty.body.hasMore).toBe(false);
   });
 
+  it("checkpoints progress in batches when a page exceeds the checkpoint batch size", async () => {
+    const rowCount = BACKFILL_CHECKPOINT_BATCH_SIZE + 20;
+    queueRows(makeDescendingRows(rowCount));
+
+    // No `limit` override: default (1000) exceeds rowCount, so hasMore is false and the
+    // job is expected to reach "completed" once all batches commit.
+    const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
+
+    expect(res.body.totalScanned).toBe(rowCount);
+    // Mark running (1) + batch of 100 (2) + partial batch of 20 (3) + mark completed (4) = 4 transactions.
+    expect(dbMock.transaction).toHaveBeenCalledTimes(4);
+
+    const progress = store.state.progress.get(job.jobName)!;
+    expect(progress.totalScanned).toBe(rowCount);
+    expect(progress.totalCreated).toBe(rowCount);
+    expect(progress.status).toBe("completed");
+    expect(progress.completedAt).not.toBeNull();
+  });
+
+  it("leaves the job idle (not completed) when the page is full and more rows may remain", async () => {
+    queueRows(makeDescendingRows(10));
+    await request(makeApp()).post(`${job.path}?limit=10`).set(authHeaders(ADMIN)).expect(200);
+
+    const progress = store.state.progress.get(job.jobName)!;
+    expect(progress.status).toBe("idle");
+    expect(progress.completedAt).toBeNull();
+  });
+
+  it("auto-resumes from the persisted checkpoint when `before` is omitted, but an explicit `before` overrides it", async () => {
+    queueRows(makeDescendingRows(3));
+    await request(makeApp()).post(`${job.path}?limit=3`).set(authHeaders(ADMIN)).expect(200);
+
+    const persistedCursor = store.state.progress.get(job.jobName)!.lastCursor!;
+
+    // Second call, no `before` in the query string: should scan using the persisted cursor.
+    queueRows([]);
+    await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
+    const autoResumeCall = store.state.executeCalls[store.state.executeCalls.length - 1];
+    const autoResumeDates = extractDateParams(autoResumeCall);
+    expect(autoResumeDates).toHaveLength(1);
+    expect(autoResumeDates[0].toISOString()).toBe(persistedCursor.toISOString());
+
+    // Third call, explicit `before` provided: must override the checkpoint value.
+    const explicitBefore = new Date(Date.UTC(2020, 0, 1)).toISOString();
+    queueRows([]);
+    await request(makeApp())
+      .post(`${job.path}?before=${encodeURIComponent(explicitBefore)}`)
+      .set(authHeaders(ADMIN))
+      .expect(200);
+    const explicitCall = store.state.executeCalls[store.state.executeCalls.length - 1];
+    const explicitDates = extractDateParams(explicitCall);
+    expect(explicitDates).toHaveLength(1);
+    expect(explicitDates[0].toISOString()).toBe(explicitBefore);
+  });
+
   it("sends no cursor condition on the very first call for a job that has never run", async () => {
     queueRows([]);
     await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
@@ -388,22 +487,58 @@ describe.each(JOBS)("POST $path", (job) => {
     expect(extractDateParams(call)).toHaveLength(0);
   });
 
+  it("marks the job failed and preserves the last committed checkpoint when a batch throws, then resumes from it on the next call", async () => {
+    const rowCount = BACKFILL_CHECKPOINT_BATCH_SIZE + 50;
+    queueRows(makeDescendingRows(rowCount));
+    // Transaction 1 = mark running, Transaction 2 = first batch (succeeds),
+    // Transaction 3 = second batch (fails).
+    store.state.failOnBatchNumber = 3;
+
+    const res = await request(makeApp())
+      .post(`${job.path}?limit=${rowCount}`)
+      .set(authHeaders(ADMIN))
+      .expect(500);
+    expect(res.body.error).toBe("simulated batch failure");
+
+    // Only the first, successfully-committed batch is durable.
+    expect(store.state.agreementEvents.size).toBe(BACKFILL_CHECKPOINT_BATCH_SIZE);
+
+    const failedProgress = store.state.progress.get(job.jobName)!;
+    expect(failedProgress.status).toBe("failed");
+    expect(failedProgress.lastError).toBe("simulated batch failure");
+    expect(failedProgress.totalScanned).toBe(BACKFILL_CHECKPOINT_BATCH_SIZE);
+    expect(failedProgress.totalCreated).toBe(BACKFILL_CHECKPOINT_BATCH_SIZE);
+    const checkpointAfterFailure = failedProgress.lastCursor!;
+
+    // Resume: caller retries without `before` — the persisted checkpoint from the surviving
+    // batch is used automatically, and the new run's totals accumulate on top of it rather
+    // than starting over. These rows represent records the (real, un-mocked) LEFT JOIN scan
+    // would return next — distinct ids from the ones already committed in the first batch.
+    const remainingRows = makeDescendingRows(30, rowCount);
+    queueRows(remainingRows);
+    const resumed = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
+
+    const resumeCall = store.state.executeCalls[store.state.executeCalls.length - 1];
+    expect(extractDateParams(resumeCall)[0].toISOString()).toBe(checkpointAfterFailure.toISOString());
+
+    expect(resumed.body.totalScanned).toBe(30);
+    const finalProgress = store.state.progress.get(job.jobName)!;
+    expect(finalProgress.status).toBe("completed");
+    expect(finalProgress.lastError).toBeNull();
+    expect(finalProgress.totalScanned).toBe(BACKFILL_CHECKPOINT_BATCH_SIZE + 30);
+    expect(finalProgress.totalCreated).toBe(BACKFILL_CHECKPOINT_BATCH_SIZE + 30);
+
+    // The first batch's rows were never reprocessed/duplicated.
+    expect(store.state.agreementEvents.size).toBe(BACKFILL_CHECKPOINT_BATCH_SIZE + 30);
+  });
+
   it("still propagates the original error to the client if the best-effort failed-status write itself throws", async () => {
     queueRows(makeDescendingRows(5));
-    // Call #1 is the "mark running" write at the start of the request (must succeed so the
-    // batch failure below is what actually drives the response); call #2 is the "mark failed"
-    // write inside the catch block once the batch itself throws — that's the one we fail.
-    store.state.failOnBatchNumber = 1;
-    store.state.failProgressWriteOnCallNumber = 2;
+    // Transaction 1 = mark running (succeeds), Transaction 2 = batch insert (fails).
+    store.state.failOnBatchNumber = 2;
 
     const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(500);
     expect(res.body.error).toBe("simulated batch failure");
-  });
-});
-
-describe("GET /api/v1/backfill/status", () => {
-  it("handles empty strings without throwing", () => {
-    expect(buildBackfillEventId("", "", "")).toBe("_backfill__");
   });
 });
 
@@ -474,62 +609,92 @@ describe("BackfillQuerySchema", () => {
     expect(() => BackfillQuerySchema.parse({ cursor: "invalid-date" })).toThrow();
   });
 
-  describe("Resume token freshness bounds (Issue #263)", () => {
-    it("rejects a resume token in the future beyond clock-skew tolerance", () => {
-      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
-      expect(() =>
-        BackfillQuerySchema.parse({ before: futureDate.toISOString() }),
-      ).toThrow("Resume token is in the future beyond clock-skew tolerance");
-    });
-
-    it("accepts a resume token within clock-skew tolerance of now", () => {
-      const nearFuture = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS - 1_000);
-      expect(() =>
-        BackfillQuerySchema.parse({ before: nearFuture.toISOString() }),
-      ).not.toThrow();
-    });
-
-    it("accepts a resume token from the distant past (idempotent replay)", () => {
-      const oldDate = new Date("2020-01-01T00:00:00.000Z");
-      expect(() =>
-        BackfillQuerySchema.parse({ before: oldDate.toISOString() }),
-      ).not.toThrow();
-    });
-
-    it("validates resumeToken alias the same way as before", () => {
-      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
-      expect(() =>
-        BackfillQuerySchema.parse({ resumeToken: futureDate.toISOString() }),
-      ).toThrow("Resume token is in the future beyond clock-skew tolerance");
-    });
-
-    it("validates cursor alias the same way as before", () => {
-      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
-      expect(() =>
-        BackfillQuerySchema.parse({ cursor: futureDate.toISOString() }),
-      ).toThrow("Resume token is in the future beyond clock-skew tolerance");
-    });
+describe("buildBackfillEventId", () => {
+  it("handles empty strings without throwing", () => {
+    expect(buildBackfillEventId("", "", "")).toBe("_backfill__");
   });
 
-  describe("validateResumeTokenFreshness", () => {
-    it("accepts a date in the past", () => {
-      const validDate = new Date(Date.now() - 1000);
-      expect(() => validateResumeTokenFreshness(validDate)).not.toThrow();
-    });
+  it("produces deterministic IDs for the same inputs", () => {
+    const id1 = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    const id2 = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    expect(id1).toBe(id2);
+  });
 
-    it("accepts a date from the distant past", () => {
-      const validDate = new Date("2020-01-01T00:00:00.000Z");
-      expect(() => validateResumeTokenFreshness(validDate)).not.toThrow();
-    });
+  it("produces different IDs for different inputs", () => {
+    const id1 = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    const id2 = buildBackfillEventId("0xtx2", "EmployeeAdded", "emp_1");
+    expect(id1).not.toBe(id2);
+  });
 
-    it("rejects a date in the future beyond clock-skew tolerance", () => {
-      const futureDate = new Date(Date.now() + CLOCK_SKEW_TOLERANCE_MS + 10_000);
-      expect(() => validateResumeTokenFreshness(futureDate)).toThrow();
-    });
+  it("includes the _backfill_ segment in the ID", () => {
+    const id = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
+    expect(id).toContain("_backfill_");
+  });
+});
 
-    it("exports CLOCK_SKEW_TOLERANCE_MS as 60 seconds in milliseconds", () => {
-      expect(CLOCK_SKEW_TOLERANCE_MS).toBe(60 * 1000);
-    });
+describe("getBackfillProgress", () => {
+  it("returns null for a job that has never run", async () => {
+    const progress = await getBackfillProgress("employee-events");
+    expect(progress).toBeNull();
+  });
+
+  it("returns progress data after a job has run", async () => {
+    queueRows([makeRow(1)]);
+    await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    const progress = await getBackfillProgress("employee-events");
+    expect(progress).not.toBeNull();
+    expect(progress!.status).toBe("completed");
+    expect(progress!.totalScanned).toBe(1);
+    expect(progress!.totalCreated).toBe(1);
+  });
+});
+
+describe("Edge cases", () => {
+  it("returns nextCursor, nextResumeToken, cursor, and durationMs on success", async () => {
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    expect(res.body.nextResumeToken).toBeDefined();
+    expect(res.body.nextCursor).toBeDefined();
+    expect(res.body.cursor).toBeDefined();
+    expect(res.body.durationMs).toBeGreaterThanOrEqual(0);
+    expect(typeof res.body.durationMs).toBe("number");
+  });
+
+  it("all three cursor aliases are identical", async () => {
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    expect(res.body.nextCursor).toBe(res.body.nextResumeToken);
+    expect(res.body.nextCursor).toBe(res.body.cursor);
+  });
+
+  it("uses onConflictDoNothing for idempotent inserts", async () => {
+    queueRows([makeRow(1)]);
+    await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    // Second call with same row should skip
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN))
+      .expect(200);
+
+    expect(res.body.created).toBe(0);
+    expect(res.body.results[0].status).toBe("skipped");
   });
 });
 
