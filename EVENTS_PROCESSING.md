@@ -463,3 +463,325 @@ POST /api/v1/backfill/milestone-events
 1. Verify `POSTGRES_CONNECTION_STRING` is set and well-formed.
 2. Confirm PostgreSQL is running and the `stellopay_indexer` database exists.
 3. Ensure the DB user has `INSERT`, `SELECT`, and `UPDATE` privileges.
+
+---
+
+## Operational Runbook
+
+This section provides step-by-step procedures for operators handling
+real-world event-processing gaps, stuck transactions, and data
+inconsistencies.
+
+---
+
+### Pre-flight Checklist
+
+Before running any reprocess or backfill operation:
+
+- [ ] Confirm you are authenticated as an **admin** (both `requireAuth` and
+  `requireAdmin` must pass).
+- [ ] Verify the database is healthy:
+  ```bash
+  curl -s http://localhost:4002/health | jq .status
+  curl -s http://localhost:4002/ready | jq .ready
+  ```
+- [ ] Check the last processed block / ledger height to assess the gap size:
+  ```bash
+  # Recent event count per type
+  SELECT event_type, COUNT(*) FROM agreement_events
+    WHERE created_at > NOW() - INTERVAL '1 hour'
+    GROUP BY event_type;
+  ```
+- [ ] Ensure no other reprocess or backfill operation is already running
+  (these operations are CPU- and RPC-intensive).
+- [ ] Review recent application logs for persistent RPC errors:
+  ```bash
+  grep -i 'rpc\|timeout\|rate limit\|5xx' /var/log/stellopay/events.log
+  ```
+- [ ] For large backfills (5000+ rows), schedule during **low-traffic hours**.
+
+---
+
+### Scenario A — Single Transaction Missing from Database
+
+**Symptoms:**
+- A specific transaction hash exists on-chain but produces no events in the
+  application.
+- User reports missing notification / analytics data for a known transaction.
+
+**Procedure:**
+
+1. Verify the tx hash on the block explorer to confirm it is mined and
+   contains the expected events.
+2. Call the single-tx reprocess endpoint:
+   ```bash
+   curl -X POST http://localhost:4002/api/v1/reprocess-events/tx/0x1234...abcd \
+     -H "Authorization: Bearer <admin-token>"
+   ```
+3. Check the response status:
+   - `"processed"`: events were missing and are now stored. ✅
+   - `"no_events"`: the tx exists but has no decodable events — may indicate
+     an ABI mismatch or a non-contract transaction.
+   - `"not_found"`: the RPC provider returned no receipt — possible network
+     issue or invalid hash.
+   - `"error"`: inspect the error message and review application logs.
+4. Verify the data appeared in the expected table:
+   ```sql
+   SELECT * FROM agreement_events WHERE transaction_hash = '0x1234...abcd';
+   ```
+
+**Escalation:** If `"not_found"` persists for a valid hash, check the RPC
+provider status and the `STARKNET_RPC_URL` configuration.
+
+---
+
+### Scenario B — Batch of Recent Transactions Missing
+
+**Symptoms:**
+- A range of recent transactions (e.g. last hour) are not reflected in the
+  database.
+- The Apibara indexer may be lagging or down.
+
+**Procedure:**
+
+1. Determine the missing tx hashes from the block explorer or indexer logs.
+2. Prepare a batch payload (max 50 hashes per request):
+   ```json
+   {
+     "tx_hashes": ["0x1111...", "0x2222...", "..."]
+   }
+   ```
+3. Submit the batch reprocess:
+   ```bash
+   curl -X POST http://localhost:4002/api/v1/reprocess-events/batch \
+     -H "Authorization: Bearer <admin-token>" \
+     -H "Content-Type: application/json" \
+     -d @batch.json
+   ```
+4. Review the per-tx `status` values in the response. Re-submit any hashes
+   that returned `"error"` or `"not_found"`.
+5. If more than 50 hashes are missing, run multiple batches sequentially.
+   Wait for each batch to complete before submitting the next.
+
+**Post-operation:** Verify the event count matches expectations:
+```sql
+SELECT COUNT(*) FROM agreement_events
+  WHERE created_at > NOW() - INTERVAL '2 hours';
+```
+
+---
+
+### Scenario C — Stuck AgreementStatusChange Events
+
+**Symptoms:**
+- Rows in `agreement_events` with `eventType = 'AgreementStatusChange'` are
+  not being decoded into their specific event type (e.g. `AgreementActivated`,
+  `AgreementCancelled`).
+
+**Procedure:**
+
+1. Count the stuck events:
+   ```sql
+   SELECT COUNT(*) FROM agreement_events
+     WHERE event_type = 'AgreementStatusChange';
+   ```
+2. If the count is manageable (< 1000), run status-change reprocess:
+   ```bash
+   curl -X POST 'http://localhost:4002/api/v1/reprocess-events/status-changes?limit=1000' \
+     -H "Authorization: Bearer <admin-token>"
+   ```
+3. If the count exceeds 1000, process in batches using `limit=1000` and
+   `fromBlock`/`toBlock` parameters to narrow each run:
+   ```bash
+   curl -X POST 'http://localhost:4002/api/v1/reprocess-events/status-changes?fromBlock=50000&toBlock=60000&limit=1000' \
+     -H "Authorization: Bearer <admin-token>"
+   ```
+4. After each batch, verify updated count:
+   ```sql
+   SELECT event_type, COUNT(*) FROM agreement_events
+     WHERE event_type != 'AgreementStatusChange'
+       AND created_at > NOW() - INTERVAL '30 minutes'
+     GROUP BY event_type;
+   ```
+5. Repeat until the stuck count approaches zero.
+
+**Troubleshooting:** If events remain stuck after reprocess:
+- The on-chain ABI may have changed — verify the contract class hash in
+  `src/starknet/abi.ts` matches the deployed contract.
+- Check application logs for decoding errors (`ABI decode failure`).
+
+---
+
+### Scenario D — Missing EmployeeAdded or MilestoneAdded Events
+
+**Symptoms:**
+- The `employees` or `milestones` table has rows without a corresponding event
+  in `agreement_events`.
+- Leaderboard or audit queries that depend on events return incomplete data.
+
+**Procedure:**
+
+1. Assess the gap size:
+   ```sql
+   -- Count employees without events
+   SELECT COUNT(*) FROM employees e
+     LEFT JOIN agreement_events ae
+       ON ae.transaction_hash = e.transaction_hash
+       AND ae.event_type = 'EmployeeAdded'
+     WHERE ae.id IS NULL;
+   ```
+2. Run the employee-event backfill:
+   ```bash
+   curl -X POST 'http://localhost:4002/api/v1/backfill/employee-events?limit=5000' \
+     -H "Authorization: Bearer <admin-token>"
+   ```
+3. If the gap exceeds 5000 rows, run multiple passes. The endpoint is
+   idempotent — rows already backfilled are skipped.
+4. Repeat the same procedure for milestone events:
+   ```bash
+   curl -X POST 'http://localhost:4002/api/v1/backfill/milestone-events?limit=5000' \
+     -H "Authorization: Bearer <admin-token>"
+   ```
+5. Verify:
+   ```sql
+   SELECT COUNT(*) FROM agreement_events WHERE event_type IN ('EmployeeAdded', 'MilestoneAdded');
+   ```
+
+**Restoring real events later:** These synthetic events are placeholders. If
+the Apibara indexer later processes the original on-chain events, the real
+events will be inserted alongside the synthetic ones (idempotent, `ON CONFLICT
+DO NOTHING`). To replace synthetic events with real ones, run the
+status-changes reprocess, which normalises `AgreementStatusChange` rows.
+
+---
+
+### Scenario E — Indexer Lag / Complete Indexer Outage
+
+**Symptoms:**
+- No new events appear in the database for an extended period.
+- Indexer health check fails.
+- Backend logs show no recent indexer activity.
+
+**Procedure:**
+
+1. Confirm the indexer is down:
+   ```bash
+   curl -s http://indexer.internal:3000/health
+   ```
+2. Determine the last indexed block:
+   ```sql
+   SELECT MAX(ledger) FROM agreement_events;
+   ```
+3. Fetch missing transactions from the block explorer for the unindexed range.
+4. Use batch reprocess (Scenario B) to fill the gap. If the gap spans
+   thousands of transactions, prioritise:
+   - High-value agreements (check `agreements` table for `reward_pool > 0`).
+   - Recently active agreements (those with activity in the last 24 hours).
+5. Restore the indexer service. Once back online, the indexer will
+   automatically catch up from the last indexed block. The reprocessed events
+   will be skipped via `ON CONFLICT DO NOTHING`.
+6. After the indexer has caught up, verify parity:
+   ```sql
+   SELECT COUNT(*) FROM agreement_events
+     WHERE created_at > NOW() - INTERVAL '1 hour';
+   ```
+
+---
+
+### Scenario F — Duplicate or Corrupt Events
+
+**Symptoms:**
+- Unexpected duplicate rows (should not happen with `ON CONFLICT DO NOTHING`
+  under normal conditions, but possible with manual INSERTs).
+- Events with null or malformed fields.
+
+**Procedure:**
+
+1. Identify anomalies:
+   ```sql
+   SELECT id, transaction_hash, event_type, event_index, created_at,
+     COUNT(*) OVER (PARTITION BY transaction_hash, event_index) AS dup_count
+   FROM agreement_events
+   ORDER BY created_at DESC
+   LIMIT 100;
+   ```
+2. Remove true duplicates (keep the earliest row):
+   ```sql
+   DELETE FROM agreement_events
+   WHERE id IN (
+     SELECT id FROM (
+       SELECT id, ROW_NUMBER() OVER (
+         PARTITION BY transaction_hash, event_index
+         ORDER BY created_at ASC
+       ) AS rn
+       FROM agreement_events
+     ) t WHERE t.rn > 1
+   );
+   ```
+3. For corrupt rows (null critical fields), delete and reprocess:
+   ```sql
+   DELETE FROM agreement_events WHERE event_type IS NULL;
+   ```
+   Then run the reprocess endpoint for the affected transaction hashes.
+
+---
+
+### Post-Operation Verification
+
+After any reprocess or backfill operation, verify:
+
+1. **Event count sanity check** — compare event counts before and after:
+   ```sql
+   SELECT event_type, COUNT(*) FROM agreement_events GROUP BY event_type;
+   ```
+2. **Data consistency** — spot-check a handful of agreement IDs:
+   ```sql
+   SELECT a.id, a.status, ae.event_type, ae.event_data
+   FROM agreements a
+   JOIN agreement_events ae ON ae.transaction_hash = a.transaction_hash
+   WHERE a.id = '<agreement-id>'
+   ORDER BY ae.event_index;
+   ```
+3. **Application health** — confirm the backend is still serving requests:
+   ```bash
+   curl -s http://localhost:4002/health
+   ```
+4. **User-facing verification** — check that impacted users can now see their
+   data in the frontend.
+
+---
+
+### Monitoring & Alerting Recommendations
+
+Set up alerts for the following conditions to catch event-processing gaps
+early:
+
+| Alert | Trigger | Suggested Threshold |
+|-------|---------|---------------------|
+| **No new events** | Zero `agreement_events` inserted in the last 15 minutes | Warning after 15m, Critical after 30m |
+| **Indexer health** | Indexer `/health` returns non-200 | Immediate critical |
+| **Backlog size** | `agreement_events` insert rate drops below 50% of the 7-day rolling average | Warning |
+| **High RPC error rate** | More than 10% of process_tx calls return `"not_found"` or `"error"` in a 5-minute window | Warning |
+| **Stuck events** | More than 100 rows with `eventType = 'AgreementStatusChange'` persisting for over 1 hour | Warning |
+| **Backfill age** | Last backfill operation was more than 7 days ago and gaps exist | Info |
+
+Example Prometheus recording rule for detecting stuck events:
+```yaml
+record: stellopay:stuck_status_changes:count
+expr: |
+  count(stellopay_agreement_events{event_type="AgreementStatusChange"})
+```
+
+---
+
+### Runbook Quick Reference
+
+| Symptom | Method | Endpoint | Max Batch |
+|---------|--------|----------|-----------|
+| Single missing tx | 4 — Reprocess single | `POST /reprocess-events/tx/:hash` | 1 tx |
+| Missing batch of txs | 5 — Reprocess batch | `POST /reprocess-events/batch` | 50 hashes |
+| Stuck status changes | 6 — Reprocess status-changes | `POST /reprocess-events/status-changes` | 1000 events |
+| Missing employee events | 7 — Backfill employees | `POST /backfill/employee-events` | 5000 rows |
+| Missing milestone events | 8 — Backfill milestones | `POST /backfill/milestone-events` | 5000 rows |
+| Indexer outage | 5 + 7 + 8 | As above | As above |
+| Duplicate/corrupt data | Manual SQL + 4/5 | SQL + reprocess | — |
