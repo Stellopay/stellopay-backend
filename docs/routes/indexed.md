@@ -1,16 +1,14 @@
 # Indexed Routes
 
-Source: [`src/routes/indexed.ts`](../../src/routes/indexed.ts)
+The indexed routes (`src/routes/indexed.ts`) expose data derived from the indexer's sync process.
 
-Read-only endpoints serving data already written to Postgres by the indexer
-(agreements, payments, milestones, employees, escrow events) and operational indexer freshness metrics. These routes
-never call the chain directly — they query the indexed copy, which is why
-responses are tagged with `source: "indexed"` where applicable.
+## Freshness and Sync Checkpoints
 
-All indexed GET endpoints are **idempotent**: repeated requests with the same
-underlying database state produce identical responses. See [Idempotency Contract](#idempotency-contract).
+The indexer sync checkpoint is deterministically derived using `deriveSyncCheckpoint`. It evaluates the maximum block number present in a set of retrieved records.
 
----
+- The `GET /indexed/freshness` and `GET /indexed/checkpoint` endpoints retrieve this high-water mark.
+- **Resilience:** The checkpoint derivation securely filters out missing or non-positive block numbers and provides fallback logging (`indexer_checkpoint_invalid_block`) if any invalid numbers are encountered during derivation.
+- A `0` block number signifies an empty or un-synced state.
 
 ## Endpoints
 
@@ -90,18 +88,22 @@ based on the response.  `ERRORS` is only incremented in the `catch` block (5xx p
 
 ---
 
-## Authorization Contract & Security Boundary
+## Authorization
+
+All checkpoint-related routes require an authenticated administrator session (`requireAuth` + `requireAdmin`) and enforce authorization before any internal database interactions.
+
+### Authorization Contract & Security Boundary
 
 `src/routes/indexed.ts` enforces a centralized authorization boundary around indexer freshness and sync checkpoint operations:
 
-### 1. Authorization Requirements
+#### 1. Authorization Requirements
 - **Freshness & Sync Checkpoints (`/indexed/freshness`, `/indexed/checkpoint`)**:
   - Requires session authentication (`requireAuth`) via `x-user-address` and `Authorization: Bearer <token>` headers.
   - Requires admin role authorization (`requireAdmin`).
   - Access control is centralized using `authorizeIndexedFreshness` (`[requireAuth, requireAdmin]`).
   - Permission checks are evaluated **strictly before** any database query, state lookup, or sensitive processing occurs.
 
-### 2. Expected Success Responses
+#### 2. Expected Success Responses
 - `GET /indexed/freshness`:
   ```json
   {
@@ -119,7 +121,7 @@ based on the response.  `ERRORS` is only incremented in the `catch` block (5xx p
   ```
   Note: `/indexed/checkpoint` intentionally omits the `freshness` field — it is a narrower contract returning only the high-water mark.
 
-### 3. Expected Authorization Failure Responses
+#### 3. Expected Authorization Failure Responses
 - **401 Unauthorized**:
   - Returned when `x-user-address` or `Authorization` headers are missing or invalid.
   - Payload: `{ "error": "Unauthorized" }`
