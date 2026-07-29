@@ -10,17 +10,32 @@ The indexer sync checkpoint is deterministically derived using `deriveSyncCheckp
 - Both endpoints share a common `resolveCheckpoint()` helper that queries the latest 100 agreement event block numbers and derives the checkpoint. This eliminates duplication and ensures the derivation logic stays in lock-step between the two routes.
 - **Resilience:** The checkpoint derivation accepts block numbers as `number`, `bigint`, or `string` (including hex prefixes like `0x`). Invalid, non-finite (e.g. `NaN`, `Infinity`), or negative values are logged as `indexer_checkpoint_invalid_block` and skipped, rather than halting the derivation. Values with unexpected types (objects, booleans, arrays) are similarly skipped with a distinct `unexpected_type` reason.
 - A `0` block number signifies an empty or un-synced state.
+- The response contract is backward-compatible: invalid or unsupported block number values are ignored while deriving the checkpoint, and the endpoint still returns a valid checkpoint body.
+
+## Response contract
+
+Both `/indexed/freshness` and `/indexed/checkpoint` return:
+
+- `source`: always `"indexed"`
+- `checkpointBlock`: highest valid block number derived from indexed records, or `0` when none exist or no valid values can be derived
+- `x-indexer-sync-checkpoint` header: mirrors `checkpointBlock`
+
+`GET /indexed/freshness` additionally returns:
+
+- `freshness`: `"synced"` when at least one agreement event record exists, otherwise `"empty"`
+
+`GET /indexed/checkpoint` intentionally omits `freshness` and returns only the checkpoint contract.
 
 ## Endpoints
 
-| Method | Path | Authorization | Description |
-|---|---|---|---|
-| GET | `/indexed/freshness` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer sync checkpoint block number and freshness state |
-| GET | `/indexed/checkpoint` | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer high-water mark sync checkpoint (no freshness) |
-| GET | `/indexed/agreements/:contract_address/user/:user_address` | Public / Standard Read | Agreements where the user is employer, contributor, or a payroll employee |
-| GET | `/indexed/agreement/:contract_address/:agreement_id` | Public / Standard Read | Full detail for one agreement (events, payments, milestones, employees, escrow events) |
-| GET | `/indexed/payments/user/:user_address` | Public / Standard Read | Payments where the user is sender or recipient |
-| GET | `/indexed/escrow/:contract_address/balance/:agreement_id` | Public / Standard Read | Escrow balance, computed by folding `Funded`/`Released`/`Refunded` events |
+| Method | Path                                                       | Authorization                              | Description                                                                                                   |
+| ------ | ---------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| GET    | `/indexed/freshness`                                       | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer sync checkpoint block number and freshness state                                                      |
+| GET    | `/indexed/checkpoint`                                      | Admin Auth (`requireAuth`, `requireAdmin`) | Indexer high-water mark sync checkpoint (no freshness). Response includes `x-indexer-sync-checkpoint` header. |
+| GET    | `/indexed/agreements/:contract_address/user/:user_address` | Public / Standard Read                     | Agreements where the user is employer, contributor, or a payroll employee                                     |
+| GET    | `/indexed/agreement/:contract_address/:agreement_id`       | Public / Standard Read                     | Full detail for one agreement (events, payments, milestones, employees, escrow events)                        |
+| GET    | `/indexed/payments/user/:user_address`                     | Public / Standard Read                     | Payments where the user is sender or recipient                                                                |
+| GET    | `/indexed/escrow/:contract_address/balance/:agreement_id`  | Public / Standard Read                     | Escrow balance, computed by folding `Funded`/`Released`/`Refunded` events                                     |
 
 All `:contract_address`/`:user_address` params are validated with
 `StarknetAddress`; `:agreement_id` with `AgreementId`. Pagination (`limit`,
@@ -38,10 +53,10 @@ via the `logIndexedEvent()` helper.
 ```jsonc
 {
   "timestamp": "2026-07-28T12:00:00.000Z",
-  "level": "info",            // "info" for success, "error" for 5xx
+  "level": "info", // "info" for success, "error" for 5xx
   "op": "indexed.agreement_detail",
   "durationMs": 42,
-  "syncCheckpoint": 12345,    // highest block number in returned rows
+  "syncCheckpoint": 12345, // highest block number in returned rows
   "httpStatus": 200,
   // Plus route-specific fields (count, eventsCount, agreementId, etc.)
 }
@@ -49,43 +64,43 @@ via the `logIndexedEvent()` helper.
 
 ### Format selection
 
-| `LOG_FORMAT` env var | Output |
-|---|---|
-| `"json"` (default) | Single JSON object per request to stdout |
-| anything else | Human-readable text: `[indexed] <timestamp> INFO <op> key=value ...` |
+| `LOG_FORMAT` env var | Output                                                               |
+| -------------------- | -------------------------------------------------------------------- |
+| `"json"` (default)   | Single JSON object per request to stdout                             |
+| anything else        | Human-readable text: `[indexed] <timestamp> INFO <op> key=value ...` |
 
 ### Operation names
 
 Exported as `INDEXED_OPS` for stable referencing in dashboards and log queries:
 
-| Constant | Operation name |
-|---|---|
-| `INDEXED_OPS.FRESHNESS` | `indexed.freshness` |
-| `INDEXED_OPS.CHECKPOINT` | `indexed.checkpoint` |
+| Constant                          | Operation name                |
+| --------------------------------- | ----------------------------- |
+| `INDEXED_OPS.FRESHNESS`           | `indexed.freshness`           |
+| `INDEXED_OPS.CHECKPOINT`          | `indexed.checkpoint`          |
 | `INDEXED_OPS.AGREEMENTS_FOR_USER` | `indexed.agreements_for_user` |
-| `INDEXED_OPS.AGREEMENT_DETAIL` | `indexed.agreement_detail` |
-| `INDEXED_OPS.PAYMENTS_FOR_USER` | `indexed.payments_for_user` |
-| `INDEXED_OPS.ESCROW_BALANCE` | `indexed.escrow_balance` |
+| `INDEXED_OPS.AGREEMENT_DETAIL`    | `indexed.agreement_detail`    |
+| `INDEXED_OPS.PAYMENTS_FOR_USER`   | `indexed.payments_for_user`   |
+| `INDEXED_OPS.ESCROW_BALANCE`      | `indexed.escrow_balance`      |
 
 ---
 
 ## Metric Counters
 
 Process-local, monotonically increasing counters — no external metrics library
-is introduced.  Snapshot via `getIndexedMetricsSnapshot()` for diagnostics or
-an admin endpoint.  Reset via `resetIndexedMetrics()` (tests only).
+is introduced. Snapshot via `getIndexedMetricsSnapshot()` for diagnostics or
+an admin endpoint. Reset via `resetIndexedMetrics()` (tests only).
 
-| Counter name (`INDEXED_METRICS`) | Meaning |
-|---|---|
-| `indexed_requests_total` | Total requests received per route |
-| `indexed_rows_found_total` | Requests that returned at least one row |
-| `indexed_sync_checkpoint_observed_total` | Requests that observed a non-zero sync checkpoint |
-| `indexed_errors_total` | Server errors (5xx) — **404s do NOT increment this** |
+| Counter name (`INDEXED_METRICS`)         | Meaning                                              |
+| ---------------------------------------- | ---------------------------------------------------- |
+| `indexed_requests_total`                 | Total requests received per route                    |
+| `indexed_rows_found_total`               | Requests that returned at least one row              |
+| `indexed_sync_checkpoint_observed_total` | Requests that observed a non-zero sync checkpoint    |
+| `indexed_errors_total`                   | Server errors (5xx) — **404s do NOT increment this** |
 
 **Increment semantics:** `incIndexedMetric(name, by = 1)` creates the counter
-on first write.  Every route handler calls `incIndexedMetric(INDEXED_METRICS.REQUESTS)`
+on first write. Every route handler calls `incIndexedMetric(INDEXED_METRICS.REQUESTS)`
 on entry, and conditionally increments `ROWS_FOUND` and `SYNC_CHECKPOINT_OBSERVED`
-based on the response.  `ERRORS` is only incremented in the `catch` block (5xx path).
+based on the response. `ERRORS` is only incremented in the `catch` block (5xx path).
 
 ---
 
@@ -98,6 +113,7 @@ All checkpoint-related routes require an authenticated administrator session (`r
 `src/routes/indexed.ts` enforces a centralized authorization boundary around indexer freshness and sync checkpoint operations:
 
 #### 1. Authorization Requirements
+
 - **Freshness & Sync Checkpoints (`/indexed/freshness`, `/indexed/checkpoint`)**:
   - Requires session authentication (`requireAuth`) via `x-user-address` and `Authorization: Bearer <token>` headers.
   - Requires admin role authorization (`requireAdmin`).
@@ -105,6 +121,7 @@ All checkpoint-related routes require an authenticated administrator session (`r
   - Permission checks are evaluated **strictly before** any database query, state lookup, or sensitive processing occurs.
 
 #### 2. Expected Success Responses
+
 - `GET /indexed/freshness`:
   ```json
   {
@@ -123,6 +140,7 @@ All checkpoint-related routes require an authenticated administrator session (`r
   Note: `/indexed/checkpoint` intentionally omits the `freshness` field — it is a narrower contract returning only the high-water mark.
 
 #### 3. Expected Authorization Failure Responses
+
 - **401 Unauthorized**:
   - Returned when `x-user-address` or `Authorization` headers are missing or invalid.
   - Payload: `{ "error": "Unauthorized" }`
@@ -139,11 +157,13 @@ All checkpoint-related routes require an authenticated administrator session (`r
 `src/routes/indexed.ts` owns the indexer data access contract for read operations:
 
 ### 1. Snapshot Read Semantics & Data Freshness
+
 - Endpoints in `indexed.ts` query local PostgreSQL tables populated by the Apibara indexer.
 - Reads represent a point-in-time snapshot of indexed state up to the latest block stored in the database.
 - Every response from `/indexed/agreements/...` identifies its data origin with `source: "indexed"` (exported as `INDEXED_DATA_SOURCE`).
 
 ### 2. Sync Checkpoints (`deriveSyncCheckpoint`)
+
 - The indexer sync progress across indexed tables (`agreements`, `agreement_events`, `payments`, `escrow_events`, `milestones`, `employees`) is marked by the `block_number` stored with each event or entity.
 - The `deriveSyncCheckpoint(records)` helper calculates the highest block number (high-water mark) across a set of retrieved records.
 - Accepts block numbers as `number`, `bigint`, or `string` (including hex-prefixed strings like `"0x1a"`). Values with unexpected types, non-finite numbers (`NaN`, `Infinity`), or negative numbers are skipped and logged.
@@ -158,6 +178,7 @@ All checkpoint-related routes require an authenticated administrator session (`r
 All GET endpoints in `src/routes/indexed.ts` are **idempotent**:
 
 ### Guarantees
+
 1. **No side effects**: Every endpoint is read-only. No writes, no state mutations, no cache updates.
 2. **Deterministic responses**: For the same underlying database state, repeated requests produce identical response bodies **and** headers.
 3. **Deterministic sync checkpoint**: `deriveSyncCheckpoint` is a pure function — same input always yields the same output. The function accepts `number`, `bigint`, and `string` block numbers (including hex prefixes), and safely skips invalid or unexpected values.
@@ -165,23 +186,25 @@ All GET endpoints in `src/routes/indexed.ts` are **idempotent**:
 5. **Cache-Control on all routes**: Freshness, checkpoint, and the public read endpoints (agreements, agreement detail) all set `Cache-Control: public, max-age=<n>` headers. This allows CDN edges and reverse proxies to serve cached responses for the configured interval.
 
 ### What this means for callers
+
 - **Safe retry**: Callers may retry any failed GET request without risk of data corruption or ambiguous outcomes.
 - **Safe caching**: The `Cache-Control` and `ETag` headers on all indexed routes enable CDN, proxy, and conditional browser caching.
 - **Conditional requests**: Callers may use `If-None-Match` with the returned `ETag` to receive a `304 Not Modified` when the indexed data has not changed, reducing bandwidth and server load.
 - **Observable idempotency**: The `x-indexer-sync-checkpoint` header is stable for a given database state, so callers can verify they are seeing consistent results.
 
 ### Scope
+
 This contract applies to all routes in `src/routes/indexed.ts`. Routes in other files (e.g. `src/routes/reprocess-events.ts`, `src/routes/backfill-events.ts`) are outside this contract.
 
 ---
 
 ## Constants
 
-| Export | Value | Purpose |
-|---|---|---|
-| `INDEXED_DATA_SOURCE` | `"indexed"` | Tag in responses indicating data origin |
-| `MAX_INTERNAL_LIMIT` | `200` | Hard cap on sub-resource queries in agreement detail |
-| `MAX_ESCROW_EVENTS_LIMIT` | `500` | Hard cap on escrow events in balance calculation |
+| Export                    | Value       | Purpose                                              |
+| ------------------------- | ----------- | ---------------------------------------------------- |
+| `INDEXED_DATA_SOURCE`     | `"indexed"` | Tag in responses indicating data origin              |
+| `MAX_INTERNAL_LIMIT`      | `200`       | Hard cap on sub-resource queries in agreement detail |
+| `MAX_ESCROW_EVENTS_LIMIT` | `500`       | Hard cap on escrow events in balance calculation     |
 
 ---
 
@@ -190,7 +213,7 @@ This contract applies to all routes in `src/routes/indexed.ts`. Routes in other 
 Several endpoints need more than one independent read to answer a single
 request. Where two queries don't depend on each other's result, they are
 issued concurrently with `Promise.all` rather than one `await` after another,
-so the request pays for the *slowest* query instead of the *sum* of both:
+so the request pays for the _slowest_ query instead of the _sum_ of both:
 
 - **`/indexed/agreements/:contract_address/user/:user_address`** — the
   direct-agreements query (employer/contributor match) and the

@@ -14,6 +14,19 @@ import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
  */
 export const INDEXED_DATA_SOURCE = "indexed";
 
+export type SyncFreshnessState = "synced" | "empty";
+
+export interface IndexedFreshnessResponse {
+  source: typeof INDEXED_DATA_SOURCE;
+  checkpointBlock: number;
+  freshness: SyncFreshnessState;
+}
+
+export interface IndexedCheckpointResponse {
+  source: typeof INDEXED_DATA_SOURCE;
+  checkpointBlock: number;
+}
+
 /**
  * Hard limit for sub-resources (events, payments, etc.) inside a detail view
  * to prevent unbounded database scans.
@@ -172,6 +185,10 @@ export const authorizeIndexedFreshness = [requireAuth, requireAdmin];
  * handled natively by the JS runtime). Invalid, non-finite, or negative values
  * are logged and skipped rather than halting the derivation.
  *
+ * The contract is backward-compatible: invalid or unexpected block numbers do
+ * not produce a runtime error; they are ignored and the checkpoint falls back
+ * to the next valid high-water mark, or `0` when none remain.
+ *
  * @param records Array of objects with an optional blockNumber property
  * @returns High-water mark block number, or 0 if records list is empty or lacks valid block numbers.
  */
@@ -259,14 +276,13 @@ const AgreementSchema = z.object({
  */
 indexedRouter.get(
   "/indexed/freshness",
-  requireAuth,
-  requireAdmin,
+  ...authorizeIndexedFreshness,
   async (_req, res, next) => {
     const startTime = performance.now();
     try {
       const { checkpointBlock, records } = await resolveCheckpoint();
 
-      const body = {
+      const body: IndexedFreshnessResponse = {
         source: INDEXED_DATA_SOURCE,
         checkpointBlock,
         freshness: records.length > 0 ? "synced" : "empty",
@@ -318,14 +334,13 @@ indexedRouter.get(
  */
 indexedRouter.get(
   "/indexed/checkpoint",
-  requireAuth,
-  requireAdmin,
+  ...authorizeIndexedFreshness,
   async (_req, res, next) => {
     const startTime = performance.now();
     try {
       const { checkpointBlock, records } = await resolveCheckpoint();
 
-      const body = {
+      const body: IndexedCheckpointResponse = {
         source: INDEXED_DATA_SOURCE,
         checkpointBlock,
       };
