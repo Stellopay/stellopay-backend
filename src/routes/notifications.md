@@ -26,6 +26,8 @@ the supplied Starknet address.  Response shape:
 - `read` is always `false` on every item — server-side read state is not yet
   persisted.
 - `unreadCount` always equals `total` in the current implementation.
+- The unread-count helper only counts explicit `read: false` values; missing
+  or malformed `read` fields are ignored instead of being treated as unread.
 
 ## Not implemented
 

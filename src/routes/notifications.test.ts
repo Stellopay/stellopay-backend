@@ -254,6 +254,19 @@ describe("notification preferences & unread count helpers", () => {
     expect(calculateUnreadCount(list)).toBe(0);
   });
 
+  it("ignores missing or malformed read values so they do not inflate unread counts", () => {
+    // Boundary guard: only explicit `read: false` items count as unread.
+    // This keeps replayed or partially hydrated records from being treated
+    // as unread by accident.
+    const list = [
+      { id: "notif-1", read: false },
+      { id: "notif-2" },
+      { id: "notif-3", read: undefined },
+      { id: "notif-4", read: true },
+    ];
+    expect(calculateUnreadCount(list)).toBe(1);
+  });
+
   it("treats numeric id 0 as a valid deduplication key", () => {
     // Edge case: id=0 is falsy in JS but must still be tracked as a unique key.
     const list = [
