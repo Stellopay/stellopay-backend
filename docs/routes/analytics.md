@@ -1,93 +1,273 @@
-# `src/routes/analytics.ts` — Aggregation Rollup Observability
+# Analytics Route Contract
 
-## Overview
+All analytics aggregation lives in `src/routes/analytics.ts`. This document is
+the single source of truth for the request/response shapes, idempotency
+guarantees, sign conventions, and edge cases.
 
-Exposes `GET /api/v1/analytics/:user_address` — a monthly aggregation rollup that combines:
-- **Payment events** (direct P2P transfers), 
-- **Escrow events** (Funded / Released / Refunded), and 
+Exposes `GET /api/v1/analytics/:user_address` — a monthly aggregation rollup
+that combines:
+
+- **Payment events** (direct P2P transfers),
+- **Escrow events** (Funded / Released / Refunded), and
 - **Agreement creation events** (proxy for platform activity).
 
-Each query is a DB-side `EXTRACT(MONTH FROM ...)` grouping, filtered to the caller's address and the requested year. Results are formatted as 12-month chart data suitable for UI rendering.
+```
+GET /api/v1/analytics/:user_address?year=<number>
+```
 
 ---
 
-## Telemetry & Metrics
+## Endpoint
 
-Every invocation of the rollup endpoint is instrumented. Telemetry fires **after all three DB queries complete** (success path) or **inside the catch block** (error path), and respects the global `LOG_FORMAT` and `LOG_LEVEL` settings.
+### Path parameters
 
-### Log format — JSON (`LOG_FORMAT=json`)
+| Parameter    | Type     | Constraint                                                          |
+| ------------ | -------- | ------------------------------------------------------------------- |
+| user_address | `string` | Valid Starknet address (validated via `StarknetAddress` Zod schema) |
 
-**Success:**
+### Query parameters
+
+| Parameter | Type     | Default      | Constraint         |
+| --------- | -------- | ------------ | ------------------ |
+| year      | `number` | current year | integer, 2020–2100 |
+
+### Headers
+
+| Header          | Direction | Description                                                      |
+| --------------- | --------- | ---------------------------------------------------------------- |
+| `If-None-Match` | request   | ETag from a previous response; triggers 304 if matched           |
+| `ETag`          | response  | SHA-256 hash of the response payload (truncated to 16 hex chars) |
+| `Cache-Control` | response  | Always `private, max-age=60`                                     |
+
+---
+
+## Response shape
+
+### Success (200)
+
 ```json
 {
-  "timestamp": "2026-07-26T18:47:00.123Z",
-  "level": "info",
-  "operation": "analytics_monthly_rollup",
-  "duration_ms": 72.14,
-  "status": "success",
-  "request_id": "req-abc-001",
-  "user_address": "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
   "year": 2026,
-  "row_counts": {
-    "payments": 4,
-    "escrow_events": 7,
-    "agreement_creations": 2
-  }
+  "data": [
+    { "month": "Jan", "views": 0 },
+    { "month": "Feb", "views": 0 },
+    { "month": "Mar", "views": 4 },
+    { "month": "Apr", "views": -3 },
+    { "month": "May", "views": 4 },
+    { "month": "Jun", "views": 2 },
+    { "month": "Jul", "views": 0 },
+    { "month": "Aug", "views": 0 },
+    { "month": "Sept", "views": 10 },
+    { "month": "Oct", "views": 0 },
+    { "month": "Nov", "views": 0 },
+    { "month": "Dec", "views": 0 }
+  ],
+  "total": 17
 }
 ```
 
-**Error (DB failure):**
+| Field | Type           | Description                                                |
+| ----- | -------------- | ---------------------------------------------------------- |
+| year  | `number`       | Calendar year queried                                      |
+| data  | `ChartMonth[]` | Exactly 12 entries (Jan → Dec), zero-filled                |
+| total | `number`       | Lossless sum of every month's raw BigInt amount, formatted |
+
+### `ChartMonth`
+
+| Field | Type     | Description                                                 |
+| ----- | -------- | ----------------------------------------------------------- |
+| month | `string` | Abbreviated label: `"Jan"` … `"Dec"`                        |
+| views | `number` | Net aggregated financial value (see sign conventions below) |
+
+> **Name note:** The field is named `views` for backward compatibility with
+> existing consumers. It represents a **net monetary amount**, not a view count.
+
+### Not Modified (304)
+
+No body. ETag matching triggers a 304 via `If-None-Match`.
+
+### Error responses
+
+| Status | Condition                        | Body                                                                 |
+| ------ | -------------------------------- | -------------------------------------------------------------------- |
+| 400    | Invalid `user_address` or `year` | `{ "error": "Validation failed", "details": [...] }`                 |
+| 409    | Duplicate rollup in flight       | `{ "error": "Duplicate rollup in progress — retry after a few seconds" }` |
+| 500    | DB failure or unexpected error   | `{ "error": "<message>" }`                                           |
+
+---
+
+## Sign conventions
+
+All values are aggregated in **BigInt space** and converted via the precomputed
+`DISPLAY_DIVISOR` (= `10 ** 6`). Amounts are aggregated across all tokens.
+
+### Payments
+
+| Condition                      | Sign | Rationale                     |
+| ------------------------------ | ---- | ----------------------------- |
+| `payment.from === userAddress` | `−`  | Outgoing payment (user paid)  |
+| `payment.to === userAddress`   | `+`  | Incoming payment (user received) |
+| Neither (third-party tx)       | `+`  | User is an intermediary       |
+
+### Escrow events
+
+| Event type | Sign | Rationale                     |
+| ---------- | ---- | ----------------------------- |
+| Funded     | `−`  | Employer sends funds out      |
+| Released   | `+`  | Contributor receives funds    |
+| Refunded   | `+`  | Employer receives refund back |
+
+### Agreement creation proxy
+
+Each `AgreementCreated` event adds **1000 base units** (≈ 0.001 display value)
+to the month. This proxy is **only applied when no payment or escrow data
+exists for that month** — real financial data always takes precedence.
+
+---
+
+## Rollup batching contract
+
+The endpoint does not expose client pagination. Internally, each of its three
+event sources is read in batches of at most `ANALYTICS_ROLLUP_BATCH_SIZE` (500
+rows). Pages use the ascending `(created_at, id)` keyset, with both fields
+forming the cursor. This makes a timestamp tie deterministic and prevents offset
+drift from skipping or repeating pre-existing rows as the tables grow.
+
+The route continues until a short page is received. If a full page fails to
+advance the cursor, it fails the request rather than looping indefinitely or
+returning a silently incomplete rollup.
+
+**Snapshot isolation:** There is no cross-query database snapshot. Events
+committed while a rollup is in progress may be included if they sort after the
+current cursor.
+
+---
+
+## Performance characteristics
+
+The three DB queries (payments, escrow events, agreement creations) are
+**independent** — they share no result dependency. The route fires them via
+`Promise.all()` so the wall-clock latency is `max(T_payments, T_escrow,
+T_agreements)` instead of the sum of the three.
+
+Monthly BigInt amounts are converted to display numbers using a **precomputed
+divisor** (`10 ** DEFAULT_TOKEN_DECIMALS`) rather than calling
+`formatTokenAmount` 13 times per request.
+
+The `MONTH_NAMES` constant is hoisted to module scope to avoid re-allocation on
+every request.
+
+---
+
+## Input Validation & Input Hardening
+
+- **`user_address` (path param)**:
+  - Validated via `StarknetAddress` Zod schema (hex string up to 64 chars,
+    optional `0x` prefix).
+  - Transformed into canonical normalized hex address before database querying.
+  - Invalid formats throw a `ZodError` mapped to HTTP 400 before database
+    execution.
+- **`year` (query param)**:
+  - Validated via `AnalyticsQuerySchema`.
+  - Must be an integer within the range `2020` to `2100`.
+  - Empty values (`""`, `null`, `undefined`) fall back gracefully to the
+    current year (`new Date().getFullYear()`).
+  - Malformed strings, non-integers (e.g. `2026.5`), or out-of-range years
+    (`1999`, `3000`) throw a `ZodError` mapped to HTTP 400.
+
+---
+
+## Data Aggregation Robustness
+
+- **Safe Amount Parsing (`parseBigIntSafe`)**:
+  - Raw amount values from database rows (`payments`, `escrowEvents`) are
+    safely parsed using `parseBigIntSafe`.
+  - Missing, `null`, `undefined`, or unparseable string values fall back to `0n`
+    instead of throwing unhandled `TypeError` or `SyntaxError` exceptions.
+- **Month Bounds Check (`isValidMonth`)**:
+  - Extracted month values are checked via `isValidMonth(month)` to ensure they
+    are integers between `1` and `12`.
+  - Any corrupted or out-of-bound month values are safely skipped without
+    corrupting chart data or array indexing.
+
+---
+
+## Idempotency contract
+
+Every invocation of the rollup endpoint is instrumented. Telemetry fires
+**after all three DB queries complete** (success path) or **inside the catch
+block for non-Zod errors** (error path), and respects global `LOG_FORMAT`
+settings. Zod 400 validation failures do not emit DB error telemetry.
+
+### 1. In-process aggregation cache
+
+Results are cached in memory via `AnalyticsCache` (TTL:
+`ANALYTICS_CACHE_TTL_MS`, default 30 s). Identical requests within the TTL
+window skip the database entirely. The cache key includes the normalized user
+address and all query parameters, so different users or years never share a
+cache slot. Failed responses are never cached.
+
+### 2. ETag / 304 Not Modified
+
+The route computes an `ETag` (truncated SHA-256 hex) from the response JSON.
+If the client sends `If-None-Match` matching the ETag, the route returns `304`
+with no body. This handles retries cleanly: the client gets a fast no-op instead
+of re-transferring the full payload.
+
+### 3. Cache-Control
+
+Every successful response includes `Cache-Control: private, max-age=60`. This
+prevents thundering-herd re-queries from the same client within a minute. The
+`private` directive ensures intermediate caches (CDNs, proxies) do not cache
+user-specific financial data.
+
+### 4. Concurrent deduplication (409)
+
+If a duplicate request for the same `user_address:year` arrives while a
+previous request is still in flight, the route returns:
+
 ```json
-{
-  "timestamp": "2026-07-26T18:47:05.456Z",
-  "level": "error",
-  "operation": "analytics_monthly_rollup",
-  "duration_ms": 1204.88,
-  "status": "error",
-  "request_id": "req-abc-001",
-  "user_address": "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
-  "error": "DB connection lost"
-}
+{ "error": "Duplicate rollup in progress — retry after a few seconds" }
 ```
 
-### Log format — text (`LOG_FORMAT=text`)
-
-```text
-[2026-07-26T18:47:00.123Z] INFO [analytics-telemetry] analytics_monthly_rollup success 72.14ms [req-abc-001] rows={"payments":4,"escrow_events":7,"agreement_creations":2}
-```
+with HTTP status **409 Conflict**. The in-flight lock is released in a `finally`
+block when the first request completes (success or error).
 
 ---
 
-## Telemetry Fields
+## Telemetry
 
-| Field | Type | Present on | Description |
-|---|---|---|---|
-| `timestamp` | ISO 8601 string | always | Log emission time |
-| `level` | `"info"` / `"error"` | always | Log severity |
-| `operation` | string | always | `"analytics_monthly_rollup"` |
-| `duration_ms` | number | always | End-to-end query + aggregation latency |
-| `status` | `"success"` / `"error"` | always | Outcome |
-| `request_id` | string | when set | Correlation ID from `res.locals.requestId` |
-| `user_address` | string | always | Normalized Starknet address |
-| `year` | number | success | Year used for date range filter |
-| `row_counts` | object | success | `{ payments, escrow_events, agreement_creations }` |
-| `error` | string | error | Error message |
+| Field          | Type                    | Present on | Description                                        |
+| -------------- | ----------------------- | ---------- | -------------------------------------------------- |
+| `timestamp`    | ISO 8601 string         | always     | Log emission time                                  |
+| `level`        | `"info"` / `"error"`    | always     | Log severity                                       |
+| `operation`    | string                  | always     | `"analytics_monthly_rollup"`                       |
+| `duration_ms`  | number                  | always     | End-to-end wall-clock time (queries + aggregation) |
+| `status`       | `"success"` / `"error"` | always     | Outcome                                            |
+| `request_id`   | string                  | when set   | Correlation ID from `res.locals.requestId`         |
+| `user_address` | string                  | always     | Normalized Starknet address                        |
+| `year`         | number                  | success    | Year used for date range filter                    |
+| `row_counts`   | object                  | success    | `{ payments, escrow_events, agreement_creations }` |
+| `error`        | string                  | error      | Error message                                      |
 
 ---
 
-## Security Notes
+## Security & Reliability Notes
 
-- `duration_ms` is total DB round-trip time for all three queries, useful as a latency gauge against slow queries or pool exhaustion.
+- `duration_ms` is the total wall-clock time for all three parallel queries plus
+  aggregation — useful as a latency gauge against slow queries or pool exhaustion.
 - `row_counts` is a diagnostic metric; it does not leak per-row data or PII.
-- `user_address` in logs is the **normalized** form; no raw user input appears in logs.
+- `user_address` in logs is the **normalized** form; no raw user input appears
+  in logs.
+- Unparseable amounts or malformed DB rows default to zero rather than crashing
+  the endpoint with a 500 error.
 
 ---
 
-## Intentionally Out of Scope
+## Edge cases intentionally out of scope
 
-| Item | Reason |
-|---|---|
-| Per-table query timers | All three queries are sequential; the aggregate time is sufficient for diagnosing slow paths. Split timers can be added if per-query breakdown is needed. |
-| Token-specific breakdowns | Amounts are aggregated across all tokens with `DEFAULT_TOKEN_DECIMALS`; per-token aggregation requires schema changes. |
-| Caching / memoization metrics | No caching is applied at the route layer; cache hit/miss telemetry is out of scope here. |
-| WCAG / accessibility | Not applicable to this server-side route. |
+| Item                      | Reason                                                                                                                                                             |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Per-query timers          | All three queries run in parallel via `Promise.all()`; the aggregate duration is sufficient for diagnosing slow paths. Per-query breakdown can be added if needed. |
+| Token-specific breakdowns | Amounts are aggregated across all tokens with `DEFAULT_TOKEN_DECIMALS`; per-token aggregation requires schema changes.                                             |
+| WCAG / accessibility      | Not applicable to this server-side route.                                                                                                                          |

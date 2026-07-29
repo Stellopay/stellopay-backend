@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { env } from "../config.js";
 import * as schema from "./schema.js";
+import * as dbModule from "./index.js";
 
 // Pool tuning shared across whichever connection string we end up using.
 // Bounded size plus idle/connection timeouts keep a stuck DB from exhausting the pool.
@@ -108,18 +109,23 @@ export async function checkDbHealth(): Promise<boolean> {
   }
 }
 
-const DB_READINESS_POLL_MS = 500;
-
-/**
- * Polls {@link checkDbHealth} until the database accepts a connection.
- * Used during process startup before marking the app ready for API traffic.
- */
 export async function waitForDbReadiness(): Promise<void> {
-  while (!(await checkDbHealth())) {
-    console.warn("[db] Waiting for database readiness...");
-    await new Promise((resolve) => setTimeout(resolve, DB_READINESS_POLL_MS));
+  const maxAttempts = env.DB_CONNECTION_RETRY_MAX_ATTEMPTS ?? 5;
+  const baseDelay = env.DB_CONNECTION_RETRY_BASE_DELAY_MS ?? 500;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const healthy = await dbModule.checkDbHealth();
+    if (healthy) {
+      return;
+    }
+    if (attempt < maxAttempts) {
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      console.warn(`[db] DB not ready (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
   }
+  throw new Error(`[db] Unable to connect to database after ${env.DB_CONNECTION_RETRY_MAX_ATTEMPTS} attempts`);
 }
+
 
 /**
  * Closes the Postgres connection pool gracefully.

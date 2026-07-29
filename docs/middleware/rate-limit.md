@@ -1,186 +1,114 @@
-# Rate-limit middleware
+# Rate-Limit Middleware — Backward-Compatible Contract
 
-Source: [`src/middleware/rate-limit.ts`](../../src/middleware/rate-limit.ts)
+> Source: `src/middleware/rate-limit.ts`  
+> Tests:  `src/middleware/rate-limit.test.ts`
+
+---
 
 ## Overview
 
-All rate limiting is built through the `makeLimiter` factory. This keeps the
-key generator, 429 response envelope, `Retry-After` header, and observability
-hooks in one place so per-route tuning stays small and consistent.
+All rate limiting in the app is built through a single factory: `makeLimiter()`.
+This centralises key generation, the 429 response envelope, and header policy so
+there is one place to tune per-route limits and one seam to swap the backing store.
 
 ---
 
-## Public API
+## Exports
 
-### `makeLimiter(options)`
+| Export | Type | Purpose |
+|---|---|---|
+| `makeLimiter(options)` | `(MakeLimiterOptions) => RateLimitRequestHandler` | Factory — builds a named limiter |
+| `keyByIp(req)` | `(Request) => string` | Shared key generator |
+| `DEFAULT_RATE_LIMIT_MESSAGE` | `string` | Canonical fallback 429 message |
+| `MakeLimiterOptions` | interface | Options type for `makeLimiter` |
 
-Returns a configured Express `RateLimitRequestHandler`.
+---
+
+## `makeLimiter(options)`
+
+### Options
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `name` | `string` | ✅ | — | Debug label; no runtime effect |
+| `windowMs` | `number` | ✅ | — | Sliding window length in ms |
+| `max` | `number` | ✅ | — | Max requests per window per key |
+| `message` | `string` | ❌ | `DEFAULT_RATE_LIMIT_MESSAGE` | Text in 429 body |
+| `skip` | `(req) => boolean` | ❌ | — | Return `true` to exempt a request |
+
+### Frozen contracts (issue #338)
+
+**429 response envelope**
+```jsonc
+{ "error": "<message>" }   // Content-Type: application/json
+```
+Shape is frozen — exactly one key (`error`). No extra fields are ever added.
+`message` defaults to `DEFAULT_RATE_LIMIT_MESSAGE` when not supplied.
+
+**Rate-limit headers**  
+`standardHeaders: false` and `legacyHeaders: false` — neither `RateLimit-*`
+nor `X-RateLimit-*` headers are emitted on any response (allowed or blocked).
+This is intentional to avoid leaking internal quota state. Do not change
+without a security review.
+
+**Key generator**  
+Always `keyByIp` — `req.ip` falling back to `"unknown"`. Honoured by Express
+`trust proxy` setting. Never swapped per-limiter.
+
+**Counter isolation**  
+Each `makeLimiter()` call produces an independent in-memory store. Two limiters
+with the same `name` do not share counters unless an explicit shared `store` is
+wired (see distributed deployments below).
+
+**skip predicate**  
+When `skip(req) === true`, the request passes through unconditionally — no
+counter increment, no 429. Skipped requests are completely transparent.
+
+**Exact boundary**  
+- Request #`max`: allowed (200 from upstream handler)  
+- Request #`max + 1`: blocked (429)
+
+---
+
+## `keyByIp(req)`
+
+```
+keyByIp(req) → req.ip || "unknown"
+```
+
+- Returns `req.ip` when truthy.
+- Returns `"unknown"` when `req.ip` is `undefined` or empty string.
+- Two requests with different IPs are keyed independently — exhausting one IP
+  never affects another.
+- IPs differing by a single octet are treated as distinct keys.
+
+---
+
+## Distributed Deployments
+
+The default store is **in-memory**, meaning:
+
+- Counters are **not shared** across replicas — each instance enforces its own counts.
+- Counters **reset on restart/redeploy**, briefly relaxing enforcement.
+
+To share limits across instances, wire a shared store at the `store` seam inside
+`makeLimiter`:
 
 ```ts
-import { makeLimiter } from "./middleware/rate-limit.js";
-
-const adminLimiter = makeLimiter({
-  name: "admin",
-  windowMs: 60_000,
-  max: 20,
-  message: "Too many admin requests.",
-});
-app.use("/api/v1/admin", adminLimiter);
-```
-
-**Options**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `name` | `string` | yes | Identifier used in log output (e.g. `"global"`, `"strict"`) |
-| `windowMs` | `number` | yes | Sliding window length in milliseconds |
-| `max` | `number` | yes | Max requests per window per key |
-| `message` | `string` | no | Body of the 429 `error` field. Defaults to `"Too many requests, please try again later."` |
-| `skip` | `(req) => boolean` | no | Return `true` to bypass counting (e.g. health checks) |
-| `store` | `Store` | no | Shared backing store for distributed deployments — see below |
-
----
-
-### `keyByIp(req)`
-
-The shared key generator used by every limiter. Returns `req.ip`, which
-Express resolves from `X-Forwarded-For` when `trust proxy` is set. Falls back
-to `"unknown"` and emits a `console.warn` when `req.ip` is undefined, making
-proxy misconfiguration visible in logs.
-
----
-
-### `retryAfterSeconds(windowMs)`
-
-Converts a window length in milliseconds to the number of whole seconds to
-put in the `Retry-After` header. Returns at least `1` to avoid sending
-`Retry-After: 0`.
-
-```ts
-retryAfterSeconds(60_000)  // → 60
-retryAfterSeconds(1_500)   // → 2  (ceiling)
-retryAfterSeconds(500)     // → 1  (minimum)
-```
-
----
-
-## 429 response contract
-
-When a client exceeds the limit, every limiter returns:
-
-```
-HTTP/1.1 429 Too Many Requests
-Content-Type: application/json
-Retry-After: <seconds>
-
-{ "error": "<message>" }
-```
-
-- **`Retry-After`** — always present on 429 responses. Value is
-  `ceil(windowMs / 1000)`, clamped to a minimum of `1`. Clients and
-  intermediate infrastructure (CDNs, API gateways, SDK retry logic) can use
-  this to back off without polling.
-- **`error`** — matches the global API error envelope so clients can handle
-  rate-limit errors with the same code path as other errors.
-
-Standard (`RateLimit-*`) and legacy (`X-RateLimit-*`) headers are **off** on
-all responses. `Retry-After` on 429 is the only rate-limit signal sent to
-clients.
-
----
-
-## Observability
-
-When a limiter fires it logs:
-
-```
-[rate-limit] limit reached for limiter="<name>"
-```
-
-This is emitted at `warn` level via `console.warn` (permitted globally for
-`src/**/*.ts`, unlike `no-console` rules that apply to `src/index.ts`). Pair
-it with a log-based alert to detect abuse patterns or mis-tuned limits.
-
-When `req.ip` cannot be resolved:
-
-```
-[rate-limit] req.ip is undefined — all unresolved clients share the 'unknown' bucket. Check your TRUST_PROXY setting.
-```
-
----
-
-## Store / distributed deployments
-
-### Default: in-memory
-
-The in-memory store (default when `store` is omitted) keeps counters in the
-Node.js process heap.
-
-**Implications:**
-- Counts are **not shared** across replicas — each instance enforces its own
-  window independently. The effective limit for a single client is
-  `max × number_of_replicas` across a load-balanced fleet.
-- Counters **reset on process restart**, briefly relaxing enforcement.
-
-This is acceptable for single-instance deployments and development. In
-production behind a load balancer, use a shared store.
-
-### Shared store (Redis)
-
-Pass a `store` to share counters across all replicas:
-
-```ts
+// Example — replace with your Redis client
 import { RedisStore } from "rate-limit-redis";
-import { createClient } from "redis";
-
-const redis = createClient({ url: process.env.REDIS_URL });
-await redis.connect();
-
-const globalLimiter = makeLimiter({
-  name: "global",
-  windowMs: env.RATE_LIMIT_WINDOW_MS,
-  max: env.RATE_LIMIT_MAX,
-  store: new RedisStore({ sendCommand: (...args) => redis.sendCommand(args) }),
-});
+// Pass `store: new RedisStore({ sendCommand })` to rateLimit(...)
 ```
 
-### Fail-open on store errors
-
-`makeLimiter` sets `passOnStoreError: true` explicitly, so when the backing
-store throws (e.g. a Redis outage) the request is allowed through rather than
-rejected. Without this, `express-rate-limit`'s own default
-(`passOnStoreError: false`) propagates the error to Express's error handling
-and fails **closed** — the opposite of the intended trade-off. Failing open is
-the right choice for availability (a Redis outage should not take down the
-API), but it means distributed enforcement silently degrades to no
-enforcement while the store is unavailable. The error is logged via
-`express-rate-limit`'s default logger (`console.error`). Monitor your store
-health independently and alert on store errors or on the
-`[rate-limit] limit reached` log line going silent during high traffic.
+This is intentionally the **only place** to make that change.
 
 ---
 
-## Production limiters
+## Out of Scope (issue #338)
 
-Configured in `src/index.ts` from environment variables:
-
-| Limiter | Routes | `windowMs` env var | `max` env var | Default window | Default max |
-|---|---|---|---|---|---|
-| `global` | `POST /api/*` (except `/health`) | `RATE_LIMIT_WINDOW_MS` | `RATE_LIMIT_MAX` | 15 min | 100 |
-| `strict` | `/api/v1/auth`, `/api/v1/contact` | `RATE_LIMIT_STRICT_WINDOW_MS` | `RATE_LIMIT_STRICT_MAX` | 5 min | 10 |
-
----
-
-## Out of scope
-
-- **Per-user / authenticated rate limiting** — all current limiters key by IP.
-  Keying by session or wallet address would require passing the auth context
-  into `keyGenerator`; that is tracked separately.
-- **Dynamic limit adjustment** — limits are fixed at process startup from env
-  vars. Runtime reconfiguration (e.g. via feature flags) is not implemented.
-- **Request cost weights** — all requests count as 1. Weighted counting
-  (e.g. expensive queries count as 5) is not implemented.
-- **Store-level retries/backoff** — `passOnStoreError: true` fails open on the
-  *first* store error rather than retrying the operation. Adding retry logic
-  belongs in the `Store` implementation (e.g. `rate-limit-redis`'s own client
-  options), not in `makeLimiter`.
+- Distributed shared-store implementation — the seam exists but wiring it is a
+  separate infrastructure concern.
+- Per-user or per-token rate limiting — current key is IP only.
+- Dynamic limit adjustment at runtime.
+- Rate-limit header emission — intentionally disabled; enabling requires a
+  security review.

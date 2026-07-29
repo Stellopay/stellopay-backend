@@ -113,8 +113,6 @@ vi.mock("../db/index.js", () => {
         contractAddress: "contractAddress",
         transactionHash: "transactionHash",
         id: "id",
-        contractAddress: "contractAddress",
-        transactionHash: "transactionHash",
       },
       employees: {
         employeeAddress: "employeeAddress",
@@ -125,9 +123,6 @@ vi.mock("../db/index.js", () => {
         transactionHash: "transactionHash",
         salaryPerPeriod: "salaryPerPeriod",
         id: "id",
-        contractAddress: "contractAddress",
-        transactionHash: "transactionHash",
-        salaryPerPeriod: "salaryPerPeriod",
       },
       milestones: {
         blockNumber: "blockNumber",
@@ -137,9 +132,6 @@ vi.mock("../db/index.js", () => {
         transactionHash: "transactionHash",
         amount: "amount",
         id: "id",
-        contractAddress: "contractAddress",
-        transactionHash: "transactionHash",
-        amount: "amount",
       },
     },
   };
@@ -153,8 +145,15 @@ const USER_ADDRESS =
 const app = express();
 app.use(express.json());
 app.use(transactionsRouter);
+// Forward structured 400 bodies produced by parseDateFilters / parsePagination;
+// fall back to 500 for unexpected errors.
 app.use((err: any, _req: any, res: any, _next: any) => {
-  res.status(500).json({ error: err.message });
+  const status: number = typeof err?.status === "number" ? err.status : 500;
+  if (err?.body) {
+    res.status(status).json(err.body);
+  } else {
+    res.status(status).json({ error: err.message });
+  }
 });
 
 // ── Helper: validate transaction item shape ──────────────────────────────
@@ -267,6 +266,16 @@ describe("Transactions Router — main endpoint", () => {
 
       expect(res.status).toBe(200);
       expect(res.body.offset).toBe(0);
+    });
+
+    it("returns 400 for non‑positive limit", async () => {
+      const res = await request(app).get(`/transactions/${USER_ADDRESS}?limit=0`);
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 for negative offset", async () => {
+      const res = await request(app).get(`/transactions/${USER_ADDRESS}?offset=-5`);
+      expect(res.status).toBe(400);
     });
   });
 
@@ -428,10 +437,9 @@ describe("Transactions Router — filtered endpoint", () => {
         `/transactions/${USER_ADDRESS}/filtered?startDate=not-a-date`,
       );
 
-      // Invalid Date objects are created but may still work; the route
-      // doesn't explicitly validate date format, so it proceeds.
-      // We just verify it doesn't crash.
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/startDate/);
     });
   });
 
@@ -582,6 +590,58 @@ describe("Transaction Export Contracts - Edge Cases", () => {
     }
   });
 
+  it("should return 400 for malformed 'from' timestamp", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=not-a-date",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("from");
+  });
+
+  it("should return 400 for malformed 'to' timestamp", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?to=not-a-date",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("to");
+  });
+
+  it("should return 400 when 'from' is after 'to'", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=2025-06-01T00:00:00Z&to=2024-01-01T00:00:00Z",
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("from");
+    expect(res.body.error).toContain("to");
+  });
+
+  it("should accept a valid date-range and still return transactions", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=2024-01-01T00:00:00Z&to=2025-06-01T00:00:00Z",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("should accept only a 'from' param without 'to'", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?from=2024-01-01T00:00:00Z",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("should accept only a 'to' param without 'from'", async () => {
+    const res = await request(app).get(
+      "/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4?to=2025-06-01T00:00:00Z",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
   it("should handle boundary/failure path gracefully when db throws", async () => {
     const { db } = await import("../db/index.js");
     vi.mocked(db.select).mockImplementationOnce(() => {
@@ -590,5 +650,406 @@ describe("Transaction Export Contracts - Edge Cases", () => {
     const res = await request(app).get("/transactions/0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4");
     expect(res.status).toBe(500);
     expect(res.body.error).toBe("Database connection lost");
+  });
+});
+
+// ── Sort-by support ───────────────────────────────────────────────────────
+
+describe("Transactions Router — sort-by support (main endpoint)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Helper: seed DB mock with rows that have distinct createdAt and amount values.
+  async function seedSortableRows() {
+    const { db } = await import("../db/index.js");
+    const rows = [
+      {
+        ...DEFAULT_ROW,
+        id: "older-payment",
+        createdAt: new Date("2025-01-01T00:00:00Z"),
+        amount: "500000",
+        eventType: "PaymentSent",
+        transactionHash: "0xaaa0000000000000000000000000000000000000000000000000000000000001",
+      },
+      {
+        ...DEFAULT_ROW,
+        id: "newer-payment",
+        createdAt: new Date("2025-06-15T10:30:00Z"),
+        amount: "2000000",
+        eventType: "PaymentSent",
+        transactionHash: "0xaaa0000000000000000000000000000000000000000000000000000000000002",
+      },
+    ];
+    vi.mocked(db.select).mockImplementation((arg: any) => {
+      if (arg && arg.count) return createQueryChain([{ count: rows.length }]);
+      return createQueryChain([...rows]);
+    });
+  }
+
+  it("returns 400 with descriptive error when sortBy is not in the allowlist", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=injectedColumn`,
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+    expect(res.body.error).toMatch(/sortBy/i);
+    expect(res.body.error).toMatch(/injectedColumn/);
+  });
+
+  it("returns 400 for arbitrary SQL-like sortBy values", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=id%3B DROP TABLE payments%3B--`,
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+  });
+
+  it("returns 400 for empty-string-like invalid sortBy", async () => {
+    // 'createdAt' is the underlying DB column — clients must use the API alias 'date'
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=createdAt`,
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+  });
+
+  it("returns 200 and preserves default ordering when sortBy is omitted", async () => {
+    const res = await request(app).get(`/transactions/${USER_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("sorts by date descending (newest first) when sortBy=date&sortDir=desc", async () => {
+    await seedSortableRows();
+
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=date&sortDir=desc`,
+    );
+
+    expect(res.status).toBe(200);
+    const txs = res.body.transactions;
+    expect(txs.length).toBeGreaterThan(1);
+
+    // Verify each transaction is no older than the next one
+    for (let i = 0; i < txs.length - 1; i++) {
+      const tA = new Date(txs[i].createdAt).getTime();
+      const tB = new Date(txs[i + 1].createdAt).getTime();
+      expect(tA).toBeGreaterThanOrEqual(tB);
+    }
+  });
+
+  it("sorts by date ascending (oldest first) when sortBy=date&sortDir=asc", async () => {
+    await seedSortableRows();
+
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=date&sortDir=asc`,
+    );
+
+    expect(res.status).toBe(200);
+    const txs = res.body.transactions;
+    expect(txs.length).toBeGreaterThan(1);
+
+    for (let i = 0; i < txs.length - 1; i++) {
+      const tA = new Date(txs[i].createdAt).getTime();
+      const tB = new Date(txs[i + 1].createdAt).getTime();
+      expect(tA).toBeLessThanOrEqual(tB);
+    }
+  });
+
+  it("defaults to desc direction when sortDir is invalid", async () => {
+    await seedSortableRows();
+
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=date&sortDir=INVALID`,
+    );
+
+    expect(res.status).toBe(200);
+    const txs = res.body.transactions;
+    for (let i = 0; i < txs.length - 1; i++) {
+      const tA = new Date(txs[i].createdAt).getTime();
+      const tB = new Date(txs[i + 1].createdAt).getTime();
+      expect(tA).toBeGreaterThanOrEqual(tB);
+    }
+  });
+
+  it("sorts by amount ascending when sortBy=amount&sortDir=asc", async () => {
+    await seedSortableRows();
+
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=amount&sortDir=asc`,
+    );
+
+    expect(res.status).toBe(200);
+    // Verify the response is valid and well-formed
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("sorts by amount descending when sortBy=amount&sortDir=desc", async () => {
+    await seedSortableRows();
+
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=amount&sortDir=desc`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("returns valid transaction item shapes when sorting", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?sortBy=date&sortDir=asc`,
+    );
+
+    expect(res.status).toBe(200);
+    for (const tx of res.body.transactions) {
+      expectValidTransactionItem(tx);
+    }
+  });
+});
+
+describe("Transactions Router — sort-by support (filtered endpoint)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 400 with descriptive error when sortBy is invalid on filtered endpoint", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?sortBy=badColumn`,
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+    expect(res.body.error).toMatch(/sortBy/i);
+    expect(res.body.error).toMatch(/badColumn/);
+  });
+
+  it("returns 200 and preserves default ordering when sortBy is omitted (filtered)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("sorts by date descending on filtered endpoint", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?sortBy=date&sortDir=desc`,
+    );
+
+    expect(res.status).toBe(200);
+    const txs = res.body.transactions;
+    for (let i = 0; i < txs.length - 1; i++) {
+      const tA = new Date(txs[i].createdAt).getTime();
+      const tB = new Date(txs[i + 1].createdAt).getTime();
+      expect(tA).toBeGreaterThanOrEqual(tB);
+    }
+  });
+
+  it("sorts by date ascending on filtered endpoint", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?sortBy=date&sortDir=asc`,
+    );
+
+    expect(res.status).toBe(200);
+    const txs = res.body.transactions;
+    for (let i = 0; i < txs.length - 1; i++) {
+      const tA = new Date(txs[i].createdAt).getTime();
+      const tB = new Date(txs[i + 1].createdAt).getTime();
+      expect(tA).toBeLessThanOrEqual(tB);
+    }
+  });
+
+  it("sorts by amount on filtered endpoint (asc)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?sortBy=amount&sortDir=asc`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("sorts by amount on filtered endpoint (desc)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?sortBy=amount&sortDir=desc`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("returns valid transaction shapes when sorting on filtered endpoint", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?sortBy=amount&sortDir=desc`,
+    );
+
+    expect(res.status).toBe(200);
+    for (const tx of res.body.transactions) {
+      expectValidTransactionItem(tx);
+    }
+  });
+});
+
+// ── Idempotency: date-range validation ───────────────────────────────────
+//
+// These tests verify the core idempotency contract:
+// - A well-formed request always returns the same response shape on retries.
+// - A malformed request always returns the same deterministic 400 on retries.
+// - An inverted range always returns a deterministic 400 on retries.
+// Both endpoints share the same underlying `parseDateFilters` logic, so we
+// cover the contract once for each route.
+
+describe("Transactions Router — idempotent date-range validation (main endpoint)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 400 with { success: false } for an invalid `from` date", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=not-a-date`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/from/);
+  });
+
+  it("returns 400 with { success: false } for an invalid `to` date", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?to=INVALID`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/to/);
+  });
+
+  it("returns 400 when `from` is after `to` (inverted range)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=2025-06-01T00:00:00Z&to=2024-01-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/from/);
+    expect(res.body.error).toMatch(/to/);
+  });
+
+  it("returns 200 for a valid `from` / `to` range (success path)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=2024-01-01T00:00:00Z&to=2025-06-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("returns 200 when only `from` is provided", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=2024-01-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("returns 200 when only `to` is provided", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?to=2025-06-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("same valid request repeated twice returns the same total and hasMore (idempotent read)", async () => {
+    const url = `/transactions/${USER_ADDRESS}?from=2024-01-01T00:00:00Z&to=2025-12-31T00:00:00Z&limit=10&offset=0`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.total).toBe(second.body.total);
+    expect(first.body.hasMore).toBe(second.body.hasMore);
+    expect(first.body.limit).toBe(second.body.limit);
+    expect(first.body.offset).toBe(second.body.offset);
+  });
+
+  it("same invalid request repeated twice always returns 400 (idempotent rejection)", async () => {
+    const url = `/transactions/${USER_ADDRESS}?from=bad`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(400);
+    expect(second.status).toBe(400);
+    expect(first.body.success).toBe(false);
+    expect(second.body.success).toBe(false);
+    expect(first.body.error).toBe(second.body.error);
+  });
+});
+
+describe("Transactions Router — idempotent date-range validation (filtered endpoint)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 400 with { success: false } for an invalid `startDate`", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=not-a-date`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/startDate/);
+  });
+
+  it("returns 400 with { success: false } for an invalid `endDate`", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?endDate=INVALID`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/endDate/);
+  });
+
+  it("returns 400 when `startDate` is after `endDate` (inverted range)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=2025-06-01T00:00:00Z&endDate=2024-01-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/startDate/);
+    expect(res.body.error).toMatch(/endDate/);
+  });
+
+  it("returns 200 for a valid date range (success path)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=2024-01-01T00:00:00Z&endDate=2025-06-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("same valid filtered request repeated twice returns identical pagination metadata (idempotent read)", async () => {
+    const url = `/transactions/${USER_ADDRESS}/filtered?startDate=2024-01-01T00:00:00Z&endDate=2025-12-31T00:00:00Z&limit=10&offset=0`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.total).toBe(second.body.total);
+    expect(first.body.hasMore).toBe(second.body.hasMore);
+    expect(first.body.limit).toBe(second.body.limit);
+    expect(first.body.offset).toBe(second.body.offset);
+  });
+
+  it("same invalid filtered request repeated twice always returns 400 (idempotent rejection)", async () => {
+    const url = `/transactions/${USER_ADDRESS}/filtered?endDate=bad`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(400);
+    expect(second.status).toBe(400);
+    expect(first.body.success).toBe(false);
+    expect(second.body.success).toBe(false);
+    expect(first.body.error).toBe(second.body.error);
   });
 });
