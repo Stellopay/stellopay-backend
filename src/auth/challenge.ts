@@ -1,5 +1,47 @@
+import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
 import { normalizeStarknetAddress } from "../utils/address.js";
+
+/** Number of entries processed per batch sweep invocation. */
+export const SWEEP_BATCH_SIZE = 500;
+
+/** Cursor tracking the next batch sweep start position. */
+let sweepOffset = 0;
+
+/**
+ * Nonce Challenge Generation, Expiration, and Validation Contract.
+ *
+ * This module manages short-lived cryptographic nonces used by Starknet wallets
+ * to prove address ownership during authentication.
+ *
+ * AUTHORIZATION & LIFECYCLE CONTRACT:
+ * 1. Address Keying & Canonicalization:
+ *    - All stored challenges are keyed by canonical Starknet address (0x + 64 hex).
+ *    - Address casing and leading-zero variations collapse to the same canonical key.
+ *
+ * 2. Input Validation & Fail-Closed Guarding:
+ *    - All functions strictly validate inputs before executing state modifications.
+ *    - Write paths (`createChallenge`, `buildTypedChallenge`) throw descriptive, non-sensitive errors
+ *      when supplied with missing, non-string, whitespace, or malformed input.
+ *    - Read/eviction paths (`getChallenge`, `clearChallenge`, `consumeChallenge`) degrade fail-closed,
+ *      returning `null` / no-op and logging structured metric events (`invalid_address`).
+ *
+ * 3. Secure Random Nonce Generation & Entropy:
+ *    - Nonces are 16-byte (128-bit) CSPRNG values generated using `crypto.randomBytes(16)`.
+ *    - Formatted as `0x`-prefixed 32-character hexadecimal strings.
+ *
+ * 4. Expiration & Replay Defense:
+ *    - `CHALLENGE_TTL_MS` is fixed at 5 minutes (300,000 ms).
+ *    - Re-issuing an active challenge returns the SAME nonce with the remaining TTL without extending expiration.
+ *    - `consumeChallenge` performs atomic read-and-delete to ensure a nonce can be used for verification exactly once.
+ *    - Expired nonces cannot be validated, consumed, or replayed.
+ *    - `restoreChallenge` may put a consumed nonce back only after a verified signature whose session
+ *      issuance failed — never after a signature failure (replay stays closed).
+ *
+ * 5. Telemetry & Non-Sensitivity:
+ *    - Emits structured JSON metrics via `console.info`.
+ *    - Canonical keys are logged; raw malformed inputs and sensitive raw tokens are never exposed.
+ */
 
 // ---------------------------------------------------------------------------
 // SNIP-12 type definitions — constant across all challenges.
@@ -21,87 +63,141 @@ const CHALLENGE_TYPES: TypedData["types"] = {
   ],
 };
 
-/**
- * Nonce challenge generation and expiry contract.
- *
- * The contract is intentionally narrow so privilege checks cannot drift as
- * new routes are added. The full contract is documented in
- * `docs/auth/challenge.md`; the body of this file is the implementation side
- * of that contract.
- *
- * TL;DR:
- *   - createChallenge requires a parseable Starknet address. Refuses to
- *     store when the in-memory store is at MAX_CHALLENGES (DoS hardening).
- *   - getChallenge / clearChallenge / consumeChallenge tolerate malformed
- *     addresses by returning null / no-op; they never throw.
- *   - consumeChallenge is the ONLY safe way to read a challenge before
- *     signature verification: it deletes atomically to close the replay
- *     race (two concurrent verify calls seeing the same nonce).
- *   - buildTypedChallenge normalizes the wallet field to the canonical
- *     (lowercase, padded) form so the wallet's signature hash matches
- *     exactly what the backend stored when the challenge was issued.
- *   - All challenges are 16-byte cryptographic nonces with a fixed
- *     CHALLENGE_TTL_MS TTL; expired entries are evicted lazily on access.
- */
+/** A stored challenge: the nonce a wallet must sign, and when it stops being valid. */
+export type ChallengeRecord = {
+  nonce: string;
+  /** Absolute expiry, `Date.now()`-based. Strictly compared: `now > expiresAtMs`. */
+  expiresAtMs: number;
+};
+
+/** How long an issued nonce stays valid. Never extended by a retry. */
 export const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
 /**
- * Hard cap on the in-memory challenge store. Prevents an unbounded Map
- * growth under spam: an attacker who keeps calling `createChallenge` from
- * fresh addresses would otherwise OOM the server. At 100k entries of ~80
- * bytes each the store tops out around ~8MB; beyond that `createChallenge`
- * throws and the caller is expected to retry (the route handler maps this
- * to a 5xx).
+ * Hard cap on the in-memory challenge store. Prevents unbounded Map growth
+ * under spam: an attacker who keeps calling `createChallenge` from fresh
+ * addresses would otherwise OOM the server.
  */
 export const MAX_CHALLENGES = 100_000;
 
-/**
- * Memoised mapping from encoded chain-ID felt → human-readable label.
- *
- * RATIONALE FOR IN-MEMORY RETENTION:
- * Challenges are highly transient. Storing them in-memory avoids unnecessary DB read/write overhead
- * for every unauthenticated challenge request. If the server restarts or a different instance
- * handles the verification, the user's wallet client simply requests a new challenge nonce with no
- * negative security implications and minimal user friction.
- *
- * SIZE CAP:
- * The Map is bounded at MAX_CHALLENGES. Beyond that, createChallenge
- * refuses to store a new entry and throws so the route layer can surface
- * the failure rather than silently dropping a security-relevant signal.
- */
-const chainIdCache = new Map<string, string>();
+/** In-memory store mapping canonical address → ChallengeRecord */
+export const challenges = new Map<string, ChallengeRecord>();
 
-/**
- * Number of `createChallenge` calls between opportunistic sweeps of expired entries.
- *
- * `getChallenge`/`consumeChallenge` only evict an entry when it is *read*, so an
- * address that requests a challenge and never follows up with `/auth/verify`
- * (an abandoned login, or an attacker enumerating addresses) would otherwise sit
- * in `challenges` forever, growing the map without bound. Sweeping periodically
- * on the write path bounds that growth without needing a background timer,
- * which would complicate shutdown and test lifecycles.
- */
+/** Number of `createChallenge` calls between opportunistic sweeps of expired entries. */
 const SWEEP_INTERVAL = 50;
 let creationsSinceSweep = 0;
 
-/** Removes all entries whose TTL has already elapsed as of `now`. */
-function sweepExpiredChallenges(now: number): void {
-  for (const [key, rec] of challenges) {
-    if (now > rec.expiresAtMs) {
-      challenges.delete(key);
-    }
+/**
+ * Max entries inspected per opportunistic sweep. Keeps each sweep O(page)
+ * even when the store approaches `MAX_CHALLENGES`.
+ */
+export const SWEEP_BATCH_SIZE = 500;
+
+/** Cursor into the challenge store for the next paginated sweep pass. */
+let sweepOffset = 0;
+
+/** Memoized mapping from encoded chain-ID felt → human-readable label. */
+const chainIdCache = new Map<string, string>();
+
+/** Helper to validate non-empty string arguments */
+function isNonEmptyString(val: unknown): val is string {
+  return typeof val === "string" && val.trim().length > 0;
+}
+
+/** Decodes a Starknet chain-ID felt into a human-readable label (e.g. "SN_SEPOLIA"). */
+function getChainIdLabel(chainId: string): string {
+  const cached = chainIdCache.get(chainId);
+  if (cached !== undefined) return cached;
+  try {
+    const label = shortString.decodeShortString(chainId);
+    chainIdCache.set(chainId, label);
+    return label;
+  } catch {
+    chainIdCache.set(chainId, chainId);
+    return chainId;
   }
 }
 
 /**
- * Generates a challenge nonce for verification.
+ * Removes expired challenge entries.
+ *
+ * Opportunistic sweeps (`full === false`) inspect at most `SWEEP_BATCH_SIZE`
+ * entries starting at `sweepOffset`, then advance the cursor. Last-resort
+ * sweeps (`full === true`) walk the entire store and reset the cursor.
+ */
+function sweepExpiredChallenges(now: number, full = false): void {
+  const entries = [...challenges.entries()];
+  if (entries.length === 0) {
+    sweepOffset = 0;
+    return;
+  }
+
+  if (full) {
+    for (const [key, rec] of entries) {
+      if (now > rec.expiresAtMs) {
+        challenges.delete(key);
+      }
+    }
+    sweepOffset = 0;
+    return;
+  }
+
+  if (sweepOffset >= entries.length) {
+    sweepOffset = 0;
+  }
+
+  const end = Math.min(sweepOffset + SWEEP_BATCH_SIZE, entries.length);
+  for (let i = sweepOffset; i < end; i++) {
+    const [key, rec] = entries[i]!;
+    if (now > rec.expiresAtMs) {
+      challenges.delete(key);
+    }
+  }
+
+  sweepOffset = end >= entries.length ? 0 : end;
+}
+
+/** Emits one structured metric line. `console.info` carries the request id. */
+function logChallengeMetric(metric: string, fields: Record<string, unknown> = {}): void {
+  console.info(
+    JSON.stringify({
+      metric,
+      ...fields,
+      timestamp: new Date().toISOString(),
+    }),
+  );
+}
+
+/**
+ * Returns the canonical Starknet address (lowercase, `0x` + 64 hex) for use
+ * as a `challenges` Map key, or null if the input is not a usable Starknet address.
+ */
+function normalizeAddressKey(address: unknown): string | null {
+  if (!isNonEmptyString(address)) return null;
+  try {
+    return normalizeStarknetAddress(address);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Issues (or re-issues) the challenge nonce a wallet must sign.
+ *
+ * IDEMPOTENT WITHIN THE ACTIVE WINDOW: if the address already has an
+ * unexpired challenge, the existing nonce is returned with its REMAINING
+ * TTL and a `challenge_replayed` metric.
  *
  * @param address - The user's Starknet wallet address
- * @returns The generated nonce and its TTL
- * @throws if the address cannot be normalized to a Starknet address, or if
- *   the in-memory store is at the MAX_CHALLENGES cap.
+ * @returns The nonce and the milliseconds remaining before it expires
+ * @throws if the address is invalid, or if a new entry would exceed `MAX_CHALLENGES`.
  */
-export function createChallenge(address: string) {
+export function createChallenge(address: unknown): { nonce: string; expires_in_ms: number } {
+  const key = normalizeAddressKey(address);
+  if (key === null) {
+    throw new Error("createChallenge: address is not a parseable Starknet address");
+  }
+
   const now = Date.now();
 
   creationsSinceSweep += 1;
@@ -110,142 +206,142 @@ export function createChallenge(address: string) {
     sweepExpiredChallenges(now);
   }
 
-  const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
-  challenges.set(address.toLowerCase(), { nonce, expiresAtMs: now + CHALLENGE_TTL_MS });
+  const existing = challenges.get(key);
+  if (existing && now <= existing.expiresAtMs) {
+    const remainingMs = existing.expiresAtMs - now;
+    logChallengeMetric("challenge_replayed", { address: key, expires_in_ms: remainingMs });
+    return { nonce: existing.nonce, expires_in_ms: remainingMs };
+  }
 
-  // Structured log/metric for challenge generation
-  console.info(JSON.stringify({
-    metric: "challenge_created",
-    address: address.toLowerCase(),
-    expires_in_ms: CHALLENGE_TTL_MS,
-    timestamp: new Date().toISOString()
-  }));
+  if (existing) {
+    // Expired: drop it here so the size check below sees an accurate count.
+    challenges.delete(key);
+  }
+
+  if (challenges.size >= MAX_CHALLENGES) {
+    // Last resort before refusing: reclaim whatever has already expired.
+    sweepExpiredChallenges(now, true);
+    if (challenges.size >= MAX_CHALLENGES) {
+      logChallengeMetric("challenge_rejected", { reason: "store_full", size: challenges.size });
+      throw new Error("createChallenge: challenge store is full");
+    }
+  }
+
+  const nonce = `0x${crypto.randomBytes(16).toString("hex")}`;
+  challenges.set(key, { nonce, expiresAtMs: now + CHALLENGE_TTL_MS });
+  logChallengeMetric("challenge_created", { address: key, expires_in_ms: CHALLENGE_TTL_MS });
 
   return { nonce, expires_in_ms: CHALLENGE_TTL_MS };
 }
 
 /**
- * Retrieves the challenge record for verification. Expired entries are
- * evicted on access.
+ * Retrieves the challenge record for verification. Expired entries are evicted on access.
+ * Read-only: prefer {@link consumeChallenge} anywhere a challenge is about to be verified.
  *
  * @param address - The user's Starknet wallet address
- * @returns The challenge record if found and valid, otherwise null. Malformed
- *   addresses resolve to null without throwing.
+ * @returns The challenge record if found and still valid, otherwise null.
  */
-export function getChallenge(address: string) {
-  const lookupKey = normalizeAddressKey(address);
-  if (lookupKey === null) {
-    console.info(
-      JSON.stringify({
-        metric: "challenge_miss",
-        reason: "invalid_address",
-        timestamp: new Date().toISOString(),
-      }),
-    );
+export function getChallenge(address: unknown): ChallengeRecord | null {
+  const key = normalizeAddressKey(address);
+  if (key === null) {
+    logChallengeMetric("challenge_miss", { reason: "invalid_address" });
     return null;
   }
 
-  const rec = challenges.get(lookupKey);
+  const rec = challenges.get(key);
   if (!rec) {
-    console.info(
-      JSON.stringify({
-        metric: "challenge_miss",
-        reason: "not_found",
-        address: address.toLowerCase(),
-        timestamp: new Date().toISOString(),
-      }),
-    );
+    logChallengeMetric("challenge_miss", { reason: "not_found", address: key });
     return null;
   }
 
   if (Date.now() > rec.expiresAtMs) {
-    challenges.delete(lookupKey);
-    console.info(
-      JSON.stringify({
-        metric: "challenge_expired",
-        address: address.toLowerCase(),
-        timestamp: new Date().toISOString(),
-      }),
-    );
+    challenges.delete(key);
+    logChallengeMetric("challenge_expired", { address: key });
     return null;
   }
+
   return rec;
 }
 
 /**
- * Clear the chain-ID decode cache.
- *
- * Only intended for use in tests that need to verify the caching behaviour
- * or that construct unusual chainId values. Production code must not call this.
+ * Drops the challenge for an address, if there is one.
+ * A silent no-op when the address is malformed or has no stored challenge.
  */
-export function clearChallenge(address: string) {
-  const lookupKey = normalizeAddressKey(address);
-  if (lookupKey === null) return;
+export function clearChallenge(address: unknown): void {
+  const key = normalizeAddressKey(address);
+  if (key === null) return;
 
-  const deleted = challenges.delete(lookupKey);
-  if (deleted) {
-    console.info(
-      JSON.stringify({
-        metric: "challenge_cleared",
-        address: address.toLowerCase(),
-        timestamp: new Date().toISOString(),
-      }),
-    );
+  if (challenges.delete(key)) {
+    logChallengeMetric("challenge_cleared", { address: key });
   }
 }
 
 /**
  * Atomically reads and deletes the challenge for an address in a single step.
- *
- * This must be used (instead of getChallenge + a later clearChallenge) anywhere a
- * challenge is about to be verified. getChallenge is read-only, so if it's read at
- * the start of an async verification and only cleared afterwards, two concurrent
- * requests can both read the same still-valid nonce before either one clears it —
- * letting the same challenge be consumed twice (a replay bypass). Deleting it at
- * read time closes that gap: the second concurrent caller sees it already gone.
+ * Prevents replay attacks where concurrent verifications race on the same nonce.
  *
  * @param address - The user's Starknet wallet address
- * @returns The challenge record if it existed and was still valid, otherwise null
+ * @returns The challenge record if it existed and was still valid, else null
  */
-export function consumeChallenge(address: string) {
+export function consumeChallenge(address: unknown): ChallengeRecord | null {
   const rec = getChallenge(address);
   if (!rec) return null;
 
-  const lookupKey = normalizeAddressKey(address);
-  if (lookupKey !== null) challenges.delete(lookupKey);
+  const key = normalizeAddressKey(address);
+  if (key !== null) challenges.delete(key);
 
-  console.info(
-    JSON.stringify({
-      metric: "challenge_consumed",
-      address: address.toLowerCase(),
-      timestamp: new Date().toISOString(),
-    }),
-  );
-
+  logChallengeMetric("challenge_consumed", { address: key });
   return rec;
+}
+
+/**
+ * Puts a previously consumed challenge back into the store so a caller can
+ * retry verification without re-signing.
+ *
+ * Used by `/auth/verify` when signature verification succeeded but session
+ * issuance failed — the caller already proved ownership of the nonce, so
+ * consuming it permanently would strand a valid proof behind a transient
+ * store error.
+ *
+ * Restores only when:
+ * - `address` is a parseable Starknet address,
+ * - the record is still within its TTL, and
+ * - the address slot is empty (never overwrite a newer challenge).
+ *
+ * @returns `true` when the record was restored, otherwise `false`.
+ */
+export function restoreChallenge(address: unknown, record: ChallengeRecord): boolean {
+  const key = normalizeAddressKey(address);
+  if (key === null) return false;
+  if (Date.now() > record.expiresAtMs) return false;
+  if (challenges.has(key)) return false;
+
+  challenges.set(key, { nonce: record.nonce, expiresAtMs: record.expiresAtMs });
+  logChallengeMetric("challenge_restored", {
+    address: key,
+    expires_in_ms: record.expiresAtMs - Date.now(),
+  });
+  return true;
 }
 
 /**
  * Builds the SNIP-12 typed-data challenge a wallet signs to prove ownership.
  *
- * Extracted from the auth route so it can be unit-tested in isolation, without
- * pulling in the Express router or the Starknet RPC provider.
- *
- * The wallet field is normalized to the canonical (lowercase, padded) form
- * before being placed in the typed-data message. This keeps the signature
- * the wallet produces stable regardless of how the caller cased the input
- * address ("0xAbC" vs "0xabc"), and matches the lowercase key the
- * `challenges` Map stores the nonce under.
+ * @throws if any input is missing, invalid type, empty, or unparseable address.
  */
-export function buildTypedChallenge(address: string, chainId: string, nonce: string): TypedData {
-  const canonicalAddress = canonicalWalletAddress(address);
-  // Wallets (ArgentX/Braavos) validate typed data using a JSON schema.
-  // They expect plain string values like:
-  // - domain.chainId: "SN_SEPOLIA" / "SN_MAIN"
-  // - domain.name/version: plain string
-  // - message.action: plain string
-  // (starknet.js will encode these according to the declared `felt` types when hashing/verifying)
-  const chainIdLabel = shortString.decodeShortString(chainId);
+export function buildTypedChallenge(address: unknown, chainId: unknown, nonce: unknown): TypedData {
+  if (!isNonEmptyString(address) || normalizeAddressKey(address) === null) {
+    throw new Error("buildTypedChallenge: address is not a parseable Starknet address");
+  }
+  if (!isNonEmptyString(chainId)) {
+    throw new Error("buildTypedChallenge: chainId must be a non-empty string");
+  }
+  if (!isNonEmptyString(nonce)) {
+    throw new Error("buildTypedChallenge: nonce must be a non-empty string");
+  }
+
+  const canonicalAddress = normalizeAddressKey(address)!;
+
   return {
     types: CHALLENGE_TYPES,
     primaryType: "Challenge",
@@ -258,37 +354,25 @@ export function buildTypedChallenge(address: string, chainId: string, nonce: str
     message: {
       action: "LOGIN",
       wallet: canonicalAddress,
-      nonce,
+      nonce: nonce.trim(),
     },
   };
 }
 
 /**
- * Returns the canonical Starknet address (lowercase, padded, mixed-case
- * checksummed) for use as a `challenges` Map key, or null if the input is
- * not a usable Starknet address. Returns null rather than throwing so that
- * `getChallenge` / `clearChallenge` / `consumeChallenge` degrade gracefully
- * on malformed input rather than 500'ing the auth route.
+ * Resets the challenge store and the sweep counter.
+ * Only intended for tests that need a clean slate between cases.
  */
-function normalizeAddressKey(address: string): string | null {
-  if (typeof address !== "string" || address.length === 0) return null;
-  try {
-    return normalizeStarknetAddress(address);
-  } catch {
-    return null;
-  }
+export function clearChallengesForTesting(): void {
+  challenges.clear();
+  creationsSinceSweep = 0;
+  sweepOffset = 0;
 }
 
 /**
- * Returns the canonical wallet field for `buildTypedChallenge`. Throws on
- * malformed input: the route layer's Zod schema already validates the
- * raw request body, so any input that fails normalize here is a caller
- * bug, not something to silently paper over.
+ * Clears the chain-ID decode cache.
+ * Only intended for tests that verify the caching behaviour.
  */
-function canonicalWalletAddress(address: string): string {
-  const canonical = normalizeAddressKey(address);
-  if (canonical === null) {
-    throw new Error("buildTypedChallenge: address is not a parseable Starknet address");
-  }
-  return canonical;
+export function clearChainIdCacheForTesting(): void {
+  chainIdCache.clear();
 }

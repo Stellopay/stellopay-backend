@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { eq, or, lt, isNotNull } from "drizzle-orm";
+import { eq, or, lt, isNotNull, isNull, inArray, and } from "drizzle-orm";
 import { env } from "../config.js";
 import { db } from "../db/index.js";
 import { sessions as sessionsTable } from "../db/schema.js";
@@ -19,19 +19,44 @@ const SESSION_MAX_TTL_MS = env.SESSION_MAX_TTL_MS;
 const SESSION_UPDATE_THRESHOLD_MS = 60 * 1000;
 // How often the background sweeper purges expired/revoked sessions from the DB.
 const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+// Maximum rows to delete/update in a single query during sweep or bulk
+// revocation.  Large operations are split across multiple bounded queries
+// to avoid long-running locks, replica lag, and statement timeouts on growth.
+const SESSION_SWEEP_BATCH_SIZE = 500;
+const SESSION_REVOKE_BATCH_SIZE = 100;
 
-// Session lifecycle contract in this module:
-// - each row persists a hashed token, the normalized wallet address, and two expiry timestamps;
-// - the sliding expiry (`expiresAt`) can move forward on successful use, but never past the
-//   immutable absolute cap (`absoluteExpiresAt`);
-// - the row is invalidated once it is revoked or rotated.
+/**
+ * Session Lifecycle & Authorization Contract:
+ *
+ * 1. Authority & Caller Roles:
+ *    - Session Creation (`createSession`): Authorized callers are wallet challenge/verification handlers.
+ *      Requires a valid, non-empty Starknet wallet address.
+ *    - Session Validation (`requireSession`, `getSessionByHash`): Authorized callers are auth middlewares and handlers.
+ *      Requires non-empty wallet address and valid session token or hash.
+ *    - Session Extension / Refresh (`rotateSession`): Authorized callers are token refresh handlers.
+ *      Requires non-empty wallet address and active session token.
+ *    - Session Invalidation (`revokeSession`, `revokeSessionByHash`, `revokeFamily`, `revokeAllSessionsForAddress`, `sweepExpiredSessions`):
+ *      Authorized callers are logout endpoints, compromise detectors, admin lockdown routines, or background sweepers.
+ *
+ * 2. Security Boundaries & Invalidation Guarantees:
+ *    - Token Immutability: Raw session tokens are returned ONLY upon creation/rotation and are NEVER logged or stored raw.
+ *      Only SHA-256 token hashes are persisted in PostgreSQL.
+ *    - Sliding Expiration Cap: Sliding TTL (`SESSION_TTL_MS`) extends on valid use, but CANNOT exceed the immutable absolute cap (`SESSION_MAX_TTL_MS`).
+ *    - Non-Reusability Guarantee: Expired, rotated, or revoked sessions are permanently unusable for authentication or rotation.
+ *    - Replay & Compromise Defense: Re-using a rotated or revoked token in `rotateSession` triggers immediate family-wide revocation (`revokeFamily`).
+ *    - Fail-Closed Error Shapes: Invalid inputs, address mismatches, or missing credentials yield `false` / `{ ok: false, reason: "invalid" }`
+ *      without exposing DB internals or raw token values.
+ */
+
 function normalizeSessionAddress(address: string): string {
-  return address.toLowerCase();
+  return address.trim().toLowerCase();
 }
 
 function getNextSlidingExpiryMs(nowMs: number, absoluteExpiresAt: Date): number {
   const slidingExpiryMs = nowMs + SESSION_TTL_MS;
   return Math.min(slidingExpiryMs, absoluteExpiresAt.getTime());
+}
+
 // ---------------------------------------------------------------------------
 // Input validation helpers
 // ---------------------------------------------------------------------------
@@ -92,7 +117,6 @@ export async function createSession(address: string) {
       address: normalizedAddress,
       message: errorMessage(error),
     });
-    incSessionMetric(SESSION_METRICS.REJECTED);
     throw error;
   }
 
@@ -346,7 +370,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
           .update(sessionsTable)
           .set({ revokedAt: now })
           .where(eq(sessionsTable.familyId, familyId));
-          
+
         incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
         logSessionEvent("warn", "session.family_revoked", {
           family_id: familyId,
@@ -359,7 +383,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
           had_rotated_at: session.rotatedAt !== null,
           had_revoked_at: session.revokedAt !== null,
         });
-        
+
         return { ok: false, reason: "reused", familyId };
       }
 
@@ -415,35 +439,6 @@ export async function rotateSession(address: string, token: string): Promise<Rot
     });
     return { ok: false, reason: "invalid" };
   }
-
-  const newToken = crypto.randomBytes(24).toString("hex");
-  const newTokenHash = crypto.createHash("sha256").update(newToken).digest("hex");
-  const nowMs = now.getTime();
-  const newExpiresAtMs = getNextSlidingExpiryMs(nowMs, session.absoluteExpiresAt);
-
-  // Issue the replacement before marking the old one rotated, so a failure
-  // here leaves the old token intact instead of orphaning the session.
-  await db.insert(sessionsTable).values({
-    tokenHash: newTokenHash,
-    address: session.address,
-    familyId,
-    expiresAt: new Date(newExpiresAtMs),
-    absoluteExpiresAt: session.absoluteExpiresAt,
-  });
-
-  await db
-    .update(sessionsTable)
-    .set({ rotatedAt: now })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
-
-  incSessionMetric(SESSION_METRICS.ROTATED);
-  logSessionEvent("info", "session.rotated", {
-    address: normalizedAddress,
-    family_id: familyId,
-    expires_in_ms: newExpiresAtMs - nowMs,
-  });
-
-  return { ok: true, token: newToken, expires_in_ms: newExpiresAtMs - nowMs };
 }
 
 /**
@@ -458,6 +453,7 @@ export async function rotateSession(address: string, token: string): Promise<Rot
  * @param familyId - The token family identifier
  */
 export async function revokeFamily(familyId: string): Promise<void> {
+  if (!isNonEmptyString(familyId)) return;
   const [existing] = await db
     .select()
     .from(sessionsTable)
@@ -475,38 +471,84 @@ export async function revokeFamily(familyId: string): Promise<void> {
     return;
   }
 
-  try {
-    await withBoundedRetry(
-      () =>
-        db
-          .update(sessionsTable)
-          .set({ revokedAt: new Date() })
-          .where(eq(sessionsTable.familyId, familyId)),
-      {},
-      (info) => {
-        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
-        logSessionEvent("warn", "session.revoke_retry", {
-          kind: "family",
-          family_id: familyId,
-          attempt: info.attempt,
-          max_attempts: info.maxAttempts,
-          message: errorMessage(info.error),
-        });
-      },
-    );
-  } catch (error) {
-    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
-    logSessionEvent("error", "session.revoke_failed", {
-      kind: "family",
-      family_id: familyId,
-      message: errorMessage(error),
-    });
-    throw error;
+  // Bounded revocation: same batching contract as revokeAllSessionsForAddress.
+  let batch = 0;
+  while (true) {
+    batch++;
+    let hashes: string[] = [];
+    try {
+      const candidates = await db
+        .select({ tokenHash: sessionsTable.tokenHash })
+        .from(sessionsTable)
+        .where(
+          and(
+            eq(sessionsTable.familyId, familyId),
+            isNull(sessionsTable.revokedAt),
+          ),
+        )
+        .limit(SESSION_REVOKE_BATCH_SIZE);
+
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        break;
+      }
+
+      hashes = candidates.map((r) => r.tokenHash).filter(Boolean);
+      if (hashes.length === 0) {
+        break;
+      }
+    } catch (error) {
+      incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+      logSessionEvent("error", "session.revoke_failed", {
+        kind: "family",
+        family_id: familyId,
+        batch,
+        phase: "select",
+        message: errorMessage(error),
+      });
+      throw error;
+    }
+
+    try {
+      await withBoundedRetry(
+        () =>
+          db
+            .update(sessionsTable)
+            .set({ revokedAt: new Date() })
+            .where(inArray(sessionsTable.tokenHash, hashes)),
+        {},
+        (info) => {
+          incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+          logSessionEvent("warn", "session.revoke_retry", {
+            kind: "family",
+            family_id: familyId,
+            batch,
+            attempt: info.attempt,
+            max_attempts: info.maxAttempts,
+            message: errorMessage(info.error),
+          });
+        },
+      );
+    } catch (error) {
+      incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+      logSessionEvent("error", "session.revoke_failed", {
+        kind: "family",
+        family_id: familyId,
+        batch,
+        phase: "update",
+        message: errorMessage(error),
+      });
+      throw error;
+    }
+
+    if (hashes.length < SESSION_REVOKE_BATCH_SIZE) {
+      break;
+    }
   }
 
   incSessionMetric(SESSION_METRICS.FAMILY_REVOKED);
   logSessionEvent("warn", "session.family_revoked", {
     family_id: familyId,
+    batches: batch,
   });
 }
 
@@ -520,15 +562,19 @@ export async function revokeFamily(familyId: string): Promise<void> {
  * RELIABILITY (issue #125): see {@link revokeSession} — the same idempotent
  * re-revoke classification + bounded-retry policy applies here.
  *
+ * Empty or whitespace-only addresses are a no-op (mirrors the
+ * `isNonEmptyString` guard on `createSession`/`requireSession`/`rotateSession`):
+ * no DB write happens and `session.rejected` (reason `missing_input`) is
+ * logged instead of `session.all_revoked`.
+ *
  * @param address - The Starknet wallet address
  */
 export async function revokeAllSessionsForAddress(address: string): Promise<void> {
+  if (!isNonEmptyString(address)) {
+    recordRejection("missing_input", undefined);
+    return;
+  }
   const normalizedAddress = normalizeSessionAddress(address);
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.address, normalizedAddress));
-  const normalizedAddress = address.toLowerCase();
   const [existing] = await db
     .select()
     .from(sessionsTable)
@@ -540,44 +586,90 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
       kind: "all",
       address: normalizedAddress,
     });
-    // Already revoked — skip the retry/update loop AND the ALL_REVOKED
-    // bump so that `session_all_revoked_total` reflects distinct address
-    // revocations only.
     return;
   }
 
-  try {
-    await withBoundedRetry(
-      () =>
-        db
-          .update(sessionsTable)
-          .set({ revokedAt: new Date() })
-          .where(eq(sessionsTable.address, normalizedAddress)),
-      {},
-      (info) => {
-        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
-        logSessionEvent("warn", "session.revoke_retry", {
-          kind: "all",
-          address: normalizedAddress,
-          attempt: info.attempt,
-          max_attempts: info.maxAttempts,
-          message: errorMessage(info.error),
-        });
-      },
-    );
-  } catch (error) {
-    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
-    logSessionEvent("error", "session.revoke_failed", {
-      kind: "all",
-      address: normalizedAddress,
-      message: errorMessage(error),
-    });
-    throw error;
+  // Bounded revocation: update in pages of SESSION_REVOKE_BATCH_SIZE so a
+  // single user with hundreds of sessions does not cause a long-running
+  // UPDATE that escalates locks or hits statement_timeout.
+  let batch = 0;
+  while (true) {
+    batch++;
+    let hashes: string[] = [];
+    try {
+      const candidates = await db
+        .select({ tokenHash: sessionsTable.tokenHash })
+        .from(sessionsTable)
+        .where(
+          and(
+            eq(sessionsTable.address, normalizedAddress),
+            isNull(sessionsTable.revokedAt),
+          ),
+        )
+        .limit(SESSION_REVOKE_BATCH_SIZE);
+
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        break;
+      }
+
+      hashes = candidates.map((r) => r.tokenHash).filter(Boolean);
+      if (hashes.length === 0) {
+        break;
+      }
+    } catch (error) {
+      incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+      logSessionEvent("error", "session.revoke_failed", {
+        kind: "all",
+        address: normalizedAddress,
+        batch,
+        phase: "select",
+        message: errorMessage(error),
+      });
+      throw error;
+    }
+
+    try {
+      await withBoundedRetry(
+        () =>
+          db
+            .update(sessionsTable)
+            .set({ revokedAt: new Date() })
+            .where(inArray(sessionsTable.tokenHash, hashes)),
+        {},
+        (info) => {
+          incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+          logSessionEvent("warn", "session.revoke_retry", {
+            kind: "all",
+            address: normalizedAddress,
+            batch,
+            attempt: info.attempt,
+            max_attempts: info.maxAttempts,
+            message: errorMessage(info.error),
+          });
+        },
+      );
+    } catch (error) {
+      incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+      logSessionEvent("error", "session.revoke_failed", {
+        kind: "all",
+        address: normalizedAddress,
+        batch,
+        phase: "update",
+        message: errorMessage(error),
+      });
+      throw error;
+    }
+
+    // Last batch indicator: fewer hashes than the batch size.
+    if (hashes.length < SESSION_REVOKE_BATCH_SIZE) {
+      break;
+    }
   }
 
   incSessionMetric(SESSION_METRICS.ALL_REVOKED);
   logSessionEvent("info", "session.all_revoked", {
     address: normalizedAddress,
+    batches: batch,
   });
 }
 
@@ -589,7 +681,7 @@ export async function revokeAllSessionsForAddress(address: string): Promise<void
 export async function getSessionByHash(
   tokenHash: string,
 ): Promise<typeof sessionsTable.$inferSelect | null> {
-  if (!tokenHash) return null;
+  if (!isNonEmptyString(tokenHash)) return null;
   const [session] = await db
     .select()
     .from(sessionsTable)
@@ -604,13 +696,51 @@ export async function getSessionByHash(
  * @param tokenHash - The SHA-256 hash of the session token to revoke
  */
 export async function revokeSessionByHash(tokenHash: string): Promise<void> {
-  if (!tokenHash) return;
+  if (!isNonEmptyString(tokenHash)) return;
   const tokenHashShort = tokenHash.slice(0, 8);
 
-  await db
-    .update(sessionsTable)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessionsTable.tokenHash, tokenHash));
+  const [existing] = await db
+    .select()
+    .from(sessionsTable)
+    .where(eq(sessionsTable.tokenHash, tokenHash))
+    .limit(1);
+  if (existing && existing.revokedAt !== null) {
+    incSessionMetric(SESSION_METRICS.REVOKED_ALREADY);
+    logSessionEvent("info", "session.revoke_already", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+    });
+    return;
+  }
+
+  try {
+    await withBoundedRetry(
+      () =>
+        db
+          .update(sessionsTable)
+          .set({ revokedAt: new Date() })
+          .where(eq(sessionsTable.tokenHash, tokenHash)),
+      {},
+      (info) => {
+        incSessionMetric(SESSION_METRICS.REVOKE_RETRY);
+        logSessionEvent("warn", "session.revoke_retry", {
+          kind: "single",
+          attempt: info.attempt,
+          max_attempts: info.maxAttempts,
+          token_hash_prefix: tokenHashShort,
+          message: errorMessage(info.error),
+        });
+      },
+    );
+  } catch (error) {
+    incSessionMetric(SESSION_METRICS.REVOKE_FAILED);
+    logSessionEvent("error", "session.revoke_failed", {
+      kind: "single",
+      token_hash_prefix: tokenHashShort,
+      message: errorMessage(error),
+    });
+    throw error;
+  }
 
   incSessionMetric(SESSION_METRICS.REVOKED);
   logSessionEvent("info", "session.revoked", {
@@ -642,46 +772,102 @@ export async function revokeSessionByHash(tokenHash: string): Promise<void> {
  */
 export async function sweepExpiredSessions(now: number = Date.now()): Promise<number> {
   const nowDate = new Date(now);
-  try {
-    const deleted = await withBoundedRetry(
-      () =>
-        db
-          .delete(sessionsTable)
-          .where(
-            or(
-              lt(sessionsTable.expiresAt, nowDate),
-              lt(sessionsTable.absoluteExpiresAt, nowDate),
-              isNotNull(sessionsTable.revokedAt),
-            ),
-          )
-          .returning({ tokenHash: sessionsTable.tokenHash }),
-      {},
-      (info) => {
-        incSessionMetric(SESSION_METRICS.SWEEP_RETRY);
-        logSessionEvent("warn", "session.sweep_retry", {
-          attempt: info.attempt,
-          max_attempts: info.maxAttempts,
-          message: errorMessage(info.error),
-        });
-      },
-    );
-    const count = deleted.length;
-    incSessionMetric(SESSION_METRICS.SWEEP_RUNS);
-    incSessionMetric(SESSION_METRICS.SWEEP_DELETED, count);
-    setSessionGauge(SESSION_GAUGES.LAST_SWEEP_DELETED, count);
-    setSessionGauge(SESSION_GAUGES.LAST_SWEEP_AT_MS, now);
-    logSessionEvent("info", "session.sweep_completed", {
-      deleted: count,
-      now: nowDate.toISOString(),
-    });
-    return count;
-  } catch (error) {
-    incSessionMetric(SESSION_METRICS.SWEEPER_ERRORS);
-    logSessionEvent("error", "session.sweep_failed", {
-      message: errorMessage(error),
-    });
-    return 0;
+  let totalDeleted = 0;
+  let batches = 0;
+
+  // Bounded sweep: delete in pages of SESSION_SWEEP_BATCH_SIZE so the
+  // DELETE never holds a long-running lock, never bloats the WAL stream
+  // for replicas, and stays under any statement_timeout.
+  while (true) {
+    let batchHashes: string[] = [];
+    try {
+      // SELECT what to delete (lightweight, no lock escalation).
+      const candidates = await db
+        .select({ tokenHash: sessionsTable.tokenHash })
+        .from(sessionsTable)
+        .where(
+          or(
+            lt(sessionsTable.expiresAt, nowDate),
+            lt(sessionsTable.absoluteExpiresAt, nowDate),
+            isNotNull(sessionsTable.revokedAt),
+          ),
+        )
+        .limit(SESSION_SWEEP_BATCH_SIZE);
+
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        break;
+      }
+
+      batchHashes = candidates.map((r) => r.tokenHash).filter(Boolean);
+      if (batchHashes.length === 0) {
+        break;
+      }
+    } catch (error) {
+      incSessionMetric(SESSION_METRICS.SWEEPER_ERRORS);
+      logSessionEvent("error", "session.sweep_failed", {
+        phase: "select",
+        message: errorMessage(error),
+      });
+      return totalDeleted;
+    }
+
+    try {
+      // DELETE by the selected hashes — wrapped in retry for transient
+      // blips.  Re-running with the same hash set is idempotent: the
+      // second DELETE just affects zero rows.
+      const deleted = await withBoundedRetry(
+        () =>
+          db
+            .delete(sessionsTable)
+            .where(inArray(sessionsTable.tokenHash, batchHashes))
+            .returning({ tokenHash: sessionsTable.tokenHash }),
+        {},
+        (info) => {
+          incSessionMetric(SESSION_METRICS.SWEEP_RETRY);
+          logSessionEvent("warn", "session.sweep_retry", {
+            batch: batches + 1,
+            attempt: info.attempt,
+            max_attempts: info.maxAttempts,
+            message: errorMessage(info.error),
+          });
+        },
+      );
+
+      batches++;
+      const batchCount = deleted.length;
+      totalDeleted += batchCount;
+
+      logSessionEvent("info", "session.sweep_batch", {
+        batch: batches,
+        deleted: batchCount,
+        running_total: totalDeleted,
+      });
+
+      // Last page: fewer hashes than the batch size means no more data.
+      if (batchHashes.length < SESSION_SWEEP_BATCH_SIZE) {
+        break;
+      }
+    } catch (error) {
+      incSessionMetric(SESSION_METRICS.SWEEPER_ERRORS);
+      logSessionEvent("error", "session.sweep_failed", {
+        phase: "delete",
+        batch: batches + 1,
+        message: errorMessage(error),
+      });
+      return totalDeleted;
+    }
   }
+
+  incSessionMetric(SESSION_METRICS.SWEEP_RUNS);
+  incSessionMetric(SESSION_METRICS.SWEEP_DELETED, totalDeleted);
+  setSessionGauge(SESSION_GAUGES.LAST_SWEEP_DELETED, totalDeleted);
+  setSessionGauge(SESSION_GAUGES.LAST_SWEEP_AT_MS, now);
+  logSessionEvent("info", "session.sweep_completed", {
+    deleted: totalDeleted,
+    batches,
+    now: nowDate.toISOString(),
+  });
+  return totalDeleted;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,8 +890,6 @@ function recordRejection(reason: SessionRejectionReason, address: string | undef
     case "expired_absolute":
       incSessionMetric(SESSION_METRICS.REJECTED_EXPIRED);
       break;
-    // "missing_input" and "db_error" are bucketed only under the global
-    // REJECTED counter; no per-reason counter to keep cardinality bounded.
   }
   logSessionEvent("warn", "session.rejected", {
     reason,

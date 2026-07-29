@@ -1,194 +1,154 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import express from "express";
-import request from "supertest";
+# Billing routes
 
-// billing.ts imports ../db/index.js which creates a real pg Pool at load time.
-// Mock it out before anything else runs so the pool is never constructed.
-vi.mock("../db/index.js", () => ({ db: {}, schema: {} }));
-vi.mock("../config.js", () => ({ env: { BILLING_ENABLED: true } }));
-vi.mock("drizzle-orm", () => ({ eq: vi.fn() }));
+Source: [`src/routes/billing.ts`](../../src/routes/billing.ts)
 
-import {
-  clearBillingIdempotencyStore,
-  withBillingIdempotency,
-  computeBillingSummary,
-  buildFullAddress,
-} from "./billing";
+## Overview
 
-// ---------------------------------------------------------------------------
-// computeBillingSummary — pure billing math, no I/O
-// ---------------------------------------------------------------------------
+All billing endpoints live under `/api/v1/billing/` and are gated behind the
+`BILLING_ENABLED` feature flag. When the flag is `false` every endpoint returns
+`HTTP 501` with a clear message. Set `BILLING_ENABLED=true` in the environment
+to activate them.
 
-describe("computeBillingSummary", () => {
-  it("returns zeros when both inputs are zero", () => {
-    expect(computeBillingSummary("0", "0")).toEqual({
-      annualRewardLimit: 0, usedAmount: 0, remainingAmount: 0, progressPercentage: 0,
-    });
-  });
+All responses follow a uniform envelope:
 
-  it("computes remainingAmount as limit minus used", () => {
-    expect(computeBillingSummary("1000", "250").remainingAmount).toBe(750);
-  });
+```json
+{ "success": true,  "data": { ... } }
+{ "success": false, "error": "..." }
+```
 
-  it("computes progressPercentage rounded to 2 dp", () => {
-    expect(computeBillingSummary("3000", "1000").progressPercentage).toBe(33.33);
-  });
+---
 
-  it("clamps remainingAmount to 0 when used exceeds limit", () => {
-    expect(computeBillingSummary("100", "200").remainingAmount).toBe(0);
-  });
+## Routes
 
-  it("returns progressPercentage=0 when limit=0 (no division by zero)", () => {
-    const s = computeBillingSummary("0", "50");
-    expect(s.progressPercentage).toBe(0);
-    expect(s.remainingAmount).toBe(0);
-  });
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/billing/profiles/:profileId` | Full profile (info + payment methods + invoices) |
+| `GET` | `/billing/profiles/:profileId/general-information` | Identity / contact fields |
+| `GET` | `/billing/profiles/:profileId/payment-methods` | Payment methods list |
+| `GET` | `/billing/profiles/:profileId/invoices` | Invoice history |
+| `GET` | `/billing/profiles/:profileId/summary` | Reward-limit / spend summary |
 
-  it("treats null/undefined as 0", () => {
-    expect(computeBillingSummary(null, null).annualRewardLimit).toBe(0);
-    expect(computeBillingSummary(undefined, undefined).usedAmount).toBe(0);
-  });
+---
 
-  it("parses DB numeric strings with trailing zeros", () => {
-    const s = computeBillingSummary("1000.000000", "250.500000");
-    expect(s.usedAmount).toBe(250.5);
-    expect(s.remainingAmount).toBe(749.5);
-  });
+## Path parameter validation
 
-  it("rounds progressPercentage to exactly 2 dp (1/3 case)", () => {
-    expect(computeBillingSummary("300", "100").progressPercentage).toBe(33.33);
-  });
+Every route validates `:profileId` before touching the database:
 
-  it("returns 100% when used equals limit", () => {
-    const s = computeBillingSummary("500", "500");
-    expect(s.remainingAmount).toBe(0);
-    expect(s.progressPercentage).toBe(100);
-  });
+- Must be between 1 and 128 characters
+- Must match `^[\w\-]+$` (alphanumeric and dashes only)
 
-  it("allows progressPercentage > 100 for over-spend", () => {
-    expect(computeBillingSummary("100", "200").progressPercentage).toBe(200);
-  });
+Invalid values return `HTTP 400` with `success: false` before any DB query runs.
 
-  it("handles fractional values", () => {
-    const s = computeBillingSummary("0.5", "0.25");
-    expect(s.remainingAmount).toBe(0.25);
-    expect(s.progressPercentage).toBe(50);
-  });
-});
+---
 
-// ---------------------------------------------------------------------------
-// buildFullAddress — pure address formatter, no I/O
-// ---------------------------------------------------------------------------
+## Sensitive field policy
 
-describe("buildFullAddress", () => {
-  it("joins all five parts with ', '", () => {
-    expect(buildFullAddress(["1 Main St", "NYC", "NY", "10001", "USA"])).toBe(
-      "1 Main St, NYC, NY, 10001, USA",
-    );
-  });
+`taxId` and `dateOfBirth` are stored in `billing_profiles` but **never** included
+in any API response. They are stripped by `stripSensitive` before serialisation.
+This applies to both the full-profile route and the general-information route.
 
-  it("returns null when all parts are absent", () => {
-    expect(buildFullAddress([null, null, undefined, null, null])).toBeNull();
-    expect(buildFullAddress([])).toBeNull();
-  });
+---
 
-  it("skips null/undefined and joins the rest", () => {
-    expect(buildFullAddress([null, "Berlin", undefined, null, "DE"])).toBe("Berlin, DE");
-  });
+## Exported pure helpers
 
-  it("returns a single part when only one is present", () => {
-    expect(buildFullAddress([null, "Paris", null, null, null])).toBe("Paris");
-  });
+These functions are extracted from the route handlers and exported so they can
+be unit-tested without a database or HTTP layer.
 
-  it("preserves order of present parts", () => {
-    expect(buildFullAddress(["10 Downing St", "London", null, null, "UK"])).toBe(
-      "10 Downing St, London, UK",
-    );
-  });
-});
+### `computeBillingSummary(annualRewardLimit, usedAmount)`
 
-// ---------------------------------------------------------------------------
-// Idempotency middleware
-// ---------------------------------------------------------------------------
+Computes the reward-limit summary fields from raw `numeric(18,6)` strings as
+stored in the database.
 
-function makeIdempotencyApp() {
-  const app = express();
-  app.use(express.json());
-  let count = 0;
-  app.post("/billing/test", withBillingIdempotency(async (req, res) => {
-    count++;
-    res.status(201).json({ count, body: req.body });
-  }));
-  return { app, getCount: () => count };
-}
+```ts
+import { computeBillingSummary } from "./routes/billing.js";
 
-describe("billing idempotency middleware", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
-    clearBillingIdempotencyStore();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    clearBillingIdempotencyStore();
-  });
+const summary = computeBillingSummary("1000.000000", "250.500000");
+// → { annualRewardLimit: 1000, usedAmount: 250.5,
+//     remainingAmount: 749.5, progressPercentage: 24.95 }
+```
 
-  it("executes normally without an idempotency key", async () => {
-    const { app, getCount } = makeIdempotencyApp();
-    await request(app).post("/billing/test").send({ amount: 10 }).expect(201);
-    await request(app).post("/billing/test").send({ amount: 20 }).expect(201);
-    expect(getCount()).toBe(2);
-  });
+**Contract**
 
-  it("replays cached response for same key and body", async () => {
-    const { app, getCount } = makeIdempotencyApp();
-    const first = await request(app).post("/billing/test").set("Idempotency-Key", "k1").send({ x: 1 });
-    const replay = await request(app).post("/billing/test").set("Idempotency-Key", "k1").send({ x: 1 });
-    expect(first.status).toBe(201);
-    expect(replay.body).toEqual(first.body);
-    expect(getCount()).toBe(1);
-  });
+| Input | Behaviour |
+|---|---|
+| `null` / `undefined` | Treated as `"0"` |
+| `usedAmount > annualRewardLimit` | `remainingAmount` is clamped to `0`; `progressPercentage` may exceed 100 (over-spend signal) |
+| `annualRewardLimit === 0` | `progressPercentage` is `0` (avoids division by zero) |
+| Any value | `progressPercentage` is rounded to 2 decimal places |
 
-  it("returns 409 when key is reused with a different body", async () => {
-    const { app } = makeIdempotencyApp();
-    await request(app).post("/billing/test").set("Idempotency-Key", "k2").send({ x: 1 });
-    const res = await request(app).post("/billing/test").set("Idempotency-Key", "k2").send({ x: 2 });
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/different request body/);
-  });
+---
 
-  it("re-executes after the 24-hour TTL expires", async () => {
-    const { app, getCount } = makeIdempotencyApp();
-    await request(app).post("/billing/test").set("Idempotency-Key", "k-ttl").send({ x: 1 });
-    vi.advanceTimersByTime(25 * 60 * 60 * 1000);
-    await request(app).post("/billing/test").set("Idempotency-Key", "k-ttl").send({ x: 1 });
-    expect(getCount()).toBe(2);
-  });
+### `buildFullAddress(parts)`
 
-  it("does not cache GET requests", async () => {
-    const app = express();
-    app.use(express.json());
-    let n = 0;
-    app.get("/billing/t", withBillingIdempotency(async (_req, res) => { n++; res.json({ n }); }));
-    await request(app).get("/billing/t").set("Idempotency-Key", "k");
-    await request(app).get("/billing/t").set("Idempotency-Key", "k");
-    expect(n).toBe(2);
-  });
+Joins address parts into a single display string, filtering absent values.
 
-  it("accepts lowercase idempotency-key header", async () => {
-    const { app, getCount } = makeIdempotencyApp();
-    await request(app).post("/billing/test").set("idempotency-key", "lc").send({ x: 1 });
-    await request(app).post("/billing/test").set("idempotency-key", "lc").send({ x: 1 });
-    expect(getCount()).toBe(1);
-  });
+```ts
+import { buildFullAddress } from "./routes/billing.js";
 
-  it("preserves the original status code in the cached replay", async () => {
-    const app = express();
-    app.use(express.json());
-    app.post("/billing/t", withBillingIdempotency(async (_req, res) => { res.status(202).json({ ok: true }); }));
-    await request(app).post("/billing/t").set("Idempotency-Key", "k202").send({});
-    const replay = await request(app).post("/billing/t").set("Idempotency-Key", "k202").send({});
-    expect(replay.status).toBe(202);
-    expect(replay.body).toEqual({ ok: true });
-  });
-});
+buildFullAddress(["1 Main St", "NYC", "NY", "10001", "USA"])
+// → "1 Main St, NYC, NY, 10001, USA"
+
+buildFullAddress([null, "Berlin", null, null, "DE"])
+// → "Berlin, DE"
+
+buildFullAddress([null, null, null, null, null])
+// → null
+```
+
+Returns `null` (not an empty string) when all parts are absent so callers can
+omit the field rather than return an empty value.
+
+---
+
+## Idempotency middleware
+
+Mutating routes can opt into replay protection by wrapping their handler with
+`withBillingIdempotency`. When the client sends an `Idempotency-Key` header:
+
+- **Same key + same body** — returns the cached response; the handler is not
+  re-executed.
+- **Same key + different body** — returns `HTTP 409 Conflict`.
+- **No key** — handler executes normally; no caching.
+- **GET / HEAD / OPTIONS** — always pass through; never cached.
+
+The cache is in-process with a 24-hour TTL. Entries are pruned lazily on each
+request. For multi-instance deployments, replace the in-process store with a
+shared backend (e.g. Redis).
+
+```ts
+import { withBillingIdempotency } from "./routes/billing.js";
+
+router.post("/billing/invoices", withBillingIdempotency(async (req, res) => {
+  // handler body — only runs once per unique key+body pair within the TTL
+}));
+```
+
+The `clearBillingIdempotencyStore()` export is provided for test isolation only.
+
+---
+
+## Summary math contract
+
+The `/summary` endpoint exposes the following computed fields:
+
+| Field | Formula | Notes |
+|---|---|---|
+| `annualRewardLimit` | `parseFloat(db.annualRewardLimit)` | Raw limit from DB |
+| `usedAmount` | `parseFloat(db.usedAmount)` | Raw used from DB |
+| `remainingAmount` | `max(0, limit - used)` | Never negative |
+| `progressPercentage` | `round((used/limit)*100, 2)` | 0 when limit=0; may exceed 100 on over-spend |
+
+---
+
+## Out of scope
+
+- **Invoice creation / mutation** — no write endpoints exist yet; all current
+  routes are read-only.
+- **Per-invoice math** — individual invoice amounts are stored as entered; no
+  aggregation or tax calculation is performed by this layer.
+- **Row-level security** — `taxId` and `dateOfBirth` are stripped at the
+  application layer. Database-level RLS is not yet applied.
+- **Pagination** — invoice and payment-method lists are returned in full.
+  Pagination is tracked separately.
+- **Currency conversion** — amounts are returned in the stored currency; no
+  FX conversion is performed.

@@ -221,6 +221,8 @@ Database schema migrations are managed using Drizzle Kit. To bootstrap or update
    pnpm db:migrate
    ```
 
+> **Naming Convention**: All migration filenames in `src/db/migrations` must start with a 13 to 14 digit timestamp prefix (e.g., `20240101123000_add_users.sql`). This ensures migrations are ordered chronologically and unambiguously. This rule is enforced in CI via `pnpm check:migrations`.
+
 Migration execution uses a StelloPay-namespaced PostgreSQL advisory lock. If another
 migration process is already running against the same database, subsequent runs wait
 for it to finish; the lock is released after either success or failure.
@@ -278,8 +280,9 @@ pnpm test:coverage   # run with a coverage report
 ```
 
 Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
-the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the build and tests
-on every push and pull request.
+the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the lint, build,
+audit, and tests on every push and pull request, and runs a standalone dependency
+vulnerability audit every Monday.
 
 ### Dependency Maintenance
 
@@ -302,6 +305,43 @@ pnpm audit --prod --audit-level high
 
 The CI workflow fails pull requests when production dependencies contain high or
 critical advisories, then runs linting, build, and tests.
+
+### CI Workflows
+
+All automation lives in `.github/workflows/ci.yml`.
+
+#### Push / PR job (`test`)
+
+Runs on every push and pull request targeting `main`, and on manual dispatch. It:
+
+1. Spins up a Postgres 16 service container and applies all Drizzle migrations.
+2. Runs `pnpm lint`, `pnpm build`, and `pnpm test`.
+3. Runs `pnpm audit --prod --audit-level high` — the workflow fails if production
+   dependencies contain high or critical advisories, blocking the merge.
+
+#### Scheduled dependency audit (`dependency-audit`)
+
+Runs every **Monday at 09:00 UTC** (independent of pushes and pull requests) and
+also on manual dispatch via `workflow_dispatch`. It:
+
+1. Installs dependencies from the frozen lockfile.
+2. Runs `pnpm audit --prod --audit-level high`.
+3. On a scheduled run: if high or critical advisories are found, automatically
+   opens (or updates) a GitHub issue labelled `security` + `dependencies` with a
+   link to the failing run and remediation steps.
+4. On a push/PR run: re-exits with a non-zero code so the workflow shows red and
+   the failure is visible to reviewers before merging.
+
+The two jobs are fully independent — the scheduled audit never interferes with the
+push/PR build, and the push/PR build never skips the lint/test/build gate.
+
+To trigger the audit manually without waiting for the weekly schedule:
+
+```bash
+# From the GitHub UI: Actions → CI → Run workflow
+# Or via the CLI:
+gh workflow run ci.yml
+```
 
 ### Linting and formatting
 
@@ -945,3 +985,12 @@ Redis via [`rate-limit-redis`](https://www.npmjs.com/package/rate-limit-redis)).
 to the `rateLimit` call inside the factory (see the marked `store` comment in
 [`src/middleware/rate-limit.ts`](src/middleware/rate-limit.ts)). No call sites
 change.
+
+### System Verification & Audit
+
+The codebase includes comprehensive verification patterns:
+- **Drizzle Foreign Key Index Consistency**: Automated checks in `src/db/schema-fk-indexes.ts` ensure all `*_id` foreign key columns are indexed.
+- **Address Normalization**: `normalizeStarknetAddress` enforces canonical 66-character lower-case hex format and SNIP-23 checksum validation.
+- **Starknet Failover**: `STARKNET_RPC_URL` supports comma-separated RPC endpoints with automatic failover.
+- **Auth Session Family Revocation**: Session token rotation with `familyId` revocation protects against refresh token replay attacks.
+
