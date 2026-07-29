@@ -71,8 +71,14 @@ export function getTokenInfo(tokenAddress: string | null | undefined): TokenInfo
  * zeros in the fraction are trimmed. Callers that want a shorter display precision
  * (e.g. STRK shown with 6 fraction digits in the transactions route) truncate the
  * returned string themselves.
+ * 
+ * @throws {TypeError} If `decimals` is not an integer or is outside the range 0-30.
  */
 export function formatTokenAmount(amount: string | bigint | null | undefined, decimals: number): string {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 30) {
+    throw new TypeError(`Invalid decimals value: ${decimals}. Expected an integer between 0 and 30.`);
+  }
+
   if (amount === null || amount === undefined || amount === "" || amount === "0" || amount === 0n) {
     return "0";
   }
