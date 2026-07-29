@@ -48,6 +48,7 @@ vi.mock("./diagnostics-metrics.js", () => ({
 vi.mock("../db/index.js", () => ({
   db: { execute: vi.fn() },
   getPoolStats: vi.fn(() => ({ total: 8, idle: 3, active: 5, waiting: 2 })),
+  checkDbHealth: vi.fn(),
   schema: {},
 }));
 
@@ -60,6 +61,7 @@ vi.mock("../starknet/client.js", () => ({
       openedAt: null,
     },
   ]),
+  provider: { getChainId: vi.fn() },
 }));
 
 import {
@@ -69,9 +71,9 @@ import {
   withDiagnosticsIdempotency,
   clearDiagnosticsIdempotencyStore,
 } from "./diagnostics.js";
-import { db, getPoolStats } from "../db/index.js";
+import { db, getPoolStats, checkDbHealth } from "../db/index.js";
 import { requireSession } from "../auth/session.js";
-import { getCircuitBreakerSnapshots } from "../starknet/client.js";
+import { getCircuitBreakerSnapshots, provider } from "../starknet/client.js";
 import {
   logDiagnosticsEvent,
   incDiagnosticsMetric,
@@ -389,6 +391,185 @@ describe("clearDiagnosticsIdempotencyStore", () => {
     await wrapped(req, res, vi.fn());
     expect(handler).toHaveBeenCalledTimes(2);
   });
+});
+
+describe("GET /diagnostics/health – dependency connectivity checks", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(requireSession).mockResolvedValue(true);
+    vi.mocked(checkDbHealth).mockResolvedValue(true);
+    vi.mocked(provider.getChainId).mockResolvedValue("0x534e5f4d41494e");
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("rejects unauthenticated requests with 401", async () => {
+    const res = await request(makeApp()).get("/api/v1/diagnostics/health");
+    expect(res.status).toBe(401);
+    expect(checkDbHealth).not.toHaveBeenCalled();
+  });
+
+  it("rejects authenticated non-admin with 403", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(NON_ADMIN));
+    expect(res.status).toBe(403);
+    expect(checkDbHealth).not.toHaveBeenCalled();
+  });
+
+  it("returns healthy when all dependencies are up", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("healthy");
+    expect(res.body.checks.database.status).toBe("healthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+    expect(res.body.checks.database.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(res.body.checks.starknet.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(checkDbHealth).toHaveBeenCalledOnce();
+    expect(provider.getChainId).toHaveBeenCalledOnce();
+  });
+
+  it("returns unhealthy overall when DB is down", async () => {
+    vi.mocked(checkDbHealth).mockResolvedValue(false);
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+  });
+
+  it("returns unhealthy overall when DB check throws", async () => {
+    vi.mocked(checkDbHealth).mockRejectedValue(new Error("db connection refused"));
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+  });
+
+  it("returns unhealthy overall when Starknet RPC is unreachable", async () => {
+    vi.mocked(provider.getChainId).mockRejectedValue(new Error("RPC timeout"));
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("healthy");
+    expect(res.body.checks.starknet.status).toBe("unhealthy");
+  });
+
+  it("returns unhealthy when both dependencies are down", async () => {
+    vi.mocked(checkDbHealth).mockRejectedValue(new Error("db down"));
+    vi.mocked(provider.getChainId).mockRejectedValue(new Error("rpc down"));
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("unhealthy");
+  });
+
+  it("returns a timeout error when DB check hangs", async () => {
+    vi.mocked(checkDbHealth).mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve(true), 10_000)),
+    );
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+    expect(res.body.checks.database.latencyMs).toBeGreaterThanOrEqual(0);
+  }, 10_000);
+
+  it("returns a timeout error when Starknet RPC check hangs", async () => {
+    vi.mocked(provider.getChainId).mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve("0x1"), 10_000)),
+    );
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("healthy");
+    expect(res.body.checks.starknet.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.latencyMs).toBeGreaterThanOrEqual(0);
+  }, 10_000);
+
+  it("does not leak connection strings, credentials, or RPC URLs in the response", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toMatch(/postgres/i);
+    expect(bodyStr).not.toMatch(/password/i);
+    expect(bodyStr).not.toMatch(/connection/i);
+    expect(bodyStr).not.toMatch(/http/i);
+    expect(bodyStr).not.toMatch(/rpc\./i);
+  });
+
+  it("returns valid response shape on every call", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("status");
+    expect(res.body).toHaveProperty("checks");
+    expect(res.body.checks).toHaveProperty("database");
+    expect(res.body.checks).toHaveProperty("starknet");
+    expect(res.body.checks.database).toHaveProperty("status");
+    expect(res.body.checks.database).toHaveProperty("latencyMs");
+    expect(res.body.checks.starknet).toHaveProperty("status");
+    expect(res.body.checks.starknet).toHaveProperty("latencyMs");
+  });
+
+  it("runs both checks concurrently", async () => {
+    let dbStart = 0;
+    let snStart = 0;
+    vi.mocked(checkDbHealth).mockImplementation(async () => {
+      dbStart = Date.now();
+      await new Promise((r) => setTimeout(r, 50));
+      return true;
+    });
+    vi.mocked(provider.getChainId).mockImplementation(async () => {
+      snStart = Date.now();
+      await new Promise((r) => setTimeout(r, 50));
+      return "0x534e5f4d41494e";
+    });
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("healthy");
+
+    const totalMs = res.body.checks.database.latencyMs + res.body.checks.starknet.latencyMs;
+    expect(totalMs).toBeLessThan(200);
+  }, 10_000);
 });
 
 describe("GET /diagnostics/events – pagination and query parameter edge cases", () => {
