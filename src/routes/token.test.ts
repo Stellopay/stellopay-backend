@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ZodError } from "zod";
 
 const {
   callContract,
@@ -48,6 +49,10 @@ vi.mock("starknet", async (importOriginal) => {
 import { clearTokenMetadataCache, getTokenMetadata, tokenRouter } from "./token.js";
 
 const CANONICAL_TOKEN = `0x${"0".repeat(61)}abc`;
+const CANONICAL_WALLET = `0x${"0".repeat(61)}123`;
+const CANONICAL_SPENDER = `0x${"0".repeat(61)}456`;
+const CANONICAL_OWNER = `0x${"0".repeat(63)}1`;
+const CANONICAL_ALLOWANCE_SPENDER = `0x${"0".repeat(63)}2`;
 
 function mockMetadataCalls() {
   callContract.mockImplementation(({ entrypoint }: { entrypoint: string }) => {
@@ -66,7 +71,7 @@ function makeApp() {
   app.use("/api/v1", tokenRouter);
   app.use(
     (error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      res.status(500).json({ error: error.message });
+      res.status(error instanceof ZodError ? 400 : 500).json({ error: error.message });
     },
   );
   return app;
@@ -191,12 +196,15 @@ describe("existing token routes", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
-      token: "0xabc",
-      owner: "0x1",
-      spender: "0x2",
+      token: CANONICAL_TOKEN,
+      owner: CANONICAL_OWNER,
+      spender: CANONICAL_ALLOWANCE_SPENDER,
       allowance: "0xf",
     });
-    expect(contractCall).toHaveBeenCalledWith("allowance", ["0x1", "0x2"]);
+    expect(contractCall).toHaveBeenCalledWith("allowance", [
+      CANONICAL_OWNER,
+      CANONICAL_ALLOWANCE_SPENDER,
+    ]);
   });
 
   it("unwraps an allowance result object", async () => {
@@ -220,7 +228,36 @@ describe("existing token routes", () => {
 
     expect(response.status).toBe(401);
     expect(response.body).toEqual({ error: "Invalid session" });
+    expect(requireSession).toHaveBeenCalledWith(CANONICAL_WALLET, "session-token");
     expect(contractPopulate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed session wallet before checking the session", async () => {
+    const response = await request(makeApp()).post("/api/v1/prepare/token/0xabc/approve").send({
+      wallet_address: "not-hex",
+      session_token: "session-token",
+      spender: "0x456",
+      amount: "5",
+    });
+
+    expect(response.status).toBe(400);
+    expect(requireSession).not.toHaveBeenCalled();
+    expect(contractPopulate).not.toHaveBeenCalled();
+    expect(getNonceForAddress).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed spender before checking the session", async () => {
+    const response = await request(makeApp()).post("/api/v1/prepare/token/0xabc/approve").send({
+      wallet_address: "0x123",
+      session_token: "session-token",
+      spender: "not-hex",
+      amount: "5",
+    });
+
+    expect(response.status).toBe(400);
+    expect(requireSession).not.toHaveBeenCalled();
+    expect(contractPopulate).not.toHaveBeenCalled();
+    expect(getNonceForAddress).not.toHaveBeenCalled();
   });
 
   it("prepares an approve call for an authenticated wallet", async () => {
@@ -239,10 +276,15 @@ describe("existing token routes", () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
       call: { entrypoint: "approve" },
-      wallet_address: "0x123",
+      wallet_address: CANONICAL_WALLET,
       nonce: "0x1",
       chain_id: "0x534e5f5345504f4c4941",
     });
-    expect(contractPopulate).toHaveBeenCalledWith("approve", ["0x456", { low: "5", high: "0" }]);
+    expect(requireSession).toHaveBeenCalledWith(CANONICAL_WALLET, "session-token");
+    expect(contractPopulate).toHaveBeenCalledWith("approve", [
+      CANONICAL_SPENDER,
+      { low: "5", high: "0" },
+    ]);
+    expect(getNonceForAddress).toHaveBeenCalledWith(CANONICAL_WALLET, "pending");
   });
 });

@@ -8,15 +8,13 @@ import { env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { StarknetAddress } from "../utils/validation.js";
 
-
-
 const WalletSession = z.object({
-  wallet_address: z.string().min(3),
+  wallet_address: StarknetAddress,
   session_token: z.string().min(10),
 });
 
 const ApproveBody = WalletSession.extend({
-  spender: z.string().min(3),
+  spender: StarknetAddress,
   amount: z.string().min(1),
 });
 
@@ -207,8 +205,6 @@ tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
       return;
     }
 
-    // Validate spender address format (no normalization to preserve raw input)
-    StarknetAddress.parse(body.spender);
     const spender = body.spender;
 
     const tokenContract = new (await import("starknet")).Contract(
@@ -220,5 +216,7 @@ tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
     res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
 });
