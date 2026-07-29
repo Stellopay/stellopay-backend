@@ -1,7 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll } from "vitest";
 import express from "express";
 import request from "supertest";
-import { requestIdMiddleware } from "./request-id.js";
+import { requestIdMiddleware, sanitiseClientId, MAX_REQUEST_ID_LENGTH } from "./request-id.js";
 import { requestIdContext, initLogger, originalConsole } from "../utils/logger.js";
 
 /** Call the middleware directly with a hand-crafted req so we can test
@@ -34,7 +34,7 @@ function makeApp() {
     next(err);
   });
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({
       error: err.message,
@@ -138,6 +138,32 @@ describe("requestIdMiddleware", () => {
     expect(res.headers["x-request-id"]).toBe(id);
   });
 
+  // ── Direct sanitiseClientId Unit Tests ───────────────────────────────────
+
+  describe("sanitiseClientId helper", () => {
+    it("returns null for undefined or empty string", () => {
+      expect(sanitiseClientId(undefined)).toBeNull();
+      expect(sanitiseClientId("")).toBeNull();
+    });
+
+    it("returns null when string exceeds MAX_REQUEST_ID_LENGTH", () => {
+      expect(sanitiseClientId("x".repeat(MAX_REQUEST_ID_LENGTH + 1))).toBeNull();
+    });
+
+    it("returns null for non-printable ASCII or control characters", () => {
+      expect(sanitiseClientId("id-with-\n-newline")).toBeNull();
+      expect(sanitiseClientId("id-with-\r-cr")).toBeNull();
+      expect(sanitiseClientId("id-with-\x00-null")).toBeNull();
+      expect(sanitiseClientId("id-with-unicode-🚀")).toBeNull();
+    });
+
+    it("returns the exact string when valid printable ASCII", () => {
+      const valid = "req-12345-abc.XYZ_99";
+      expect(sanitiseClientId(valid)).toBe(valid);
+      expect(sanitiseClientId("a".repeat(MAX_REQUEST_ID_LENGTH))).toBe("a".repeat(MAX_REQUEST_ID_LENGTH));
+    });
+  });
+
   // ── AsyncLocalStorage Concurrency ────────────────────────────────────────
 
   describe("AsyncLocalStorage concurrency", () => {
@@ -178,12 +204,12 @@ describe("requestIdMiddleware", () => {
 
       // Verify the logs output the correct ID due to AsyncLocalStorage isolation
       // req-2 finishes first (50ms)
-      expect(calls[0][0]).toContain("[req-2]");
-      expect(calls[0][1]).toContain("finishing request for ms=50");
+      expect(calls[0][0]).toContain('"request_id":"req-2"');
+      expect(calls[0][0]).toContain("finishing request for ms=50");
 
       // req-1 finishes second (100ms)
-      expect(calls[1][0]).toContain("[req-1]");
-      expect(calls[1][1]).toContain("finishing request for ms=100");
+      expect(calls[1][0]).toContain('"request_id":"req-1"');
+      expect(calls[1][0]).toContain("finishing request for ms=100");
       
       // restore
       originalConsole.info = origInfo;

@@ -10,8 +10,17 @@ export interface UnindexedForeignKeyColumn {
   jsName: string;
 }
 
+const TABLE_CONFIG_CACHE = new WeakMap<Table, ReturnType<typeof getTableConfig>>();
+
+function getCachedTableConfig(table: Table): ReturnType<typeof getTableConfig> {
+  if (!TABLE_CONFIG_CACHE.has(table)) {
+    TABLE_CONFIG_CACHE.set(table, getTableConfig(table));
+  }
+  return TABLE_CONFIG_CACHE.get(table)!;
+}
+
 /**
- * True when the column looks like a relational foreign key (e.g. agreementId → agreement_id).
+ * True when the column looks like a relational foreign key (e.g. agreementId -> agreement_id).
  * Sensitive identifiers such as taxId are excluded.
  */
 export function isForeignKeyShapedColumn(
@@ -72,19 +81,23 @@ function readConstraintColumns(constraint: unknown): readonly unknown[] {
 }
 
 /** SQL column names covered by indexes, primary keys, or unique constraints on the table. */
-export function getIndexedColumnSqlNames(table: Table): Set<string> {
-  const config = getTableConfig(table);
+export function getIndexedColumnSqlNames(table: Table, config?: ReturnType<typeof getTableConfig>): Set<string> {
+  const tableConfig = config ?? getCachedTableConfig(table);
+  if (!tableConfig) {
+    return new Set();
+  }
+
   const indexed = new Set<string>();
 
-  for (const primaryKey of config.primaryKeys) {
+  for (const primaryKey of tableConfig.primaryKeys) {
     addColumnNames(indexed, readConstraintColumns(primaryKey));
   }
 
-  for (const tableIndex of config.indexes) {
+  for (const tableIndex of tableConfig.indexes) {
     addColumnNames(indexed, readConstraintColumns(tableIndex));
   }
 
-  for (const uniqueConstraint of config.uniqueConstraints) {
+  for (const uniqueConstraint of tableConfig.uniqueConstraints) {
     addColumnNames(indexed, readConstraintColumns(uniqueConstraint));
   }
 
@@ -96,7 +109,11 @@ export function getIndexedColumnSqlNames(table: Table): Set<string> {
  */
 export function findUnindexedForeignKeyColumns(table: Table): UnindexedForeignKeyColumn[] {
   const tableName = getTableName(table);
-  const indexedColumns = getIndexedColumnSqlNames(table);
+  const config = getCachedTableConfig(table);
+  if (!config) {
+    return [];
+  }
+  const indexedColumns = getIndexedColumnSqlNames(table, config);
   const offenders: UnindexedForeignKeyColumn[] = [];
 
   for (const [jsName, column] of Object.entries(getTableColumns(table))) {
@@ -134,9 +151,13 @@ export function findUnindexedForeignKeyColumnsInSchema(
 }
 
 /**
- * Asserts every FK-shaped column in the schema module has a supporting index.
+ * Validates the schema contract: every FK-shaped column must have a supporting index.
+ *
+ * This is the single entry point for schema validation. It replaces ad-hoc calls to
+ * `assertSchemaForeignKeyIndexes` and `findUnindexedForeignKeyColumnsInSchema` in tests,
+ * ensuring the schema contract is checked through one tight path.
  */
-export function assertSchemaForeignKeyIndexes(schemaModule: Record<string, unknown>): void {
+export function validateSchema(schemaModule: Record<string, unknown>): void {
   const unindexed = findUnindexedForeignKeyColumnsInSchema(schemaModule);
 
   if (unindexed.length === 0) {
@@ -151,4 +172,11 @@ export function assertSchemaForeignKeyIndexes(schemaModule: Record<string, unkno
     `Foreign-key-shaped column(s) missing an index: ${details}. ` +
       "Add a Drizzle index() on the column or document an exclusion in schema-fk-indexes.ts.",
   );
+}
+
+/**
+ * @deprecated Use {@link validateSchema} instead. Kept for backward compatibility.
+ */
+export function assertSchemaForeignKeyIndexes(schemaModule: Record<string, unknown>): void {
+  validateSchema(schemaModule);
 }

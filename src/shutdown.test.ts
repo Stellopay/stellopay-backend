@@ -176,6 +176,111 @@ describe("Graceful Shutdown", () => {
 
     expect(callOrder).toEqual(["server.close", "pool.close"]);
   });
+
+  // ── Force-exit timeout guard tests (issue #144) ───────────────────────────
+
+  it("force-exit guard fires when server.close hangs beyond forceExitTimeoutMs", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // server.close never calls back — simulates a hung server_close step
+    mockServer.close = vi.fn(() => {}); // no callback ever
+
+    setupGracefulShutdown(
+      mockServer as unknown as Server,
+      mockClosePool,
+      10_000,
+      3_000, // forceExitTimeoutMs shorter than drain
+    );
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    handler("SIGTERM");
+
+    expect(mockServer.close).toHaveBeenCalled();
+
+    // Advance past force-exit timeout
+    vi.advanceTimersByTime(3_001);
+    await Promise.resolve(); // flush microtasks
+
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+    const errCall = errorSpy.mock.calls.find((c: any) =>
+      c[0].includes("Force-exit timeout"),
+    );
+    expect(errCall).toBeDefined();
+    expect(errCall[0]).toMatch(/server_close/);
+
+    errorSpy.mockRestore();
+  });
+
+  it("force-exit guard names the stuck step as pool_close when pool hangs", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    let resolve!: () => void;
+    mockClosePool.mockReturnValue(new Promise<void>((r) => { resolve = r; }));
+
+    setupGracefulShutdown(
+      mockServer as unknown as Server,
+      mockClosePool,
+      10_000,
+      5_000,
+    );
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    handler("SIGTERM");
+    mockServer._closeCallback(); // server closes fine
+
+    // Advance past force-exit timeout
+    vi.advanceTimersByTime(5_001);
+    await Promise.resolve();
+
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+    const errCall = errorSpy.mock.calls.find((c: any) =>
+      c[0].includes("Force-exit timeout"),
+    );
+    expect(errCall).toBeDefined();
+    expect(errCall[0]).toMatch(/pool_close/);
+
+    errorSpy.mockRestore();
+    resolve();
+  });
+
+  it("force-exit guard does NOT fire on a normal fast shutdown", async () => {
+    setupGracefulShutdown(
+      mockServer as unknown as Server,
+      mockClosePool,
+      10_000,
+      15_000,
+    );
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    const shutdownPromise = handler("SIGTERM");
+    await mockServer._closeCallback();
+    await shutdownPromise;
+
+    // Normal exit with 0 — force guard never fired
+    expect(processExitSpy).toHaveBeenCalledWith(0);
+    expect(processExitSpy).not.toHaveBeenCalledWith(1);
+  });
+
+  it("forceExitTimeoutMs defaults to drainTimeoutMs + 5000 when not supplied", async () => {
+    // With drain=1000, force should default to 6000. Advance to 5999 → no exit.
+    // This test just verifies the guard isn't shorter than drain by default.
+    setupGracefulShutdown(mockServer as unknown as Server, mockClosePool, 1_000);
+
+    const sigtermHandlerCall = processOnSpy.mock.calls.find((call: any) => call[0] === "SIGTERM");
+    const handler = sigtermHandlerCall[1];
+
+    handler("SIGTERM");
+    // Don't call server close callback — drain fires at 1001ms, not force guard
+    vi.advanceTimersByTime(1_001);
+
+    // Drain timeout fires first (process.exit(1) from drain timer)
+    expect(processExitSpy).toHaveBeenCalledWith(1);
+  });
 });
 
 describe("Graceful Shutdown HTTP integration", () => {

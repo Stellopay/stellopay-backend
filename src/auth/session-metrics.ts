@@ -35,6 +35,7 @@ export type SessionEventName =
   | "session.family_revoked"
   | "session.all_revoked"
   | "session.sweep_completed"
+  | "session.sweep_batch"
   | "session.sweep_failed"
   | "session.sweeper_crashed"
   | "session.revoke_retry"

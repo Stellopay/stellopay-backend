@@ -1,122 +1,144 @@
-# Event Reprocessing Routes
+# Reprocess Events Routes
 
-Base path: `/api/v1/reprocess-events`
+Routes for re-decoding and re-processing on-chain events that were previously stored with a generic `AgreementStatusChange` type. These endpoints are owned by `src/routes/reprocess-events.ts` and are the single source of truth for event reprocessing, retry budgets, and quarantine status reporting.
 
-All three routes require the caller to be authenticated (`requireAuth`) and
-hold an admin role (`requireAdmin`). Unauthenticated or non-admin requests
-receive a `401`/`403` before any of the logic below runs.
+All endpoints require authentication (`requireAuth` + `requireAdmin`).
 
-## `POST /reprocess-events/tx/:tx_hash`
+## Endpoints
 
-Reprocess a single transaction's events to (re)decode their event names.
+### `POST /reprocess-events/tx/:tx_hash`
 
-- **Params**: `:tx_hash` — a Starknet transaction hash (0x-prefixed, 3–66
-  hex characters).
-- **Response** `200`:
-  ```json
-  { "message": "Events reprocessed", "result": { "txHash": "...", "status": "processed", "eventsProcessed": 1, "eventLabels": ["AgreementCreated-123"], "tokenVerified": true } }
-  ```
-- **Errors**: `400` invalid hash format, `404` transaction not found.
-- Delegates to the shared `processTxReceipt` (see `src/routes/events.ts`),
-  which persists rows with `ON CONFLICT DO NOTHING` keyed on
-  `transaction_hash + event_index` — re-running the same tx is a safe no-op.
+Reprocess events for a single transaction.
 
-## `POST /reprocess-events/batch`
+**Validation**
+- `:tx_hash` must be a valid Starknet transaction hash (0x-prefixed, 3–66 chars).
 
-Reprocess events for multiple transactions in one request.
+**Success response (200)**
+```json
+{
+  "message": "Events reprocessed",
+  "result": {
+    "txHash": "0x...",
+    "status": "processed | no_events | not_found | error",
+    "eventsProcessed": 0,
+    "eventLabels": [],
+    "tokenVerified": true | false | undefined,
+    "error": "string (only when status is error)"
+  }
+}
+```
 
-- **Body**: `{ "tx_hashes": string[] }` — 1 to `MAX_BATCH_SIZE` (50) hashes.
-- **Response** `200`:
-  ```json
-  {
-    "summary": {
-      "total": 2,
-      "processed": 1,
-      "noEvents": 0,
-      "notFound": 0,
-      "errors": 0,
-      "totalEventsProcessed": 3,
-      "duplicates": 1
+**Failure responses**
+- `400` – invalid `tx_hash` format
+- `404` – transaction not found on-chain
+- `500` – unexpected server error
+
+### `POST /reprocess-events/batch`
+
+Reprocess events for multiple transactions. Per-tx errors never abort the rest of the batch.
+
+**Validation**
+- `tx_hashes` must be a non-empty array of valid Starknet tx hashes.
+- Maximum of **50** hashes per request (`MAX_BATCH_SIZE`).
+
+**Retry budget**
+- Up to **50** transactions per request.
+- Each hash is processed independently; failures are captured per result.
+
+**Success response (200)**
+```json
+{
+  "summary": {
+    "total": 2,
+    "processed": 1,
+    "noEvents": 0,
+    "notFound": 0,
+    "errors": 1,
+    "totalEventsProcessed": 1
+  },
+  "results": [
+    {
+      "txHash": "0x...",
+      "status": "processed | no_events | not_found | error",
+      "eventsProcessed": 0,
+      "eventLabels": [],
+      "tokenVerified": true | false | undefined,
+      "error": "string (only when status is error)"
+    }
+  ]
+}
+```
+
+**Failure responses**
+- `400` – validation failure (empty array, invalid hash format, oversized array)
+- `500` – unexpected server error
+
+### `POST /reprocess-events/status-changes`
+
+Reprocess all `AgreementStatusChange` events to decode their actual names. Only events still tagged as `AgreementStatusChange` are processed; already-updated events are automatically skipped. Re-runs are safe no-ops at the database level.
+
+**Validation**
+- `limit` (query, optional, default 100, max **1000**)
+- `fromBlock` / `toBlock` (query, optional) — filter by block number range
+
+**Retry budget**
+- Up to **1000** events per request (`MAX_STATUS_LIMIT`).
+- Unrecoverable events are reported in the response instead of failing the whole request.
+
+**Quarantine and retry statuses**
+
+Each event returns a `results` entry. The per-event statuses below act as a quarantine policy — unrecoverable events are surfaced to the caller rather than dropped.
+
+| Status | Meaning | Retry advice |
+|--------|---------|--------------|
+| `updated` | Event type was successfully decoded and updated in the database. | None. |
+| `no_change` | Event remains `AgreementStatusChange` after ABI and selector fallback. | Re-run later or inspect manually. |
+| `dedup_skipped` | Duplicate `transaction_hash + event_index` within the same request. | None; dedup is per-request only. |
+| `no_receipt` | Provider returned no receipt for the transaction hash. | Retry the single-tx endpoint after RPC recovery. |
+| `event_not_found` | Receipt exists but lacks the expected event index. | Inspect receipt manually; likely a chain reorg or indexing lag. |
+| `error` | Unexpected error while decoding or persisting the event. | Inspect `error` message and retry if transient. |
+
+**Success response (200)**
+```json
+{
+  "message": "Reprocessed 10 events, updated 8",
+  "updated": 8,
+  "results": [
+    {
+      "eventId": "0x..._0",
+      "status": "updated",
+      "oldType": "AgreementStatusChange",
+      "newType": "AgreementActivated"
     },
-    "results": [ /* one entry per input hash, same order/length as tx_hashes */ ]
-  }
-  ```
-- **Errors**: `400` on an empty/oversized array or an invalid hash format.
+    {
+      "eventId": "0x..._1",
+      "status": "no_change",
+      "eventType": "AgreementStatusChange"
+    }
+  ]
+}
+```
 
-### Batching contract
+**Failure responses**
+- `400` – validation failure (invalid `limit`, negative block numbers)
+- `500` – unexpected server error
 
-- **Max batch size**: at most `MAX_BATCH_SIZE` (50) hashes per request; a
-  larger array is rejected with `400` before any processing starts.
-- **Per-tx error isolation**: a failure processing one hash (e.g. an RPC
-  error) is captured into that hash's `results` entry with
-  `status: "error"` and never aborts the rest of the batch.
-- **Duplicate-hash dedup**: hashes are deduplicated using their
-  `normalizeTransactionHash` form, so two spellings of the same hash (e.g.
-  a padded 66-char hash vs. an unpadded one) are recognized as the same
-  transaction. Each unique hash is passed to `processTxReceipt` **exactly
-  once**, regardless of how many times it appears in the request. The
-  `results` array still has the same length and index-correspondence as
-  the input `tx_hashes` array — duplicate entries reuse the first
-  occurrence's result object rather than being recomputed. `summary.total`
-  is still `tx_hashes.length`; `summary.duplicates` reports how many
-  entries were duplicates of an earlier hash in the same request. This
-  keeps `summary.processed`/`totalEventsProcessed` an accurate reflection
-  of the RPC calls actually made, while preserving positional
-  compatibility for existing callers.
+## Shared Behavior
 
-## `POST /reprocess-events/status-changes`
+### Idempotency
 
-Reprocess all events still tagged `AgreementStatusChange` so their real
-event name can be decoded from the on-chain receipt.
+All three endpoints delegate to `processTxReceipt` or use `ON CONFLICT DO NOTHING` keys. Re-submitting identical input produces no duplicate rows.
 
-- **Query params**:
-  - `limit` (optional, default `100`, max `1000`)
-  - `fromBlock` (optional) — only events at or above this block number
-  - `toBlock` (optional) — only events at or below this block number
-- **Response** `200`:
-  ```json
-  {
-    "message": "Reprocessed 2 events, updated 1",
-    "updated": 1,
-    "results": [ { "eventId": "...", "status": "updated", "oldType": "AgreementStatusChange", "newType": "AgreementActivated" } ],
-    "hasMore": false
-  }
-  ```
-- **Errors**: `400` on invalid query params.
+### Error handling
 
-### Pagination contract
+Validation errors now extract the first Zod `issue.message` (Zod v4 compatible) and return it as `{ error: "..." }` with a `400` status. Outer catch-all errors return `500`.
 
-- **Deterministic order**: matching rows are ordered by `block_number ASC,
-  event_index ASC`. This makes repeated calls with the same filters
-  page through the backlog in a stable, forward-progressing order instead
-  of relying on the database's unspecified default row order (which
-  Postgres does **not** guarantee without an explicit `ORDER BY`).
-- **`hasMore` flag**: `true` whenever the page returned exactly `limit`
-  rows, signaling that more matching rows may exist beyond this page.
-  `false` when fewer than `limit` rows were returned (the backlog for the
-  given filters is exhausted).
-- **Paging forward**: since the response only returns event-level
-  results (not raw block numbers), a caller that wants to page through a
-  large backlog should track the highest `blockNumber` it has seen among
-  successfully-updated events (via a side query, or by widening `limit`)
-  and re-invoke the endpoint with `fromBlock` set to one past that block.
-  Combined with the deterministic ordering above, this guarantees forward
-  progress across calls.
+### Repeated-work reduction
 
-### Known limitations / out of scope
+`POST /reprocess-events/status-changes` caches `Contract` instances by contract address in a per-request `Map`. When multiple events share the same address, the parser instance is reused instead of re-instantiated per event.
 
-There is **no persistent retry-count or quarantine state** for events that
-repeatedly fail to update in `/status-changes` (statuses `no_receipt`,
-`event_not_found`, or `error`). Because such events never have their
-`eventType` changed away from `AgreementStatusChange`, they remain
-eligible for reprocessing on **every** subsequent call unless the caller
-manually advances `fromBlock` past them.
+## Edge Cases Out of Scope
 
-Adding real retry-count/quarantine tracking would require a schema
-migration (a new column on `agreement_events`, e.g. `retry_count` or
-`quarantined_at`) and is intentionally **out of scope** for this change.
-The deterministic ordering and `hasMore` signal above are a lighter-weight
-fix that stabilizes the pagination contract without touching the schema;
-operators who need to skip permanently-stuck rows should advance
-`fromBlock` past them manually until quarantine tracking is added in a
-follow-up.
+- Soft-delete or purge of `AgreementStatusChange` rows is not provided by these routes.
+- Cross-contract selector collisions are not validated; the selectors map is best-effort fallback only.
+- The `dedup_skipped` quarantine state is per-request only and is not persisted across deployments.

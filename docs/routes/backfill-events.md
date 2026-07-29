@@ -1,106 +1,80 @@
-# Backfill Events
+# Backfill Events Routes
 
-**Overview:**
-The backfill endpoints allow administrators to synthesize events for employees and milestones that exist in the database but have not yet emitted or indexed their corresponding events (`EmployeeAdded` or `MilestoneAdded`).
+The backfill routes (`src/routes/backfill-events.ts`) handle synthetic backfilling of
+indexer events for `EmployeeAdded` and `MilestoneAdded` event types.
 
-These endpoints are used to restore a consistent indexer state safely.
+## Resume Tokens and Replay Windows
 
-## Endpoints
+### Input aliases
 
-- `POST /api/v1/backfill/employee-events`
-- `POST /api/v1/backfill/milestone-events`
+Three query-parameter names all feed the same replay-window boundary.
+Any caller that supplies **one** of them will continue to work unchanged.
 
-### Authentication and Authorization
-Both routes require an active admin session (`requireAuth` + `requireAdmin`).
+| Parameter      | Type   | Description                                      |
+|----------------|--------|--------------------------------------------------|
+| `before`       | string | ISO-8601 date. Primary parameter name.           |
+| `resumeToken`  | string | Alias for `before`.                              |
+| `cursor`       | string | Alias for `before`.                              |
 
-### Query Parameters
+If more than one is provided, the resolved value is determined by the
+well-defined precedence **`before` → `resumeToken` → `cursor`**.  This is a
+tiebreaker, not a validation error — old callers that happen to send both
+`before` and `resumeToken` (e.g. a client migrating between parameter names)
+always get a deterministic result.
 
-| Parameter     | Type              | Default | Max    | Description                                                     |
-| ------------- | ----------------- | ------- | ------ | ----------------------------------------------------------------|
-| `limit`       | number            | `1000`  | `5000` | Maximum number of rows to scan.                                 |
-| `agreementId` | string            | —       | —      | Restrict backfill to a single agreement.                        |
-| `before`      | ISO-8601 datetime | —       | —      | Resume cursor. Only scans rows with `created_at` strictly older than this timestamp. |
+### Output aliases
 
-*The default limit is defined by `DEFAULT_BACKFILL_LIMIT` (1000) and the maximum is defined by `MAX_BACKFILL_LIMIT` (5000).*
+Every successful response includes three cursor fields that are **always
+identical**:
 
-An invalid `before` value (anything that doesn't parse as a date) is rejected with the same `400 { "error": "<message>" }` shape used for every other validation failure on these routes.
+| Field             | Type          | Description                                           |
+|-------------------|---------------|-------------------------------------------------------|
+| `nextCursor`      | string \| null | Primary cursor name. ISO-8601 `created_at` of the oldest row scanned in this page, or `null` if zero rows were scanned. |
+| `nextResumeToken` | string \| null | Identical to `nextCursor`. Compatibility alias.       |
+| `cursor`          | string \| null | Identical to `nextCursor`. Compatibility alias.       |
 
-Omitting `before` entirely preserves the pre-existing behavior of these endpoints exactly: the newest un-backfilled rows (up to `limit`) are scanned, unbounded by any cursor.
+Callers may read whichever field they were written against; all three will
+always have the same value.
 
-### Resume Tokens and Replay Windows
+### Freshness boundaries
 
-Both endpoints scan rows ordered by `created_at DESC`, so without a cursor every call rescans starting from the newest un-backfilled row. The `before` parameter bounds that scan to a **replay window** older than a previously-seen point in time, and each response returns a **resume token** so a caller can continue from where it left off:
+- **Future dates** — a resume token more than `CLOCK_SKEW_TOLERANCE_MS`
+  (60 seconds) ahead of the server clock are rejected with `400`. A
+  structured warning is logged as `backfill_resume_token_future`.
+- **Past dates** — accepted without bound. Since synthetic event IDs use
+  `ON CONFLICT DO NOTHING`, replaying old tokens is idempotent and harmless.
+- **Clock-skew tolerance** — tokens up to 60 s ahead of `Date.now()` are
+  accepted, allowing for minor differences between client and server clocks.
 
-```json
-{
-  "message": "Backfilled 3 EmployeeAdded events",
-  "totalScanned": 10,
-  "created": 3,
-  "results": [
-    {
-      "employeeId": "emp_1",
-      "agreementId": "agr_123",
-      "status": "created"
-    }
-  ],
-  "nextCursor": "2024-01-01T00:00:00.000Z",
-  "hasMore": true
-}
-```
+### Auto-resume
 
-- `nextCursor` — the ISO-8601 `created_at` of the oldest (last, since results are ordered newest-first) row in the current page, or `null` if zero rows were scanned.
-- `hasMore` — `true` when the number of scanned rows equals the requested `limit` (the page was full and more rows may exist beyond it), `false` otherwise.
+When `before`, `resumeToken`, and `cursor` are all omitted, the route loads
+the persisted checkpoint from `backfill_progress` and uses its `lastCursor`
+as the resume boundary. An explicit parameter always takes precedence over
+the persisted checkpoint.
 
-**Paging through a large backlog:**
+## Checkpoints
 
-1. Call the endpoint with no `before` param.
-2. Take the response's `nextCursor` and pass it as `before` on the next call.
-3. Repeat, always using the most recent response's `nextCursor` as the next request's `before`.
-4. Stop when `hasMore` is `false` or `nextCursor` is `null` — there is nothing older left to scan.
+- Batches of entries dynamically update their persisted checkpoints to safely
+  recover from interruptions without reprocessing everything.
+- The checkpoint batch size (`BACKFILL_CHECKPOINT_BATCH_SIZE = 100`) matches
+  the DB transaction boundary — each batch and its checkpoint commit
+  atomically.
 
-Because each page only requires rows strictly older than the last cursor seen, a caller that crashes or times out mid-backlog can safely restart from the last `nextCursor` it received without re-scanning (or re-processing) rows from completed pages.
+## Backward-compatibility contract (Issue #264)
 
-### Safe and Idempotent Inserts
-
-To guarantee that synthesized backfill events never collide with genuine on-chain events and that operations are safely repeatable — including replaying the same page more than once:
-
-1. **Synthetic Event IDs**:
-   A backfill event uses the format:
-   `{transactionHash}_backfill_{eventType}_{rowId}`
-   *(Implemented via the `buildBackfillEventId` helper).*
-   Because genuine on-chain events use `{txHash}_{eventIndex}`, the `_backfill_` segment ensures collisions are impossible.
-
-2. **Sentinel Event Index**:
-   Every backfill row is inserted with an `eventIndex` of `0` (`BACKFILL_EVENT_INDEX`). The `_backfill_` segment in the synthetic event ID is the primary mechanism that distinguishes backfill rows from real on-chain events.
-
-3. **Transaction Safety**:
-   The database inserts run within a single transaction using `ON CONFLICT DO NOTHING`, rendering repeat calls completely safe (no-ops for already backfilled events). This guarantee is unaffected by `before`: since the cursor only narrows the candidate row set, re-running any page (with or without a cursor) never creates duplicate events.
-
-### Response Contract
-
-Both endpoints return a `BackfillResponse` with the following shape:
-
-```json
-{
-  "message": "Backfilled 3 EmployeeAdded events",
-  "totalScanned": 10,
-  "created": 3,
-  "results": [
-    {
-      "employeeId": "emp_1",
-      "agreementId": "agr_123",
-      "status": "created"
-    }
-  ],
-  "nextCursor": "2024-01-01T00:00:00.000Z",
-  "hasMore": true
-}
-```
-
-The `results` array contains a preview sample limited to a maximum of 10 items (`RESULTS_PREVIEW_SIZE`). For the milestone endpoint, `milestoneId` is returned instead of `employeeId`.
-
-## Known Limitations / Out of Scope
-
-- **No concurrent/parallel worker partitioning**: These endpoints support single-caller sequential resumption only. There is no row-locking, worker-id sharding, or other mechanism to let multiple callers safely split a backlog and process it in parallel. Running two callers against the same backlog concurrently may cause both to scan overlapping rows (harmless, since inserts are idempotent, but wasteful). This is an intentional, documented trade-off for this change — parallel backfill workers are out of scope.
-- **Automatic scaling / pagination**: The caller must issue repeated requests, following the resume-token contract above, if the number of missing rows is extremely large.
-- **Handling of events missing transaction hashes**: Records inserted through out-of-band means that completely lack an original `transaction_hash` cannot be safely backfilled using these routes, as the synthetic ID heavily relies on the source transaction hash.
+1. **Input alias stability** — `before`, `resumeToken`, and `cursor` are
+   frozen parameter names. No existing caller that supplies any one of them
+   will break.
+2. **Precedence tiebreaker** — when multiple aliases appear, the order
+   `before` → `resumeToken` → `cursor` applies deterministically.
+3. **Output alias stability** — `nextCursor`, `nextResumeToken`, and `cursor`
+   appear on every successful response. They are always identical; callers
+   may read whichever field they prefer.
+4. **Replay idempotency** — repeated calls with the same or older cursor
+   never duplicate rows. The deterministic event-ID format
+   (`{txHash}_backfill_{eventType}_{rowId}`) guarantees no collision with
+   real on-chain events.
+5. **Future-token rejection** — tokens more than 60 s ahead of the server
+   clock are rejected, preventing unbounded table scans while tolerating
+   normal clock drift.

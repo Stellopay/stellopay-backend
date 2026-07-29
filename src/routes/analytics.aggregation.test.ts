@@ -90,7 +90,7 @@ vi.mock("drizzle-orm", () => ({
   inArray: vi.fn(() => ({ type: "inArray" })),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import { analyticsRouter, analyticsAggregationCache } from "./analytics.js";
 
 function makeApp() {
   const app = express();
@@ -124,6 +124,7 @@ const USER = "0x0000000000000000000000000000000000000000000000000000000000000abc
 
 beforeEach(() => {
   vi.clearAllMocks();
+  analyticsAggregationCache.clear();
   queryState.rows.payments = [];
   queryState.rows.escrowEvents = [];
   queryState.rows.agreementEvents = [];
@@ -135,8 +136,8 @@ describe("analytics monthly aggregation", () => {
   it("sums payments, subtracts funding, adds releases/refunds, and zero-fills the rest", async () => {
     // Amounts are multiples of 1e6 so the 6-decimal display maps to whole units.
     queryState.rows.payments = [
-      { month: 3, amount: "5000000" }, // +5 in March
-      { month: 9, amount: "10000000" }, // +10 in September
+      { month: 3, amount: "5000000", from: "0xother", to: USER }, // +5 in March (incoming)
+      { month: 9, amount: "10000000", from: USER, to: "0xother" }, // -10 in September (outgoing)
     ];
     queryState.rows.escrowEvents = [
       { month: 3, amount: "2000000", eventType: "Funded" }, // -2 in March
@@ -157,15 +158,16 @@ describe("analytics monthly aggregation", () => {
     expect(viewsFor(res.body.data, "Apr")).toBe(-3);
     expect(viewsFor(res.body.data, "May")).toBe(4);
     expect(viewsFor(res.body.data, "Jun")).toBe(2);
-    expect(viewsFor(res.body.data, "Sept")).toBe(10);
+    // September: outgoing payment of 10 → -10.
+    expect(viewsFor(res.body.data, "Sept")).toBe(-10);
 
     // Untouched months are zero-filled, not absent.
     for (const empty of ["Jan", "Feb", "Jul", "Aug", "Oct", "Nov", "Dec"]) {
       expect(viewsFor(res.body.data, empty)).toBe(0);
     }
 
-    // Total is the lossless sum of every month: 4 - 3 + 4 + 2 + 10 = 17.
-    expect(res.body.total).toBe(17);
+    // Total is the lossless sum: 4 - 3 + 4 + 2 - 10 = -3.
+    expect(res.body.total).toBe(-3);
   });
 
   it("treats a month with only funding as negative", async () => {
