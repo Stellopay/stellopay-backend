@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
-import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics, seenRequestIds, REDACTED_VALUE } from "./access-log.js";
+import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics, seenRequestIds, REDACTED_VALUE, validateCorrelationId, MAX_CACHE_SIZE } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
 
 // ---------------------------------------------------------------------------
@@ -203,7 +203,7 @@ describe("accessLogMiddleware — success path", () => {
   });
 
   it("echoes the client-supplied x-request-id into the log entry", async () => {
-    const customId = "my-custom-request-id-123";
+    const customId = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
     const res = await request(app).get("/test").set("x-request-id", customId);
     expect(res.status).toBe(200);
 
@@ -232,6 +232,39 @@ describe("accessLogMiddleware — success path", () => {
     const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
     expect(logObj.request_id).not.toBe("unknown");
     expect(logObj.request_id.trim()).not.toBe("");
+  });
+
+  it("rejects a non-UUID x-request-id and falls back to a generated UUID", async () => {
+    const res = await request(app).get("/test").set("x-request-id", "not-a-uuid");
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.request_id).not.toBe("not-a-uuid");
+    expect(logObj.request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+  });
+
+  it("rejects an overlong x-request-id that exceeds 36 characters", async () => {
+    const longId = "x".repeat(1000);
+    const res = await request(app).get("/test").set("x-request-id", longId);
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.request_id).not.toBe(longId);
+    expect(logObj.request_id.length).toBeLessThanOrEqual(36);
+  });
+
+  it("accepts a valid UUID v4 x-request-id into the log entry", async () => {
+    const uuid = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    const res = await request(app).get("/test").set("x-request-id", uuid);
+    expect(res.status).toBe(200);
+
+    expect(consoleInfoSpy).toHaveBeenCalledTimes(1);
+    const logObj = JSON.parse(consoleInfoSpy.mock.calls[0][0]);
+    expect(logObj.request_id).toBe(uuid);
   });
 });
 
@@ -591,6 +624,92 @@ describe("getMetrics / resetMetrics", () => {
     const m = getMetrics();
     expect(m.totalRequests).toBe(1);
     expect(m.requestsByStatus[200]).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateCorrelationId — unit tests
+// ---------------------------------------------------------------------------
+
+describe("validateCorrelationId", () => {
+  it("returns the input for a valid UUID v4 string", () => {
+    const uuid = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    expect(validateCorrelationId(uuid)).toBe(uuid);
+  });
+
+  it("returns null for a non-UUID string", () => {
+    expect(validateCorrelationId("not-a-uuid")).toBeNull();
+    expect(validateCorrelationId("my-custom-request-id-123")).toBeNull();
+  });
+
+  it("returns null for an empty string", () => {
+    expect(validateCorrelationId("")).toBeNull();
+  });
+
+  it("returns null for a string longer than 36 chars", () => {
+    expect(validateCorrelationId("x".repeat(100))).toBeNull();
+  });
+
+  it("returns null for non-string types", () => {
+    expect(validateCorrelationId(undefined)).toBeNull();
+    expect(validateCorrelationId(null)).toBeNull();
+    expect(validateCorrelationId(123)).toBeNull();
+    expect(validateCorrelationId({})).toBeNull();
+    expect(validateCorrelationId([])).toBeNull();
+  });
+
+  it("returns null for a UUID with wrong version (not v4)", () => {
+    // UUID v1
+    expect(validateCorrelationId("a1b2c3d4-e5f6-1a7b-8c9d-0e1f2a3b4c5d")).toBeNull();
+  });
+
+  it("returns null for a string that looks like a UUID but with invalid chars", () => {
+    expect(validateCorrelationId("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5g")).toBeNull();
+  });
+
+  it("is case-insensitive for valid UUIDs", () => {
+    const uuid = "A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D";
+    expect(validateCorrelationId(uuid)).toBe(uuid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// seenRequestIds — cache boundary tests
+// ---------------------------------------------------------------------------
+
+describe("seenRequestIds — cache boundary", () => {
+  afterEach(() => {
+    seenRequestIds.reset();
+  });
+
+  it("accepts new IDs until the cache is full, then continues to return true", () => {
+    // Fill the cache up to MAX_CACHE_SIZE - 1.
+    for (let i = 0; i < MAX_CACHE_SIZE - 1; i++) {
+      expect(seenRequestIds.add(`id-${i}`)).toBe(true);
+    }
+    // One more insert hits the limit.
+    expect(seenRequestIds.add("last-before-full")).toBe(true);
+    expect(seenRequestIds.cache.size).toBe(MAX_CACHE_SIZE);
+
+    // Beyond the limit, add() still returns true (log it) but does NOT insert.
+    expect(seenRequestIds.add("beyond-limit")).toBe(true);
+    expect(seenRequestIds.cache.size).toBe(MAX_CACHE_SIZE);
+    expect(seenRequestIds.cache.has("beyond-limit")).toBe(false);
+  });
+
+  it("returns false for a duplicate ID", () => {
+    expect(seenRequestIds.add("dup-id")).toBe(true);
+    expect(seenRequestIds.add("dup-id")).toBe(false);
+  });
+
+  it("reset() clears the cache", () => {
+    seenRequestIds.add("id-1");
+    seenRequestIds.add("id-2");
+    expect(seenRequestIds.cache.size).toBe(2);
+
+    seenRequestIds.reset();
+    expect(seenRequestIds.cache.size).toBe(0);
+    expect(seenRequestIds.add("id-1")).toBe(true);
   });
 });
 
