@@ -7,7 +7,8 @@ The indexed routes (`src/routes/indexed.ts`) expose data derived from the indexe
 The indexer sync checkpoint is deterministically derived using `deriveSyncCheckpoint`. It evaluates the maximum block number present in a set of retrieved records.
 
 - The `GET /indexed/freshness` and `GET /indexed/checkpoint` endpoints retrieve this high-water mark.
-- **Resilience:** The checkpoint derivation securely filters out missing or non-positive block numbers and provides fallback logging (`indexer_checkpoint_invalid_block`) if any invalid numbers are encountered during derivation.
+- Both endpoints share a common `resolveCheckpoint()` helper that queries the latest 100 agreement event block numbers and derives the checkpoint. This eliminates duplication and ensures the derivation logic stays in lock-step between the two routes.
+- **Resilience:** The checkpoint derivation accepts block numbers as `number`, `bigint`, or `string` (including hex prefixes like `0x`). Invalid, non-finite (e.g. `NaN`, `Infinity`), or negative values are logged as `indexer_checkpoint_invalid_block` and skipped, rather than halting the derivation. Values with unexpected types (objects, booleans, arrays) are similarly skipped with a distinct `unexpected_type` reason.
 - A `0` block number signifies an empty or un-synced state.
 
 ## Endpoints
@@ -145,7 +146,8 @@ All checkpoint-related routes require an authenticated administrator session (`r
 ### 2. Sync Checkpoints (`deriveSyncCheckpoint`)
 - The indexer sync progress across indexed tables (`agreements`, `agreement_events`, `payments`, `escrow_events`, `milestones`, `employees`) is marked by the `block_number` stored with each event or entity.
 - The `deriveSyncCheckpoint(records)` helper calculates the highest block number (high-water mark) across a set of retrieved records.
-- If a query returns an empty result set or records without block numbers, `deriveSyncCheckpoint` returns `0`.
+- Accepts block numbers as `number`, `bigint`, or `string` (including hex-prefixed strings like `"0x1a"`). Values with unexpected types, non-finite numbers (`NaN`, `Infinity`), or negative numbers are skipped and logged.
+- If a query returns an empty result set or records without valid block numbers, `deriveSyncCheckpoint` returns `0`.
 - This function is **pure and deterministic**: repeated calls with the same input always return the same output.
 - **`x-indexer-sync-checkpoint` Header**: Every successful response from the admin endpoints (`GET /indexed/freshness`, `GET /indexed/checkpoint`) and the read endpoints that return indexed records (`GET /indexed/agreements/...`, `GET /indexed/agreement/...`, `GET /indexed/payments/...`, `GET /indexed/escrow/...`) includes the `x-indexer-sync-checkpoint` HTTP header with the derived high-water mark block number.
 
@@ -157,12 +159,15 @@ All GET endpoints in `src/routes/indexed.ts` are **idempotent**:
 
 ### Guarantees
 1. **No side effects**: Every endpoint is read-only. No writes, no state mutations, no cache updates.
-2. **Deterministic responses**: For the same underlying database state, repeated requests produce identical response bodies and headers.
-3. **Deterministic sync checkpoint**: `deriveSyncCheckpoint` is a pure function — same input always yields the same output.
+2. **Deterministic responses**: For the same underlying database state, repeated requests produce identical response bodies **and** headers.
+3. **Deterministic sync checkpoint**: `deriveSyncCheckpoint` is a pure function — same input always yields the same output. The function accepts `number`, `bigint`, and `string` block numbers (including hex prefixes), and safely skips invalid or unexpected values.
+4. **ETag stability**: Every response includes an `ETag` header derived from a SHA-256 hash of the response body. For the same database state, the ETag is identical across requests, enabling conditional `If-None-Match` requests that return `304 Not Modified`.
+5. **Cache-Control on all routes**: Freshness, checkpoint, and the public read endpoints (agreements, agreement detail) all set `Cache-Control: public, max-age=<n>` headers. This allows CDN edges and reverse proxies to serve cached responses for the configured interval.
 
 ### What this means for callers
 - **Safe retry**: Callers may retry any failed GET request without risk of data corruption or ambiguous outcomes.
-- **Safe caching**: The `Cache-Control` and `ETag` headers on public read endpoints enable CDN and browser caching without coordination.
+- **Safe caching**: The `Cache-Control` and `ETag` headers on all indexed routes enable CDN, proxy, and conditional browser caching.
+- **Conditional requests**: Callers may use `If-None-Match` with the returned `ETag` to receive a `304 Not Modified` when the indexed data has not changed, reducing bandwidth and server load.
 - **Observable idempotency**: The `x-indexer-sync-checkpoint` header is stable for a given database state, so callers can verify they are seeing consistent results.
 
 ### Scope
@@ -246,4 +251,3 @@ as a decimal string to avoid precision loss over the wire.
 - **Manual re-indexing / event reprocessing** — event reprocessing and backfilling are owned by `src/routes/reprocess-events.ts` and `src/routes/backfill-events.ts`.
 - **Cursor-based pagination** — these endpoints use offset/limit (`parsePagination`), not the cursor pattern documented in [`docs/routes/read.md`](./read.md).
 - **Cross-request caching** — every request re-reads from Postgres; there is no in-process or shared cache in front of these queries.
-- **Cache headers on `/indexed/payments` and `/indexed/escrow` endpoints** — these are public read endpoints but intentionally lack cache headers because response content could vary per-user address. Cache headers are applied only where response content is independent of the caller.

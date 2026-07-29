@@ -492,6 +492,51 @@ describe("indexer freshness and sync checkpoint helpers", () => {
       expect(second).toBe(first);
       expect(third).toBe(first);
     });
+
+    it("string coercion: derives checkpoint from numeric string block numbers", () => {
+      const records = [
+        { blockNumber: "100" },
+        { blockNumber: "250" },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(250);
+    });
+
+    it("string coercion: handles hex-prefixed string block numbers", () => {
+      const records = [
+        { blockNumber: "0x1a" },
+        { blockNumber: "0x64" },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(100);
+    });
+
+    it("boundary path: ignores Infinity, -Infinity, and NaN block numbers", () => {
+      const records = [
+        { blockNumber: Infinity },
+        { blockNumber: -Infinity },
+        { blockNumber: NaN },
+        { blockNumber: 42 },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(42);
+    });
+
+    it("boundary path: skips records with unexpected blockNumber types", () => {
+      const records = [
+        { blockNumber: { obj: true } },
+        { blockNumber: [1, 2, 3] },
+        { blockNumber: true },
+        { blockNumber: 99 },
+      ];
+      expect(deriveSyncCheckpoint(records)).toBe(99);
+    });
+
+    it("boundary path: handles null records in the array", () => {
+      const records = [
+        null,
+        { blockNumber: 50 },
+        undefined,
+      ] as any;
+      expect(deriveSyncCheckpoint(records)).toBe(50);
+    });
   });
 
   describe("indexer freshness and sync checkpoint route headers", () => {
@@ -572,6 +617,123 @@ describe("indexer freshness and sync checkpoint helpers", () => {
       expect(res2.status).toBe(200);
       expect(res2.body).toEqual(res1.body);
     });
+
+    it("idempotency: repeated GET /indexed/agreements/:contract_address/user/:user_address returns identical body for same DB state", async () => {
+      state.rows.agreements = [
+        { id: "a1", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 100 },
+      ];
+
+      const opts = () =>
+        request(makeApp()).get(
+          `/api/v1/indexed/agreements/${defaults.workAgreementAddress}/user/${VALID}`
+        );
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+
+    it("idempotency: repeated GET /indexed/agreement/:contract_address/:agreement_id returns identical body for same DB state", async () => {
+      state.rows.agreements = [{ id: "7", contractAddress: defaults.workAgreementAddress, employer: VALID, contributor: VALID, mode: 0, createdAt: new Date(), blockNumber: 100 }];
+      state.rows.agreementEvents = [{ id: "e1", blockNumber: 200 }];
+      state.rows.payments = [{ id: "p1", blockNumber: 300 }];
+      state.rows.milestones = [{ id: "m1", blockNumber: 400 }];
+      state.rows.employees = [{ id: "emp1", blockNumber: 500 }];
+      state.rows.escrowEvents = [{ id: "x1", blockNumber: 600 }];
+
+      const opts = () =>
+        request(makeApp()).get(
+          `/api/v1/indexed/agreement/${defaults.workAgreementAddress}/7`
+        );
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+
+    it("idempotency: repeated GET /indexed/payments/user/:user_address returns identical body for same DB state", async () => {
+      state.rows.payments = [{ id: "p1", blockNumber: 100 }];
+
+      const opts = () =>
+        request(makeApp()).get(`/api/v1/indexed/payments/user/${VALID}`);
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+
+    it("idempotency: repeated GET /indexed/escrow/:contract_address/balance/:agreement_id returns identical body for same DB state", async () => {
+      state.rows.escrowEvents = [
+        { eventType: "Funded", amount: "1000", blockNumber: 10 },
+      ];
+
+      const opts = () =>
+        request(makeApp()).get(
+          `/api/v1/indexed/escrow/${defaults.payrollEscrowAddress}/balance/7`
+        );
+
+      const [res1, res2] = await Promise.all([opts(), opts()]);
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual(res1.body);
+    });
+  });
+});
+
+describe("freshness and checkpoint cache headers", () => {
+  it("freshness: sets Cache-Control and ETag headers", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cache-control"]).toContain("public, max-age=");
+    expect(res.headers.etag).toBeDefined();
+  });
+
+  it("checkpoint: sets Cache-Control and ETag headers", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/checkpoint")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cache-control"]).toContain("public, max-age=");
+    expect(res.headers.etag).toBeDefined();
+  });
+
+  it("ETag stability: same DB state produces same ETag on freshness", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+    const opts = () =>
+      request(makeApp())
+        .get("/api/v1/indexed/freshness")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    const [res1, res2] = await Promise.all([opts(), opts()]);
+    expect(res1.headers.etag).toBe(res2.headers.etag);
+  });
+
+  it("ETag stability: same DB state produces same ETag on checkpoint", async () => {
+    state.rows.agreementEvents = [{ blockNumber: 500 }];
+
+    const opts = () =>
+      request(makeApp())
+        .get("/api/v1/indexed/checkpoint")
+        .set("x-user-address", ADMIN_ADDRESS)
+        .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    const [res1, res2] = await Promise.all([opts(), opts()]);
+    expect(res1.headers.etag).toBe(res2.headers.etag);
   });
 });
 
