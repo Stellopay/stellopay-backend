@@ -24,7 +24,7 @@ import { sql } from "drizzle-orm";
  *
  * | # | Invariant | Rationale |
  * |---|-----------|-----------|
- * | I1 | **Table inventory** — exactly 10 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
+ * | I1 | **Table inventory** — exactly 11 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
  * | I2 | **FK index** — every `*Id` column mapped to `*_id` in SQL has a
  *        btree `index()` unless it is a PK or a documented exclusion
  *        (e.g. `taxId`). See `schema-fk-indexes.ts`. | Joins and filtered queries
@@ -48,6 +48,34 @@ import { sql } from "drizzle-orm";
  *        corresponding runtime validation helper exported from this module
  *        (e.g. `assertValidU256` matches the u256 CHECK). | Callers validate
  *        early to produce actionable errors instead of opaque DB violations. |
+ *
+ * ## Backward-compatibility policy
+ *
+ * This module follows strict backward compatibility for the public API
+ * surface. The following are **breaking changes** and MUST bump
+ * {@link SCHEMA_COMPATIBILITY_VERSION}:
+ *
+ * - Removing or renaming any exported table definition
+ * - Removing or renaming any exported runtime validation helper
+ * - Changing the signature (parameter count, types, return type) of any
+ *   exported helper
+ * - Removing or renaming a named CHECK constraint
+ * - Changing the regex or logic in a shared constraint constant
+ *   (`U256_DECIMAL_REGEX`, `CURRENCY_CODE_REGEX`)
+ * - Changing the numeric value of `MAX_PAGE_SIZE`, `DEFAULT_PAGE_SIZE`, or
+ *   `MAX_BATCH_SIZE`
+ * - Removing items from `SENSITIVE_BILLING_FIELDS`
+ *
+ * The following are **safe additive changes** that preserve compatibility:
+ *
+ * - Adding a new table definition (requires entry in {@link SCHEMA_TABLES})
+ * - Adding a new CHECK constraint (must not collide with existing names)
+ * - Adding a new runtime validation helper following existing naming patterns
+ * - Adding a new column with a `DEFAULT` clause to an existing table
+ * - Adding new items to `SENSITIVE_BILLING_FIELDS` (tightening the boundary)
+ *
+ * Version is tracked via {@link SCHEMA_COMPATIBILITY_VERSION} and enforced
+ * by tests in `src/db/migration.test.ts`.
  *
  * ## Adding a new table
  *
@@ -605,6 +633,30 @@ export const backfillProgress = pgTable(
     ),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Compatibility Version
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema compatibility version.
+ *
+ * Increment this when a **breaking change** is made to the public API surface
+ * of this module (see the backward-compatibility policy in the module header).
+ *
+ * Callers can check this value to guard against unexpected schema drift:
+ *
+ * ```ts
+ * import { SCHEMA_COMPATIBILITY_VERSION } from "./schema.js";
+ * if (SCHEMA_COMPATIBILITY_VERSION < 2) {
+ *   // handle old-format data
+ * }
+ * ```
+ *
+ * - Version `1` — initial stable contract (invariants I1–I7, all tables,
+ *   helpers, and CHECK constraints as of the initial migration set).
+ */
+export const SCHEMA_COMPATIBILITY_VERSION = 1;
 
 // ---------------------------------------------------------------------------
 // Pagination & Batching Constants
