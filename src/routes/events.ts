@@ -287,158 +287,146 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
           "DisputeResolved",
         ].includes(eventType)
       ) {
-        try {
+        await db
+          .insert(schema.agreementEvents)
+          .values({
+            id: `${normalizedTxHash}_${i}`,
+            agreementId,
+            contractAddress: fromAddress,
+            eventType,
+            blockNumber: Number(blockNumber),
+            transactionHash: normalizedTxHash,
+            eventIndex: i,
+          })
+          .onConflictDoNothing();
+
+        // On AgreementCreated, also upsert the agreements row
+        if (eventType === "AgreementCreated" && decodedEvent.data) {
+          const employer = normalizeAddress(
+            toHexString(BigInt(decodedEvent.data.employer || eventData[1])),
+          );
+          const contributor = decodedEvent.data.contributor
+            ? normalizeAddress(toHexString(BigInt(decodedEvent.data.contributor || eventData[2])))
+            : null;
+          const tokenFromEvent = normalizeAddress(
+            toHexString(BigInt(decodedEvent.data.token || eventData[3])),
+          );
+          const mode = Number(decodedEvent.data.mode || eventData[4] || 0);
+          const paymentType = Number(
+            decodedEvent.data.payment_type || decodedEvent.data.paymentType || eventData[5] || 0,
+          );
+
           await db
-            .insert(schema.agreementEvents)
+            .insert(schema.agreements)
             .values({
-              id: `${normalizedTxHash}_${i}`,
-              agreementId,
+              id: agreementId,
               contractAddress: fromAddress,
-              eventType,
+              employer,
+              contributor: contributor || null,
+              token: tokenFromEvent,
+              mode,
+              paymentType,
+              status: 0,
+              totalAmount: "0",
+              paidAmount: "0",
+              disputeStatus: 0,
               blockNumber: Number(blockNumber),
               transactionHash: normalizedTxHash,
-              eventIndex: i,
             })
-            .onConflictDoNothing();
+            .onConflictDoUpdate({
+              target: schema.agreements.id,
+              set: { updatedAt: new Date() },
+            });
 
-          // On AgreementCreated, also upsert the agreements row
-          if (eventType === "AgreementCreated" && decodedEvent.data) {
-            const employer = normalizeAddress(
-              toHexString(BigInt(decodedEvent.data.employer || eventData[1])),
-            );
-            const contributor = decodedEvent.data.contributor
-              ? normalizeAddress(toHexString(BigInt(decodedEvent.data.contributor || eventData[2])))
-              : null;
-            const tokenFromEvent = normalizeAddress(
-              toHexString(BigInt(decodedEvent.data.token || eventData[3])),
-            );
-            const mode = Number(decodedEvent.data.mode || eventData[4] || 0);
-            const paymentType = Number(
-              decodedEvent.data.payment_type || decodedEvent.data.paymentType || eventData[5] || 0,
-            );
-
-            await db
-              .insert(schema.agreements)
-              .values({
-                id: agreementId,
-                contractAddress: fromAddress,
-                employer,
-                contributor: contributor || null,
-                token: tokenFromEvent,
-                mode,
-                paymentType,
-                status: 0,
-                totalAmount: "0",
-                paidAmount: "0",
-                disputeStatus: 0,
-                blockNumber: Number(blockNumber),
-                transactionHash: normalizedTxHash,
-              })
-              .onConflictDoUpdate({
-                target: schema.agreements.id,
-                set: { updatedAt: new Date() },
-              });
-
-            // Verify the token against the on-chain contract before responding.
-            // Awaited, not fire and forget, so the authoritative on-chain value
-            // settles the stored row before process_tx returns.
-            sawAgreementCreated = true;
-            const verified = await verifyAndUpdateToken(agreementId, fromAddress, tokenFromEvent);
-            if (!verified) allTokensVerified = false;
-          }
-
-          eventLabels.push(`${eventType}-${agreementId}`);
-        } catch (e) {
-          console.error(`[events] Failed to store ${eventType}:`, e);
+          // Verify the token against the on-chain contract before responding.
+          // Awaited, not fire and forget, so the authoritative on-chain value
+          // settles the stored row before process_tx returns.
+          sawAgreementCreated = true;
+          const verified = await verifyAndUpdateToken(agreementId, fromAddress, tokenFromEvent);
+          if (!verified) allTokensVerified = false;
         }
+
+        eventLabels.push(`${eventType}-${agreementId}`);
       }
 
       // Payment events
       else if (["PaymentSent", "PaymentReceived"].includes(eventType) && decodedEvent.data) {
-        try {
-          const from = normalizeAddress(
-            toHexString(BigInt(decodedEvent.data.from || eventData[1])),
-          );
-          const to = normalizeAddress(toHexString(BigInt(decodedEvent.data.to || eventData[2])));
-          const amount = decodedEvent.data.amount
-            ? typeof decodedEvent.data.amount === "object" &&
-              decodedEvent.data.amount.low &&
-              decodedEvent.data.amount.high
-              ? (
-                  BigInt(decodedEvent.data.amount.low) +
-                  (BigInt(decodedEvent.data.amount.high) << 128n)
-                ).toString()
-              : decodedEvent.data.amount.toString()
-            : eventData.length >= 4
-              ? BigInt(eventData[3]).toString()
-              : "0";
-          const token = normalizeAddress(
-            toHexString(BigInt(decodedEvent.data.token || eventData[4] || eventData[2])),
-          );
+        const from = normalizeAddress(
+          toHexString(BigInt(decodedEvent.data.from || eventData[1])),
+        );
+        const to = normalizeAddress(toHexString(BigInt(decodedEvent.data.to || eventData[2])));
+        const amount = decodedEvent.data.amount
+          ? typeof decodedEvent.data.amount === "object" &&
+            decodedEvent.data.amount.low &&
+            decodedEvent.data.amount.high
+            ? (
+                BigInt(decodedEvent.data.amount.low) +
+                (BigInt(decodedEvent.data.amount.high) << 128n)
+              ).toString()
+            : decodedEvent.data.amount.toString()
+          : eventData.length >= 4
+            ? BigInt(eventData[3]).toString()
+            : "0";
+        const token = normalizeAddress(
+          toHexString(BigInt(decodedEvent.data.token || eventData[4] || eventData[2])),
+        );
 
-          await db
-            .insert(schema.payments)
-            .values({
-              id: `${normalizedTxHash}_${i}`,
-              agreementId,
-              contractAddress: fromAddress,
-              from,
-              to,
-              amount,
-              token,
-              eventType,
-              blockNumber: Number(blockNumber),
-              transactionHash: normalizedTxHash,
-            })
-            .onConflictDoNothing();
+        await db
+          .insert(schema.payments)
+          .values({
+            id: `${normalizedTxHash}_${i}`,
+            agreementId,
+            contractAddress: fromAddress,
+            from,
+            to,
+            amount,
+            token,
+            eventType,
+            blockNumber: Number(blockNumber),
+            transactionHash: normalizedTxHash,
+          })
+          .onConflictDoNothing();
 
-          eventLabels.push(`${eventType}-${agreementId}`);
-        } catch (e) {
-          console.error(`[events] Failed to store payment event:`, e);
-        }
+        eventLabels.push(`${eventType}-${agreementId}`);
       }
 
       // Escrow events
       else if (["Funded", "Released", "Refunded"].includes(eventType) && decodedEvent.data) {
-        try {
-          const employer = decodedEvent.data.employer
-            ? normalizeAddress(toHexString(BigInt(decodedEvent.data.employer)))
-            : "";
-          const to = decodedEvent.data.to
-            ? normalizeAddress(toHexString(BigInt(decodedEvent.data.to)))
-            : null;
-          const amount = decodedEvent.data.amount
-            ? typeof decodedEvent.data.amount === "object" &&
-              decodedEvent.data.amount.low &&
-              decodedEvent.data.amount.high
-              ? (
-                  BigInt(decodedEvent.data.amount.low) +
-                  (BigInt(decodedEvent.data.amount.high) << 128n)
-                ).toString()
-              : decodedEvent.data.amount.toString()
-            : eventData.length >= 3
-              ? BigInt(eventData[2]).toString()
-              : "0";
+        const employer = decodedEvent.data.employer
+          ? normalizeAddress(toHexString(BigInt(decodedEvent.data.employer)))
+          : "";
+        const to = decodedEvent.data.to
+          ? normalizeAddress(toHexString(BigInt(decodedEvent.data.to)))
+          : null;
+        const amount = decodedEvent.data.amount
+          ? typeof decodedEvent.data.amount === "object" &&
+            decodedEvent.data.amount.low &&
+            decodedEvent.data.amount.high
+            ? (
+                BigInt(decodedEvent.data.amount.low) +
+                (BigInt(decodedEvent.data.amount.high) << 128n)
+              ).toString()
+            : decodedEvent.data.amount.toString()
+          : eventData.length >= 3
+            ? BigInt(eventData[2]).toString()
+            : "0";
 
-          await db
-            .insert(schema.escrowEvents)
-            .values({
-              id: `${normalizedTxHash}_${i}`,
-              agreementId,
-              contractAddress: fromAddress,
-              eventType,
-              employer: eventType === "Funded" ? employer : "",
-              to: eventType !== "Funded" ? to : null,
-              amount,
-              blockNumber: Number(blockNumber),
-              transactionHash: normalizedTxHash,
-            })
-            .onConflictDoNothing();
+        await db
+          .insert(schema.escrowEvents)
+          .values({
+            id: `${normalizedTxHash}_${i}`,
+            agreementId,
+            contractAddress: fromAddress,
+            eventType,
+            employer: eventType === "Funded" ? employer : "",
+            to: eventType !== "Funded" ? to : null,
+            amount,
+            blockNumber: Number(blockNumber),
+            transactionHash: normalizedTxHash,
+          })
+          .onConflictDoNothing();
 
-          eventLabels.push(`${eventType}-${agreementId}`);
-        } catch (e) {
-          console.error(`[events] Failed to store escrow event:`, e);
-        }
+        eventLabels.push(`${eventType}-${agreementId}`);
       }
     }
 
@@ -446,55 +434,51 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
     // 4b. Heuristic fallback (ABI decoding unavailable)
     // ----------------------------------------------------------------
     else if (eventData.length >= 6) {
-      try {
-        const hAgreementId = BigInt(eventData[0]).toString();
-        const employer = normalizeAddress(toHexString(BigInt(eventData[1])));
-        const contributor = eventData[2]
-          ? normalizeAddress(toHexString(BigInt(eventData[2])))
-          : null;
-        const token = normalizeAddress(toHexString(BigInt(eventData[3])));
-        const mode = Number(eventData[4]);
-        const paymentType = Number(eventData[5]);
+      const hAgreementId = BigInt(eventData[0]).toString();
+      const employer = normalizeAddress(toHexString(BigInt(eventData[1])));
+      const contributor = eventData[2]
+        ? normalizeAddress(toHexString(BigInt(eventData[2])))
+        : null;
+      const token = normalizeAddress(toHexString(BigInt(eventData[3])));
+      const mode = Number(eventData[4]);
+      const paymentType = Number(eventData[5]);
 
-        await db
-          .insert(schema.agreementEvents)
-          .values({
-            id: `${normalizedTxHash}_${i}`,
-            agreementId: hAgreementId,
-            contractAddress: fromAddress,
-            eventType: "AgreementCreated",
-            blockNumber: Number(blockNumber),
-            transactionHash: normalizedTxHash,
-            eventIndex: i,
-          })
-          .onConflictDoNothing();
+      await db
+        .insert(schema.agreementEvents)
+        .values({
+          id: `${normalizedTxHash}_${i}`,
+          agreementId: hAgreementId,
+          contractAddress: fromAddress,
+          eventType: "AgreementCreated",
+          blockNumber: Number(blockNumber),
+          transactionHash: normalizedTxHash,
+          eventIndex: i,
+        })
+        .onConflictDoNothing();
 
-        await db
-          .insert(schema.agreements)
-          .values({
-            id: hAgreementId,
-            contractAddress: fromAddress,
-            employer,
-            contributor: contributor || null,
-            token,
-            mode,
-            paymentType,
-            status: 0,
-            totalAmount: "0",
-            paidAmount: "0",
-            disputeStatus: 0,
-            blockNumber: Number(blockNumber),
-            transactionHash: normalizedTxHash,
-          })
-          .onConflictDoUpdate({
-            target: schema.agreements.id,
-            set: { updatedAt: new Date() },
-          });
+      await db
+        .insert(schema.agreements)
+        .values({
+          id: hAgreementId,
+          contractAddress: fromAddress,
+          employer,
+          contributor: contributor || null,
+          token,
+          mode,
+          paymentType,
+          status: 0,
+          totalAmount: "0",
+          paidAmount: "0",
+          disputeStatus: 0,
+          blockNumber: Number(blockNumber),
+          transactionHash: normalizedTxHash,
+        })
+        .onConflictDoUpdate({
+          target: schema.agreements.id,
+          set: { updatedAt: new Date() },
+        });
 
-        eventLabels.push(`AgreementCreated-${hAgreementId}`);
-      } catch (e) {
-        console.error(`[events] Failed to store heuristic AgreementCreated:`, e);
-      }
+      eventLabels.push(`AgreementCreated-${hAgreementId}`);
     }
   }
 
@@ -644,21 +628,29 @@ eventsRouter.post(
     // like independent units of work. `duplicates` accounts for the rest of
     // `total`: total === processed + noEvents + notFound + errors + duplicates.
     const uniqueResults = Array.from(resultsByNormalizedHash.values());
+    const errorsCount = uniqueResults.filter((r) => r.status === "error").length;
     const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
-    res.json({
+    // Fan-out delivery resilience: return 207 Multi-Status if there were errors, 
+    // signalling partial success to webhook callers so they can retry.
+    res.status(errorsCount > 0 ? 207 : 200).json({
       summary: {
         total: results.length,
         processed: uniqueResults.filter((r) => r.status === "processed").length,
         noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
         notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-        errors: uniqueResults.filter((r) => r.status === "error").length,
+        errors: errorsCount,
         duplicates,
         totalEventsProcessed: totalProcessed,
       },
       results,
     });
   } catch (e) {
+    // Envelope validation resilience: standard 400 for structural errors
+    if (e instanceof z.ZodError) {
+      res.status(400).json({ error: "Invalid request envelope" });
+      return;
+    }
     next(e);
   }
 });

@@ -49,7 +49,9 @@ Process multiple Starknet transactions in a single request.
 | ------------ | ---------- | ------------------------------------------------------------------------ |
 | `tx_hashes`  | `string[]` | 1 to `MAX_BATCH_SIZE` (50) entries, each validated by `TxHashSchema`.    |
 
-**Response** (`200`)
+**Response** (`200` or `207`)
+
+If all transactions are processed successfully, the endpoint returns `200 OK`. If one or more transactions fail (e.g., due to RPC timeouts or DB errors), the endpoint returns `207 Multi-Status` to explicitly signal partial or full failure, allowing webhook providers or callers to safely retry the batch.
 
 ```json
 {
@@ -77,7 +79,7 @@ Process multiple Starknet transactions in a single request.
 total === processed + noEvents + notFound + errors + duplicates
 ```
 
-A per-tx error is captured into that tx's result entry (`status: "error"`) and never aborts the rest of the batch.
+A per-tx error is captured into that tx's result entry (`status: "error"`) and never aborts the rest of the batch. However, the presence of any errors in the batch changes the response status from `200` to `207 Multi-Status`.
 
 ---
 
@@ -97,8 +99,14 @@ A per-tx error is captured into that tx's result entry (`status: "error"`) and n
 Both endpoints validate transaction hash format identically via the shared `TxHashSchema` (`0x`-prefixed hex, 3–66 characters). This was previously inconsistent: `process_tx/:tx_hash` accepted any string and let malformed input fall through to the RPC layer, producing a murky downstream error instead of a clean validation failure. Both endpoints now return the same `400` shape on malformed input:
 
 ```json
-{ "error": "Invalid Starknet transaction hash format" }
+{ "error": "Invalid request envelope" }
 ```
+
+## Fan-out delivery resilience contract
+
+Previously, if a database insertion failed while fanning out a Starknet receipt into the `agreements`, `agreementEvents`, `payments`, or `escrowEvents` tables, the error was silently caught and logged, marking the transaction as successfully processed. This caused partial state updates and prevented automatic retries.
+
+Database errors now bubble up from the fan-out loop, marking the transaction as failed (`status: "error"`). This guarantees that a transaction is only marked as processed when its entire set of decoded events has been safely persisted, enabling reliable replay and retries.
 
 ## Known limitations / out of scope
 

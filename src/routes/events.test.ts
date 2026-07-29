@@ -332,6 +332,20 @@ describe("processTxReceipt – batch semantics (per-tx isolation)", () => {
     await expect(processTxReceipt(TX_A)).rejects.toThrow("RPC timeout");
   });
 
+  it("a failing db insert bubbles up so the tx is not falsely marked as success", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(
+      makeAgreementReceipt(TX_A) as any,
+    );
+
+    // Simulate database failure during fan-out delivery
+    vi.mocked(db.insert).mockImplementationOnce(() => {
+      throw new Error("DB Connection Lost");
+    });
+
+    await expect(processTxReceipt(TX_A)).rejects.toThrow("DB Connection Lost");
+  });
+
   it("re-processing the same tx is idempotent (no duplicate rows)", async () => {
     parseEventMock.mockReturnValue(decodedAgreementCreated());
     vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
@@ -548,6 +562,32 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.summary.total).toBe(1);
     expect(res.body.results).toHaveLength(1);
+  });
+
+  it("process_batch returns 400 with a clean error for a malformed envelope", async () => {
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: "not-an-array" }); // Malformed
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid request envelope");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  it("process_batch returns 207 Multi-Status when one or more transactions fail", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any) // Success
+      .mockRejectedValue(new Error("RPC timeout")); // Error for TX_B and its retries
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(207);
+    expect(res.body.summary.total).toBe(2);
+    expect(res.body.summary.processed).toBe(1);
+    expect(res.body.summary.errors).toBe(1);
   });
 
   it("process_tx returns 400 with a clean error for a malformed hash", async () => {
