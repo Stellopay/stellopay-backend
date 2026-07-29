@@ -113,8 +113,6 @@ vi.mock("../db/index.js", () => {
         contractAddress: "contractAddress",
         transactionHash: "transactionHash",
         id: "id",
-        contractAddress: "contractAddress",
-        transactionHash: "transactionHash",
       },
       employees: {
         employeeAddress: "employeeAddress",
@@ -125,9 +123,6 @@ vi.mock("../db/index.js", () => {
         transactionHash: "transactionHash",
         salaryPerPeriod: "salaryPerPeriod",
         id: "id",
-        contractAddress: "contractAddress",
-        transactionHash: "transactionHash",
-        salaryPerPeriod: "salaryPerPeriod",
       },
       milestones: {
         blockNumber: "blockNumber",
@@ -137,9 +132,6 @@ vi.mock("../db/index.js", () => {
         transactionHash: "transactionHash",
         amount: "amount",
         id: "id",
-        contractAddress: "contractAddress",
-        transactionHash: "transactionHash",
-        amount: "amount",
       },
     },
   };
@@ -153,8 +145,15 @@ const USER_ADDRESS =
 const app = express();
 app.use(express.json());
 app.use(transactionsRouter);
+// Forward structured 400 bodies produced by parseDateFilters / parsePagination;
+// fall back to 500 for unexpected errors.
 app.use((err: any, _req: any, res: any, _next: any) => {
-  res.status(500).json({ error: err.message });
+  const status: number = typeof err?.status === "number" ? err.status : 500;
+  if (err?.body) {
+    res.status(status).json(err.body);
+  } else {
+    res.status(status).json({ error: err.message });
+  }
 });
 
 // ── Helper: validate transaction item shape ──────────────────────────────
@@ -438,10 +437,9 @@ describe("Transactions Router — filtered endpoint", () => {
         `/transactions/${USER_ADDRESS}/filtered?startDate=not-a-date`,
       );
 
-      // Invalid Date objects are created but may still work; the route
-      // doesn't explicitly validate date format, so it proceeds.
-      // We just verify it doesn't crash.
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toMatch(/startDate/);
     });
   });
 
@@ -894,5 +892,164 @@ describe("Transactions Router — sort-by support (filtered endpoint)", () => {
     for (const tx of res.body.transactions) {
       expectValidTransactionItem(tx);
     }
+  });
+});
+
+// ── Idempotency: date-range validation ───────────────────────────────────
+//
+// These tests verify the core idempotency contract:
+// - A well-formed request always returns the same response shape on retries.
+// - A malformed request always returns the same deterministic 400 on retries.
+// - An inverted range always returns a deterministic 400 on retries.
+// Both endpoints share the same underlying `parseDateFilters` logic, so we
+// cover the contract once for each route.
+
+describe("Transactions Router — idempotent date-range validation (main endpoint)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 400 with { success: false } for an invalid `from` date", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=not-a-date`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/from/);
+  });
+
+  it("returns 400 with { success: false } for an invalid `to` date", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?to=INVALID`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/to/);
+  });
+
+  it("returns 400 when `from` is after `to` (inverted range)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=2025-06-01T00:00:00Z&to=2024-01-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/from/);
+    expect(res.body.error).toMatch(/to/);
+  });
+
+  it("returns 200 for a valid `from` / `to` range (success path)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=2024-01-01T00:00:00Z&to=2025-06-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("returns 200 when only `from` is provided", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?from=2024-01-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("returns 200 when only `to` is provided", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}?to=2025-06-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("same valid request repeated twice returns the same total and hasMore (idempotent read)", async () => {
+    const url = `/transactions/${USER_ADDRESS}?from=2024-01-01T00:00:00Z&to=2025-12-31T00:00:00Z&limit=10&offset=0`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.total).toBe(second.body.total);
+    expect(first.body.hasMore).toBe(second.body.hasMore);
+    expect(first.body.limit).toBe(second.body.limit);
+    expect(first.body.offset).toBe(second.body.offset);
+  });
+
+  it("same invalid request repeated twice always returns 400 (idempotent rejection)", async () => {
+    const url = `/transactions/${USER_ADDRESS}?from=bad`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(400);
+    expect(second.status).toBe(400);
+    expect(first.body.success).toBe(false);
+    expect(second.body.success).toBe(false);
+    expect(first.body.error).toBe(second.body.error);
+  });
+});
+
+describe("Transactions Router — idempotent date-range validation (filtered endpoint)", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 400 with { success: false } for an invalid `startDate`", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=not-a-date`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/startDate/);
+  });
+
+  it("returns 400 with { success: false } for an invalid `endDate`", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?endDate=INVALID`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/endDate/);
+  });
+
+  it("returns 400 when `startDate` is after `endDate` (inverted range)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=2025-06-01T00:00:00Z&endDate=2024-01-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/startDate/);
+    expect(res.body.error).toMatch(/endDate/);
+  });
+
+  it("returns 200 for a valid date range (success path)", async () => {
+    const res = await request(app).get(
+      `/transactions/${USER_ADDRESS}/filtered?startDate=2024-01-01T00:00:00Z&endDate=2025-06-01T00:00:00Z`,
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.transactions)).toBe(true);
+  });
+
+  it("same valid filtered request repeated twice returns identical pagination metadata (idempotent read)", async () => {
+    const url = `/transactions/${USER_ADDRESS}/filtered?startDate=2024-01-01T00:00:00Z&endDate=2025-12-31T00:00:00Z&limit=10&offset=0`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.total).toBe(second.body.total);
+    expect(first.body.hasMore).toBe(second.body.hasMore);
+    expect(first.body.limit).toBe(second.body.limit);
+    expect(first.body.offset).toBe(second.body.offset);
+  });
+
+  it("same invalid filtered request repeated twice always returns 400 (idempotent rejection)", async () => {
+    const url = `/transactions/${USER_ADDRESS}/filtered?endDate=bad`;
+    const first = await request(app).get(url);
+    const second = await request(app).get(url);
+
+    expect(first.status).toBe(400);
+    expect(second.status).toBe(400);
+    expect(first.body.success).toBe(false);
+    expect(second.body.success).toBe(false);
+    expect(first.body.error).toBe(second.body.error);
   });
 });
