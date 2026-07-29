@@ -11,8 +11,6 @@ import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
 import { notFoundResponse } from "./not-found.js";
 import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
-const AddressParam = z.string().min(3);
-
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
 
