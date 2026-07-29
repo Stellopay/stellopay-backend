@@ -149,6 +149,66 @@ export const EnvSchema = z
     // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
     TRUST_PROXY: z.string().optional().default("1"),
 
+    // Comma-separated list of admin addresses for privileged routes.
+    ADMIN_ADDRESSES: z
+      .string()
+      .optional()
+      .default("")
+      .transform((s) =>
+        s
+          .split(",")
+          .map((a) => a.trim().toLowerCase())
+          .filter((a) => a.length > 0),
+      ),
+
+    // Analytics aggregation in-process cache TTL (milliseconds).
+    // Repeated identical requests within this window hit the in-memory cache
+    // instead of re-running expensive aggregation queries. Default is 30 s
+    // (≈ 2–5 Starknet blocks) which is conservative enough that a re-fetch after
+    // a new block will see up-to-date data within a reasonable time.
+    ANALYTICS_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(30_000),
+
+    // Session token lifetime in milliseconds (sliding expiry) — default 24 hours
+    SESSION_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(24 * 60 * 60 * 1000),
+
+    // Absolute maximum session lifetime in milliseconds — default 7 days
+    SESSION_MAX_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(7 * 24 * 60 * 60 * 1000),
+
+    // Feature flag: set to "true" to enable billing profile endpoints.
+    // When false (default) all /billing/* routes return 501 Not Implemented.
+    BILLING_ENABLED: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((v) => v === "true"),
+
+    // Drain timeout for graceful shutdown (milliseconds) — default 10000 (10 seconds)
+    SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(10000),
+
+    // Retry configuration for initial DB connectivity check
+    DB_CONNECTION_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().optional().default(5),
+    DB_CONNECTION_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().optional().default(500),
+
     // Indexed query cache max-age in seconds.
     // Controls Cache-Control: public, max-age=<N> on indexed read responses.
     // A Starknet block is produced roughly every 6–12 s; 12 s is a safe default.

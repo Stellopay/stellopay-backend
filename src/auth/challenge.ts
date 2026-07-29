@@ -2,6 +2,12 @@ import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
+/** Number of entries processed per batch sweep invocation. */
+export const SWEEP_BATCH_SIZE = 500;
+
+/** Cursor tracking the next batch sweep start position. */
+let sweepOffset = 0;
+
 /**
  * Nonce Challenge Generation, Expiration, and Validation Contract.
  *

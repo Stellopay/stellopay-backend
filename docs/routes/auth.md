@@ -510,6 +510,74 @@ extra cost to no-body requests.
 
 ---
 
+## Observability events and metrics
+
+Every auth route handler in `src/routes/auth.ts` emits exactly one
+structured log event per terminal decision (success or failure) through
+`logAuthEvent` in `src/routes/auth-metrics.ts`, and bumps a matching
+process-local counter through `incAuthMetric`.
+
+The event catalogue is defined in `src/routes/auth-metrics.ts` as the
+`AuthEventName` union. Every event carries `timestamp`, `level`, and
+`event` fields automatically. Callers must not pass raw session tokens,
+signatures, or token hashes; only lower-cased addresses and bounded reason
+codes are allowed.
+
+### Event catalogue
+
+| Event name | Level | When | Extra fields |
+| :--- | :--- | :--- | :--- |
+| `auth.challenge.issued` | info | Fresh nonce created (full TTL) | `address`, `expires_in_ms` |
+| `auth.challenge.retried` | info | Existing nonce replayed (remaining TTL) | `address`, `expires_in_ms` |
+| `auth.challenge.failed` | error | `createChallenge` / RPC / parse throws | `message`, `duration_ms` |
+| `auth.verify.session_issued` | info | Signature verified, session created | `address`, `expires_in_ms`, `duration_ms` |
+| `auth.verify.locked_out` | warn | Account is locked out | `address` |
+| `auth.verify.no_challenge` | warn | No active challenge for the address | `address` |
+| `auth.verify.signature_invalid` | warn | RPC signature check returned false | `address` |
+| `auth.verify.failed` | error | Session-store write or other catch-all | `message`, `duration_ms` |
+| `auth.session.validate_success` | info | Token validated successfully | `address`, `duration_ms` |
+| `auth.session.validate_rejected` | warn | Token rejected (unknown/expired/revoked) | `address` |
+| `auth.session.validate_error` | error | DB error during validation | `message`, `duration_ms` |
+| `auth.refresh.completed` | info | Token rotated successfully | `address`, `expires_in_ms`, `duration_ms` |
+| `auth.refresh.rejected` | warn | Invalid refresh token | `address`, `reason` |
+| `auth.refresh.failed` | error | Rotation write error | `message`, `duration_ms` |
+| `auth.logout.completed` | info | Session revoked successfully | `address`, `duration_ms` |
+| `auth.logout.failed` | error | Session-store write failure | `address`, `message`, `duration_ms` |
+| `auth.revoke.completed` | info | All sessions revoked for address | `address`, `duration_ms` |
+| `auth.revoke.missing_principal` | warn | `req.auth.address` missing | (none) |
+| `auth.revoke.failed` | error | Session-store write failure | `address`, `message`, `duration_ms` |
+| `auth.session_revoke.completed` | info | Specific session revoked | `token_hash_prefix`, `by_owner`, `caller`, `duration_ms` |
+| `auth.session_revoke.not_found` | warn | `token_hash` does not match any session | `token_hash_prefix`, `caller` |
+| `auth.session_revoke.denied` | warn | Caller not owner nor admin | `reason`, `caller`, `owner` |
+| `auth.session_revoke.failed` | error | Session-store write failure | `message`, `duration_ms` |
+| `auth.debug.request` | debug | Every incoming auth request | `method`, `path`, `body` (redacted) |
+
+### Metric counter names
+
+Every event has a matching counter in the `AUTH_METRICS` constant
+object in `src/routes/auth-metrics.ts`. Counter names follow the pattern:
+
+```
+auth_{endpoint}_{outcome}_total
+```
+
+For example, `auth_challenge_issued_total`, `auth_verify_session_issued_total`,
+`auth_logout_completed_total`, etc.
+
+Point-in-time snapshots of all counters are available via
+exported `getAuthMetricsSnapshot()`, which returns a shallow copy of the
+internal `{ counters: Record<string, number> }` state. Tests reset counters
+between cases with `resetAuthMetrics()`.
+
+### Debug middleware telemetry
+
+The debug middleware (registered via `authRouter.use(...)`) emits a
+`auth.debug.request` event at `debug` level for every incoming request,
+with the request method, path, and a body object where `session_token`
+and `signature` are redacted to `"***"`.
+
+---
+
 ## Known limitations / out of scope
 
 - **Address format regex is intentionally loose at the route layer.** All
