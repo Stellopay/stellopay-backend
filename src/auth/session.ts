@@ -32,6 +32,7 @@ function normalizeSessionAddress(address: string): string {
 function getNextSlidingExpiryMs(nowMs: number, absoluteExpiresAt: Date): number {
   const slidingExpiryMs = nowMs + SESSION_TTL_MS;
   return Math.min(slidingExpiryMs, absoluteExpiresAt.getTime());
+}
 // ---------------------------------------------------------------------------
 // Input validation helpers
 // ---------------------------------------------------------------------------

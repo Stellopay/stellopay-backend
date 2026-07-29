@@ -835,23 +835,28 @@ async function fetchAndBuildTransactions(
       const sign = isReceived ? "+" : "-";
       const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
 
-    const allTransactions: TransactionRecord[] = [
-      ...uniqueAgreementEvents.map((a) => {
-        const dateTime = formatDate(a.createdAt);
-        return {
-          id: a.transactionHash.slice(0, 10), type: formatEventType(a.eventType),
-          address: formatAddress(a.employer === userAddress ? a.contributor || "N/A" : a.employer),
-          date: dateTime.date, time: dateTime.time, token: "-", amount: "-",
-          status: "Completed" as const, tokenIcon: "", txHash: a.transactionHash, createdAt: a.createdAt,
-        };
-      }),
-      ...payments.map((p) => {
-        const dateTime = formatDate(p.createdAt);
-        const tokenInfo = getTokenInfo(p.token);
-        const amountStr = formatAmount(p.amount, tokenInfo);
-        const isReceived = p.eventType === "PaymentReceived";
-        const sign = isReceived ? "+" : "-";
-        const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+      return {
+        id: p.transactionHash.slice(0, 10),
+        type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
+        address: formatAddress(isReceived ? p.from : p.to),
+        date: dateTime.date,
+        time: dateTime.time,
+        token: tokenInfo.name,
+        amount: finalAmount,
+        status: "Completed" as const,
+        tokenIcon: tokenInfo.icon,
+        txHash: p.transactionHash,
+        createdAt: p.createdAt,
+      };
+    }),
+    ...escrowEvents.map((e) => {
+      const dateTime = formatDate(e.createdAt);
+      const tokenAddress = escrowTokenMap.get(e.agreementId) || null;
+      const tokenInfo = getTokenInfo(tokenAddress);
+      const amountStr = formatAmount(e.amount, tokenInfo);
+      const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
+      const sign = isIncoming ? "+" : "-";
+      const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
 
       return {
         id: e.transactionHash.slice(0, 10),

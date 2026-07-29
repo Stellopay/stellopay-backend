@@ -37,10 +37,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
+       
       console.error(JSON.stringify(logEntry));
     } else {
-      // eslint-disable-next-line no-console
+       
       console.info(JSON.stringify(logEntry));
     }
   } else {
@@ -55,10 +55,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
       `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
 
     if (logEntry.level === "error") {
-      // eslint-disable-next-line no-console
+       
       console.error(msg);
     } else {
-      // eslint-disable-next-line no-console
+       
       console.info(msg);
     }
   }
