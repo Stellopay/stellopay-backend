@@ -173,6 +173,27 @@ export function assertValidU256(value: string, name: string): void {
   }
 }
 
+/**
+ * Asserts that `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters). Throws a descriptive {@link RangeError} when
+ * the assertion fails.
+ *
+ * Runtime counterpart of the DB-level CHECK constraints using
+ * {@link CURRENCY_CODE_REGEX} (e.g. `billing_profiles_currency_check`,
+ * `billing_invoices_currency_check`). Recording both a non-throwing
+ * `isValidCurrencyCode` and a throwing `assertValidCurrencyCode` mirrors the
+ * `isValidU256` / `assertValidU256` pair so callers can pick the level of
+ * strictness they need.
+ */
+export function assertValidCurrencyCode(code: string, name: string): void {
+  if (!CURRENCY_CODE_REGEX.test(code)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidCurrencyCode", name, value: code, reason: "invalid_format" });
+    throw new RangeError(
+      `${name} must be a valid ISO 4217-style currency code (exactly three uppercase ASCII letters), got "${code}"`,
+    );
+  }
+}
+
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
   "agreements",
@@ -450,6 +471,34 @@ export const billingProfiles = pgTable(
     ),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Security Boundary - Sensitive Fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields in the billing profiles schema that are sensitive and must be stripped
+ * before returning data through public API routes.
+ */
+export const SENSITIVE_BILLING_FIELDS = ["taxId", "dateOfBirth"] as const;
+
+export type SensitiveBillingFields = typeof SENSITIVE_BILLING_FIELDS[number];
+
+/**
+ * Strips sensitive fields from a billing profile object to enforce a security boundary
+ * and prevent privilege drift.
+ */
+export function stripSensitiveBillingFields<T extends Record<string, any>>(
+  profile: T,
+): Omit<T, SensitiveBillingFields> {
+  const copy = { ...profile };
+  for (const field of SENSITIVE_BILLING_FIELDS) {
+    if (field in copy) {
+      delete copy[field];
+    }
+  }
+  return copy;
+}
 
 /**
  * billing_payment_methods – payment methods attached to a billing profile.

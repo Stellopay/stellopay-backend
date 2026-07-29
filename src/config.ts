@@ -248,6 +248,28 @@ export const EnvSchema = z
     .positive()
     .optional()
     .default(60_000),
+
+    // Graceful shutdown drain timeout (milliseconds) — default 10 seconds
+    SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(10_000),
+
+    // Feature flag for billing endpoints — default false
+    BILLING_ENABLED: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((v) => v === "true"),
+
+    // Maximum allowed billing amount per request — default 1,000,000
+    MAX_BILLING_AMOUNT: z.coerce
+      .number()
+      .positive()
+      .optional()
+      .default(1_000_000),
 })
   .superRefine((data, ctx) => {
     const isDev =

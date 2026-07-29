@@ -100,6 +100,28 @@ Any revoked or rotated token is rejected by `requireSession`.
 revocation state indicates they are no longer active. This is the cleanup path for
 expired or explicitly invalidated sessions.
 
+**Batching contract (issue #316):** The sweep runs in bounded pages of
+`SESSION_SWEEP_BATCH_SIZE` (500) rows. Each iteration:
+
+1. **SELECT** up to 500 token hashes that match the expired-or-revoked predicate.
+2. **DELETE** those specific hashes (with bounded retry, 3 attempts).
+3. Emits a `session.sweep_batch` info log per page.
+4. Repeats until the SELECT returns fewer than 500 rows (last page) or zero rows.
+
+This ensures the DELETE never holds a long-running lock, never bloats the WAL
+stream for replicas, and stays under any configured `statement_timeout`. A
+single invocation may produce zero or more `session.sweep_batch` log lines before
+the final `session.sweep_completed` summary.
+
+### Bulk revocation batching
+
+`revokeAllSessionsForAddress` and `revokeFamily` also operate in bounded pages of
+`SESSION_REVOKE_BATCH_SIZE` (100) rows. Each iteration SELECTs up to 100
+non-revoked token hashes (`revokedAt IS NULL`) for the target address or family,
+then UPDATEs them in a single statement. The loop continues until the SELECT
+returns empty. This prevents a single user or a large token family from causing
+a long-running UPDATE that escalates locks or exhausts the retry budget.
+
 ### Compatibility and scope
 
 This contract is intentionally scoped to the existing module and its current

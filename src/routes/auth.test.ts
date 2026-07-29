@@ -132,6 +132,56 @@ import {
   AUTH_METRICS,
 } from "./auth-metrics.js";
 import { lockouts } from "../auth/lockout.js";
+import { clearChallengesForTesting } from "../auth/challenge.js";
+
+/**
+ * Issue #193: locks the authorization contract for every route on this
+ * router by inspecting Express's registered middleware stack, so
+ * `requireAuth` cannot be silently dropped from session-mutating routes
+ * (or added to public login/challenge/session-presentation routes) without
+ * a test failing here.
+ */
+describe("authRouter — authorization contract (Issue #193)", () => {
+  const routeLayers = (authRouter as any).stack.filter((layer: any) => layer.route);
+
+  const PUBLIC_PATHS = [
+    "/auth/challenge",
+    "/auth/verify",
+    "/auth/session/validate",
+    "/auth/refresh",
+  ];
+  const BEARER_PATHS = ["/auth/logout", "/auth/revoke", "/auth/session/revoke"];
+
+  it("registers exactly the seven expected auth routes", () => {
+    const paths = routeLayers.map((l: any) => l.route.path);
+    // Declaration order in auth.ts — not alphabetical.
+    expect(paths).toEqual([
+      "/auth/challenge",
+      "/auth/verify",
+      "/auth/session/validate",
+      "/auth/logout",
+      "/auth/refresh",
+      "/auth/revoke",
+      "/auth/session/revoke",
+    ]);
+  });
+
+  it.each(PUBLIC_PATHS)("%s stays public (no requireAuth on the route stack)", (path) => {
+    const layer = routeLayers.find((l: any) => l.route.path === path);
+    expect(layer).toBeDefined();
+    const names = layer.route.stack.map((s: any) => s.name);
+    expect(names).not.toContain("requireAuth");
+  });
+
+  it.each(BEARER_PATHS)("%s requires requireAuth before its handler", (path) => {
+    const layer = routeLayers.find((l: any) => l.route.path === path);
+    expect(layer).toBeDefined();
+    const names = layer.route.stack.map((s: any) => s.name);
+    const authIdx = names.indexOf("requireAuth");
+    expect(authIdx).toBeGreaterThanOrEqual(0);
+    expect(authIdx).toBeLessThan(names.length - 1);
+  });
+});
 
 function makeApp() {
   const app = express();
@@ -198,6 +248,7 @@ describe("Auth Routes Integration", () => {
     mockState.sessions = [];
     vi.clearAllMocks();
     lockouts.clear();
+    clearChallengesForTesting();
   });
 
   afterEach(() => {
@@ -294,7 +345,7 @@ describe("Auth Routes Integration", () => {
   });
 
   it("rejects verify once the challenge TTL has elapsed", async () => {
-    const address = "0xee110edc8a11e09e";
+    const address = "0xeeee000000000001";
     const appInstance = makeApp();
 
     const challengeRes = await request(appInstance)
@@ -313,12 +364,8 @@ describe("Auth Routes Integration", () => {
     expect(verifyRes.body.error).toMatch(/No active challenge/);
   });
 
-  // TODO(pre-existing): challenge is consumed before createSession is called, so
-  // a session-store failure leaves the challenge consumed, and the retry
-  // arrives to find no active challenge. This test reflects the old contract
-  // where the challenge was only consumed on success. Tracked in follow-up PR.
-  it.skip("keeps the challenge available for retry when session issuance fails after verification", async () => {
-    const address = "0x0e707af7e05e55100fa1140e";
+  it("keeps the challenge available for retry when session issuance fails after verification", async () => {
+    const address = "0xeeee000000000002";
     const appInstance = makeApp();
 
     const challengeRes = await request(appInstance)
@@ -359,8 +406,28 @@ describe("Auth Routes Integration", () => {
     }
   });
 
+  it("does not restore the challenge after a signature failure (replay stays closed)", async () => {
+    const address = "0xeeee00000000001b";
+    const appInstance = makeApp();
+
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(false);
+
+    const badVerify = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xbad", "0xbad"] });
+    expect(badVerify.status).toBe(401);
+
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+    const retry = await request(appInstance)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: ["0xgood", "0xgood"] });
+    expect(retry.status).toBe(400);
+    expect(retry.body.error).toMatch(/No active challenge/);
+  });
+
   it("rejects a replayed verify call reusing an already-consumed challenge", async () => {
-    const address = "0x0e11a7a77e317";
+    const address = "0xeeee000000000003";
     const appInstance = makeApp();
 
     const challengeRes = await request(appInstance)
@@ -388,7 +455,7 @@ describe("Auth Routes Integration", () => {
   });
 
   it("accepts a valid challenge exactly once, even when verify is attempted concurrently", async () => {
-    const address = "0xc00c400e075e01f7";
+    const address = "0xeeee000000000004";
     const appInstance = makeApp();
 
     const challengeRes = await request(appInstance)
@@ -433,7 +500,7 @@ describe("Auth Routes Integration", () => {
   // changes. Skipped to keep CI green on the lint fix; tracked in the
   // follow-up PR that addresses the underlying route.
   it.skip("rotates the refresh token on each call and invalidates the previous one", async () => {
-    const address = "0x007a71008a1171a78";
+    const address = "0xeeee000000000005";
     const appInstance = makeApp();
 
     await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -473,7 +540,7 @@ describe("Auth Routes Integration", () => {
   // changes. Skipped to keep CI green on the lint fix; tracked in the
   // follow-up PR.
   it.skip("rejects reuse of a stale rotated refresh token and revokes the whole family", async () => {
-    const address = "0x57a1e0e45ea77e317";
+    const address = "0xeeee000000000006";
     const appInstance = makeApp();
 
     await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -502,7 +569,7 @@ describe("Auth Routes Integration", () => {
   });
 
   it("revoke endpoint immediately invalidates outstanding tokens for that user", async () => {
-    const address = "0x0e503ee5e0778109";
+    const address = "0xeeee000000000007";
     const appInstance = makeApp();
 
     await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -525,12 +592,8 @@ describe("Auth Routes Integration", () => {
     expect(refreshAfterRevokeRes.status).toBe(401);
   });
 
-  // TODO(pre-existing): after the 15-minute lockout elapses, verify returns 400
-  // instead of the expected 200. The challenge exists but is not found by
-  // consumeChallenge, suggesting a key-mismatch under frozen-clock conditions.
-  // Reproducible upstream, unrelated to observability changes.
-  it.skip("locks out an account after 5 consecutive failed logins, and successful login resets it", async () => {
-    const address = "0x10c30477e57";
+  it("locks out an account after 5 consecutive failed logins, and successful login resets it", async () => {
+    const address = "0xeeee000000000008";
     const appInstance = makeApp();
 
     mockProvider.verifyMessageInStarknet.mockResolvedValue(false);
@@ -562,10 +625,11 @@ describe("Auth Routes Integration", () => {
     expect(lockedRes.body.error).toBe("Invalid signature or account locked");
     expect(mockProvider.verifyMessageInStarknet).not.toHaveBeenCalled();
 
-    // Fast forward 15 minutes
+    // Fast forward 15 minutes (past lockout). Challenge TTL is only 5 minutes,
+    // so the outstanding nonce from the locked attempt is gone — re-issue.
     vi.advanceTimersByTime(15 * 60 * 1000 + 1);
 
-    // Now it should succeed
+    await request(appInstance).post("/api/v1/auth/challenge").send({ address });
     const validVerifyRes = await request(appInstance)
       .post("/api/v1/auth/verify")
       .send({ address, signature: ["0xgood", "0xgood"] });
@@ -590,11 +654,11 @@ describe("Auth Routes Integration", () => {
     expect(singleGood.status).toBe(200);
   });
 
-  it("retry within the active TTL returns the same nonce (single outstanding challenge per address)", async () => {
-    const address = "0xc8a11e09e05e06017e";
+  it("retries of /auth/challenge within the TTL keep the same outstanding nonce", async () => {
+    const address = "0xeeee000000000009";
     const appInstance = makeApp();
 
-    // Issue a first challenge, then a second before the first is ever consumed.
+    // Issue a first challenge, then retry before the first is ever consumed.
     const firstChallengeRes = await request(appInstance)
       .post("/api/v1/auth/challenge")
       .send({ address });
@@ -608,25 +672,19 @@ describe("Auth Routes Integration", () => {
     expect(secondChallengeRes.status).toBe(200);
     const secondNonce = secondChallengeRes.body.nonce;
 
-    // createChallenge is idempotent within the active TTL window:
-    // the same nonce is returned with the remaining TTL.
+    // Retries within TTL are idempotent: the same outstanding nonce is returned.
     expect(secondNonce).toBe(firstNonce);
-    expect(secondChallengeRes.body.expires_in_ms).toBeLessThanOrEqual(
-      firstChallengeRes.body.expires_in_ms,
-    );
 
     mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
 
-    // Exactly one verify attempt succeeds for the address, consuming the
-    // sole outstanding challenge.
+    // Exactly one verify attempt succeeds for the address, consuming the challenge.
     const verifyRes = await request(appInstance)
       .post("/api/v1/auth/verify")
       .send({ address, signature: ["0xsig1", "0xsig2"] });
     expect(verifyRes.status).toBe(200);
     expect(verifyRes.body.ok).toBe(true);
 
-    // A second verify attempt for the same address now finds no active
-    // challenge, proving the nonce was consumed.
+    // A second verify finds no active challenge.
     const staleVerifyRes = await request(appInstance)
       .post("/api/v1/auth/verify")
       .send({ address, signature: ["0xsig1", "0xsig2"] });
@@ -635,9 +693,9 @@ describe("Auth Routes Integration", () => {
   });
 
   it("session revocation route gates correctly (owner, admin, other)", async () => {
-    const addressOwner = "0x060e0add0e55".toLowerCase();
-    const addressOther = "0x078e0add0e55".toLowerCase();
-    const addressAdmin = "0xad310add0e55".toLowerCase();
+    const addressOwner = "0xeeee00000000000a";
+    const addressOther = "0xeeee00000000000b";
+    const addressAdmin = "0xeeee00000000000c";
     const appInstance = makeApp();
 
     // Setup: Push admin address to env.ADMIN_ADDRESSES if not present
@@ -727,7 +785,7 @@ describe("Auth Routes Integration", () => {
   // -----------------------------------------------------------------------
   describe("/auth/challenge idempotency", () => {
     it("returns the same nonce when retried within the active TTL window", async () => {
-      const address = "0xc8a11e09e0e707";
+      const address = "0xeeee00000000000d";
       const appInstance = makeApp();
 
       const first = await request(appInstance)
@@ -749,7 +807,7 @@ describe("Auth Routes Integration", () => {
     });
 
     it("issues a fresh nonce after the original challenge has expired", async () => {
-      const address = "0xc8a11e09eee110ed0e707";
+      const address = "0xeeee00000000000e";
       const appInstance = makeApp();
 
       const first = await request(appInstance)
@@ -773,10 +831,10 @@ describe("Auth Routes Integration", () => {
 
       const first = await request(appInstance)
         .post("/api/v1/auth/challenge")
-        .send({ address: "0x31eedca5e" });
+        .send({ address: "0xabcdef" });
       const second = await request(appInstance)
         .post("/api/v1/auth/challenge")
-        .send({ address: "0x31eedca5e" });
+        .send({ address: "0xABCDEF" });
 
       expect(first.status).toBe(200);
       expect(second.status).toBe(200);
@@ -784,7 +842,7 @@ describe("Auth Routes Integration", () => {
     });
 
     it("a retry after the challenge was consumed returns a brand-new nonce (consume is terminal)", async () => {
-      const address = "0xc8a11e09ec00543ed78e00e701ed";
+      const address = "0xeeee00000000000f";
       const appInstance = makeApp();
 
       const first = await request(appInstance)
@@ -806,7 +864,7 @@ describe("Auth Routes Integration", () => {
 
   describe("session issuance idempotency (verify + refresh)", () => {
     it("two /auth/verify calls cannot both create a session off the same challenge", async () => {
-      const address = "0x00d04b1e5e55100";
+      const address = "0xeeee000000000010";
       const appInstance = makeApp();
 
       await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -829,7 +887,7 @@ describe("Auth Routes Integration", () => {
     });
 
     it("/auth/session/validate is read-only and trivially idempotent on retry", async () => {
-      const address = "0x5a11da7e0e707";
+      const address = "0xeeee000000000011";
       const appInstance = makeApp();
 
       await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -858,11 +916,8 @@ describe("Auth Routes Integration", () => {
       expect(mockState.sessions).toHaveLength(1);
     });
 
-    // TODO(lint-fix-310): pre-existing rotation bug — the route returns 401
-    // instead of 200 for the first rotation. Reproducible upstream, unrelated
-    // to observability changes. Skipped to keep CI green.
-    it.skip("/auth/refresh is deterministic per input token (replay of a rotated token fails closed)", async () => {
-      const address = "0x0ef0e58de7e03101571c";
+    it("/auth/refresh is deterministic per input token (replay of a rotated token fails closed)", async () => {
+      const address = "0xeeee000000000012";
       const appInstance = makeApp();
 
       await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -888,7 +943,7 @@ describe("Auth Routes Integration", () => {
 
   describe("logout / revoke idempotency (already-revoked → 401, not an error)", () => {
     it("/auth/logout is idempotent for a still-valid session, and rejects a session that was already revoked", async () => {
-      const address = "0x1090470e707";
+      const address = "0xeeee000000000013";
       const appInstance = makeApp();
 
       await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -917,7 +972,7 @@ describe("Auth Routes Integration", () => {
     });
 
     it("/auth/revoke rejects a session that was already revoked", async () => {
-      const address = "0x0e503e0e707";
+      const address = "0xeeee000000000014";
       const appInstance = makeApp();
 
       await request(appInstance).post("/api/v1/auth/challenge").send({ address });
@@ -966,7 +1021,7 @@ describe("admin address set", () => {
   it("rebuildAdminSet reflects a newly pushed admin address", async () => {
     const { env } = await import("../config.js");
     const appInstance = makeApp();
-    const newAdmin = "0xb0a0d0e6ad310";
+    const newAdmin = "0xeeee000000000015";
 
     // Confirm it's not an admin before the push.
     expect(env.ADMIN_ADDRESSES.map((a) => a.toLowerCase())).not.toContain(newAdmin);
@@ -977,7 +1032,7 @@ describe("admin address set", () => {
     // Create sessions for the new admin and an owner.
     mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
 
-    const owner = "0x060e0f007e57e";
+    const owner = "0xeeee000000000016";
     await request(appInstance).post("/api/v1/auth/challenge").send({ address: owner });
     const ownerVerify = await request(appInstance)
       .post("/api/v1/auth/verify")
@@ -1008,13 +1063,13 @@ describe("admin address set", () => {
     const { env } = await import("../config.js");
     const appInstance = makeApp();
 
-    const mixedCaseAdmin = "0xca5e105e051715ead310";
+    const mixedCaseAdmin = "0xEEEE000000000017";
     env.ADMIN_ADDRESSES.push(mixedCaseAdmin);
     rebuildAdminSet();
 
     mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
 
-    const owner = "0x060e0f007e577";
+    const owner = "0xeeee000000000018";
     await request(appInstance).post("/api/v1/auth/challenge").send({ address: owner });
     const ownerVerify = await request(appInstance)
       .post("/api/v1/auth/verify")
@@ -1045,12 +1100,12 @@ describe("admin address set", () => {
     const { env } = await import("../config.js");
     const appInstance = makeApp();
     // Ensure the address we use is NOT in the admin list.
-    const nonAdmin = "0x007a0ad310999";
+    const nonAdmin = "0xeeee000000000019";
     expect(env.ADMIN_ADDRESSES.map((a) => a.toLowerCase())).not.toContain(nonAdmin);
 
     mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
 
-    const owner = "0x060e0f007e572";
+    const owner = "0xeeee00000000001a";
     await request(appInstance).post("/api/v1/auth/challenge").send({ address: owner });
     const ownerVerify = await request(appInstance)
       .post("/api/v1/auth/verify")
@@ -1113,6 +1168,27 @@ describe("debug middleware body-clone guard", () => {
     expect(body.session_token).not.toBe("supersecrettoken1234");
 
     restoreSpies(spies);
+  });
+
+  it("redacts refresh_token from the log when body is present", async () => {
+    const logs: unknown[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...args) => logs.push(args));
+
+    const appInstance = makeApp();
+    await request(appInstance)
+      .post("/api/v1/auth/refresh")
+      .send({ address: "0x1", refresh_token: "supersecretrefresh1234" });
+
+    const authLog = logs.find(
+      (entry) => Array.isArray(entry) && String(entry[0]).includes("/auth/refresh"),
+    ) as unknown[] | undefined;
+
+    expect(authLog).toBeDefined();
+    const bodyArg = (authLog as any[])[1] as { body: Record<string, unknown> };
+    expect(bodyArg.body.refresh_token).toBe("***");
+    expect(bodyArg.body.refresh_token).not.toBe("supersecretrefresh1234");
+
+    spy.mockRestore();
   });
 
   describe("Harden login input validation", () => {

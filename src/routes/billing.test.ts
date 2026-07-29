@@ -27,6 +27,7 @@ vi.mock("../config.js", () => ({
     BILLING_ENABLED: true,
     LOG_FORMAT: "json",
     LOG_LEVEL: "debug",
+    MAX_BILLING_AMOUNT: 1_000_000,
   },
 }));
 
@@ -1082,5 +1083,114 @@ describe("billing idempotency middleware", () => {
     expect(second.status).toBe(201);
     // Both executed because the scopes differ.
     expect(getExecutionCount()).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Billing Request Validation Integration Tests
+// ---------------------------------------------------------------------------
+
+describe("billing request validation integration", () => {
+  const profileId = "bp_valid123";
+
+  beforeEach(() => {
+    queuedResults = [];
+    selectCallCount = 0;
+    failingCall = null;
+    resetBillingMetrics();
+    clearBillingIdempotencyStore();
+    vi.mocked(db.select).mockImplementation(makeQueryBuilder as any);
+  });
+
+  afterEach(() => {
+    resetBillingMetrics();
+    clearBillingIdempotencyStore();
+  });
+
+  it("accepts valid currency code and billing amount query parameters", async () => {
+    // Queue: profile row (ownership) + empty payment methods + empty invoices
+    queueRows([profileRow({ id: profileId })], [], []);
+    const res = await request(makeApp())
+      .get(`/api/v1/billing/profiles/${profileId}?currency=USD&amount=500`)
+      .set(authHeaders("0xowner"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+  });
+
+  it("rejects unknown currency code with HTTP 400", async () => {
+    queueRows([profileRow({ id: profileId })]);
+    const res = await request(makeApp())
+      .get(`/api/v1/billing/profiles/${profileId}?currency=XYZ`)
+      .set(authHeaders("0xowner"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("Unsupported currency code 'XYZ'");
+  });
+
+  it("rejects malformed currency code (lowercase) with HTTP 400", async () => {
+    queueRows([profileRow({ id: profileId })]);
+    const res = await request(makeApp())
+      .get(`/api/v1/billing/profiles/${profileId}?currency=usd`)
+      .set(authHeaders("0xowner"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("Invalid currency code format");
+  });
+
+  it("rejects zero billing amount with HTTP 400", async () => {
+    queueRows([profileRow({ id: profileId })]);
+    const res = await request(makeApp())
+      .get(`/api/v1/billing/profiles/${profileId}?amount=0`)
+      .set(authHeaders("0xowner"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("Billing amount must be greater than zero");
+  });
+
+  it("rejects negative billing amount with HTTP 400", async () => {
+    queueRows([profileRow({ id: profileId })]);
+    const res = await request(makeApp())
+      .get(`/api/v1/billing/profiles/${profileId}?amount=-50`)
+      .set(authHeaders("0xowner"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("Billing amount must be greater than zero");
+  });
+
+  it("rejects billing amount exceeding max configured limit with HTTP 400", async () => {
+    queueRows([profileRow({ id: profileId })]);
+    const res = await request(makeApp())
+      .get(`/api/v1/billing/profiles/${profileId}?amount=2000000`)
+      .set(authHeaders("0xowner"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toContain("exceeds maximum allowed limit");
+  });
+
+  it("enforces validation consistently across multiple billing entry points", async () => {
+    const endpoints = [
+      { url: `/api/v1/billing/profiles/${profileId}/general-information?currency=INVALID`, rows: [[profileRow({ id: profileId })]] },
+      { url: `/api/v1/billing/profiles/${profileId}/payment-methods?amount=-10`, rows: [[profileRow({ id: profileId })]] },
+      { url: `/api/v1/billing/profiles/${profileId}/invoices?amount=5000000`, rows: [[profileRow({ id: profileId })]] },
+      { url: `/api/v1/billing/profiles/${profileId}/summary?currency=FOO`, rows: [[profileRow({ id: profileId })]] },
+    ];
+
+    for (const { url } of endpoints) {
+      // Reset queued results for each iteration
+      queuedResults = [[profileRow({ id: profileId })]];
+      selectCallCount = 0;
+      const res = await request(makeApp())
+        .get(url)
+        .set(authHeaders("0xowner"));
+
+      expect(res.status).toBe(400);
+      expect(res.body.success).toBe(false);
+    }
   });
 });
