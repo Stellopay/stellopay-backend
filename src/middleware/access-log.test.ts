@@ -110,6 +110,64 @@ describe("redactSensitiveParams", () => {
     expect(result).not.toContain("ghi");
     expect(result).toContain("page=1");
   });
+
+  it("handles null/undefined gracefully by treating them as strings", () => {
+    // @ts-expect-error — testing runtime resilience with non-string inputs
+    expect(() => redactSensitiveParams(null)).not.toThrow();
+    // @ts-expect-error
+    expect(() => redactSensitiveParams(undefined)).not.toThrow();
+  });
+
+  it("returns safe string for a URL with only sensitive params", () => {
+    const result = redactSensitiveParams("/login?password=hunter2&token=abc123");
+    expect(result).toContain("/login?");
+    expect(result).toContain(`password=${REDACTED_VALUE}`);
+    expect(result).toContain(`token=${REDACTED_VALUE}`);
+    expect(result).not.toContain("hunter2");
+    expect(result).not.toContain("abc123");
+  });
+
+  it("handles a URL fragment after query string", () => {
+    const result = redactSensitiveParams("/api?token=secret#section");
+    expect(result).not.toContain("secret");
+    expect(result).toContain(`token=${REDACTED_VALUE}`);
+  });
+
+  it("redacts 'api_key' and 'apikey' case-insensitively", () => {
+    const result = redactSensitiveParams("/v1/data?api_key=sk-abc123&ApiKey=sk-def456");
+    expect(result).not.toContain("sk-abc123");
+    expect(result).not.toContain("sk-def456");
+  });
+
+  it("returns only path portion for a malformed URL with extra '?'", () => {
+    // Multiple '?' characters — the URL constructor will reject
+    const result = redactSensitiveParams("/path?token=abc?extra=malformed");
+    expect(result).not.toContain("abc");
+  });
+
+  it("preserves numeric query params like page=1&limit=50", () => {
+    expect(redactSensitiveParams("/items?page=1&limit=50&offset=10")).toBe(
+      "/items?page=1&limit=50&offset=10",
+    );
+  });
+
+  it("redacts 'private_key' param", () => {
+    const result = redactSensitiveParams("/wallet?private_key=0xdeadbeef");
+    expect(result).not.toContain("0xdeadbeef");
+    expect(result).toContain(`private_key=${REDACTED_VALUE}`);
+  });
+
+  it("returns empty string for empty input", () => {
+    // @ts-expect-error — testing runtime resilience
+    const result = redactSensitiveParams("");
+    expect(typeof result).toBe("string");
+  });
+
+  it("redacts 'sig' param (short signature) alongside other safe params", () => {
+    const result = redactSensitiveParams("/verify?sig=0xabc123&message=hello");
+    expect(result).not.toContain("0xabc123");
+    expect(result).toContain("message=hello");
+  });
 });
 
 // ---------------------------------------------------------------------------
