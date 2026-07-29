@@ -1,9 +1,9 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { z } from "zod";
 import { requireAuth, requireAdmin } from "../auth/middleware.js";
-import { db, getPoolStats } from "../db/index.js";
+import { db, getPoolStats, checkDbHealth } from "../db/index.js";
 import { sql } from "drizzle-orm";
-import { getCircuitBreakerSnapshots } from "../starknet/client.js";
+import { getCircuitBreakerSnapshots, provider } from "../starknet/client.js";
 import {
   logDiagnosticsEvent,
   incDiagnosticsMetric,
@@ -13,6 +13,8 @@ import {
 } from "./diagnostics-metrics.js";
 
 export const diagnosticsRouter = Router();
+
+const DIAGNOSTICS_CHECK_TIMEOUT_MS = 5_000;
 
 const DIAGNOSTICS_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -287,17 +289,6 @@ diagnosticsRouter.get(
         offset,
       });
 
-      const userAddress = Array.isArray(req.headers["x-user-address"])
-        ? req.headers["x-user-address"][0]
-        : req.headers["x-user-address"];
-
-      incDiagnosticsMetric(DIAGNOSTICS_METRICS.REQUESTS);
-      logDiagnosticsEvent("info", "diagnostics.request", {
-        admin: typeof userAddress === "string" ? userAddress.toLowerCase() : "unknown",
-        limit,
-        offset,
-      });
-
       const data = await fetchDiagnosticsData(db, { limit, offset });
 
       incDiagnosticsMetric(DIAGNOSTICS_METRICS.SUCCESS);
@@ -314,6 +305,105 @@ diagnosticsRouter.get(
         error: e instanceof Error ? e.message : String(e),
         stack: e instanceof Error ? e.stack?.split("\n").slice(0, 3).join("\n") : undefined,
       });
+      next(e);
+    }
+  }
+);
+
+export type DependencyStatus = "healthy" | "unhealthy";
+
+export interface DependencyCheckResult {
+  status: DependencyStatus;
+  latencyMs: number;
+}
+
+export interface HealthCheckResponse {
+  status: "healthy" | "unhealthy";
+  checks: {
+    database: DependencyCheckResult;
+    starknet: DependencyCheckResult;
+  };
+}
+
+/**
+ * Runs a promise with a bounded timeout. If the promise does not settle within
+ * `ms` milliseconds it is rejected with a TimeoutError. This ensures that a
+ * slow or hanging dependency never blocks the diagnostics endpoint.
+ */
+export async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms),
+    ),
+  ]);
+}
+
+/**
+ * Performs a lightweight DB reachability check via checkDbHealth.
+ * The check is bounded by DIAGNOSTICS_CHECK_TIMEOUT_MS to avoid hanging.
+ */
+export async function checkDatabaseHealth(): Promise<DependencyCheckResult> {
+  const start = Date.now();
+  try {
+    const healthy = await withTimeout(checkDbHealth(), DIAGNOSTICS_CHECK_TIMEOUT_MS);
+    return { status: healthy ? "healthy" : "unhealthy", latencyMs: Date.now() - start };
+  } catch {
+    return { status: "unhealthy", latencyMs: Date.now() - start };
+  }
+}
+
+/**
+ * Performs a lightweight Starknet RPC reachability check via getChainId.
+ * The check is bounded by DIAGNOSTICS_CHECK_TIMEOUT_MS to avoid hanging.
+ */
+export async function checkStarknetHealth(): Promise<DependencyCheckResult> {
+  const start = Date.now();
+  try {
+    await withTimeout(provider.getChainId(), DIAGNOSTICS_CHECK_TIMEOUT_MS);
+    return { status: "healthy", latencyMs: Date.now() - start };
+  } catch {
+    return { status: "unhealthy", latencyMs: Date.now() - start };
+  }
+}
+
+/**
+ * Runs all dependency checks concurrently and aggregates the results into a
+ * single HealthCheckResponse. The overall status is "healthy" only when every
+ * individual dependency is healthy.
+ */
+export async function runHealthChecks(): Promise<HealthCheckResponse> {
+  const [database, starknet] = await Promise.all([
+    checkDatabaseHealth(),
+    checkStarknetHealth(),
+  ]);
+
+  const overall: HealthCheckResponse["status"] =
+    database.status === "healthy" && starknet.status === "healthy"
+      ? "healthy"
+      : "unhealthy";
+
+  return { status: overall, checks: { database, starknet } };
+}
+
+/**
+ * GET /diagnostics/health (operator only)
+ *
+ * Returns per-dependency health status for DB and Starknet RPC, plus an
+ * overall status. Each check runs with a bounded timeout so diagnostics
+ * never hangs on a slow dependency. No connection strings, credentials,
+ * or raw RPC URLs are included in the response.
+ */
+diagnosticsRouter.get(
+  "/diagnostics/health",
+  requireAuth,
+  requireAdmin,
+  async (_req, res, next) => {
+    try {
+      const result = await runHealthChecks();
+      const httpStatus = result.status === "healthy" ? 200 : 503;
+      res.status(httpStatus).json(result);
+    } catch (e) {
       next(e);
     }
   }

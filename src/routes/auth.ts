@@ -1,7 +1,12 @@
 import { Router } from "express";
 import { z } from "zod";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
-import { buildTypedChallenge, consumeChallenge, createChallenge, getChallenge } from "../auth/challenge.js";
+import {
+  buildTypedChallenge,
+  consumeChallenge,
+  createChallenge,
+  restoreChallenge,
+} from "../auth/challenge.js";
 import {
   createSession,
   requireSession,
@@ -15,6 +20,24 @@ import { requireAuth } from "../auth/middleware.js";
 import { env } from "../config.js";
 import { isLockedOut, recordFailure, clearFailures } from "../auth/lockout.js";
 
+/**
+ * Authorization & session-issuance contract for `authRouter` (Issue #193).
+ *
+ * Privilege boundaries are locked by stack-inspection tests in
+ * `src/routes/auth.test.ts` and documented in `docs/routes/auth.md`. Do not
+ * add or drop `requireAuth` on a route without updating those three in lockstep.
+ *
+ * Public (no bearer session — wallet proof / token presentation only):
+ *   POST /auth/challenge, /auth/verify, /auth/session/validate, /auth/refresh
+ *
+ * Session-bearer (`requireAuth` before any session mutation):
+ *   POST /auth/logout, /auth/revoke, /auth/session/revoke
+ *
+ * Session issuance (`/auth/verify`) may only mint a token after a consumed
+ * challenge has been signature-verified. If issuance fails after that proof,
+ * the challenge is restored so the caller can retry without re-signing.
+ * Signature failure leaves the challenge consumed (replay-closed).
+ */
 const AddressString = z.string().min(3).max(100);
 const TokenString = z.string().min(10).max(1000);
 
@@ -75,11 +98,12 @@ export const authRouter = Router();
 
 // Debug logger for auth routes (helps track nonce/signature/RPC issues).
 // The body is only cloned when it is a non-null object to avoid an
-// unconditional spread on every request.
+// unconditional spread on every request. Sensitive token fields are redacted.
 authRouter.use((req, _res, next) => {
   if (req.body && typeof req.body === "object") {
     const bodyLog: Record<string, unknown> = { ...req.body };
     if (bodyLog.session_token) bodyLog.session_token = "***";
+    if (bodyLog.refresh_token) bodyLog.refresh_token = "***";
     if (bodyLog.signature) bodyLog.signature = "***";
     // eslint-disable-next-line no-console
     console.log(`[auth] ${req.method} ${req.originalUrl}`, { body: bodyLog });
@@ -112,7 +136,12 @@ authRouter.post("/auth/challenge", async (req, res, next) => {
   }
 });
 
-// Step 2: backend verifies signature using account's isValidSignature (RPC verify)
+// Step 2: backend verifies signature using account's isValidSignature (RPC verify).
+//
+// AUTHORIZATION BOUNDARY: a session token is issued only after (1) lockout
+// check, (2) atomic challenge consume, and (3) successful signature verify.
+// Session-store failure after (3) restores the challenge so the ownership
+// proof is not stranded; signature failure leaves the challenge consumed.
 authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
@@ -144,19 +173,30 @@ authRouter.post("/auth/verify", async (req, res, next) => {
     }
 
     clearFailures(address);
-    const session = await createSession(address);
-    res.json({
-      ok: true,
-      address,
-      session_token: session.token,
-      // The token returned as `session_token` is also valid as the initial
-      // `refresh_token` for /auth/refresh (createSession issues a single,
-      // dual-role token). Exposing both field names here means a caller
-      // reading only this response can discover that contract without
-      // needing to read /auth/refresh's response shape too.
-      refresh_token: session.token,
-      expires_in_ms: session.expires_in_ms,
-    });
+    try {
+      const session = await createSession(address);
+      res.json({
+        ok: true,
+        address,
+        session_token: session.token,
+        // The token returned as `session_token` is also valid as the initial
+        // `refresh_token` for /auth/refresh (createSession issues a single,
+        // dual-role token). Exposing both field names here means a caller
+        // reading only this response can discover that contract without
+        // needing to read /auth/refresh's response shape too.
+        refresh_token: session.token,
+        expires_in_ms: session.expires_in_ms,
+      });
+    } catch (sessionErr) {
+      // Ownership was proven but the session store failed. Restore the same
+      // nonce/TTL so a retry of /auth/verify can succeed without a new
+      // challenge + re-sign. Never overwrite a challenge issued in between.
+      restoreChallenge(address, ch);
+      // eslint-disable-next-line no-console
+      console.error("[auth] /auth/verify session issuance error", sessionErr);
+      res.status(500).json({ error: "Unable to issue session" });
+      return;
+    }
   } catch (e) {
     // eslint-disable-next-line no-console
     console.error("[auth] /auth/verify error", e);

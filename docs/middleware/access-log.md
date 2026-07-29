@@ -2,6 +2,14 @@
 
 The `accessLogMiddleware` is a core Express middleware in `src/middleware/access-log.ts` responsible for generating a single, structured log entry for every HTTP request.
 
+## Security boundary
+
+The middleware enforces two explicit security gates:
+
+1. **Path-skip list** (`/health`, `/ready`) — requests to these paths are excluded from logging *before* any correlation ID is read or any timer is started. This is the sole authorization gate; any future endpoint that must never be logged must be added here.
+
+2. **Correlation-ID validation** (`validateCorrelationId`) — only UUID v4-formatted strings from `res.locals.requestId` are trusted. Non-UUID values (including overlong strings that could cause memory pressure) are silently replaced with a freshly-generated `crypto.randomUUID()`. This prevents log-line forgery, cache poisoning, and memory-exhaustion attacks through the `x-request-id` header.
+
 ## Contract
 
 - **Idempotency & Correlation IDs**: Logs are deduplicated based on correlation ID (typically `res.locals.requestId`). The same request ID is only logged once within a 60-second window. This ensures that accidental duplicate calls or retries passing the same ID only produce at most one log line. A random fallback ID (`crypto.randomUUID()`) is generated if no correlation ID is found, so every log line always carries a valid, non-empty request ID.
