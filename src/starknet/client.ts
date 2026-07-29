@@ -6,6 +6,12 @@ import {
   logStarknetEvent,
   STARKNET_METRICS,
 } from "./client-metrics.js";
+import {
+  EndpointCircuitBreaker,
+  CircuitOpenError,
+  type CircuitBreakerSnapshot,
+  snapshotCircuitBreaker,
+} from "./circuit-breaker.js";
 
 export {
   getStarknetMetricsSnapshot,
@@ -286,6 +292,13 @@ async function invokeWithFailover(
     const candidate = rpcProviders[index];
     if (!candidate) continue;
 
+    const breaker = circuitBreakers[index];
+
+    // Skip endpoints whose circuit is OPEN — fail-fast until cooldown elapses
+    if (!breaker.isCallPermitted()) {
+      continue;
+    }
+
     try {
       const fn = Reflect.get(candidate, method) as (...a: unknown[]) => unknown;
       if (typeof fn !== "function") {
@@ -311,6 +324,8 @@ async function invokeWithFailover(
         healthyRpcIndex = index;
       }
 
+      breaker.recordSuccess();
+
       logStarknetEvent("debug", "starknet.rpc.success", {
         method: methodName,
         endpoint: starknetRpcUrls[index],
@@ -327,7 +342,6 @@ async function invokeWithFailover(
 
       return result;
     } catch (err) {
-      // Don't count CircuitOpenError as a new failure against the breaker
       if (!(err instanceof CircuitOpenError)) {
         breaker.recordFailure();
       }

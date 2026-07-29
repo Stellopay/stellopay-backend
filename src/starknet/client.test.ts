@@ -51,10 +51,13 @@ import {
   agreementContract,
   clearContractCache,
   resetRpcFailoverForTests,
+  resetCircuitBreakersForTests,
   getStarknetMetricsSnapshot,
+  getCircuitBreakerSnapshots,
   resetStarknetMetrics,
   incStarknetMetric,
   STARKNET_METRICS,
+  ChainIdMismatchError,
 } from "./client.js";
 import { CircuitOpenError } from "./circuit-breaker.js";
 
@@ -500,5 +503,336 @@ describe("Performance Optimizations", () => {
     const fn1 = provider.getChainId;
     const fn2 = provider.getChainId;
     expect(fn1).toBe(fn2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Circuit breaker integration
+// ---------------------------------------------------------------------------
+describe("Circuit breaker integration", () => {
+  const CB_FAIL_THRESHOLD = "2";
+  const CB_SUCCESS_THRESHOLD = "1";
+  const CB_COOLDOWN_MS = "5000";
+  const CB_WINDOW_MS = "30000";
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD = CB_FAIL_THRESHOLD;
+    process.env.CIRCUIT_BREAKER_SUCCESS_THRESHOLD = CB_SUCCESS_THRESHOLD;
+    process.env.CIRCUIT_BREAKER_COOLDOWN_MS = CB_COOLDOWN_MS;
+    process.env.CIRCUIT_BREAKER_WINDOW_MS = CB_WINDOW_MS;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("records failure on RPC error and stays CLOSED below threshold", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary] = mockRpcProviders;
+    primary!.getBlock.mockRejectedValue(new Error("RPC fail"));
+
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("RPC fail");
+
+    const snap = client.getCircuitBreakerSnapshots();
+    // 1 failure < threshold=2 → still CLOSED
+    expect(snap[0].state).toBe("CLOSED");
+    expect(snap[0].recentFailureCount).toBe(1);
+  });
+
+  it("opens circuit after reaching failure threshold and skips the endpoint", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary, secondary] = mockRpcProviders;
+
+    // Call 1: both endpoints fail → each breaker records 1 failure
+    primary!.getBlock.mockImplementationOnce(() => Promise.reject(new Error("fail1")));
+    secondary!.getBlock.mockImplementationOnce(() => Promise.reject(new Error("fail1s")));
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("fail1s");
+
+    // Call 2: primary fails → reaches threshold=2 → OPEN; secondary succeeds
+    primary!.getBlock.mockImplementationOnce(() => Promise.reject(new Error("fail2")));
+    secondary!.getBlock.mockImplementationOnce(() => Promise.resolve({ block_number: 42 }));
+
+    const result = await client.provider.getBlock("latest");
+    expect(result).toEqual({ block_number: 42 });
+
+    const snap = client.getCircuitBreakerSnapshots();
+    expect(snap[0].state).toBe("OPEN");
+    expect(snap[0].recentFailureCount).toBe(2);
+  });
+
+  it("probe call succeeds and closes the circuit after cooldown", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary] = mockRpcProviders;
+
+    // 2 failures → circuit opens (single endpoint, both fail same endpoint)
+    primary!.getBlock.mockImplementationOnce(() => Promise.reject(new Error("f1")));
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("f1");
+
+    primary!.getBlock.mockImplementationOnce(() => Promise.reject(new Error("f2")));
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("f2");
+
+    expect(client.getCircuitBreakerSnapshots()[0].state).toBe("OPEN");
+
+    // Advance past cooldown → next isCallPermitted() transitions to HALF_OPEN
+    vi.advanceTimersByTime(5001);
+
+    // Probe succeeds → successThreshold=1 → CLOSED
+    primary!.getBlock.mockImplementationOnce(() => Promise.resolve({ block_number: 100 }));
+
+    await client.provider.getBlock("latest");
+    expect(client.getCircuitBreakerSnapshots()[0].state).toBe("CLOSED");
+  });
+
+  it("records success on successful RPC call", async () => {
+    vi.useRealTimers();
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary] = mockRpcProviders;
+    primary!.getBlock.mockResolvedValue({ block_number: 1 });
+
+    await client.provider.getBlock("latest");
+
+    // Breaker should be CLOSED with no failures (success zeroes the counter)
+    const snap = client.getCircuitBreakerSnapshots();
+    expect(snap[0].state).toBe("CLOSED");
+    expect(snap[0].recentFailureCount).toBe(0);
+  });
+
+  it("getCircuitBreakerSnapshots returns accurate snapshot data", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc,https://secondary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const snapshots = client.getCircuitBreakerSnapshots();
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[0].endpointUrl).toBe("https://primary.example/rpc");
+    expect(snapshots[1].endpointUrl).toBe("https://secondary.example/rpc");
+    expect(snapshots[0].state).toBe("CLOSED");
+    expect(snapshots[1].state).toBe("CLOSED");
+    expect(snapshots[0].openedAt).toBeNull();
+    expect(snapshots[1].openedAt).toBeNull();
+  });
+
+  it("resetCircuitBreakersForTests resets all breakers", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary] = mockRpcProviders;
+    primary!.getBlock.mockRejectedValue(new Error("fail"));
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("fail");
+
+    // Should have 1 failure
+    expect(client.getCircuitBreakerSnapshots()[0].recentFailureCount).toBe(1);
+
+    client.resetCircuitBreakersForTests();
+    const snap = client.getCircuitBreakerSnapshots();
+    expect(snap[0].state).toBe("CLOSED");
+    expect(snap[0].recentFailureCount).toBe(0);
+    expect(snap[0].openedAt).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fee quote failover paths
+// ---------------------------------------------------------------------------
+describe("Fee quote RPC failover", () => {
+  const CB_FAIL_THRESHOLD = "3";
+  const CB_SUCCESS_THRESHOLD = "1";
+  const CB_COOLDOWN_MS = "10000";
+  const CB_WINDOW_MS = "60000";
+
+  beforeEach(() => {
+    process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD = CB_FAIL_THRESHOLD;
+    process.env.CIRCUIT_BREAKER_SUCCESS_THRESHOLD = CB_SUCCESS_THRESHOLD;
+    process.env.CIRCUIT_BREAKER_COOLDOWN_MS = CB_COOLDOWN_MS;
+    process.env.CIRCUIT_BREAKER_WINDOW_MS = CB_WINDOW_MS;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("falls back to secondary endpoint on fee quote failure", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetStarknetMetrics();
+
+    const [primary, secondary] = mockRpcProviders;
+
+    primary!.estimateFee.mockRejectedValue(new Error("fee estimation down"));
+    secondary!.estimateFee.mockResolvedValue({ overall_fee: "2500" });
+
+    const result = await client.provider.estimateFee([]);
+    expect(result).toEqual({ overall_fee: "2500" });
+  });
+
+  it("increments fee quote error metrics when all endpoints fail on fee quote", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetStarknetMetrics();
+
+    const [primary, secondary] = mockRpcProviders;
+    primary!.estimateFee.mockRejectedValue(new Error("primary fee down"));
+    secondary!.estimateFee.mockRejectedValue(new Error("secondary fee down"));
+
+    await expect(client.provider.estimateFee([])).rejects.toThrow("secondary fee down");
+
+    const snap = client.getStarknetMetricsSnapshot().counters;
+    expect(snap[client.STARKNET_METRICS.FEE_QUOTE_REQUESTS]).toBe(1);
+    expect(snap[client.STARKNET_METRICS.FEE_QUOTE_ERRORS]).toBe(1);
+    expect(snap[client.STARKNET_METRICS.RPC_ERRORS]).toBe(2);
+    expect(snap[client.STARKNET_METRICS.RPC_FAILOVERS]).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ChainIdMismatchError
+// ---------------------------------------------------------------------------
+describe("ChainIdMismatchError", () => {
+  it("creates an error with the correct name and message", () => {
+    const err = new ChainIdMismatchError(
+      "0x1",
+      "0x2",
+      "https://primary.example/rpc",
+      "https://secondary.example/rpc",
+    );
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("ChainIdMismatchError");
+    expect(err.message).toContain("0x1");
+    expect(err.message).toContain("0x2");
+    expect(err.message).toContain("https://primary.example/rpc");
+    expect(err.message).toContain("https://secondary.example/rpc");
+  });
+
+  it("exposes all constructor properties", () => {
+    const err = new ChainIdMismatchError(
+      "0x534e5f4d41494e",
+      "0x534e5f5345504f4c4941",
+      "https://rpc1.example/rpc",
+      "https://rpc2.example/rpc",
+    );
+    expect(err.primaryChainId).toBe("0x534e5f4d41494e");
+    expect(err.secondaryChainId).toBe("0x534e5f5345504f4c4941");
+    expect(err.primaryUrl).toBe("https://rpc1.example/rpc");
+    expect(err.secondaryUrl).toBe("https://rpc2.example/rpc");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RPC argument cloning edge cases (Map, Set, custom instances)
+// ---------------------------------------------------------------------------
+describe("RPC argument cloning edge cases", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("clones Map arguments during failover — original is not mutated", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary, secondary] = mockRpcProviders;
+    const original = new Map([["key", "value"]]);
+    const payload = { map: original };
+
+    primary!.getBlock.mockImplementationOnce((p: typeof payload) => {
+      p.map.set("mutated", true);
+      throw new Error("primary down");
+    });
+    secondary!.getBlock.mockImplementationOnce((p: typeof payload) => {
+      return Promise.resolve({ received: p });
+    });
+
+    const result = await client.provider.getBlock(payload);
+
+    // Original must not reflect the mutation made on the primary attempt
+    expect(original.has("mutated")).toBe(false);
+    // Secondary receives a fresh clone (not the mutated version)
+    expect(result.received.map.has("mutated")).toBe(false);
+    expect(result.received.map.get("key")).toBe("value");
+  });
+
+  it("clones Set arguments during failover — original is not mutated", async () => {
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary, secondary] = mockRpcProviders;
+    const original = new Set([1, 2, 3]);
+    const payload = { set: original };
+
+    primary!.getBlock.mockImplementationOnce((p: typeof payload) => {
+      p.set.add(999);
+      throw new Error("primary down");
+    });
+    secondary!.getBlock.mockImplementationOnce((p: typeof payload) => {
+      return Promise.resolve({ received: p });
+    });
+
+    const result = await client.provider.getBlock(payload);
+
+    // Original must not reflect the mutation made on the primary attempt
+    expect(original.has(999)).toBe(false);
+    // Secondary receives a fresh clone (not the mutated version)
+    expect(result.received.set.has(999)).toBe(false);
+    expect(result.received.set.has(1)).toBe(true);
+  });
+
+  it("passes custom class instances through unchanged during failover", async () => {
+    class CustomType {
+      constructor(readonly value: number) {}
+    }
+
+    const client = await loadClientWithRpcUrls(
+      "https://primary.example/rpc,https://secondary.example/rpc",
+    );
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary, secondary] = mockRpcProviders;
+    const original = new CustomType(42);
+    const payload = { custom: original };
+
+    primary!.getBlock.mockImplementationOnce((p: typeof payload) => {
+      throw new Error("primary down");
+    });
+    secondary!.getBlock.mockImplementationOnce((p: typeof payload) => {
+      return Promise.resolve({ received: p.custom.value });
+    });
+
+    const result = await client.provider.getBlock(payload);
+
+    // Custom class instances are NOT deep-cloned (only plain objects, Map, Set, Date)
+    // They are passed through by reference to the secondary attempt
+    expect(result).toEqual({ received: 42 });
   });
 });
