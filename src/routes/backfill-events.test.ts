@@ -236,6 +236,7 @@ vi.mock("drizzle-orm", async (importOriginal) => {
 import {
   backfillEventsRouter,
   RESULTS_PREVIEW_SIZE,
+  BACKFILL_CHECKPOINT_BATCH_SIZE,
   buildBackfillEventId,
   BackfillQuerySchema,
   DEFAULT_BACKFILL_LIMIT,
@@ -601,6 +602,7 @@ describe("BackfillQuerySchema", () => {
     expect(() => BackfillQuerySchema.parse({ resumeToken: "invalid-date" })).toThrow();
     expect(() => BackfillQuerySchema.parse({ cursor: "invalid-date" })).toThrow();
   });
+});
 
 describe("buildBackfillEventId", () => {
   it("handles empty strings without throwing", () => {
