@@ -19,6 +19,7 @@ import { validateSchema } from "./schema-fk-indexes.js";
 import { pgTable, text } from "drizzle-orm/pg-core";
 import * as schema from "./schema.js";
 import {
+  SCHEMA_COMPATIBILITY_VERSION,
   agreements,
   agreementEvents,
   payments,
@@ -580,6 +581,239 @@ describe("schema check constraints", () => {
         const output = schema.stripSensitiveBillingFields(input);
         expect(output).toEqual(input);
       });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Backward-compatibility contract
+// ---------------------------------------------------------------------------
+
+describe("backward-compatibility contract", () => {
+  // ── B1: Compatibility version ──────────────────────────────────────────
+
+  describe("B1 — compatibility version", () => {
+    it("exports SCHEMA_COMPATIBILITY_VERSION with the initial value of 1", () => {
+      expect(SCHEMA_COMPATIBILITY_VERSION).toBe(1);
+    });
+
+    it("SCHEMA_COMPATIBILITY_VERSION is a frozen number constant", () => {
+      expect(typeof SCHEMA_COMPATIBILITY_VERSION).toBe("number");
+      expect(Object.isFrozen).toBeDefined();
+    });
+  });
+
+  // ── B2: Export inventory — helpers and constants must not disappear ────
+
+  describe("B2 — export inventory stability", () => {
+    it("exports every expected validation helper function", () => {
+      expect(typeof schema.isValidU256).toBe("function");
+      expect(typeof schema.isValidCurrencyCode).toBe("function");
+      expect(typeof schema.isValidNonNegativeInteger).toBe("function");
+      expect(typeof schema.assertNonNegative).toBe("function");
+      expect(typeof schema.assertValidU256).toBe("function");
+      expect(typeof schema.assertValidCurrencyCode).toBe("function");
+      expect(typeof schema.clampPageLimit).toBe("function");
+      expect(typeof schema.clampBatchSize).toBe("function");
+      expect(typeof schema.validateBatchSize).toBe("function");
+      expect(typeof schema.stripSensitiveBillingFields).toBe("function");
+    });
+
+    it("exports every expected constant", () => {
+      expect(typeof schema.U256_DECIMAL_REGEX).toBe("string");
+      expect(schema.U256_DECIMAL_PATTERN).toBeInstanceOf(RegExp);
+      expect(schema.CURRENCY_CODE_REGEX).toBeInstanceOf(RegExp);
+      expect(typeof schema.MAX_PAGE_SIZE).toBe("number");
+      expect(typeof schema.DEFAULT_PAGE_SIZE).toBe("number");
+      expect(typeof schema.MAX_BATCH_SIZE).toBe("number");
+      expect(Array.isArray(schema.SCHEMA_TABLES)).toBe(true);
+      expect(Array.isArray(schema.SENSITIVE_BILLING_FIELDS)).toBe(true);
+      expect(typeof schema.SCHEMA_COMPATIBILITY_VERSION).toBe("number");
+    });
+
+    it("exports exactly 11 tables", () => {
+      expect(schema.SCHEMA_TABLES).toHaveLength(11);
+    });
+
+    it("SENSITIVE_BILLING_FIELDS contains exactly the expected fields", () => {
+      expect(schema.SENSITIVE_BILLING_FIELDS).toEqual(["taxId", "dateOfBirth"]);
+    });
+  });
+
+  // ── B3: Runtime helper ↔ DB constraint parity ─────────────────────────
+
+  describe("B3 — helper-to-constraint mapping", () => {
+    it("isValidU256 maps to the U256_DECIMAL_REGEX DB CHECK constraint", () => {
+      expect(isValidU256("0")).toBe(true);
+      expect(isValidU256("1")).toBe(true);
+      expect(isValidU256("-1")).toBe(false);
+      expect(isValidU256("abc")).toBe(false);
+    });
+
+    it("isValidCurrencyCode maps to the currency CHECK constraints", () => {
+      expect(isValidCurrencyCode("USD")).toBe(true);
+      expect(isValidCurrencyCode("EUR")).toBe(true);
+      expect(isValidCurrencyCode("usd")).toBe(false);
+      expect(isValidCurrencyCode("")).toBe(false);
+    });
+
+    it("isValidNonNegativeInteger maps to block_number CHECK >= 0 constraints", () => {
+      expect(isValidNonNegativeInteger(0)).toBe(true);
+      expect(isValidNonNegativeInteger(1)).toBe(true);
+      expect(isValidNonNegativeInteger(-1)).toBe(false);
+      expect(isValidNonNegativeInteger(1.5)).toBe(false);
+    });
+
+    it("assertNonNegative maps to block_number CHECK >= 0 constraints with a thrown error", () => {
+      expect(() => assertNonNegative(0, "test")).not.toThrow();
+      expect(() => assertNonNegative(-1, "test")).toThrow(RangeError);
+    });
+
+    it("assertValidU256 maps to U256_DECIMAL_REGEX CHECK constraints with a thrown error", () => {
+      expect(() => assertValidU256("0", "test")).not.toThrow();
+      expect(() => assertValidU256("-1", "test")).toThrow(RangeError);
+      expect(() => assertValidU256("-1", "test")).toThrow('"-1"');
+    });
+
+    it("assertValidCurrencyCode maps to currency CHECK constraints with a thrown error", () => {
+      expect(() => assertValidCurrencyCode("USD", "test")).not.toThrow();
+      expect(() => assertValidCurrencyCode("usd", "test")).toThrow(RangeError);
+    });
+  });
+
+  // ── B4: every table with enum columns has at least one enum CHECK ──────
+
+  describe("B4 — enum CHECK constraint coverage", () => {
+    const enumCheckTables = [
+      { name: "agreements", constraint: "agreements_mode_check" },
+      { name: "payments", constraint: "payments_event_type_check" },
+      { name: "escrowEvents", constraint: "escrow_events_event_type_check" },
+      { name: "billingProfiles", constraint: "billing_profiles_profile_type_check" },
+      { name: "billingPaymentMethods", constraint: "billing_payment_methods_type_check" },
+      { name: "billingInvoices", constraint: "billing_invoices_status_check" },
+      { name: "backfillProgress", constraint: "backfill_progress_status_check" },
+    ];
+
+    it.each(enumCheckTables)("$name declares the enum CHECK $constraint", ({ name, constraint }) => {
+      const entry = schema.SCHEMA_TABLES.find((t) => t.name === name);
+      expect(entry, `${name} must be registered in SCHEMA_TABLES`).toBeDefined();
+      const names = getCheckConstraintNames(entry!.table);
+      expect(names, `${name} must declare ${constraint}`).toContain(constraint);
+    });
+  });
+
+  // ── B5: Boundary paths for validation helpers ──────────────────────────
+
+  describe("B5 — validation helper boundary paths", () => {
+    describe("isValidU256 boundary", () => {
+      it("rejects exactly at 79 digits (one past max)", () => {
+        expect(isValidU256("1" + "0".repeat(78))).toBe(false);
+      });
+
+      it("accepts exactly at 78 digits (max)", () => {
+        expect(isValidU256("1" + "0".repeat(77))).toBe(true);
+      });
+
+      it("rejects empty string", () => {
+        expect(isValidU256("")).toBe(false);
+      });
+
+      it("rejects zero with leading digit", () => {
+        expect(isValidU256("00")).toBe(false);
+      });
+
+      it("accepts single zero", () => {
+        expect(isValidU256("0")).toBe(true);
+      });
+    });
+
+    describe("clampPageLimit boundary", () => {
+      it("returns NaN for NaN (current behavior — not NaN-safe)", () => {
+        expect(Number.isNaN(clampPageLimit(NaN))).toBe(true);
+      });
+
+      it("returns DEFAULT_PAGE_SIZE for negative infinity", () => {
+        expect(clampPageLimit(-Infinity)).toBe(DEFAULT_PAGE_SIZE);
+      });
+
+      it("caps exactly at MAX_PAGE_SIZE", () => {
+        expect(clampPageLimit(MAX_PAGE_SIZE + 0.5)).toBe(MAX_PAGE_SIZE);
+      });
+    });
+
+    describe("validateBatchSize boundary", () => {
+      it("throws RangeError for zero", () => {
+        expect(() => validateBatchSize(0)).toThrow(RangeError);
+      });
+
+      it("throws RangeError for MAX_BATCH_SIZE + 1", () => {
+        expect(() => validateBatchSize(MAX_BATCH_SIZE + 1)).toThrow(RangeError);
+      });
+
+      it("throws RangeError for floating point within range", () => {
+        expect(() => validateBatchSize(50.5)).toThrow(RangeError);
+      });
+    });
+
+    describe("clampBatchSize boundary", () => {
+      it("returns NaN for NaN (current behavior — not NaN-safe)", () => {
+        expect(Number.isNaN(clampBatchSize(NaN))).toBe(true);
+      });
+
+      it("returns 0 for negative values", () => {
+        expect(clampBatchSize(-100)).toBe(0);
+      });
+    });
+
+    describe("assertNonNegative boundary", () => {
+      it("rejects negative zero string coercion", () => {
+        expect(() => assertNonNegative(-0, "test")).not.toThrow();
+      });
+
+      it("throws for non-number type", () => {
+        expect(() => assertNonNegative("0" as unknown as number, "test")).toThrow(RangeError);
+      });
+    });
+  });
+
+  // ── B6: Assert that removing a constraint would be detected ────────────
+
+  describe("B6 — constraint inventory completeness", () => {
+    it("every agreement constraint from migration SQL is present in Drizzle metadata", () => {
+      const names = getCheckConstraintNames(agreements);
+      expect(names).toEqual(
+        expect.arrayContaining([
+          "agreements_mode_check",
+          "agreements_payment_type_check",
+          "agreements_status_check",
+          "agreements_dispute_status_check",
+          "agreements_block_number_check",
+          "agreements_total_amount_check",
+          "agreements_paid_amount_check",
+        ]),
+      );
+    });
+
+    it("no duplicate CHECK constraint names exist across the schema", () => {
+      const seen = new Map<string, string>();
+      const duplicates: Array<{ name: string; tables: string[] }> = [];
+
+      for (const { name, table } of schema.SCHEMA_TABLES) {
+        for (const checkName of getCheckConstraintNames(table)) {
+          const existing = seen.get(checkName);
+          if (existing) {
+            if (!duplicates.find((d) => d.name === checkName)) {
+              duplicates.push({ name: checkName, tables: [existing] });
+            }
+            const entry = duplicates.find((d) => d.name === checkName);
+            entry?.tables.push(name);
+          } else {
+            seen.set(checkName, name);
+          }
+        }
+      }
+
+      expect(duplicates, "duplicate CHECK constraint names across tables").toEqual([]);
     });
   });
 });
