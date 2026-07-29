@@ -1,13 +1,52 @@
 # Auth route contract (`src/routes/auth.ts`)
 
 This document is the source of truth for the runtime contract of the routes
-in [`src/routes/auth.ts`](../src/routes/auth.ts) — wallet-ownership login
+in [`src/routes/auth.ts`](../../src/routes/auth.ts) — wallet-ownership login
 (challenge, signature verification, session issuance, refresh, validation,
 logout, revocation).
 
 The contract below is what callers, integration tests, and the inline route
 handlers all describe. Behaviour on any endpoint is frozen unless this
 document is updated alongside the change.
+
+---
+
+## Security Boundary & Authorization
+
+Privilege checks on this router must not drift during maintenance. The
+runtime handlers, `src/routes/auth.test.ts` stack-inspection cases, and this
+section describe the same boundary.
+
+### Access control policy
+
+| Class | Routes | Gate |
+| :--- | :--- | :--- |
+| **Public (wallet proof / token presentation)** | `POST /auth/challenge`, `POST /auth/verify`, `POST /auth/session/validate`, `POST /auth/refresh` | No bearer session. Challenge/verify prove wallet ownership; validate/refresh present a raw token in the JSON body. |
+| **Session-bearer** | `POST /auth/logout`, `POST /auth/revoke`, `POST /auth/session/revoke` | `requireAuth` runs **before** any session mutation. Missing/invalid bearer → `401 { "error": "Unauthorized" }` with no store side effects beyond the auth check itself. |
+
+### Session issuance boundary (`POST /auth/verify`)
+
+A session token is minted only after all of the following succeed, in order:
+
+1. Zod body validation.
+2. Lockout check (`isLockedOut`) — fail closed with a generic `401` **before** consuming the challenge.
+3. Atomic challenge consume (`consumeChallenge`) — closes concurrent replay.
+4. Starknet signature verification against the consumed nonce.
+5. `createSession` persistence.
+
+If step 5 fails after step 4 succeeded, the route **restores** the consumed
+challenge (`restoreChallenge`) with the same nonce and remaining TTL, and
+returns `500 { "error": "Unable to issue session" }`. The caller may retry
+`/auth/verify` with the same signature without re-issuing a challenge.
+Signature failure (step 4) leaves the challenge consumed — replay-closed.
+
+### Session revoke privilege (`POST /auth/session/revoke`)
+
+After `requireAuth`, the caller may revoke a `token_hash` only when they own
+the target session (case-insensitive address equality) **or** their address
+is in `env.ADMIN_ADDRESSES` (O(1) Set via `isAdminAddress` /
+`rebuildAdminSet`). Non-owners that are not admins receive the same generic
+`401 Unauthorized` envelope as unauthenticated callers.
 
 ---
 
@@ -46,10 +85,11 @@ the active proof expected by the next `/auth/verify` call.
 { "address": "0xWALLET" }
 ```
 
-Validation: `address` is `z.string().min(3)`. The schema is `.strict()` —
-additional properties on the body cause `400 Validation failed`. Address
-format / hex-shape is intentionally **not** enforced (see "Known limitations
-/ out of scope").
+Validation: `address` is `z.string().min(3).max(100)`. The schema is
+`.strict()` — additional properties on the body cause `400 Validation failed`.
+Address format / hex-shape is intentionally **not** enforced at the route
+layer (see "Known limitations / out of scope"); `createChallenge` still
+requires a parseable Starknet address and throws otherwise.
 
 ### Response `200`
 
@@ -82,8 +122,8 @@ format / hex-shape is intentionally **not** enforced (see "Known limitations
 
 | Status | Body | When |
 | :--- | :--- | :--- |
-| `400` | `{ "error": "Validation failed", "details": [...] }` | Body fails Zod (unknown property, `address` shorter than 3 chars, missing `address`) |
-| `500` | `{ "error": "<underlying error message>" }` | `createChallenge` throws (see *Out of scope* for the asymmetric address-validation surface); `getCachedNetworkInfo` throws (RPC failure); `buildTypedChallenge` throws |
+| `400` | `{ "error": "Validation failed", "details": [...] }` | Body fails Zod (unknown property, `address` shorter than 3 chars or longer than 100, missing `address`) |
+| `500` | `{ "error": "<underlying error message>" }` | `createChallenge` throws (unparseable address or store full); `getCachedNetworkInfo` throws (RPC failure); `buildTypedChallenge` throws |
 
 ### Idempotency within the active TTL window
 
@@ -126,8 +166,8 @@ Validation:
 
 | Field | Schema | Notes |
 | :--- | :--- | :--- |
-| `address` | `z.string().min(3)` | Same intentionally-unvalidated format as challenge |
-| `signature` | `z.array(z.string().min(1)).min(2)` | At least two non-empty felts. **No fixed upper bound** — Starknet wallets can produce variable-length signatures, send the array returned by the wallet without truncating. |
+| `address` | `z.string().min(3).max(100)` | Same intentionally-loose route format as challenge |
+| `signature` | `z.array(z.string().min(1).max(255)).min(2).max(10)` | Between 2 and 10 non-empty felts (max 255 chars each). Clamp rejects oversized payloads before RPC verify. |
 | (envelope) | `.strict()` | Unknown properties are rejected with `400 Validation failed` |
 
 ### Response `200`
@@ -155,7 +195,7 @@ in-memory store on success.
 | `400` | `{ "error": "No active challenge (or expired). Call /auth/challenge again." }` | No challenge for the address — never requested, expired, already consumed, or overwritten by a later challenge | n/a |
 | `401` | `{ "error": "Invalid signature or account locked" }` | **`isLockedOut(address)`** returned true at the top of the handler — lockout is checked **before** `consumeChallenge` runs | **unchanged** |
 | `401` | `{ "error": "Invalid signature or account locked" }` | RPC signature check failed — `consumeChallenge` already ran and removed the nonce | **consumed** |
-| `500` | `{ "error": "<underlying error message>" }` | Session-store write throws after signature was successfully verified | **consumed** |
+| `500` | `{ "error": "Unable to issue session" }` | Session-store write throws after signature was successfully verified | **restored** (same nonce + remaining TTL via `restoreChallenge`) |
 
 > **The two `401` envelopes are byte-identical** — a caller cannot tell
 > whether the 401 came from the lockout branch (challenge still valid,
@@ -170,6 +210,10 @@ in-memory store on success.
 > "retry the existing signature with the existing nonce". Only call
 > sites that can introspect the in-flight challenge's TTL can decide to
 > skip the re-issue between consecutive attempts.
+>
+> **Session issuance `500` is different:** the challenge is restored, so
+> retrying `/auth/verify` with the same signature is the correct recovery
+> path until the challenge TTL elapses.
 
 ### Replay and concurrency
 
@@ -206,8 +250,8 @@ the token TTL server-side but does NOT issue a new token.
 { "address": "0xWALLET", "session_token": "raw-token" }
 ```
 
-Validation: `address` is `z.string().min(3)`; `session_token` is
-`z.string().min(10)`; envelope is `.strict()`.
+Validation: `address` is `z.string().min(3).max(100)`; `session_token` is
+`z.string().min(10).max(1000)`; envelope is `.strict()`.
 
 ### Response `200`
 
@@ -244,8 +288,8 @@ sliding TTL.
 { "address": "0xWALLET", "refresh_token": "raw-token" }
 ```
 
-Validation: `address` is `z.string().min(3)`; `refresh_token` is
-`z.string().min(10)`; envelope is `.strict()`.
+Validation: `address` is `z.string().min(3).max(100)`; `refresh_token` is
+`z.string().min(10).max(1000)`; envelope is `.strict()`.
 
 ### Response `200`
 
@@ -348,10 +392,8 @@ Headers: same as `/auth/logout`.
 { "token_hash": "<64 hex chars — SHA-256 of the raw token>" }
 ```
 
-Validation: `token_hash` is `z.string().length(64)`. The envelope for this
-endpoint is **not** `.strict()` — it permits additional properties so future
-fields (e.g. an admin-only reason string) can be added without breaking
-existing callers.
+Validation: `token_hash` is `z.string().length(64).regex(/^[0-9a-fA-F]{64}$/i)`.
+The envelope is `.strict()`.
 
 ### Response `200`
 
@@ -363,7 +405,7 @@ existing callers.
 
 | Status | Body | When |
 | :--- | :--- | :--- |
-| `400` | `{ "error": "Validation failed", "details": [...] }` | `token_hash` is not exactly 64 chars |
+| `400` | `{ "error": "Validation failed", "details": [...] }` | `token_hash` is not exactly 64 hex chars |
 | `401` | `{ "error": "Unauthorized" }` | Missing / invalid bearer; or caller is not the owner and not in the admin set |
 | `404` | `{ "error": "Session not found" }` | `token_hash` does not match any session row (active or revoked) |
 | `500` | `{ "error": "<underlying error message>" }` | `revokeSessionByHash` throws (session-store write fails) |
@@ -452,9 +494,9 @@ rebuild deterministically and re-run the scenario.
 ## Debug middleware body clone
 
 The first middleware on `authRouter` clones `req.body` for a structured log
-line, redacting `session_token` and `signature` so plaintext never reaches
-the log. The clone is skipped entirely when `req.body` is not a non-null
-object:
+line, redacting `session_token`, `refresh_token`, and `signature` so
+plaintext never reaches the log. The clone is skipped entirely when
+`req.body` is not a non-null object:
 
 ```ts
 if (req.body && typeof req.body === "object") { /* clone + redact */ }
@@ -538,18 +580,21 @@ and `signature` are redacted to `"***"`.
 
 ## Known limitations / out of scope
 
-- **Address format regex is intentionally loose.** All four request schemas
-  (`AddressBody`, `VerifyBody`, `SessionBody`, `RefreshBody`) restrict
-  `address` to a maximum string length of 100 characters to prevent huge
-  payloads from reaching downstream logic, but they deliberately omit a strict
-  Starknet-address/hex regex check. This is left as-is to preserve compatibility
-  with existing callers and tests (which use non-address placeholder strings such
-  as `"address"` or `"0xExpiredChallenge"`); tightening it to strictly require
-  hex digits is out of scope for this change.
-- `signature` arrays are clamped to realistic length bounds (between 2 and 10 elements, max 255 chars per element) to reject excessively large or deeply nested payloads before signature verification.
+- **Address format regex is intentionally loose at the route layer.** All
+  four request schemas (`AddressBody`, `VerifyBody`, `SessionBody`,
+  `RefreshBody`) restrict `address` to `min(3).max(100)` to prevent huge
+  payloads, but they deliberately omit a strict Starknet-address/hex regex
+  check. Downstream `createChallenge` / `buildTypedChallenge` still require
+  a parseable Starknet address and throw on garbage — that asymmetric
+  surface is intentional and out of scope to unify here.
+- `signature` arrays are clamped to realistic length bounds (between 2 and
+  10 elements, max 255 chars per element) to reject excessively large
+  payloads before signature verification.
 - `getCachedNetworkInfo()` is already memoised in `src/starknet/client.ts`
   and adds no per-request overhead beyond a Map lookup; no change was
   needed there.
 - The `chainIdCache` inside `src/auth/challenge.ts` (`buildTypedChallenge`)
   is likewise already memoised; the double-decode concern is already
   handled at that layer.
+- Horizontal multi-instance challenge stores, Redis-backed challenges, and
+  background timer sweeps remain out of scope (see `docs/auth/challenge.md`).

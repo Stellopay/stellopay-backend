@@ -152,6 +152,16 @@ const RefundBody = WalletSession.extend({
 const ESCROW_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Number of escrow events fetched per batch when replaying indexed events
+ * to compute an agreement balance.  Kept small enough to avoid unbounded
+ * memory growth on long-lived agreements while large enough to minimise
+ * round-trips.
+ *
+ * @see getAgreementBalanceInternal
+ */
+const ESCROW_BALANCE_BATCH_SIZE = 100;
+
+/**
  * An entry in the in-memory idempotency store.
  *
  * Stores the response body and status code for a previously completed
@@ -338,12 +348,14 @@ export function withEscrowIdempotency(
  *
  * ## Indexed path (preferred)
  *
- * 1. Queries `escrow_events` from the local database filtered by
- *    `contractAddress` and `agreementId`, ordered by `blockNumber`.
+ * 1. Queries `escrow_events` from the local database in **batches of
+ *    {@link ESCROW_BALANCE_BATCH_SIZE}** rows, filtered by
+ *    `contractAddress` and `agreementId`, ordered by `(blockNumber, id)`
+ *    to guarantee stable pagination across batches.
  * 2. **Deduplicates** events by their unique `id` (computed as
  *    `transaction_hash + event_index` on insert).  The same Starknet event
  *    may appear multiple times in the indexer output; deduplication guards
- *    against double-counting.
+ *    against double-counting.  The dedup set persists across batches.
  * 3. Replays the deduplicated stream:
  *    - `Funded` → **adds** the amount.
  *    - `Released` or `Refunded` → **subtracts** the amount.
@@ -352,17 +364,23 @@ export function withEscrowIdempotency(
  *    **clamped to `0`** and a structured warning is logged.
  * 5. Returns `{ balance, source: "indexed" }`.
  *
+ * **Batching contract:** Each iteration fetches at most
+ * {@link ESCROW_BALANCE_BATCH_SIZE} rows via offset-based pagination.
+ * The loop continues until a page returns fewer rows than the batch size
+ * (indicating the last page).  Offset pagination is safe because new
+ * events are always appended (they won't shift earlier pages).
+ *
  * ## Contract fallback path
  *
- * When indexed data is unavailable (empty result set) or the database
- * query throws, the function falls through to a direct Starknet contract
- * call (`get_agreement_balance`).  The returned value is coerced from
- * whatever type Starknet.js provides (bigint, number, string, or
- * `{ low, high }` U256 object) into a `bigint`.
+ * When indexed data is unavailable (empty result set on the **first**
+ * page) or the database query throws, the function falls through to a
+ * direct Starknet contract call (`get_agreement_balance`).  The returned
+ * value is coerced from whatever type Starknet.js provides (bigint,
+ * number, string, or `{ low, high }` U256 object) into a `bigint`.
  *
  * Return value is always `{ balance: bigint, source: "indexed" | "contract" }`.
  *
- * @param address    - Normalised Starknet address of the escrow contract.
+ * @param address      - Normalised Starknet address of the escrow contract.
  * @param agreement_id - The agreement identifier.
  * @returns The balance as a non-negative bigint and the resolution source.
  */
@@ -371,21 +389,34 @@ async function getAgreementBalanceInternal(
   agreement_id: bigint,
 ): Promise<{ balance: bigint; source: "indexed" | "contract" }> {
   try {
-    const escrowEvents = await db
-      .select()
-      .from(schema.escrowEvents)
-      .where(
-        and(
-          eq(schema.escrowEvents.contractAddress, address),
-          eq(schema.escrowEvents.agreementId, agreement_id.toString()),
-        ),
-      )
-      .orderBy(schema.escrowEvents.blockNumber);
+    let offset = 0;
+    let balance = BigInt(0);
+    const seenEventIds = new Set<string>();
+    let totalEventCount = 0;
 
-    if (Array.isArray(escrowEvents) && escrowEvents.length > 0) {
-      let balance = BigInt(0);
-      const seenEventIds = new Set<string>();
-      for (const event of escrowEvents) {
+    // Batched pagination: fetch events in pages of BATCH_SIZE to avoid
+    // unbounded memory growth on long-lived agreements.
+    while (true) {
+      const page = await db
+        .select()
+        .from(schema.escrowEvents)
+        .where(
+          and(
+            eq(schema.escrowEvents.contractAddress, address),
+            eq(schema.escrowEvents.agreementId, agreement_id.toString()),
+          ),
+        )
+        .orderBy(schema.escrowEvents.blockNumber, schema.escrowEvents.id)
+        .limit(ESCROW_BALANCE_BATCH_SIZE)
+        .offset(offset);
+
+      if (!Array.isArray(page) || page.length === 0) {
+        break;
+      }
+
+      totalEventCount += page.length;
+
+      for (const event of page) {
         if (event && event.id) {
           if (seenEventIds.has(event.id)) {
             continue;
@@ -398,6 +429,16 @@ async function getAgreementBalanceInternal(
           balance -= BigInt(event.amount);
         }
       }
+
+      // Last page: fewer rows than the batch size means no more data.
+      if (page.length < ESCROW_BALANCE_BATCH_SIZE) {
+        break;
+      }
+
+      offset += ESCROW_BALANCE_BATCH_SIZE;
+    }
+
+    if (totalEventCount > 0) {
       if (balance < 0n) {
         console.warn({
           event: "escrow_balance_clamped",
@@ -413,7 +454,7 @@ async function getAgreementBalanceInternal(
         address,
         agreement_id: agreement_id.toString(),
         balance: balance.toString(),
-        event_count: escrowEvents.length,
+        event_count: totalEventCount,
       });
       return { balance, source: "indexed" };
     }

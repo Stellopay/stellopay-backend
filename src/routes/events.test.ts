@@ -160,7 +160,7 @@ import {
   BatchProcessEnvelopeSchema,
 } from "./events.js";
 import { db } from "../db/index.js";
-import { provider, agreementContract } from "../starknet/client.js";
+import { provider, agreementContract, escrowContract } from "../starknet/client.js";
 import { env } from "../config.js";
 
 // ---------------------------------------------------------------------------

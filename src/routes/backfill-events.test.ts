@@ -236,10 +236,12 @@ vi.mock("drizzle-orm", async (importOriginal) => {
 import {
   backfillEventsRouter,
   RESULTS_PREVIEW_SIZE,
+  BACKFILL_CHECKPOINT_BATCH_SIZE,
   buildBackfillEventId,
   BackfillQuerySchema,
   DEFAULT_BACKFILL_LIMIT,
   MAX_BACKFILL_LIMIT,
+  normalizeResumeCursor,
   getBackfillProgress,
 } from "./backfill-events.js";
 import { requireSession } from "../auth/session.js";
@@ -307,13 +309,6 @@ function makeDescendingRows(count: number, idOffset = 0) {
   return Array.from({ length: count }, (_, i) =>
     makeRow(idOffset + i, { createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, count - i)) }),
   );
-}
-
-function authHeaders(address: string) {
-  return {
-    "x-user-address": address,
-    authorization: "Bearer testtoken",
-  };
 }
 
 beforeEach(() => {
@@ -487,6 +482,59 @@ describe.each(JOBS)("POST $path", (job) => {
     expect(extractDateParams(call)).toHaveLength(0);
   });
 
+  it("accepts `resumeToken` as an alias for `before` and resolves the same cursor", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const cursorDate = new Date(Date.UTC(2025, 0, 1)).toISOString();
+    queueRows([]);
+    await request(makeApp())
+      .post(`${job.path}?resumeToken=${encodeURIComponent(cursorDate)}`)
+      .set(authHeaders(ADMIN))
+      .expect(200);
+    const call = store.state.executeCalls[store.state.executeCalls.length - 1];
+    const dates = extractDateParams(call);
+    expect(dates).toHaveLength(1);
+    expect(dates[0].toISOString()).toBe(cursorDate);
+  });
+
+  it("accepts `cursor` as an alias for `before` and resolves the same cursor", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const cursorDate = new Date(Date.UTC(2025, 0, 1)).toISOString();
+    queueRows([]);
+    await request(makeApp())
+      .post(`${job.path}?cursor=${encodeURIComponent(cursorDate)}`)
+      .set(authHeaders(ADMIN))
+      .expect(200);
+    const call = store.state.executeCalls[store.state.executeCalls.length - 1];
+    const dates = extractDateParams(call);
+    expect(dates).toHaveLength(1);
+    expect(dates[0].toISOString()).toBe(cursorDate);
+  });
+
+  it("prefers `before` over `resumeToken` when both are provided", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const beforeDate = new Date(Date.UTC(2025, 0, 1)).toISOString();
+    const resumeDate = new Date(Date.UTC(2025, 6, 1)).toISOString();
+    queueRows([]);
+    await request(makeApp())
+      .post(`${job.path}?before=${encodeURIComponent(beforeDate)}&resumeToken=${encodeURIComponent(resumeDate)}`)
+      .set(authHeaders(ADMIN))
+      .expect(200);
+    const call = store.state.executeCalls[store.state.executeCalls.length - 1];
+    const dates = extractDateParams(call);
+    expect(dates).toHaveLength(1);
+    expect(dates[0].toISOString()).toBe(beforeDate);
+  });
+
+  it("returns all three output cursors (nextCursor, nextResumeToken, cursor) on every response", async () => {
+    queueRows([makeRow(1)]);
+    const res = await request(makeApp()).post(job.path).set(authHeaders(ADMIN)).expect(200);
+    expect(res.body).toHaveProperty("nextCursor");
+    expect(res.body).toHaveProperty("nextResumeToken");
+    expect(res.body).toHaveProperty("cursor");
+    expect(res.body.nextCursor).toBe(res.body.nextResumeToken);
+    expect(res.body.nextCursor).toBe(res.body.cursor);
+  });
+
   it("marks the job failed and preserves the last committed checkpoint when a batch throws, then resumes from it on the next call", async () => {
     const rowCount = BACKFILL_CHECKPOINT_BATCH_SIZE + 50;
     queueRows(makeDescendingRows(rowCount));
@@ -608,6 +656,7 @@ describe("BackfillQuerySchema", () => {
     expect(() => BackfillQuerySchema.parse({ resumeToken: "invalid-date" })).toThrow();
     expect(() => BackfillQuerySchema.parse({ cursor: "invalid-date" })).toThrow();
   });
+});
 
 describe("buildBackfillEventId", () => {
   it("handles empty strings without throwing", () => {
@@ -629,6 +678,49 @@ describe("buildBackfillEventId", () => {
   it("includes the _backfill_ segment in the ID", () => {
     const id = buildBackfillEventId("0xtx1", "EmployeeAdded", "emp_1");
     expect(id).toContain("_backfill_");
+  });
+});
+
+describe("normalizeResumeCursor", () => {
+  const d1 = new Date("2025-01-01T00:00:00Z");
+  const d2 = new Date("2025-06-01T00:00:00Z");
+  const d3 = new Date("2025-12-01T00:00:00Z");
+
+  it("returns undefined when all three are undefined", () => {
+    expect(normalizeResumeCursor(undefined, undefined, undefined)).toBeUndefined();
+  });
+
+  it("returns the before value when only before is provided", () => {
+    expect(normalizeResumeCursor(d1, undefined, undefined)).toBe(d1);
+  });
+
+  it("returns the resumeToken value when only resumeToken is provided", () => {
+    expect(normalizeResumeCursor(undefined, d1, undefined)).toBe(d1);
+  });
+
+  it("returns the cursor value when only cursor is provided", () => {
+    expect(normalizeResumeCursor(undefined, undefined, d1)).toBe(d1);
+  });
+
+  it("prefers before over resumeToken when both are provided", () => {
+    expect(normalizeResumeCursor(d1, d2, undefined)).toBe(d1);
+  });
+
+  it("prefers before over cursor when both are provided", () => {
+    expect(normalizeResumeCursor(d1, undefined, d2)).toBe(d1);
+  });
+
+  it("prefers resumeToken over cursor when both are provided", () => {
+    expect(normalizeResumeCursor(undefined, d1, d2)).toBe(d1);
+  });
+
+  it("prefers before over both resumeToken and cursor when all three are provided", () => {
+    expect(normalizeResumeCursor(d1, d2, d3)).toBe(d1);
+  });
+
+  it("returns undefined when all three are null or empty string (coerced to undefined)", () => {
+    const u = undefined as any;
+    expect(normalizeResumeCursor(u, u, u)).toBeUndefined();
   });
 });
 

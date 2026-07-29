@@ -30,7 +30,11 @@ vi.mock("../db/index.js", () => {
       select: vi.fn(() => ({
         from: vi.fn(() => ({
           where: vi.fn(() => ({
-            orderBy: vi.fn(),
+            orderBy: vi.fn(() => ({
+              limit: vi.fn(() => ({
+                offset: vi.fn(),
+              })),
+            })),
           })),
         })),
       })),
@@ -40,6 +44,7 @@ vi.mock("../db/index.js", () => {
         contractAddress: "contractAddress",
         agreementId: "agreementId",
         blockNumber: "blockNumber",
+        id: "id",
       },
     },
   };
@@ -64,8 +69,10 @@ describe("escrow routes", () => {
     vi.clearAllMocks();
     clearEscrowIdempotencyStore();
 
-    // Default db.select to resolve to empty array
-    const mockOrderBy = vi.fn().mockResolvedValue([]);
+    // Default db.select chain to resolve to empty array on first call
+    const mockOffset = vi.fn().mockResolvedValue([]);
+    const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+    const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
     const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
     const mockFrom = vi.fn(() => ({ where: mockWhere }));
     (db.select as any).mockReturnValue({ from: mockFrom });
@@ -75,11 +82,13 @@ describe("escrow routes", () => {
 
   describe("GET /escrow/:address/get_agreement_balance/:agreement_id", () => {
     it("returns balance from indexed data when available", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([
+      const mockOffset = vi.fn().mockResolvedValue([
         { eventType: "Funded", amount: "1000" },
         { eventType: "Released", amount: "200" },
         { eventType: "Refunded", amount: "100" },
       ]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -96,10 +105,12 @@ describe("escrow routes", () => {
     });
 
     it("clamps negative balance to zero", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([
+      const mockOffset = vi.fn().mockResolvedValue([
         { eventType: "Funded", amount: "100" },
         { eventType: "Released", amount: "200" }, // More released than funded
       ]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -116,7 +127,9 @@ describe("escrow routes", () => {
     });
 
     it("falls back to contract call when indexed data is empty", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([]);
+      const mockOffset = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -135,7 +148,9 @@ describe("escrow routes", () => {
     });
 
     it("falls back to contract call when db throws", async () => {
-      const mockOrderBy = vi.fn().mockRejectedValue(new Error("DB Error"));
+      const mockOffset = vi.fn().mockRejectedValue(new Error("DB Error"));
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -154,11 +169,13 @@ describe("escrow routes", () => {
     });
 
     it("deduplicates indexed events by unique event ID", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([
+      const mockOffset = vi.fn().mockResolvedValue([
         { id: "evt-1", eventType: "Funded", amount: "1000" },
         { id: "evt-1", eventType: "Funded", amount: "1000" },
         { id: "evt-2", eventType: "Released", amount: "200" },
       ]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -358,7 +375,9 @@ describe("escrow routes", () => {
     });
 
     it("emits escrow_balance_resolved log with source=indexed when DB has events", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([{ eventType: "Funded", amount: "1000" }]);
+      const mockOffset = vi.fn().mockResolvedValue([{ eventType: "Funded", amount: "1000" }]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -377,7 +396,9 @@ describe("escrow routes", () => {
     });
 
     it("emits escrow_balance_fallback log when indexed data is empty", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([]);
+      const mockOffset = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -396,7 +417,9 @@ describe("escrow routes", () => {
     });
 
     it("emits escrow_balance_resolved log with source=contract after fallback", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([]);
+      const mockOffset = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -418,10 +441,12 @@ describe("escrow routes", () => {
     });
 
     it("emits escrow_balance_clamped warn when balance would go negative", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([
+      const mockOffset = vi.fn().mockResolvedValue([
         { eventType: "Funded", amount: "100" },
         { eventType: "Released", amount: "200" },
       ]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -437,7 +462,9 @@ describe("escrow routes", () => {
     });
 
     it("emits escrow_balance_fallback with reason=db_error when DB throws", async () => {
-      const mockOrderBy = vi.fn().mockRejectedValue(new Error("connection refused"));
+      const mockOffset = vi.fn().mockRejectedValue(new Error("connection refused"));
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -882,10 +909,12 @@ describe("escrow routes", () => {
 
   describe("boundary — balance resolution", () => {
     it("handles events without an id field gracefully (no deduplication)", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([
+      const mockOffset = vi.fn().mockResolvedValue([
         { eventType: "Funded", amount: "1000" },
         { eventType: "Funded", amount: "500" },
       ]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -902,7 +931,9 @@ describe("escrow routes", () => {
     });
 
     it("handles contract balance returned as a plain string", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([]);
+      const mockOffset = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -921,7 +952,9 @@ describe("escrow routes", () => {
     });
 
     it("handles contract balance returned as a plain number", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([]);
+      const mockOffset = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -940,7 +973,9 @@ describe("escrow routes", () => {
     });
 
     it("handles contract balance returned as a plain bigint", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([]);
+      const mockOffset = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -959,10 +994,12 @@ describe("escrow routes", () => {
     });
 
     it("balances exactly to zero (equal funded and released)", async () => {
-      const mockOrderBy = vi.fn().mockResolvedValue([
+      const mockOffset = vi.fn().mockResolvedValue([
         { eventType: "Funded", amount: "1000" },
         { eventType: "Released", amount: "1000" },
       ]);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
       const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
       const mockFrom = vi.fn(() => ({ where: mockWhere }));
       (db.select as any).mockReturnValue({ from: mockFrom });
@@ -976,6 +1013,133 @@ describe("escrow routes", () => {
         balance: "0",
         source: "indexed",
       });
+    });
+  });
+
+  describe("batched pagination — balance resolution", () => {
+    it("accumulates balance correctly across multiple batches", async () => {
+      // Simulate 250 events: 3 pages (100 + 100 + 50)
+      // Page 1: 100 Funded events of 10 each
+      const page1 = Array.from({ length: 100 }, (_, i) => ({
+        id: `evt-p1-${i}`,
+        eventType: "Funded" as const,
+        amount: "10",
+      }));
+      // Page 2: 100 Released events of 5 each
+      const page2 = Array.from({ length: 100 }, (_, i) => ({
+        id: `evt-p2-${i}`,
+        eventType: "Released" as const,
+        amount: "5",
+      }));
+      // Page 3: 50 Refunded events of 2 each
+      const page3 = Array.from({ length: 50 }, (_, i) => ({
+        id: `evt-p3-${i}`,
+        eventType: "Refunded" as const,
+        amount: "2",
+      }));
+
+      // mockOffset is called 3 times with offsets 0, 100, 200
+      const mockOffset = vi
+        .fn()
+        .mockResolvedValueOnce(page1)
+        .mockResolvedValueOnce(page2)
+        .mockResolvedValueOnce(page3);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
+      const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
+      const mockFrom = vi.fn(() => ({ where: mockWhere }));
+      (db.select as any).mockReturnValue({ from: mockFrom });
+
+      const res = await request(makeApp())
+        .get("/api/v1/escrow/0x123/get_agreement_balance/1")
+        .expect(200);
+
+      // Balance = (100*10) - (100*5) - (50*2) = 1000 - 500 - 100 = 400
+      expect(res.body).toEqual({
+        agreement_id: "1",
+        balance: "400",
+        source: "indexed",
+      });
+      expect(mockOffset).toHaveBeenCalledTimes(3);
+    });
+
+    it("handles exactly one full batch (boundary)", async () => {
+      const page = Array.from({ length: 100 }, (_, i) => ({
+        id: `evt-${i}`,
+        eventType: "Funded" as const,
+        amount: "1",
+      }));
+
+      const mockOffset = vi.fn().mockResolvedValueOnce(page);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
+      const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
+      const mockFrom = vi.fn(() => ({ where: mockWhere }));
+      (db.select as any).mockReturnValue({ from: mockFrom });
+
+      const res = await request(makeApp())
+        .get("/api/v1/escrow/0x123/get_agreement_balance/1")
+        .expect(200);
+
+      expect(res.body).toEqual({ agreement_id: "1", balance: "100", source: "indexed" });
+      // One full batch: loop fetches it, sees length === BATCH_SIZE, fetches second page (empty)
+      expect(mockOffset).toHaveBeenCalledTimes(2);
+    });
+
+    it("deduplicates events across batch boundaries", async () => {
+      // Page 1 ends with evt-99 and evt-100 (duplicate); page 2 starts with same duplicate
+      const page1 = Array.from({ length: 100 }, (_, i) => ({
+        id: `evt-${i}`,
+        eventType: "Funded" as const,
+        amount: "10",
+      }));
+      // Page 2: first event is a duplicate of the last from page 1
+      const page2 = [
+        { id: "evt-99", eventType: "Funded" as const, amount: "10" },
+        ...Array.from({ length: 49 }, (_, i) => ({
+          id: `evt-p2-${i}`,
+          eventType: "Released" as const,
+          amount: "5",
+        })),
+      ];
+
+      const mockOffset = vi.fn().mockResolvedValueOnce(page1).mockResolvedValueOnce(page2);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
+      const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
+      const mockFrom = vi.fn(() => ({ where: mockWhere }));
+      (db.select as any).mockReturnValue({ from: mockFrom });
+
+      const res = await request(makeApp())
+        .get("/api/v1/escrow/0x123/get_agreement_balance/1")
+        .expect(200);
+
+      // Balance = 100*10 - 49*5 = 1000 - 245 = 755
+      expect(res.body).toEqual({ agreement_id: "1", balance: "755", source: "indexed" });
+    });
+
+    it("stops pagination when a page returns fewer than BATCH_SIZE", async () => {
+      // Only 30 events — one page, then loop stops
+      const page = Array.from({ length: 30 }, (_, i) => ({
+        id: `evt-${i}`,
+        eventType: "Funded" as const,
+        amount: "1",
+      }));
+
+      const mockOffset = vi.fn().mockResolvedValueOnce(page);
+      const mockLimit = vi.fn(() => ({ offset: mockOffset }));
+      const mockOrderBy = vi.fn(() => ({ limit: mockLimit }));
+      const mockWhere = vi.fn(() => ({ orderBy: mockOrderBy }));
+      const mockFrom = vi.fn(() => ({ where: mockWhere }));
+      (db.select as any).mockReturnValue({ from: mockFrom });
+
+      const res = await request(makeApp())
+        .get("/api/v1/escrow/0x123/get_agreement_balance/1")
+        .expect(200);
+
+      expect(res.body).toEqual({ agreement_id: "1", balance: "30", source: "indexed" });
+      // Only one page fetched — offset is called once
+      expect(mockOffset).toHaveBeenCalledTimes(1);
     });
   });
 

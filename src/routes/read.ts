@@ -37,50 +37,13 @@ import { shortString } from "starknet";
 import { agreementContract, escrowContract, provider } from "../starknet/client.js";
 import { u256ToString, toHexString } from "../utils/codec.js";
 import { env } from "../config.js";
+import { NumericCursorSchema, loggedParse } from "../utils/validation.js";
 
 // ---------- validation ----------
 
 const AddressParam = z.string().min(3);
 
-interface TelemetryEntry {
-  operation: string;
-  duration_ms: number;
-  status: "success" | "error";
-  request_id?: string;
-  token?: string;
-  owner?: string;
-  escrow?: string;
-  agreement?: string;
-  agreement_id?: string;
-  error?: string;
-}
 
-function logReadTelemetry(entry: TelemetryEntry) {
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    level: entry.status === "error" ? "error" : "info",
-    ...entry,
-  };
-
-  if (env.LOG_FORMAT === "json") {
-    if (logEntry.level === "error") {
-      console.error(JSON.stringify(logEntry));
-    } else {
-      console.info(JSON.stringify(logEntry));
-    }
-  } else {
-    const msg = `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [read-telemetry] ${
-      logEntry.operation
-    } ${logEntry.status} ${logEntry.duration_ms}ms${
-      logEntry.request_id ? ` [${logEntry.request_id}]` : ""
-    }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-    if (logEntry.level === "error") {
-      console.error(msg);
-    } else {
-      console.info(msg);
-    }
-  }
-}
 
 function asU256FromResult(result: string[]) {
   if (!Array.isArray(result) || result.length < 2) return null;
@@ -375,6 +338,9 @@ interface TelemetryEntry {
   agreement_id?: string;
   /** Number of retry rounds (0 on first-try success, maxAttempts-1 at exhaustion). */
   retries?: number;
+  cursor?: string;
+  order?: string;
+  limit?: number;
   error?: string;
 }
 
@@ -713,8 +679,22 @@ function paginateCursorRecords(
   limit: number,
 ) {
   const ordered = [...records].sort((left, right) => {
+    if (left.id === right.id) {
+      return left.value.localeCompare(right.value);
+    }
     return order === "asc" ? left.id - right.id : right.id - left.id;
   });
+
+  if (cursor !== undefined && ordered.length > 0) {
+    const minId = Math.min(...ordered.map((r) => r.id));
+    const maxId = Math.max(...ordered.map((r) => r.id));
+    if (order === "asc" && cursor >= maxId) {
+      return { records: [], nextCursor: null };
+    }
+    if (order === "desc" && (cursor > maxId || cursor <= minId)) {
+      return { records: [], nextCursor: null };
+    }
+  }
 
   const filtered = ordered.filter((record) => {
     if (cursor === undefined) return true;
@@ -725,13 +705,6 @@ function paginateCursorRecords(
   const hasMore = filtered.length > page.length;
   const nextCursor = page.length > 0 && hasMore ? String(page[page.length - 1].id) : null;
 
-  if (cursor !== undefined && ordered.length > 0) {
-    const boundary = order === "asc" ? ordered[ordered.length - 1].id : ordered[0].id;
-    if (cursor > boundary) {
-      return { records: [], nextCursor: null };
-    }
-  }
-
   return {
     records: page,
     nextCursor,
@@ -739,17 +712,27 @@ function paginateCursorRecords(
 }
 
 readRouter.get("/records/cursor/:address", async (req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId =
+    (req.headers["x-request-id"] as string) ??
+    (req.headers["idempotency-key"] as string) ??
+    res.locals.requestId;
   try {
     const address = AddressParam.parse(req.params.address);
-    const { cursor, order, limit } = CursorQuery.parse(req.query);
-    let parsedCursor: number | undefined;
+    const { cursor, order, limit } = loggedParse(
+      CursorQuery,
+      req.query,
+      "records/cursor:query",
+    );
 
+    // Validate the cursor format before it reaches any query-builder path.
+    // loggedParse throws a ValidationError (status 400) on malformed input,
+    // which the global error handler replays as a clean 400 with a structured
+    // error body — preventing a confusing 500 and blocking injection-adjacent
+    // payloads from reaching the database layer.
+    let parsedCursor: number | undefined;
     if (cursor !== undefined) {
-      const numericCursor = Number(cursor);
-      if (!Number.isInteger(numericCursor) || numericCursor <= 0) {
-        throw new Error("Invalid cursor");
-      }
-      parsedCursor = numericCursor;
+      parsedCursor = loggedParse(NumericCursorSchema, cursor, "records/cursor:cursor");
     }
 
     // explicit security boundary
@@ -771,16 +754,32 @@ readRouter.get("/records/cursor/:address", async (req, res, next) => {
       limit,
     );
 
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logReadTelemetry({
+      operation: "records_cursor_read",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "success",
+      request_id: requestId,
+      cursor,
+      order,
+      limit,
+    });
+
     res.json({
       address,
       records,
       nextCursor,
       order,
     });
-  } catch (e) {
-    if (e instanceof z.ZodError || (e instanceof Error && e.message === "Invalid cursor")) {
-      return res.status(500).json({ error: "Invalid cursor" });
-    }
+  } catch (e: any) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logReadTelemetry({
+      operation: "records_cursor_read",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "error",
+      request_id: requestId,
+      error: e?.message || String(e),
+    });
     next(e);
   }
 });

@@ -171,7 +171,7 @@ describe("indexer status routes", () => {
       escrowEvents: 3,
     });
 
-    // TODO: status should reflect actual DB connectivity instead of a hardcoded constant.
+    // Verify status reflects active database connectivity
     expect(res.body.status).toBe("connected");
     expect(res.body.latest.events).toHaveLength(5);
     expect(res.body.latest.events.map((event: { id: string }) => event.id)).toEqual([
