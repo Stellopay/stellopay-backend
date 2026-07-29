@@ -2,12 +2,6 @@ import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
-/** Number of entries processed per batch sweep invocation. */
-export const SWEEP_BATCH_SIZE = 500;
-
-/** Cursor tracking the next batch sweep start position. */
-let sweepOffset = 0;
-
 /**
  * Nonce Challenge Generation, Expiration, and Validation Contract.
  *
@@ -93,7 +87,14 @@ let creationsSinceSweep = 0;
  */
 export const SWEEP_BATCH_SIZE = 500;
 
-/** Cursor into the challenge store for the next paginated sweep pass. */
+/**
+ * Snapshot of keys taken when the current pagination cycle started.
+ * Kept stable across sweeps so entries added or deleted between invocations
+ * never shift the resume position. `null` when no cycle is in progress.
+ */
+let sweepKeysSnapshot: string[] | null = null;
+
+/** Index into `sweepKeysSnapshot` for the next paginated sweep pass. */
 let sweepOffset = 0;
 
 /** Memoized mapping from encoded chain-ID felt → human-readable label. */
@@ -122,39 +123,53 @@ function getChainIdLabel(chainId: string): string {
  * Removes expired challenge entries.
  *
  * Opportunistic sweeps (`full === false`) inspect at most `SWEEP_BATCH_SIZE`
- * entries starting at `sweepOffset`, then advance the cursor. Last-resort
- * sweeps (`full === true`) walk the entire store and reset the cursor.
+ * entries from the stable `sweepKeysSnapshot`, then advance `sweepOffset`.
+ * Because the snapshot is captured once per cycle, entries added or deleted
+ * between sweeps never shift the resume position. Last-resort sweeps
+ * (`full === true`) walk the entire store and reset the cycle.
  */
 function sweepExpiredChallenges(now: number, full = false): void {
-  const entries = [...challenges.entries()];
-  if (entries.length === 0) {
+  if (challenges.size === 0) {
+    sweepKeysSnapshot = null;
     sweepOffset = 0;
     return;
   }
 
   if (full) {
-    for (const [key, rec] of entries) {
-      if (now > rec.expiresAtMs) {
-        challenges.delete(key);
-      }
+    for (const [key, rec] of challenges) {
+      if (now > rec.expiresAtMs) challenges.delete(key);
     }
+    sweepKeysSnapshot = null;
     sweepOffset = 0;
     return;
   }
 
-  if (sweepOffset >= entries.length) {
+  // Start a new pagination cycle when there is no active snapshot.
+  if (sweepKeysSnapshot === null) {
+    sweepKeysSnapshot = [...challenges.keys()];
     sweepOffset = 0;
   }
 
-  const end = Math.min(sweepOffset + SWEEP_BATCH_SIZE, entries.length);
-  for (let i = sweepOffset; i < end; i++) {
-    const [key, rec] = entries[i]!;
-    if (now > rec.expiresAtMs) {
-      challenges.delete(key);
-    }
+  // If the cycle is complete, start a fresh one next time.
+  if (sweepOffset >= sweepKeysSnapshot.length) {
+    sweepKeysSnapshot = null;
+    sweepOffset = 0;
+    return;
   }
 
-  sweepOffset = end >= entries.length ? 0 : end;
+  const end = Math.min(sweepOffset + SWEEP_BATCH_SIZE, sweepKeysSnapshot.length);
+  for (let i = sweepOffset; i < end; i++) {
+    const key = sweepKeysSnapshot[i]!;
+    const rec = challenges.get(key);
+    if (rec && now > rec.expiresAtMs) challenges.delete(key);
+  }
+
+  sweepOffset = end;
+  if (sweepOffset >= sweepKeysSnapshot.length) {
+    // This cycle is done — next sweep will start fresh.
+    sweepKeysSnapshot = null;
+    sweepOffset = 0;
+  }
 }
 
 /** Emits one structured metric line. `console.info` carries the request id. */
@@ -366,6 +381,7 @@ export function buildTypedChallenge(address: unknown, chainId: unknown, nonce: u
 export function clearChallengesForTesting(): void {
   challenges.clear();
   creationsSinceSweep = 0;
+  sweepKeysSnapshot = null;
   sweepOffset = 0;
 }
 
