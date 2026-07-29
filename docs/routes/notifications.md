@@ -138,6 +138,8 @@ unread counts independently of the HTTP handler.
 - Notifications without an `id` are counted individually (no deduplication key).
 - Supports both `string` and `number` id types, including `0`.
 - Only counts items where `read === false`.
+- Missing or malformed `read` values are treated as read items, which keeps
+  partially hydrated or replayed records from inflating the unread count.
 - Returns `0` for an empty array.
 
 **Invariant in the HTTP response:** because every emitted notification has

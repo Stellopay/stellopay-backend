@@ -61,17 +61,20 @@ export function getDefaultNotificationPreferences(): NotificationPreferences {
  * - Notifications without `id` are counted individually
  * - Supports both string and numeric `id` types
  * - Only counts items where `read === false`
+ * - Missing or malformed `read` values are treated as read items
  * - Function signature and counting logic are frozen
  *
- * @param notifications - Array of notification objects with `read` boolean
- *                        and optional `id` field
+ * @param notifications - Array of notification objects with an optional
+ *                        `read` boolean and optional `id` field
  * @returns Count of unique unread notifications
  */
-export function calculateUnreadCount(notifications: Array<{ id?: string | number, read: boolean }>): number {
+export function calculateUnreadCount(
+  notifications: Array<{ id?: string | number; read?: boolean }>,
+): number {
   const uniqueIds = new Set<string | number>();
   let count = 0;
   for (const n of notifications) {
-    if (!n.read) {
+    if (n.read === false) {
       if (n.id !== undefined) {
         if (!uniqueIds.has(n.id)) {
           uniqueIds.add(n.id);
