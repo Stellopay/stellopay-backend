@@ -106,10 +106,16 @@ sit in the map forever. Every 50th `createChallenge` call therefore initiates a 
 pass that deletes entries whose TTL has already elapsed.
 
 The sweep is **paginated** to bound synchronous work: each invocation checks at most
-`SWEEP_BATCH_SIZE` (500) entries and advances a cursor (`sweepOffset`). The next sweep
-continues from where the previous one stopped, wrapping back to offset 0 after reaching
-the end of the store. This means a single sweep call costs O(SWEEP_BATCH_SIZE) regardless
-of store size.
+`SWEEP_BATCH_SIZE` (500) entries from a stable key snapshot (`sweepKeysSnapshot`) and
+advances a cursor (`sweepOffset`) into it. The next sweep continues from where the
+previous one stopped, starting a fresh snapshot when the previous cycle is complete.
+This means a single sweep call costs O(SWEEP_BATCH_SIZE) regardless of store size.
+
+The snapshot is captured once at the start of each pagination cycle (by copying the
+Map's current keys into `sweepKeysSnapshot`). Because the snapshot is immutable for
+the duration of the cycle, entries added or deleted between sweeps never shift the
+resume position — the cursor is always an index into a fixed array, not a position
+tied to the live-ordered Map.
 
 At `SWEEP_BATCH_SIZE = 500` and a full store of 100,000 entries, a complete pass requires
 200 sweep invocations. At the sweep interval of 50 `createChallenge` calls, a full pass
@@ -302,8 +308,9 @@ any dashboard or alert that consumes the metric.
 
 ## Test helpers
 
-`clearChallengesForTesting()` empties the store and resets both the sweep counter
-(`creationsSinceSweep`) and the page cursor (`sweepOffset`); `clearChainIdCacheForTesting()`
+`clearChallengesForTesting()` empties the store and resets the sweep counter
+(`creationsSinceSweep`), the snapshot (`sweepKeysSnapshot`), and the page cursor
+(`sweepOffset`); `clearChainIdCacheForTesting()`
 empties the chain-ID memo. Both exist for test isolation only — calling either in production
 would invalidate every in-flight login, reset pagination mid-pass, or discard a warm cache
 for no reason.
@@ -328,9 +335,9 @@ must go through the functions above.
 - Sweep: a valid entry surviving unrelated traffic, an abandoned expired entry being
   evicted without ever being read, and not-yet-expired entries left in place.
 - Batch sweep pagination: the per-invocation page limit (`SWEEP_BATCH_SIZE`), cursor
-  advancement across multiple sweeps, cursor wrap-around after a full pass, graceful
-  handling of an empty store, cursor reset when the store shrinks below the cursor, and
-  the last-resort full sweep when the store is full.
+  advancement across multiple sweeps, snapshot completion and restart after a full pass,
+  graceful handling of an empty store, cursor stability when entries are added between
+  sweeps (drift immunity), and the last-resort full sweep when the store is full.
 - `getChallenge` / `clearChallenge` / `consumeChallenge`: success, expiry boundary,
   not-found and invalid-address misses, silent no-ops, the consume-once replay race, and
   cross-format address resolution.

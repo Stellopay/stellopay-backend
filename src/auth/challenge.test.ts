@@ -429,25 +429,21 @@ describe("batch sweep pagination", () => {
     expect(challenges.size).toBe(extra + 49 + 1);
   });
 
-  // TODO(pre-existing): the cursor logic in sweepExpiredChallenges does not
-  // account for entries added between sweeps that shift the cursor. The
-  // second sweep re-processes already-swept entries and misses some expired
-  // ones. Tracked in follow-up batch-sweep fix PR.
-  it.skip("success path: advances cursor across multiple sweeps until all expired entries are removed", () => {
+  it("success path: advances cursor across multiple sweeps until all expired entries are removed", () => {
     addEntries(SWEEP_BATCH_SIZE + 200, -1);
 
     // Sweep 1 — triggered on the 50th createChallenge call.
+    // New cycle starts: snapshots all keys (700 expired + 49 traffic = 749).
     // Processes [0, 500), removes 500 expired. sweepOffset = 500.
     // After sweep 1: 200 expired + 49 traffic + 1 trigger = 250 survive.
     createTraffic(49);
     createChallenge("0xcccc"); // triggers sweep 1
     expect(challenges.size).toBe(200 + 49 + 1);
 
-    // Sweep 2 — creationsSinceSweep reset to 0. We need 50 more calls.
-    // Before sweep 2: 200 expired + 49 traffic + 1 trigger + 49 new traffic
-    //   + 1 new trigger = 300 entries.
-    // sweepOffset (500) >= 300, so resets to 0.
-    // Snapshot: 300 entries. Processes [0, 300), removes all 200 expired.
+    // Sweep 2 — 50 more calls trigger the next sweep.
+    // The snapshot from cycle start (749 keys) is still live at offset 500.
+    // Processes [500, 749) using the stable snapshot — entries added as
+    // traffic do not shift these indices. Removes the remaining 200 expired.
     // After sweep 2: 49 + 1 + 49 + 1 = 100 survive.
     createTraffic(49);
     createChallenge("0xdddd"); // triggers sweep 2
@@ -457,14 +453,15 @@ describe("batch sweep pagination", () => {
     expect(getChallenge("0xdddd")).not.toBeNull();
   });
 
-  it("boundary path: cursor wraps to 0 after sweeping the entire store", () => {
+  it("boundary path: a full sweep cycle wraps to 0 and starts fresh", () => {
     // Fill with fewer entries than one batch so a single sweep
-    // consumes everything and the cursor wraps to 0.
+    // consumes everything and the cycle completes.
     const smallCount = SWEEP_BATCH_SIZE - 100;
     addEntries(smallCount, -1); // all expired
 
     // Trigger sweep 1: 400 expired + 49 traffic = 449 entries.
-    // Processes [0, 449) — all expired. sweepOffset wraps to 0.
+    // New cycle: snapshots all 449 keys. Processes [0, 449) — all expired.
+    // sweepOffset reaches the end, snapshot is discarded.
     // After sweep 1: 49 traffic + 1 trigger = 50 survive.
     createTraffic(49);
     createChallenge("0xeeee"); // triggers sweep 1
@@ -474,7 +471,8 @@ describe("batch sweep pagination", () => {
     addEntries(smallCount, CHALLENGE_TTL_MS);
 
     // Sweep 2: triggered by another 50 calls.
-    // sweepOffset is 0. Snapshot: 400 fresh + 50 old + 50 new = 500 entries.
+    // No active snapshot, so a new cycle starts.
+    // Snapshots: 400 fresh + 50 old + 50 new = 500 entries.
     // Processes [0, 500) — none expired. All survive.
     createTraffic(49);
     createChallenge("0xffff"); // triggers sweep 2
@@ -488,31 +486,36 @@ describe("batch sweep pagination", () => {
     expect(challenges.size).toBe(1);
   });
 
-  it("boundary path: resets cursor when store has shrunk below offset", () => {
+  it("boundary path: stable snapshot survives entries being deleted between sweeps", () => {
     // Fill with entries beyond one batch.
     addEntries(SWEEP_BATCH_SIZE + 50, -1);
 
-    // Sweep 1: 550 expired + 49 traffic = 599 entries in snapshot.
-    // Processes [0, 500), removes 500 expired. sweepOffset = 500.
+    // Sweep 1: 550 expired + 49 traffic = 599 entries.
+    // New cycle snapshots all 599 keys. Processes [0, 500), removes 500 expired.
+    // sweepOffset = 500. Snapshot retains all 599 keys (stable across sweeps).
     // After sweep 1: 50 expired + 49 traffic + 1 trigger = 100.
     createTraffic(49);
     createChallenge("0xcafe"); // triggers sweep 1
     expect(challenges.size).toBe(50 + 49 + 1);
 
-    // Directly delete all but one entry, shrinking store below offset 500.
+    // Directly delete all but one entry from the Map.
+    // The snapshot from sweep 1 still references the deleted keys — that is fine.
     const keys = [...challenges.keys()];
     for (const key of keys) {
       if (key !== canonical("cafe")) challenges.delete(key);
     }
     expect(challenges.size).toBe(1); // only "0xcafe" remains
 
-    // Sweep 2: triggered by 50 more calls.
-    // Before sweep: 1 (0xcafe) + 49 traffic + 1 trigger = 51 entries.
-    // sweepOffset (500) >= 51, resets to 0.
-    // Processes [0, 51), none expired. All survive.
+    // Sweep 2: 50 more calls trigger the sweep.
+    // The stable snapshot is still at offset 500.
+    // Processes [500, 599) from the snapshot. Most of these keys no longer
+    // exist in the Map (were deleted above), so challenges.get() returns null
+    // and the sweep is a no-op. No entries are missed.
     createTraffic(49);
     createChallenge("0xbeef"); // triggers sweep 2
 
+    // After sweep 2: snapshot consumed (sweepOffset >= length), cycle done.
+    // 1 (cafe) + 49 traffic + 1 trigger = 51 survive.
     expect(challenges.size).toBe(1 + 49 + 1);
     expect(getChallenge("0xcafe")).not.toBeNull();
   });
@@ -534,6 +537,33 @@ describe("batch sweep pagination", () => {
     // entry remains.
     expect(challenges.size).toBe(1);
     expect(getChallenge("0xade0")).not.toBeNull();
+  });
+
+  it("stable snapshot: entries added between sweeps never shift the resume position", () => {
+    // Enough expired entries for two paginated sweep passes.
+    addEntries(Math.round(SWEEP_BATCH_SIZE * 1.5), -1); // 750 expired
+
+    // Sweep 1 — new cycle snapshots all keys. Processes [0, 500), removes
+    // 500 expired. sweepOffset = 500. Snapshot preserved across sweeps.
+    createTraffic(49);
+    createChallenge("0x5000"); // triggers sweep 1
+    expect(challenges.size).toBe(250 + 49 + 1);
+
+    // Flood with fresh entries that would shift a re-taken snapshot.
+    // With the stable snapshot these go at the end of the Map but the
+    // snapshot indices 500+ still point to the remaining 250 expired.
+    for (let i = 0; i < 200; i++) {
+      createChallenge(canonical((0x500000 + i).toString(16)));
+    }
+
+    // After the flood the snapshot must have been exhausted by the sweeps
+    // triggered during the 200 calls. The remaining store has 0 expired +
+    // all the traffic + trigger entries.
+    expect(challenges.size).toBe(49 + 1 + 200);
+    // But every expired entry from the original addEntries must be gone.
+    for (let i = 0; i < 750; i++) {
+      expect(challenges.has(canonical((0x200000 + i).toString(16)))).toBe(false);
+    }
   });
 });
 
