@@ -154,7 +154,9 @@ const app = express();
 app.use(express.json());
 app.use(transactionsRouter);
 app.use((err: any, _req: any, res: any, _next: any) => {
-  res.status(500).json({ error: err.message });
+  console.error("Test App Error:", err);
+  const status = err.status || 500;
+  res.status(status).json({ success: false, error: err.message });
 });
 
 // ── Helper: validate transaction item shape ──────────────────────────────
@@ -290,14 +292,12 @@ describe("Transactions Router — main endpoint", () => {
       expect(res.body).toHaveProperty("transactions");
     });
 
-    it("returns empty when no matching event types exist for a table", async () => {
-      // Event types that don't match any table's types should still return 200
+    it("returns 400 when an invalid event type is provided", async () => {
       const res = await request(app).get(
         `/transactions/${USER_ADDRESS}?eventTypes=NonExistent`,
       );
 
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty("transactions");
+      expect(res.status).toBe(400);
     });
 
     it("ignores empty eventTypes parameter", async () => {
@@ -438,10 +438,7 @@ describe("Transactions Router — filtered endpoint", () => {
         `/transactions/${USER_ADDRESS}/filtered?startDate=not-a-date`,
       );
 
-      // Invalid Date objects are created but may still work; the route
-      // doesn't explicitly validate date format, so it proceeds.
-      // We just verify it doesn't crash.
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(400);
     });
   });
 
@@ -491,7 +488,6 @@ describe("Transactions Router — logging", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    mockAuthResult = { address: userAddress, token: "test-token" };
 
     const { db } = await import("../db/index.js");
     vi.mocked(db.select).mockImplementation((arg: any) => {
