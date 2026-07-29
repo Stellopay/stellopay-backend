@@ -530,6 +530,38 @@ function parseDateFilters(req: {
 }): { startDate?: Date; endDate?: Date } {
   const rawStart = req.query.from || req.query.startDate;
   const rawEnd = req.query.to || req.query.endDate;
+/**
+ * Parses and validates optional date-range parameters from the request query.
+ *
+ * Idempotency contract
+ * --------------------
+ * Both endpoints that accept date filters (`startDate`/`endDate` on the
+ * filtered route, `from`/`to` on the main route) must return the **same**
+ * response for the **same** input on every retry.  That guarantee breaks down
+ * when `new Date("not-a-date")` silently produces an `Invalid Date` which
+ * drizzle then serialises to a garbage SQL literal.  To keep retries safe:
+ *
+ * - If a date string is present but parses to `Invalid Date`, this function
+ *   throws an error with `status = 400` and a `{ success: false, error }` body
+ *   so the caller always receives the same deterministic rejection.
+ * - If `from`/`startDate` is strictly after `to`/`endDate`, the range can never
+ *   match any row on any retry — this is also rejected with 400.
+ * - Absent parameters are returned as `undefined` (no filter applied), which is
+ *   idempotent: every retry with no date params sees all rows.
+ *
+ * @param req - Express-compatible request with a `query` map.
+ * @param opts.fromParam  - Query-param name for the lower bound (default `"startDate"`).
+ * @param opts.toParam    - Query-param name for the upper bound (default `"endDate"`).
+ * @throws Error (status=400) when a date string is invalid or the range is inverted.
+ */
+function parseDateFilters(
+  req: { query: Record<string, unknown> },
+  opts: { fromParam?: string; toParam?: string } = {},
+): { startDate?: Date; endDate?: Date } {
+  const { fromParam = "startDate", toParam = "endDate" } = opts;
+
+  const rawFrom = req.query[fromParam] as string | undefined;
+  const rawTo = req.query[toParam] as string | undefined;
 
   let startDate: Date | undefined;
   let endDate: Date | undefined;
@@ -570,6 +602,44 @@ function parseDateFilters(req: {
     const err = new Error("`from` date cannot be after `to` date");
     // @ts-ignore custom status property
     err.status = 400;
+  if (rawFrom) {
+    const d = new Date(rawFrom);
+    if (Number.isNaN(d.getTime())) {
+      const err = new Error(
+        `Invalid \`${fromParam}\` value "${rawFrom}". Provide an ISO 8601 date string.`,
+      );
+      // @ts-ignore custom status property read by the error-handler middleware
+      err.status = 400;
+      // @ts-ignore
+      err.body = { success: false, error: `Invalid \`${fromParam}\` value "${rawFrom}". Provide an ISO 8601 date string.` };
+      throw err;
+    }
+    startDate = d;
+  }
+
+  if (rawTo) {
+    const d = new Date(rawTo);
+    if (Number.isNaN(d.getTime())) {
+      const err = new Error(
+        `Invalid \`${toParam}\` value "${rawTo}". Provide an ISO 8601 date string.`,
+      );
+      // @ts-ignore
+      err.status = 400;
+      // @ts-ignore
+      err.body = { success: false, error: `Invalid \`${toParam}\` value "${rawTo}". Provide an ISO 8601 date string.` };
+      throw err;
+    }
+    endDate = d;
+  }
+
+  if (startDate && endDate && startDate > endDate) {
+    const err = new Error(
+      `\`${fromParam}\` must not be after \`${toParam}\`.`,
+    );
+    // @ts-ignore
+    err.status = 400;
+    // @ts-ignore
+    err.body = { success: false, error: `\`${fromParam}\` must not be after \`${toParam}\`.` };
     throw err;
   }
 
@@ -979,6 +1049,30 @@ async function fetchAndBuildTransactions(
       const isReceived = p.eventType === "PaymentReceived";
       const sign = isReceived ? "+" : "-";
       const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+
+      return {
+        id: p.transactionHash.slice(0, 10),
+        type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
+        address: formatAddress(isReceived ? p.from : p.to),
+        date: dateTime.date,
+        time: dateTime.time,
+        token: tokenInfo.name,
+        amount: finalAmount,
+        status: "Completed" as const,
+        tokenIcon: tokenInfo.icon,
+        txHash: p.transactionHash,
+        createdAt: p.createdAt,
+      };
+    }),
+    ...escrowEvents.map((e) => {
+      const dateTime = formatDate(e.createdAt);
+      const tokenAddress = escrowTokenMap.get(e.agreementId) || null;
+      const tokenInfo = getTokenInfo(tokenAddress);
+      const amountStr = formatAmount(e.amount, tokenInfo);
+      const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
+      const sign = isIncoming ? "+" : "-";
+      const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+
       return {
         id: p.transactionHash.slice(0, 10),
         type: formatEventType(p.eventType),
@@ -1162,9 +1256,12 @@ function respondPaginated(
 // Contract:
 // - Accepts `eventTypes` query filter (comma-separated).
 // - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
+// - Accepts optional `from` / `to` ISO 8601 date-range params for idempotent
+//   reconciliation.  Invalid or inverted ranges are rejected with 400 so that
+//   retrying the same malformed request always produces the same deterministic
+//   error response.
 // - Deduplicates agreement events by id.
 // - Employee condition mode: "employer-or-employee".
-// - Does NOT support date-range filtering.
 
 transactionsRouter.get(
   "/transactions/:user_address",
@@ -1175,6 +1272,14 @@ transactionsRouter.get(
       const eventTypes = parseEventTypes(req);
       const { startDate, endDate } = parseDateFilters(req);
 
+      // Idempotent date-range validation: `from` / `to` are the supported
+      // aliases on the main endpoint.  Absent params → no date filter (all
+      // rows).  Invalid or inverted ranges → 400 so retries are deterministic.
+      const { startDate, endDate } = parseDateFilters(req, {
+        fromParam: "from",
+        toParam: "to",
+      });
+
       // Validate and parse sort parameters against the allowlist.
       const sortResult = parseSortParams(req);
       if (sortResult.error) {
@@ -1184,6 +1289,11 @@ transactionsRouter.get(
       const { sortBy, sortDir } = sortResult;
 
       const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined, startDate, endDate });
+      const conds = buildConditions(userAddress, {
+        eventTypes: eventTypes ?? undefined,
+        startDate,
+        endDate,
+      });
       const { allTransactions, total } = await fetchAndBuildTransactions(
         userAddress,
         conds,
@@ -1192,7 +1302,11 @@ transactionsRouter.get(
       );
 
       respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.status === 400 && e?.body) {
+        res.status(400).json(e.body);
+        return;
+      }
       next(e);
     }
   },
@@ -1201,7 +1315,10 @@ transactionsRouter.get(
 // ── Route: filtered transaction list (with optional date-range) ──────────
 //
 // Contract:
-// - Accepts `startDate` / `endDate` query filters.
+// - Accepts `startDate` / `endDate` query filters (ISO 8601).
+//   Invalid strings or inverted ranges are rejected with 400 so that retrying
+//   the same malformed request always produces the same deterministic error,
+//   keeping the endpoint safe for idempotent reconciliation workflows.
 // - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
 // - Employee condition mode: "employee-only".
 // - Does NOT deduplicate agreement events.
@@ -1213,6 +1330,9 @@ transactionsRouter.get(
     try {
       const userAddress = normalizeAddr(req.params.user_address);
       const { limit, offset } = parsePagination(req);
+
+      // Idempotent date-range validation.  Absent → no date filter.
+      // Invalid or inverted → 400 so retries are deterministic.
       const { startDate, endDate } = parseDateFilters(req);
 
       // Validate and parse sort parameters against the allowlist.
@@ -1235,9 +1355,12 @@ transactionsRouter.get(
       );
 
       respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.status === 400 && e?.body) {
+        res.status(400).json(e.body);
+        return;
+      }
       next(e);
     }
-
   },
 );

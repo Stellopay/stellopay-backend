@@ -4,6 +4,26 @@
 > definitions, CHECK constraints, FK indexes, and runtime validation helpers
 > exported from that module drive every query, migration, and test.
 
+## Idempotency Contract
+
+Every exported function in the schema module is **idempotent**:
+
+- **Query helpers** (`isValidU256`, `isValidCurrencyCode`,
+  `isValidNonNegativeInteger`, `clampPageLimit`, `clampBatchSize`,
+  `validateBatchSize`, `stripSensitiveBillingFields`): pure-function
+  contract — the same arguments always produce the same return value.
+- **Assertion helpers** (`assertNonNegative`, `assertValidU256`,
+  `assertValidCurrencyCode`): same-throw contract — the same valid
+  arguments always succeed; the same invalid arguments always throw a
+  semantically equivalent error.
+- **Migration helpers** (`getPendingMigrationFileNames`,
+  `withMigrationLock`): pure logic and transactional locks mean the
+  migration system is safe to retry. Drizzle's migrator tracks applied
+  migrations, so re-applying the same set is a no-op.
+
+This contract is enforced by the `idempotency contract` test block in
+`src/db/migration.test.ts` (invariant I8).
+
 ## Backward-compatibility Policy
 
 The schema module exports a public API surface that follows strict backward
@@ -33,7 +53,7 @@ compatibility. Compatibility is tracked via `SCHEMA_COMPATIBILITY_VERSION`
 
 ## Invariants
 
-The schema enforces seven invariants (I1–I7), verified by
+The schema enforces eight invariants (I1–I8), verified by
 `schema-consistency.test.ts` and `migration.test.ts`:
 
 | # | Invariant | Enforcement |
@@ -45,6 +65,7 @@ The schema enforces seven invariants (I1–I7), verified by
 | I5 | **Block-number CHECK** — every block_number column has `CHECK >= 0`. | `migration.test.ts` |
 | I6 | **Enum CHECK** — every closed-set column has `CHECK IN (...)` or `CHECK BETWEEN`. | `schema-consistency.test.ts` |
 | I7 | **Runtime ↔ DB parity** — every CHECK has a runtime validation helper. | `migration.test.ts` |
+| I8 | **Idempotency** — every exported helper produces the same result for the same arguments on repeated calls. | `migration.test.ts` |
 
 ## Constraints and Migration Safety
 

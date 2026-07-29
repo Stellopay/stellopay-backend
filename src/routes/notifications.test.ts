@@ -337,6 +337,7 @@ describe("notifications route", () => {
       makeEscrowEvent({ id: "escrow-1", eventType: "Funded" }),
     ];
 
+    const res = await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
     await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
 
     expect(dbMock.select).toHaveBeenCalledTimes(4);

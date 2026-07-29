@@ -135,6 +135,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
+       
+      console.error(JSON.stringify(logEntry));
+    } else {
+       
       console.error(JSON.stringify(logEntry));
     } else {
       console.info(JSON.stringify(logEntry));
@@ -149,6 +153,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
       `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
 
     if (logEntry.level === "error") {
+       
+      console.error(msg);
+    } else {
+       
       console.error(msg);
     } else {
       console.info(msg);

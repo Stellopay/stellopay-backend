@@ -997,6 +997,7 @@ describe("Auth Routes Integration", () => {
     });
   });
 });
+});
 
 // ---------------------------------------------------------------------------
 // rebuildAdminSet / isAdminAddress — pre-built Set contract

@@ -818,6 +818,213 @@ describe("backward-compatibility contract", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Idempotency contract
+// ---------------------------------------------------------------------------
+
+describe("idempotency contract", () => {
+  // ── I1: Pure-function helpers return the same value on repeated calls ──
+
+  describe("I1 — query helper idempotency", () => {
+    it("isValidU256 returns the same result for the same input", () => {
+      const inputs = ["0", "1", "12345", "", "-1", "01", "1.5", "abc"];
+      for (const input of inputs) {
+        const first = isValidU256(input);
+        const second = isValidU256(input);
+        expect(second, `isValidU256("${input}") must be idempotent`).toBe(first);
+      }
+    });
+
+    it("isValidCurrencyCode returns the same result for the same input", () => {
+      const codes = ["USD", "EUR", "GBP", "", "usd", "US", "USDD", "123"];
+      for (const code of codes) {
+        const first = isValidCurrencyCode(code);
+        const second = isValidCurrencyCode(code);
+        expect(second, `isValidCurrencyCode("${code}") must be idempotent`).toBe(first);
+      }
+    });
+
+    it("isValidNonNegativeInteger returns the same result for the same input", () => {
+      const inputs = [0, 1, 100, -1, 1.5, NaN, Infinity];
+      for (const input of inputs) {
+        const first = isValidNonNegativeInteger(input);
+        const second = isValidNonNegativeInteger(input);
+        expect(second, `isValidNonNegativeInteger(${input}) must be idempotent`).toBe(first);
+      }
+    });
+
+    it("clampPageLimit returns the same value for the same input", () => {
+      const inputs = [-5, 0, 1, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_PAGE_SIZE + 1, 1000, NaN, -Infinity];
+      for (const input of inputs) {
+        const first = clampPageLimit(input);
+        const second = clampPageLimit(input);
+        expect(Number.isNaN(first) ? Number.isNaN(second) : second === first).toBe(true);
+      }
+    });
+
+    it("clampBatchSize returns the same value for the same input", () => {
+      const inputs = [-5, 0, 1, MAX_BATCH_SIZE, MAX_BATCH_SIZE + 1, 50, NaN, -100];
+      for (const input of inputs) {
+        const first = clampBatchSize(input);
+        const second = clampBatchSize(input);
+        expect(Number.isNaN(first) ? Number.isNaN(second) : second === first).toBe(true);
+      }
+    });
+
+    it("validateBatchSize returns the same value for the same valid input", () => {
+      const inputs = [1, MAX_BATCH_SIZE, 50];
+      for (const input of inputs) {
+        const first = validateBatchSize(input);
+        const second = validateBatchSize(input);
+        expect(second, `validateBatchSize(${input}) must be idempotent`).toBe(first);
+      }
+    });
+
+    it("stripSensitiveBillingFields is idempotent", () => {
+      const input = {
+        id: "profile-1",
+        ownerAddress: "0xowner",
+        taxId: "EIN-12345",
+        dateOfBirth: "1990-01-01",
+        firstName: "Alice",
+      };
+      const first = schema.stripSensitiveBillingFields(input);
+      const second = schema.stripSensitiveBillingFields(first);
+      expect(second).toEqual(first);
+    });
+
+    it("stripSensitiveBillingFields is a no-op when called twice", () => {
+      const input = {
+        id: "profile-2",
+        ownerAddress: "0xowner",
+        firstName: "Bob",
+      };
+      const first = schema.stripSensitiveBillingFields(input);
+      const second = schema.stripSensitiveBillingFields(first);
+      expect(second).toEqual(first);
+    });
+  });
+
+  // ── I2: Assertion helpers throw the same error on repeated invalid calls ──
+
+  describe("I2 — assertion helper idempotency", () => {
+    it("assertNonNegative succeeds on repeated valid calls", () => {
+      expect(() => { assertNonNegative(0, "test"); }).not.toThrow();
+      expect(() => { assertNonNegative(0, "test"); }).not.toThrow();
+    });
+
+    it("assertNonNegative throws the same error type on repeated invalid calls", () => {
+      expect(() => { assertNonNegative(-1, "test"); }).toThrow(RangeError);
+      expect(() => { assertNonNegative(-1, "test"); }).toThrow(RangeError);
+    });
+
+    it("assertValidU256 succeeds on repeated valid calls", () => {
+      expect(() => { assertValidU256("0", "test"); }).not.toThrow();
+      expect(() => { assertValidU256("0", "test"); }).not.toThrow();
+    });
+
+    it("assertValidU256 throws the same error type on repeated invalid calls", () => {
+      expect(() => { assertValidU256("-1", "test"); }).toThrow(RangeError);
+      expect(() => { assertValidU256("-1", "test"); }).toThrow(RangeError);
+    });
+
+    it("assertValidCurrencyCode succeeds on repeated valid calls", () => {
+      expect(() => { assertValidCurrencyCode("USD", "test"); }).not.toThrow();
+      expect(() => { assertValidCurrencyCode("USD", "test"); }).not.toThrow();
+    });
+
+    it("assertValidCurrencyCode throws the same error type on repeated invalid calls", () => {
+      expect(() => { assertValidCurrencyCode("usd", "test"); }).toThrow(RangeError);
+      expect(() => { assertValidCurrencyCode("usd", "test"); }).toThrow(RangeError);
+    });
+  });
+
+  // ── I3: Validation error messages are stable (same input → same message text) ──
+
+  describe("I3 — error message stability", () => {
+    it("assertNonNegative produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => assertNonNegative(-1, "blockNumber"));
+      const msg2 = extract(() => assertNonNegative(-1, "blockNumber"));
+      expect(msg1).toBe("blockNumber must be non-negative, got -1");
+      expect(msg2).toBe(msg1);
+    });
+
+    it("assertValidU256 produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => assertValidU256("-1", "amount"));
+      const msg2 = extract(() => assertValidU256("-1", "amount"));
+      expect(msg1).toContain("amount");
+      expect(msg1).toContain('"-1"');
+      expect(msg2).toBe(msg1);
+    });
+
+    it("assertValidCurrencyCode produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => assertValidCurrencyCode("usd", "currency"));
+      const msg2 = extract(() => assertValidCurrencyCode("usd", "currency"));
+      expect(msg1).toContain("currency");
+      expect(msg1).toContain('"usd"');
+      expect(msg2).toBe(msg1);
+    });
+
+    it("validateBatchSize produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => validateBatchSize(0, "batchSize"));
+      const msg2 = extract(() => validateBatchSize(0, "batchSize"));
+      expect(msg1).toContain("batchSize");
+      expect(msg2).toBe(msg1);
+    });
+  });
+
+  // ── I4: Migration helpers are idempotent ──────────────────────────
+
+  describe("I4 — migration helper idempotency", () => {
+    it("getPendingMigrationFileNames returns the same result for the same inputs", () => {
+      const entries = [
+        { idx: 0, when: 100, tag: "0000_initial" },
+        { idx: 1, when: 200, tag: "0001_add_sessions" },
+      ];
+
+      const first = getPendingMigrationFileNames(entries, 100);
+      const second = getPendingMigrationFileNames(entries, 100);
+      expect(first).toEqual(["0001_add_sessions.sql"]);
+      expect(second).toEqual(first);
+    });
+
+    it("getPendingMigrationFileNames with null timestamp returns all pending both times", () => {
+      const entries = [
+        { idx: 0, when: 100, tag: "0000_initial" },
+        { idx: 1, when: 200, tag: "0001_add_sessions" },
+      ];
+
+      const first = getPendingMigrationFileNames(entries, null);
+      const second = getPendingMigrationFileNames(entries, null);
+      expect(first).toEqual(["0000_initial.sql", "0001_add_sessions.sql"]);
+      expect(second).toEqual(first);
+    });
+
+    it("getPendingMigrationFileNames with up-to-date timestamp returns empty both times", () => {
+      const entries = [
+        { idx: 0, when: 100, tag: "0000_initial" },
+      ];
+
+      const first = getPendingMigrationFileNames(entries, 200);
+      const second = getPendingMigrationFileNames(entries, 200);
+      expect(first).toEqual([]);
+      expect(second).toEqual(first);
+    });
+  });
+});
+
 describe("migration dry-run helpers", () => {
   it("lists migrations newer than the last applied migration timestamp", () => {
     const pendingMigrations = getPendingMigrationFileNames(

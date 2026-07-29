@@ -48,6 +48,31 @@ import { sql } from "drizzle-orm";
  *        corresponding runtime validation helper exported from this module
  *        (e.g. `assertValidU256` matches the u256 CHECK). | Callers validate
  *        early to produce actionable errors instead of opaque DB violations. |
+ * | I8 | **Idempotency** — every exported helper is idempotent: calling it
+ *        multiple times with the same arguments produces the same result
+ *        (pure function contract, same-throw contract for assertion helpers). | Retries and
+ *        duplicate delivery must not produce ambiguous outcomes. A caller
+ *        that retries with the same input must observe the same output. |
+ *
+ * ## Idempotency contract
+ *
+ * Every exported function in this module is **idempotent** under the
+ * following rules:
+ *
+ * - **Query helpers** (`isValidU256`, `isValidCurrencyCode`,
+ *   `isValidNonNegativeInteger`, `clampPageLimit`, `clampBatchSize`,
+ *   `validateBatchSize`, `stripSensitiveBillingFields`): calling any of
+ *   these twice with the same arguments returns the same value both times
+ *   (pure-function contract).
+ * - **Assertion helpers** (`assertNonNegative`, `assertValidU256`,
+ *   `assertValidCurrencyCode`): calling any of these twice with the same
+ *   _valid_ arguments succeeds both times; calling them twice with the same
+ *   _invalid_ arguments throws a semantically equivalent error both times
+ *   (same-throw contract — error message may differ by stack trace).
+ * - **Migration helpers** (`getPendingMigrationFileNames`,
+ *   `withMigrationLock`): pure logic and transactional locks ensure the
+ *   migration system is safe to retry. Drizzle's migrator tracks applied
+ *   migrations, so applying the same migration set twice is a no-op.
  *
  * ## Backward-compatibility policy
  *
