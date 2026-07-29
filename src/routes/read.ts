@@ -44,6 +44,36 @@ import { NumericCursorSchema, loggedParse } from "../utils/validation.js";
 const AddressParam = z.string().min(3);
 
 
+function logReadTelemetry(entry: TelemetryEntry) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
+
+  if (env.LOG_FORMAT === "json") {
+    if (logEntry.level === "error") {
+       
+      console.error(JSON.stringify(logEntry));
+    } else {
+       
+      console.info(JSON.stringify(logEntry));
+    }
+  } else {
+    const msg = `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [read-telemetry] ${
+      logEntry.operation
+    } ${logEntry.status} ${logEntry.duration_ms}ms${
+      logEntry.request_id ? ` [${logEntry.request_id}]` : ""
+    }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+    if (logEntry.level === "error") {
+       
+      console.error(msg);
+    } else {
+       
+      console.info(msg);
+    }
+  }
+}
 
 function asU256FromResult(result: string[]) {
   if (!Array.isArray(result) || result.length < 2) return null;
