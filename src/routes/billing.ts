@@ -183,7 +183,59 @@ export function withBillingIdempotency(
   };
 }
 
-/** Zod schema for the :profileId path param – non-empty string, max 128 chars */
+// ---------------------------------------------------------------------------
+// Billing math helpers (exported for unit testing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes the reward-limit summary fields from raw profile numeric strings.
+ *
+ * Extracted as a pure function so it can be unit-tested independently of the
+ * database and Express layers. All inputs come from `numeric(18,6)` columns
+ * stored as decimal strings.
+ *
+ * @param annualRewardLimit - Raw `annualRewardLimit` string from the DB (e.g. `"1000.000000"`).
+ * @param usedAmount        - Raw `usedAmount` string from the DB (e.g. `"250.500000"`).
+ * @returns Computed summary fields ready to include in the API response.
+ */
+export function computeBillingSummary(
+  annualRewardLimit: string | null | undefined,
+  usedAmount: string | null | undefined,
+): {
+  annualRewardLimit: number;
+  usedAmount: number;
+  remainingAmount: number;
+  progressPercentage: number;
+} {
+  const limit = parseFloat(annualRewardLimit ?? "0");
+  const used = parseFloat(usedAmount ?? "0");
+  const remaining = Math.max(0, limit - used);
+  const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+
+  return {
+    annualRewardLimit: limit,
+    usedAmount: used,
+    remainingAmount: remaining,
+    progressPercentage: Math.round(progressPct * 100) / 100,
+  };
+}
+
+/**
+ * Builds a single-line display address from individual address components,
+ * filtering out any null/undefined/empty parts.
+ *
+ * Returns `null` when no parts are present so the caller can omit the field
+ * rather than returning an empty string.
+ *
+ * @param parts - Ordered address parts: [street, city, state, zipCode, country].
+ * @returns Comma-joined address string, or `null` if all parts are absent.
+ */
+export function buildFullAddress(
+  parts: Array<string | null | undefined>,
+): string | null {
+  const present = parts.filter(Boolean) as string[];
+  return present.length > 0 ? present.join(", ") : null;
+}
 const profileIdSchema = z.object({
   profileId: z
     .string()
@@ -322,10 +374,13 @@ billingRouter.get(
       const safe = stripSensitive(profile);
 
       // Compute a convenience fullAddress for UI display
-      const addrParts = [safe.street, safe.city, safe.state, safe.zipCode, safe.country].filter(
-        Boolean,
-      );
-      const fullAddress = addrParts.length ? addrParts.join(", ") : null;
+      const fullAddress = buildFullAddress([
+        safe.street,
+        safe.city,
+        safe.state,
+        safe.zipCode,
+        safe.country,
+      ]);
 
       ok(res, { ...safe, fullAddress });
     } catch (err: any) {
@@ -438,19 +493,13 @@ billingRouter.get(
         return;
       }
 
-      const limit = parseFloat(profile.annualRewardLimit ?? "0");
-      const used = parseFloat(profile.usedAmount ?? "0");
-      const remaining = Math.max(0, limit - used);
-      const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+      const summary = computeBillingSummary(profile.annualRewardLimit, profile.usedAmount);
 
       ok(res, {
         profileId: profile.id,
         profileType: profile.profileType,
-        annualRewardLimit: limit,
-        usedAmount: used,
-        remainingAmount: remaining,
+        ...summary,
         currency: profile.currency,
-        progressPercentage: Math.round(progressPct * 100) / 100,
       });
     } catch (err: any) {
       console.error("[billing] Error fetching billing summary:", err);
