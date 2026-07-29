@@ -148,6 +148,9 @@ app.use(transactionsRouter);
 // Forward structured 400 bodies produced by parseDateFilters / parsePagination;
 // fall back to 500 for unexpected errors.
 app.use((err: any, _req: any, res: any, _next: any) => {
+  console.error("Test App Error:", err);
+  const status = err.status || 500;
+  res.status(status).json({ success: false, error: err.message });
   const status: number = typeof err?.status === "number" ? err.status : 500;
   if (err?.body) {
     res.status(status).json(err.body);
@@ -289,14 +292,12 @@ describe("Transactions Router — main endpoint", () => {
       expect(res.body).toHaveProperty("transactions");
     });
 
-    it("returns empty when no matching event types exist for a table", async () => {
-      // Event types that don't match any table's types should still return 200
+    it("returns 400 when an invalid event type is provided", async () => {
       const res = await request(app).get(
         `/transactions/${USER_ADDRESS}?eventTypes=NonExistent`,
       );
 
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty("transactions");
+      expect(res.status).toBe(400);
     });
 
     it("ignores empty eventTypes parameter", async () => {
@@ -489,7 +490,6 @@ describe("Transactions Router — logging", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    mockAuthResult = { address: userAddress, token: "test-token" };
 
     const { db } = await import("../db/index.js");
     vi.mocked(db.select).mockImplementation((arg: any) => {

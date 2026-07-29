@@ -405,8 +405,16 @@ const DEFAULT_LIMIT = 50;
  * - Values exceeding `MAX_LIMIT` are silently reduced to `MAX_LIMIT`.
  */
 function parsePagination(req: { query: Record<string, unknown> }): { limit: number; offset: number } {
-  const rawLimit = z.coerce.number().int().positive().optional().parse(req.query.limit);
-  const rawOffset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset);
+  let rawLimit, rawOffset;
+  try {
+    rawLimit = z.coerce.number().int().positive().optional().parse(req.query.limit);
+    rawOffset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset);
+  } catch (e) {
+    const err = new Error("Invalid pagination parameters");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
 
   const limit = typeof rawLimit === "number" ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
   const offset = typeof rawOffset === "number" ? rawOffset : 0;
@@ -486,19 +494,42 @@ function parseSortParams(req: { query: Record<string, unknown> }):
  *
  * - Returns `null` when the parameter is absent, empty, or whitespace-only.
  * - Individual values are trimmed; empty segments are discarded.
+ * - Validates that all requested types exist in `ALLOWED_EVENT_TYPES`.
  */
 function parseEventTypes(req: {
   query: Record<string, unknown>;
 }): string[] | null {
-  const raw = req.query.eventTypes as string | undefined;
+  const raw = req.query.eventTypes;
   if (!raw) return null;
+  if (typeof raw !== "string") {
+    const err = new Error("`eventTypes` must be a comma-separated string");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
   const parsed = raw
     .split(",")
     .map((t) => t.trim())
     .filter((t) => t.length > 0);
+    
+  for (const eventType of parsed) {
+    if (!ALLOWED_EVENT_TYPES.has(eventType)) {
+      const err = new Error(`Invalid event type requested: ${eventType}`);
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+  }
+
   return parsed.length > 0 ? parsed : null;
 }
 
+/** Parses optional startDate/from and endDate/to from the query string. */
+function parseDateFilters(req: {
+  query: Record<string, unknown>;
+}): { startDate?: Date; endDate?: Date } {
+  const rawStart = req.query.from || req.query.startDate;
+  const rawEnd = req.query.to || req.query.endDate;
 /**
  * Parses and validates optional date-range parameters from the request query.
  *
@@ -535,6 +566,42 @@ function parseDateFilters(
   let startDate: Date | undefined;
   let endDate: Date | undefined;
 
+  if (rawStart) {
+    if (typeof rawStart !== "string") {
+      const err = new Error("`from` or `startDate` must be a valid date string");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+    startDate = new Date(rawStart);
+    if (isNaN(startDate.getTime())) {
+      const err = new Error("Invalid `from` or `startDate` date format");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  if (rawEnd) {
+    if (typeof rawEnd !== "string") {
+      const err = new Error("`to` or `endDate` must be a valid date string");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+    endDate = new Date(rawEnd);
+    if (isNaN(endDate.getTime())) {
+      const err = new Error("Invalid `to` or `endDate` date format");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  if (startDate && endDate && startDate > endDate) {
+    const err = new Error("`from` date cannot be after `to` date");
+    // @ts-ignore custom status property
+    err.status = 400;
   if (rawFrom) {
     const d = new Date(rawFrom);
     if (Number.isNaN(d.getTime())) {
@@ -1020,6 +1087,28 @@ async function fetchAndBuildTransactions(
         createdAt: p.createdAt,
       };
     }),
+    ...escrowEvents.map((e) => {
+      const dateTime = formatDate(e.createdAt);
+      const tokenAddress = escrowTokenMap.get(e.agreementId);
+      const tokenInfo = getTokenInfo(tokenAddress);
+      const amountStr = formatAmount(e.amount, tokenInfo);
+      const isIncoming = e.eventType === "Funded";
+      const sign = isIncoming ? "+" : "-";
+      const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+      return {
+        id: e.transactionHash.slice(0, 10),
+        type: formatEventType(e.eventType),
+        address: formatAddress(isIncoming ? (e.employer || "N/A") : (e.to || "N/A")),
+        date: dateTime.date,
+        time: dateTime.time,
+        token: tokenInfo.name,
+        amount: finalAmount,
+        status: "Completed" as const,
+        tokenIcon: tokenInfo.icon,
+        txHash: e.transactionHash,
+        createdAt: e.createdAt,
+      };
+    }),
     ...employeeEvents.map((e) => {
       const dateTime = formatDate(e.createdAt);
       const address =
@@ -1181,6 +1270,7 @@ transactionsRouter.get(
       const userAddress = normalizeAddr(req.params.user_address);
       const { limit, offset } = parsePagination(req);
       const eventTypes = parseEventTypes(req);
+      const { startDate, endDate } = parseDateFilters(req);
 
       // Idempotent date-range validation: `from` / `to` are the supported
       // aliases on the main endpoint.  Absent params → no date filter (all
@@ -1198,6 +1288,7 @@ transactionsRouter.get(
       }
       const { sortBy, sortDir } = sortResult;
 
+      const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined, startDate, endDate });
       const conds = buildConditions(userAddress, {
         eventTypes: eventTypes ?? undefined,
         startDate,

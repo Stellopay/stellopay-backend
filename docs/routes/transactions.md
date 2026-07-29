@@ -46,6 +46,17 @@ interface TransactionExport {
 
 ## Endpoints
 
+1. **Pagination Defaults:** Limit defaults to `50` (capped at `100`). Offset defaults to `0`.
+2. **Filtering Defaults:** Without an explicit `startDate` or `endDate`, the `/filtered` endpoint defaults to bounding all time. If `eventTypes` is provided to the standard endpoint, it acts as an explicit inclusion list.
+3. **Sorting Contract:** Records are primarily sorted by `createdAt` in descending order (newest first). A secondary sort on the literal `transactionHash` is used to break ties predictably.
+
+## Error Handling
+
+To ensure strict contract enforcement, the endpoints return `400 Bad Request` for malformed query inputs instead of bubbling up generic server errors (`500`):
+- **Pagination:** Requests with non-positive `limit` (e.g. `0`, `-5`) or negative `offset` return `400`.
+- **Date Filters:** Unrecognized date strings for `startDate`, `endDate`, `from`, or `to` return `400`. Providing a `startDate` that occurs strictly after `endDate` also returns `400`.
+- **Event Types:** Requests containing an unrecognised or invalid event type in the `eventTypes` list return `400`.
+- **Sorting:** Providing a `sortBy` value that is not explicitly in the allowlist (i.e. not `date` or `amount`) returns `400`.
 ### `GET /transactions/:user_address`
 
 Returns the merged transaction feed for `user_address`.
