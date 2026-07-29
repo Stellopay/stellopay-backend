@@ -29,6 +29,8 @@ import { normalizeStarknetAddress } from "../utils/address.js";
  *    - Re-issuing an active challenge returns the SAME nonce with the remaining TTL without extending expiration.
  *    - `consumeChallenge` performs atomic read-and-delete to ensure a nonce can be used for verification exactly once.
  *    - Expired nonces cannot be validated, consumed, or replayed.
+ *    - `restoreChallenge` may put a consumed nonce back only after a verified signature whose session
+ *      issuance failed — never after a signature failure (replay stays closed).
  *
  * 5. Telemetry & Non-Sensitivity:
  *    - Emits structured JSON metrics via `console.info`.
@@ -79,6 +81,15 @@ export const challenges = new Map<string, ChallengeRecord>();
 const SWEEP_INTERVAL = 50;
 let creationsSinceSweep = 0;
 
+/**
+ * Max entries inspected per opportunistic sweep. Keeps each sweep O(page)
+ * even when the store approaches `MAX_CHALLENGES`.
+ */
+export const SWEEP_BATCH_SIZE = 500;
+
+/** Cursor into the challenge store for the next paginated sweep pass. */
+let sweepOffset = 0;
+
 /** Memoized mapping from encoded chain-ID felt → human-readable label. */
 const chainIdCache = new Map<string, string>();
 
@@ -101,9 +112,37 @@ function getChainIdLabel(chainId: string): string {
   }
 }
 
-/** Removes all entries whose TTL has already elapsed as of `now`. */
-function sweepExpiredChallenges(now: number): void {
-  for (const [key, rec] of challenges) {
+/**
+ * Removes expired challenge entries.
+ *
+ * Opportunistic sweeps (`full === false`) inspect at most `SWEEP_BATCH_SIZE`
+ * entries starting at `sweepOffset`, then advance the cursor. Last-resort
+ * sweeps (`full === true`) walk the entire store and reset the cursor.
+ */
+function sweepExpiredChallenges(now: number, full = false): void {
+  const entries = [...challenges.entries()];
+  if (entries.length === 0) {
+    sweepOffset = 0;
+    return;
+  }
+
+  if (full) {
+    for (const [key, rec] of entries) {
+      if (now > rec.expiresAtMs) {
+        challenges.delete(key);
+      }
+    }
+    sweepOffset = 0;
+    return;
+  }
+
+  if (sweepOffset >= entries.length) {
+    sweepOffset = 0;
+  }
+
+  const end = Math.min(sweepOffset + SWEEP_BATCH_SIZE, entries.length);
+  for (let i = sweepOffset; i < end; i++) {
+    const [key, rec] = entries[i]!;
     if (now > rec.expiresAtMs) {
       challenges.delete(key);
     }
@@ -247,6 +286,36 @@ export function consumeChallenge(address: unknown): ChallengeRecord | null {
 
   logChallengeMetric("challenge_consumed", { address: key });
   return rec;
+}
+
+/**
+ * Puts a previously consumed challenge back into the store so a caller can
+ * retry verification without re-signing.
+ *
+ * Used by `/auth/verify` when signature verification succeeded but session
+ * issuance failed — the caller already proved ownership of the nonce, so
+ * consuming it permanently would strand a valid proof behind a transient
+ * store error.
+ *
+ * Restores only when:
+ * - `address` is a parseable Starknet address,
+ * - the record is still within its TTL, and
+ * - the address slot is empty (never overwrite a newer challenge).
+ *
+ * @returns `true` when the record was restored, otherwise `false`.
+ */
+export function restoreChallenge(address: unknown, record: ChallengeRecord): boolean {
+  const key = normalizeAddressKey(address);
+  if (key === null) return false;
+  if (Date.now() > record.expiresAtMs) return false;
+  if (challenges.has(key)) return false;
+
+  challenges.set(key, { nonce: record.nonce, expiresAtMs: record.expiresAtMs });
+  logChallengeMetric("challenge_restored", {
+    address: key,
+    expires_in_ms: record.expiresAtMs - Date.now(),
+  });
+  return true;
 }
 
 /**
