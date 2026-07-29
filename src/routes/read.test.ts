@@ -26,8 +26,6 @@ const { callContract, envMock, mockEscrow, mockAgreement } = vi.hoisted(() => {
   };
 });
 
-const providerCallContract = vi.fn();
-
 vi.mock("../starknet/client.js", () => ({
   provider: { callContract },
   escrowContract: vi.fn(() => mockEscrow),
@@ -433,6 +431,166 @@ describe("GET /records/cursor/:address", () => {
       .expect(400);
 
     expect(res.body.error).toMatch(/cursor/i);
+  });
+
+  it("guarantees idempotency on repeated requests with identical parameters", async () => {
+    const app = makeApp();
+
+    const req1 = await request(app)
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .set("Idempotency-Key", "req-test-key-123")
+      .query({ cursor: "4", order: "desc", limit: 2 })
+      .expect(200);
+
+    const req2 = await request(app)
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .set("Idempotency-Key", "req-test-key-123")
+      .query({ cursor: "4", order: "desc", limit: 2 })
+      .expect(200);
+
+    expect(req1.body).toEqual(req2.body);
+    expect(req1.body).toEqual({
+      address: "0xabc",
+      records: [
+        { id: 3, value: "record-3" },
+        { id: 2, value: "record-2" },
+      ],
+      nextCursor: "2",
+      order: "desc",
+    });
+  });
+
+  it("supports order=asc pagination and boundary conditions", async () => {
+    const app = makeApp();
+
+    const page1 = await request(app)
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ order: "asc", limit: 2 })
+      .expect(200);
+
+    expect(page1.body).toEqual({
+      address: "0xabc",
+      records: [
+        { id: 1, value: "record-1" },
+        { id: 2, value: "record-2" },
+      ],
+      nextCursor: "2",
+      order: "asc",
+    });
+
+    const page2 = await request(app)
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: page1.body.nextCursor, order: "asc", limit: 2 })
+      .expect(200);
+
+    expect(page2.body).toEqual({
+      address: "0xabc",
+      records: [
+        { id: 3, value: "record-3" },
+        { id: 4, value: "record-4" },
+      ],
+      nextCursor: "4",
+      order: "asc",
+    });
+
+    const pageAtMax = await request(app)
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "5", order: "asc", limit: 2 })
+      .expect(200);
+
+    expect(pageAtMax.body).toEqual({
+      address: "0xabc",
+      records: [],
+      nextCursor: null,
+      order: "asc",
+    });
+  });
+
+  it("returns empty records when cursor is at or below minimum ID in desc order", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ cursor: "1", order: "desc", limit: 2 })
+      .expect(200);
+
+    expect(res.body).toEqual({
+      address: "0xabc",
+      records: [],
+      nextCursor: null,
+      order: "desc",
+    });
+  });
+
+  it("supports full pagination traversal from first to last page", async () => {
+    const app = makeApp();
+    const allRecords: Array<{ id: number; value: string }> = [];
+    let currentCursor: string | null = null;
+
+    do {
+      const queryParams: Record<string, string | number> = { limit: 2, order: "desc" };
+      if (currentCursor) {
+        queryParams.cursor = currentCursor;
+      }
+
+      const res = await request(app)
+        .get("/api/v1/records/cursor/0xabc")
+        .set("Authorization", "Bearer 0xabc")
+        .query(queryParams)
+        .expect(200);
+
+      allRecords.push(...res.body.records);
+      currentCursor = res.body.nextCursor;
+    } while (currentCursor !== null);
+
+    expect(allRecords).toEqual([
+      { id: 5, value: "record-5" },
+      { id: 4, value: "record-4" },
+      { id: 3, value: "record-3" },
+      { id: 2, value: "record-2" },
+      { id: 1, value: "record-1" },
+    ]);
+  });
+
+  it("returns 401 when Authorization header is missing", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .expect(401);
+
+    expect(res.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 when Bearer token does not match requested address", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xother")
+      .expect(403);
+
+    expect(res.body).toEqual({ error: "Forbidden: privilege check failed" });
+  });
+
+  it("returns 400 for an invalid order parameter", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ order: "invalid" })
+      .expect(400);
+
+    expect(res.body.error).toBeDefined();
+  });
+
+  it("returns 400 for an out-of-range limit parameter", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/records/cursor/0xabc")
+      .set("Authorization", "Bearer 0xabc")
+      .query({ limit: 0 })
+      .expect(400);
+
+    expect(res.body.error).toBeDefined();
   });
 });
 
