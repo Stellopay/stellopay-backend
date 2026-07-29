@@ -36,7 +36,9 @@ import {
   createChallenge,
   getChallenge,
   MAX_CHALLENGES,
+  restoreChallenge,
   SWEEP_BATCH_SIZE,
+  verifyChallenge,
 } from "./challenge.js";
 
 // SN_SEPOLIA / SN_MAIN encoded as felt short strings, as the RPC returns them.
@@ -690,6 +692,125 @@ describe("consumeChallenge", () => {
     expect(consumeChallenge(canonical("aabb"))?.nonce).toBe(nonce);
     expect(challenges.size).toBe(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// verifyChallenge — early fail-fast nonce validation
+// ---------------------------------------------------------------------------
+
+describe("verifyChallenge", () => {
+  it("returns the record for a valid unexpired nonce", () => {
+    const { nonce } = createChallenge("0xabcd");
+    infoSpy.mockClear();
+
+    const result = verifyChallenge("0xabcd", nonce);
+    expect(result).not.toBeNull();
+    expect(result!.nonce).toBe(nonce);
+    expect(result!.expiresAtMs).toBe(CHALLENGE_TTL_MS);
+    expect(metricNames()).toEqual([]);
+  });
+
+  it("returns null for expired nonce (and evicts it)", () => {
+    const { nonce } = createChallenge("0xdead");
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+    infoSpy.mockClear();
+
+    expect(verifyChallenge("0xdead", nonce)).toBeNull();
+    expect(metrics()[0]).toMatchObject({ metric: "challenge_expired", address: canonical("dead") });
+    expect(challenges.has(canonical("dead"))).toBe(false);
+  });
+
+  it("returns null for consumed nonce", () => {
+    const { nonce } = createChallenge("0xc0ffee");
+    consumeChallenge("0xc0ffee");
+    infoSpy.mockClear();
+
+    const result = verifyChallenge("0xc0ffee", nonce);
+    expect(result).toBeNull();
+    expect(metrics()[0]).toMatchObject({
+      metric: "challenge_verify_miss",
+      reason: "not_found",
+    });
+  });
+
+  it("returns null for wrong nonce on same address", () => {
+    createChallenge("0xbaba");
+    infoSpy.mockClear();
+
+    expect(verifyChallenge("0xbaba", "0xdeadbeef")).toBeNull();
+    expect(metrics()[0]).toMatchObject({
+      metric: "challenge_verify_miss",
+      reason: "nonce_mismatch",
+    });
+  });
+
+  it("returns null for invalid address", () => {
+    expect(verifyChallenge("not-a-real-address", "0xnonce")).toBeNull();
+    expect(metrics()[0]).toMatchObject({
+      metric: "challenge_verify_miss",
+      reason: "invalid_address",
+    });
+  });
+
+  it("returns null for invalid nonce type", () => {
+    createChallenge("0xabcd");
+    infoSpy.mockClear();
+
+    const invalidNonces = [null, undefined, "", "   ", 123, {}];
+    for (const badNonce of invalidNonces) {
+      expect(verifyChallenge("0xabcd", badNonce as any)).toBeNull();
+    }
+    expect(metrics().every((m) => m.metric === "challenge_verify_miss" && m.reason === "invalid_nonce")).toBe(
+      true,
+    );
+  });
+
+  it("resolves an address written differently to how it was created", () => {
+    const { nonce } = createChallenge("0xAABB");
+    expect(verifyChallenge(canonical("aabb"), nonce)).not.toBeNull();
+    expect(verifyChallenge("0xaabb", nonce)).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreChallenge
+// ---------------------------------------------------------------------------
+
+describe("restoreChallenge", () => {
+  it("restores within TTL when slot empty", () => {
+    const { nonce } = createChallenge("0xabcd");
+    const record = consumeChallenge("0xabcd")!;
+    infoSpy.mockClear();
+
+    expect(restoreChallenge("0xabcd", record)).toBe(true);
+    expect(getChallenge("0xabcd")?.nonce).toBe(nonce);
+    expect(metrics()[0]).toMatchObject({ metric: "challenge_restored" });
+  });
+
+  it("returns false for expired record", () => {
+    const { nonce } = createChallenge("0xdead");
+    const record = consumeChallenge("0xdead")!;
+    vi.advanceTimersByTime(CHALLENGE_TTL_MS + 1);
+
+    expect(restoreChallenge("0xdead", record)).toBe(false);
+  });
+
+  it("returns false when slot occupied", () => {
+    const { nonce: freshNonce } = createChallenge("0xbeef");
+    const record = consumeChallenge("0xbeef")!;
+    createChallenge("0xbeef"); // fresh nonce occupies the slot
+    infoSpy.mockClear();
+
+    expect(restoreChallenge("0xbeef", { nonce: record.nonce, expiresAtMs: record.expiresAtMs })).toBe(
+      false,
+    );
+  });
+
+  it("returns false for invalid address", () => {
+    const record = { nonce: "0xabc", expiresAtMs: Date.now() + CHALLENGE_TTL_MS };
+    expect(restoreChallenge("not-a-real-address", record)).toBe(false);
+  });
+
 });
 
 // ---------------------------------------------------------------------------

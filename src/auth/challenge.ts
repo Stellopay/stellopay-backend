@@ -17,8 +17,8 @@ import { normalizeStarknetAddress } from "../utils/address.js";
  *    - All functions strictly validate inputs before executing state modifications.
  *    - Write paths (`createChallenge`, `buildTypedChallenge`) throw descriptive, non-sensitive errors
  *      when supplied with missing, non-string, whitespace, or malformed input.
- *    - Read/eviction paths (`getChallenge`, `clearChallenge`, `consumeChallenge`) degrade fail-closed,
- *      returning `null` / no-op and logging structured metric events (`invalid_address`).
+ *    - Read/eviction paths (`getChallenge`, `clearChallenge`, `consumeChallenge`, `verifyChallenge`)
+ *      degrade fail-closed, returning `null` / no-op and logging structured metric events (`invalid_address`).
  *
  * 3. Secure Random Nonce Generation & Entropy:
  *    - Nonces are 16-byte (128-bit) CSPRNG values generated using `crypto.randomBytes(16)`.
@@ -28,6 +28,8 @@ import { normalizeStarknetAddress } from "../utils/address.js";
  *    - `CHALLENGE_TTL_MS` is fixed at 5 minutes (300,000 ms).
  *    - Re-issuing an active challenge returns the SAME nonce with the remaining TTL without extending expiration.
  *    - `consumeChallenge` performs atomic read-and-delete to ensure a nonce can be used for verification exactly once.
+ *    - `verifyChallenge` provides an idempotent, early fail-fast nonce check: for the same valid input
+ *      it always returns the same result, allowing safe retry of verification flows.
  *    - Expired nonces cannot be validated, consumed, or replayed.
  *    - `restoreChallenge` may put a consumed nonce back only after a verified signature whose session
  *      issuance failed — never after a signature failure (replay stays closed).
@@ -337,6 +339,55 @@ export function restoreChallenge(address: unknown, record: ChallengeRecord): boo
     expires_in_ms: record.expiresAtMs - Date.now(),
   });
   return true;
+}
+
+/**
+ * Validates a nonce against the challenge store without consuming it.
+ *
+ * IDEMPOTENT: for the same valid input (`address`, `nonce`) the function
+ * returns the same result until the challenge expires or is consumed.
+ * Calling `verifyChallenge` repeatedly with the same arguments is safe
+ * and does not mutate the store (except lazy eviction of expired entries).
+ *
+ * This provides an early fail-fast check before building typed data
+ * or proceeding with signature verification. A caller can verify the
+ * nonce is still valid, build the typed data, and only then move to
+ * signature verification — without worrying that the nonce was stale.
+ *
+ * @param address - The user's Starknet wallet address
+ * @param nonce   - The nonce string to verify
+ * @returns The challenge record if the nonce is valid and unexpired, otherwise null.
+ */
+export function verifyChallenge(address: unknown, nonce: unknown): ChallengeRecord | null {
+  const key = normalizeAddressKey(address);
+  if (key === null) {
+    logChallengeMetric("challenge_verify_miss", { reason: "invalid_address" });
+    return null;
+  }
+
+  if (!isNonEmptyString(nonce)) {
+    logChallengeMetric("challenge_verify_miss", { reason: "invalid_nonce" });
+    return null;
+  }
+
+  const rec = challenges.get(key);
+  if (!rec) {
+    logChallengeMetric("challenge_verify_miss", { reason: "not_found", address: key });
+    return null;
+  }
+
+  if (rec.nonce !== nonce.trim()) {
+    logChallengeMetric("challenge_verify_miss", { reason: "nonce_mismatch", address: key });
+    return null;
+  }
+
+  if (Date.now() > rec.expiresAtMs) {
+    challenges.delete(key);
+    logChallengeMetric("challenge_expired", { address: key });
+    return null;
+  }
+
+  return rec;
 }
 
 /**
