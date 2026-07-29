@@ -310,6 +310,8 @@ describe("GET /records/cursor/:address", () => {
       ],
       nextCursor: "4",
       order: "desc",
+      limit: 2,
+      hasMore: true,
     });
   });
 
@@ -326,6 +328,8 @@ describe("GET /records/cursor/:address", () => {
     ]);
     expect(res.body.nextCursor).toBe("2");
     expect(res.body.order).toBe("desc");
+    expect(res.body.limit).toBe(2);
+    expect(res.body.hasMore).toBe(true);
   });
 
   it("returns an empty result when the cursor is beyond the available records", async () => {
@@ -340,6 +344,8 @@ describe("GET /records/cursor/:address", () => {
       records: [],
       nextCursor: null,
       order: "desc",
+      limit: 2,
+      hasMore: false,
     });
   });
 
@@ -459,6 +465,8 @@ describe("GET /records/cursor/:address", () => {
       ],
       nextCursor: "2",
       order: "desc",
+      limit: 2,
+      hasMore: true,
     });
   });
 
@@ -479,6 +487,8 @@ describe("GET /records/cursor/:address", () => {
       ],
       nextCursor: "2",
       order: "asc",
+      limit: 2,
+      hasMore: true,
     });
 
     const page2 = await request(app)
@@ -495,6 +505,8 @@ describe("GET /records/cursor/:address", () => {
       ],
       nextCursor: "4",
       order: "asc",
+      limit: 2,
+      hasMore: true,
     });
 
     const pageAtMax = await request(app)
@@ -508,6 +520,8 @@ describe("GET /records/cursor/:address", () => {
       records: [],
       nextCursor: null,
       order: "asc",
+      limit: 2,
+      hasMore: false,
     });
   });
 
@@ -523,6 +537,8 @@ describe("GET /records/cursor/:address", () => {
       records: [],
       nextCursor: null,
       order: "desc",
+      limit: 2,
+      hasMore: false,
     });
   });
 
