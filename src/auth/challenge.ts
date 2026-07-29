@@ -2,6 +2,12 @@ import crypto from "node:crypto";
 import { shortString, type TypedData } from "starknet";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
+/** Number of entries processed per batch sweep invocation. */
+export const SWEEP_BATCH_SIZE = 500;
+
+/** Cursor tracking the next batch sweep start position. */
+let sweepOffset = 0;
+
 /**
  * Nonce Challenge Generation, Expiration, and Validation Contract.
  *
@@ -101,9 +107,22 @@ function getChainIdLabel(chainId: string): string {
   }
 }
 
-/** Removes all entries whose TTL has already elapsed as of `now`. */
-function sweepExpiredChallenges(now: number): void {
-  for (const [key, rec] of challenges) {
+/**
+ * Removes expired entries in batches (cursor-based), so a large store
+ * does not block the event loop. When `full` is true, processes ALL
+ * entries in one pass (last-resort before refusing a new entry).
+ */
+function sweepExpiredChallenges(now: number, full = false): void {
+  const entries = [...challenges.entries()];
+  if (entries.length === 0) {
+    sweepOffset = 0;
+    return;
+  }
+
+  const end = full ? entries.length : Math.min(sweepOffset + SWEEP_BATCH_SIZE, entries.length);
+
+  for (let i = sweepOffset; i < end; i++) {
+    const [key, rec] = entries[i];
     if (now > rec.expiresAtMs) {
       challenges.delete(key);
     }
