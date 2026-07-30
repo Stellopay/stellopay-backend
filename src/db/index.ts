@@ -91,20 +91,47 @@ export function getPoolStats(): PoolStats {
   };
 }
 
+/** Result of a database health-check probe. */
+export interface HealthCheckResult {
+  /** true when SELECT 1 succeeds, false otherwise. */
+  healthy: boolean;
+  /** Round-trip time of the health-check query in milliseconds. */
+  latencyMs: number;
+  /** true when the query succeeded but exceeded the degraded-latency threshold. */
+  degraded: boolean;
+}
+
 /**
- * Checks whether the database is reachable with a lightweight probe.
+ * Checks whether the database is reachable with a lightweight probe and
+ * reports the round-trip latency.
  *
- * @returns `true` when `SELECT 1` succeeds, otherwise `false`.
+ * @returns An object with `healthy`, `latencyMs`, and `degraded` fields.
+ *   - `healthy` is `true` when `SELECT 1` succeeds.
+ *   - `latencyMs` is the query duration in milliseconds.
+ *   - `degraded` is `true` when the query succeeded but took longer than
+ *     `env.DB_HEALTH_DEGRADED_LATENCY_MS`.
  */
-export async function checkDbHealth(): Promise<boolean> {
+export async function checkDbHealth(): Promise<HealthCheckResult> {
+  const start = performance.now();
   try {
     await pool.query("SELECT 1");
-    return true;
+    const latencyMs = performance.now() - start;
+    return {
+      healthy: true,
+      latencyMs: Math.round(latencyMs * 100) / 100,
+      degraded: latencyMs >= env.DB_HEALTH_DEGRADED_LATENCY_MS,
+    };
   } catch (error) {
+    const latencyMs = performance.now() - start;
     console.error("[db] Health check failed", {
       message: error instanceof Error ? error.message : String(error),
+      latencyMs: Math.round(latencyMs * 100) / 100,
     });
-    return false;
+    return {
+      healthy: false,
+      latencyMs: Math.round(latencyMs * 100) / 100,
+      degraded: false,
+    };
   }
 }
 
@@ -112,8 +139,8 @@ export async function waitForDbReadiness(): Promise<void> {
   const maxAttempts = env.DB_CONNECTION_RETRY_MAX_ATTEMPTS;
   const baseDelay = env.DB_CONNECTION_RETRY_BASE_DELAY_MS;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const healthy = await checkDbHealth();
-    if (healthy) {
+    const result = await checkDbHealth();
+    if (result.healthy) {
       return;
     }
     if (attempt < maxAttempts) {
@@ -123,17 +150,6 @@ export async function waitForDbReadiness(): Promise<void> {
     }
   }
   throw new Error(`[db] Unable to connect to database after ${env.DB_CONNECTION_RETRY_MAX_ATTEMPTS} attempts`);
-}
-
-/**
- * Polls {@link checkDbHealth} until the database accepts a connection.
- * Used during process startup before marking the app ready for API traffic.
- */
-export async function waitForDbReadiness(): Promise<void> {
-  while (!(await checkDbHealth())) {
-    console.warn("[db] Waiting for database readiness...");
-    await new Promise((resolve) => setTimeout(resolve, DB_READINESS_POLL_MS));
-  }
 }
 
 /**

@@ -50,7 +50,7 @@ systemRouter.get("/system/live", (_req, res) => {
 
 systemRouter.get("/system/ready", async (_req, res, next) => {
   try {
-    const [dbHealthy, rpcHealthy] = await Promise.all([
+    const [dbResult, rpcHealthy] = await Promise.all([
       checkDbHealth(),
       provider.getBlockNumber().then(
         () => true,
@@ -59,13 +59,13 @@ systemRouter.get("/system/ready", async (_req, res, next) => {
     ]);
 
     const checks: Record<string, string> = {};
-    if (dbHealthy) checks.database = "reachable";
+    if (dbResult.healthy) checks.database = dbResult.degraded ? "degraded" : "reachable";
     else checks.database = "unreachable";
 
     if (rpcHealthy) checks["starknet-rpc"] = "reachable";
     else checks["starknet-rpc"] = "unreachable";
 
-    const allHealthy = dbHealthy && rpcHealthy;
+    const allHealthy = dbResult.healthy && rpcHealthy;
     res.status(allHealthy ? 200 : 503).json({ status: allHealthy ? "ok" : "degraded", checks });
   } catch (e) {
     next(e);

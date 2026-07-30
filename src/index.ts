@@ -130,8 +130,13 @@ app.use("/api/", globalLimiter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/ready", async (_req, res) => {
-  const isReady = await checkDbHealth();
-  res.status(isReady ? 200 : 503).json(isReady ? { ok: true } : { ok: false });
+  const result = await checkDbHealth();
+  res.status(result.healthy ? 200 : 503).json({
+    ok: result.healthy,
+    healthy: result.healthy,
+    latencyMs: result.latencyMs,
+    degraded: result.degraded,
+  });
 });
 
 app.use("/api/v1", escrowRouter);
