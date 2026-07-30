@@ -8,6 +8,12 @@ runtime behavior, tests, and this doc aligned — see
 [src/auth/session.test.ts](src/auth/session.test.ts) for the tests that pin
 down every rule below.
 
+The cross-module wallet flow is covered by
+[`src/routes/auth.test.ts`](../../src/routes/auth.test.ts): it drives the real
+Express app through challenge, signed verification, bearer logout, replay,
+expiry, and post-revocation rejection. The test uses a deterministic signer
+and replaces only the external RPC/database boundaries.
+
 ## Session authorization contract & security boundaries
 
 ### Caller roles & authorization requirements
