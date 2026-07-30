@@ -6,8 +6,7 @@ import {
   boolean,
   timestamp,
   index,
-  primaryKey,
-  jsonb,
+  uniqueIndex,
   numeric,
   check,
   type PgTableWithColumns,
@@ -321,6 +320,10 @@ export const agreementEvents = pgTable(
     contractAddressIdx: index("agreement_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("agreement_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("agreement_events_block_number_idx").on(table.blockNumber),
+    transactionPositionKey: uniqueIndex("agreement_events_transaction_position_key").on(
+      table.transactionHash,
+      table.eventIndex,
+    ),
     blockNumberCheck: check(
       "agreement_events_block_number_check",
       sql`${table.blockNumber} >= 0`,
@@ -446,6 +449,7 @@ export const escrowEvents = pgTable(
     contractAddressIdx: index("escrow_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("escrow_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("escrow_events_block_number_idx").on(table.blockNumber),
+    transactionPositionKey: uniqueIndex("escrow_events_transaction_position_key").on(table.id),
     blockNumberCheck: check("escrow_events_block_number_check", sql`${table.blockNumber} >= 0`),
     amountCheck: check(
       "escrow_events_amount_check",

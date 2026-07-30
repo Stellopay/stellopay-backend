@@ -116,6 +116,14 @@ primary key gives billing and diagnostics handlers a shared database-level
 claim point; expired rows can be removed by a scheduled cleanup query using the
 `expires_at` index.
 
+### Event ingestion identity
+
+`agreement_events` and `escrow_events` each enforce a unique transaction
+position at the database layer. Agreement rows use `(transaction_hash,
+event_index)`; escrow rows use the same transaction hash plus their deterministic
+event id. Event ingestion uses `ON CONFLICT DO NOTHING`, so retries and a
+concurrent backfill are treated as already-processed events instead of errors.
+
 ## Security Boundary (Sensitive Fields)
 
 - **Sensitive Fields**: Sensitive fields (`taxId`, `dateOfBirth` in the
