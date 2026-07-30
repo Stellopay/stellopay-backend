@@ -31,13 +31,14 @@
  *     handlers — they remain exported and documented for future use.
  */
 import { Router } from "express";
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { z } from "zod";
 import { shortString } from "starknet";
 import { agreementContract, escrowContract, provider } from "../starknet/client.js";
 import { u256ToString, toHexString } from "../utils/codec.js";
 import { env } from "../config.js";
 import { NumericCursorSchema, loggedParse } from "../utils/validation.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
 
 // ---------- validation ----------
 
@@ -379,6 +380,16 @@ function logReadTelemetry(entry: TelemetryEntry) {
 
 export const readRouter = Router();
 
+/** Send a read-only indexed response with conditional-request support. */
+function sendIndexedResponse(req: Request, res: Response, body: unknown): void {
+  applyIndexedCacheHeaders(res, body);
+  if (req.fresh) {
+    res.status(304).end();
+    return;
+  }
+  res.json(body);
+}
+
 // ---------- token / balances ----------
 
 readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
@@ -388,7 +399,7 @@ readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
     const token = AddressParam.parse(req.params.token);
     const owner = AddressParam.parse(req.params.owner);
     const balance = await erc20BalanceOf(token, owner);
-    res.json({ token, owner, balance });
+    sendIndexedResponse(req, res, { token, owner, balance });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     logReadTelemetry({
@@ -427,7 +438,7 @@ readRouter.get("/token/:token/decimals", async (req, res, next) => {
       token,
       request_id: res.locals.requestId,
     });
-    res.json({ token, decimals });
+    sendIndexedResponse(req, res, { token, decimals });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     logReadTelemetry({
@@ -465,7 +476,7 @@ readRouter.get("/token/:token/symbol", async (req, res, next) => {
       token,
       request_id: res.locals.requestId,
     });
-    res.json({ token, symbol });
+    sendIndexedResponse(req, res, { token, symbol });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     logReadTelemetry({
@@ -509,7 +520,7 @@ readRouter.get("/escrow/:address/balance/:agreement_id", async (req, res, next) 
       agreement_id: agreement_id.toString(),
       request_id: requestId,
     });
-    res.json({
+    sendIndexedResponse(req, res, {
       escrow: escrowAddress,
       agreement_id: agreement_id.toString(),
       balance: u256ToString(balance),
@@ -562,7 +573,7 @@ readRouter.get("/escrow/:address/summary/:agreement_id", async (req, res, next) 
       agreement_id: agreement_id.toString(),
       request_id: requestId,
     });
-    res.json({
+    sendIndexedResponse(req, res, {
       escrow: escrowAddress,
       agreement_id: agreement_id.toString(),
       employer: toHexString(employer),
@@ -622,7 +633,7 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
       agreement_id: agreement_id.toString(),
       request_id: requestId,
     });
-    res.json({
+    sendIndexedResponse(req, res, {
       agreement: agreementAddress,
       agreement_id: agreement_id.toString(),
       employer: toHexString(employer),
