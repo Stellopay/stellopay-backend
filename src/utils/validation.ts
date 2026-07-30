@@ -435,6 +435,17 @@ export const AgreementId = z
   .trim()
   .regex(/^\d+$/, "agreement_id must be a numeric string");
 
+/**
+ * Shared schema for request idempotency keys.
+ *
+ * Keeping this constraint in one place prevents middleware from accepting
+ * different key formats and avoids storing whitespace or control characters
+ * in replay caches.
+ */
+export const IdempotencyKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,255}$/, "Invalid idempotency key");
+
 export const MAX_PAGE_LIMIT = 100;
 
 export const DEFAULT_PAGE_LIMIT = 50;

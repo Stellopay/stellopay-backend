@@ -24,6 +24,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
+import { IdempotencyKeySchema } from "../utils/validation.js";
 
 export const billingRouter = express.Router();
 
@@ -117,7 +118,12 @@ export function withBillingIdempotency(
   handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
 ) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const idempotencyKey = getHeader(req, "Idempotency-Key") ?? getHeader(req, "idempotency-key");
+    const rawIdempotencyKey =
+      getHeader(req, "Idempotency-Key") ?? getHeader(req, "idempotency-key");
+    const idempotencyKey =
+      rawIdempotencyKey && IdempotencyKeySchema.safeParse(rawIdempotencyKey).success
+        ? rawIdempotencyKey
+        : undefined;
     const method = req.method.toUpperCase();
 
     if (!idempotencyKey || ["GET", "HEAD", "OPTIONS"].includes(method)) {
@@ -230,9 +236,7 @@ export function computeBillingSummary(
  * @param parts - Ordered address parts: [street, city, state, zipCode, country].
  * @returns Comma-joined address string, or `null` if all parts are absent.
  */
-export function buildFullAddress(
-  parts: Array<string | null | undefined>,
-): string | null {
+export function buildFullAddress(parts: Array<string | null | undefined>): string | null {
   const present = parts.filter(Boolean) as string[];
   return present.length > 0 ? present.join(", ") : null;
 }
