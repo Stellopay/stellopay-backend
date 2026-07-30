@@ -565,11 +565,12 @@ analyticsRouter.get(
         },
       });
 
-      const responseBody = {
+      const responseBody: AnalyticsResponseType = {
         year,
         data: chartData,
         total: toDisplayNumber(totalRaw),
       };
+      assertAnalyticsResponseShape(responseBody);
       await Promise.resolve(analyticsCache.set(cacheKey, responseBody));
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(responseBody);
