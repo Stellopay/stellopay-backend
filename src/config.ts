@@ -146,6 +146,9 @@ export const EnvSchema = z
       .positive()
       .optional()
       .default(200),
+
+    // Optional Redis endpoint for sharing rate-limit counters across replicas.
+    REDIS_URL: z.string().url().optional(),
     // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
     TRUST_PROXY: z.string().optional().default("1"),
 
