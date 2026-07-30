@@ -1,6 +1,40 @@
 ﻿import { getChecksumAddress } from "starknet";
 
 const STARKNET_ADDRESS_HEX_LENGTH = 64;
+const ADDRESS_NORMALIZATION_CACHE_MAX_ENTRIES = 1_024;
+
+/**
+ * Recently normalized inputs. Address normalization is on a number of hot
+ * request paths, and the same contract/token addresses are commonly parsed
+ * repeatedly while building one response. A Map gives us a small LRU without
+ * introducing a dependency or allowing unbounded user-controlled growth.
+ */
+const normalizedAddressCache = new Map<string, string>();
+
+/** Clear the address cache between tests or configuration reloads. */
+export function clearAddressNormalizationCache(): void {
+  normalizedAddressCache.clear();
+}
+
+function getCachedAddress(input: string): string | undefined {
+  const cached = normalizedAddressCache.get(input);
+  if (cached === undefined) return undefined;
+
+  // Refresh recency whenever an entry is used.
+  normalizedAddressCache.delete(input);
+  normalizedAddressCache.set(input, cached);
+  return cached;
+}
+
+function cacheAddress(input: string, normalized: string): void {
+  normalizedAddressCache.delete(input);
+  normalizedAddressCache.set(input, normalized);
+  while (normalizedAddressCache.size > ADDRESS_NORMALIZATION_CACHE_MAX_ENTRIES) {
+    const oldest = normalizedAddressCache.keys().next().value;
+    if (oldest === undefined) break;
+    normalizedAddressCache.delete(oldest);
+  }
+}
 
 /**
  * Normalize a Starknet address to the canonical database lookup key.
@@ -28,6 +62,9 @@ export function normalizeStarknetAddress(address: string): string {
   if (!trimmed) {
     throw new Error("Starknet address is required");
   }
+  const cached = getCachedAddress(trimmed);
+  if (cached !== undefined) return cached;
+
   const normalized = trimmed.toLowerCase();
   const prefixed = normalized.startsWith("0x") ? normalized : `0x${normalized}`;
   const hex = prefixed.replace(/^0x/, "");
@@ -51,5 +88,6 @@ export function normalizeStarknetAddress(address: string): string {
     }
   }
 
+  cacheAddress(trimmed, canonical);
   return canonical;
 }

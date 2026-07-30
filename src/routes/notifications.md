@@ -1,15 +1,41 @@
-# Notifications API
+# Notifications route — inline reference
 
-## GET /api/v1/notifications/:user_address
-Returns a list of notifications (payments, agreement events, and escrow events).
-- **Hardening**: The output is validated against a strict schema. Any malformed database records are caught at runtime to prevent broken JSON responses.
+> **Full documentation:** `docs/routes/notifications.md`
 
-## GET /api/v1/notifications/:user_address/unread-count
-Returns the count of unread notifications.
-- **Guarantee**: The `count` is always an integer `>= 0`.
-- **Response**: `{ "count": number }`
+## Implemented endpoints
 
-## PATCH /api/v1/notifications/:user_address/preferences
-Updates notification settings.
-- **Strict Validation**: Only `email`, `push`, and `marketing` (booleans) are accepted. 
-- **Error Handling**: Providing unknown keys or invalid types results in a `400 Validation failed` error.
+### `GET /api/v1/notifications/:user_address`
+
+Returns a paginated feed of payments, agreement events, and escrow events for
+the supplied Starknet address.  Response shape:
+
+```json
+{
+  "notifications": [...],
+  "total":         0,
+  "unreadCount":   0,
+  "limit":         10,
+  "offset":        0,
+  "hasMore":       false
+}
+```
+
+- Default page size: **10** (`NOTIFICATIONS_DEFAULT_LIMIT`)
+- Maximum page size: **50** (`NOTIFICATIONS_MAX_LIMIT`); out-of-range values
+  return **400**.
+- `read` is always `false` on every item — server-side read state is not yet
+  persisted.
+- `unreadCount` always equals `total` in the current implementation.
+- The unread-count helper only counts explicit `read: false` values; missing
+  or malformed `read` fields are ignored instead of being treated as unread.
+
+## Not implemented
+
+The following endpoints do **not** exist in this route and must not be added
+without a separate design review:
+
+- `GET /api/v1/notifications/:user_address/unread-count` — use the
+  `unreadCount` field from the main response instead.
+- `PATCH /api/v1/notifications/:user_address/preferences` — no preference
+  persistence exists; `getDefaultNotificationPreferences()` returns the
+  read-only default shape.

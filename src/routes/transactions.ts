@@ -25,8 +25,9 @@
  * the user **is** the employee (`employee-only`).
  */
 import { Router } from "express";
+import type { Request, Response } from "express";
 import { z } from "zod";
-import { db, schema } from "../db/index.js";
+import { readDb, schema } from "../db/index.js";
 import { eq, and, or, desc, gte, lte, inArray, sql, count } from "drizzle-orm";
 import { agreementContract } from "../starknet/client.js";
 import { toHexString } from "../utils/codec.js";
@@ -37,6 +38,7 @@ import {
   getTokenInfo as resolveTokenInfo,
   type TokenInfo,
 } from "../utils/token-formatting.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -405,8 +407,16 @@ const DEFAULT_LIMIT = 50;
  * - Values exceeding `MAX_LIMIT` are silently reduced to `MAX_LIMIT`.
  */
 function parsePagination(req: { query: Record<string, unknown> }): { limit: number; offset: number } {
-  const rawLimit = z.coerce.number().int().positive().optional().parse(req.query.limit);
-  const rawOffset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset);
+  let rawLimit, rawOffset;
+  try {
+    rawLimit = z.coerce.number().int().positive().optional().parse(req.query.limit);
+    rawOffset = z.coerce.number().int().nonnegative().optional().parse(req.query.offset);
+  } catch (e) {
+    const err = new Error("Invalid pagination parameters");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
 
   const limit = typeof rawLimit === "number" ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
   const offset = typeof rawOffset === "number" ? rawOffset : 0;
@@ -486,29 +496,155 @@ function parseSortParams(req: { query: Record<string, unknown> }):
  *
  * - Returns `null` when the parameter is absent, empty, or whitespace-only.
  * - Individual values are trimmed; empty segments are discarded.
+ * - Validates that all requested types exist in `ALLOWED_EVENT_TYPES`.
  */
 function parseEventTypes(req: {
   query: Record<string, unknown>;
 }): string[] | null {
-  const raw = req.query.eventTypes as string | undefined;
+  const raw = req.query.eventTypes;
   if (!raw) return null;
+  if (typeof raw !== "string") {
+    const err = new Error("`eventTypes` must be a comma-separated string");
+    // @ts-ignore custom status property
+    err.status = 400;
+    throw err;
+  }
   const parsed = raw
     .split(",")
     .map((t) => t.trim())
     .filter((t) => t.length > 0);
+    
+  for (const eventType of parsed) {
+    if (!ALLOWED_EVENT_TYPES.has(eventType)) {
+      const err = new Error(`Invalid event type requested: ${eventType}`);
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+  }
+
   return parsed.length > 0 ? parsed : null;
 }
 
-/** Parses optional startDate and endDate from the query string. */
+/** Parses optional startDate/from and endDate/to from the query string. */
 function parseDateFilters(req: {
   query: Record<string, unknown>;
 }): { startDate?: Date; endDate?: Date } {
-  const startDate = req.query.startDate
-    ? new Date(req.query.startDate as string)
-    : undefined;
-  const endDate = req.query.endDate
-    ? new Date(req.query.endDate as string)
-    : undefined;
+  const rawStart = req.query.from || req.query.startDate;
+  const rawEnd = req.query.to || req.query.endDate;
+/**
+ * Parses and validates optional date-range parameters from the request query.
+ *
+ * Idempotency contract
+ * --------------------
+ * Both endpoints that accept date filters (`startDate`/`endDate` on the
+ * filtered route, `from`/`to` on the main route) must return the **same**
+ * response for the **same** input on every retry.  That guarantee breaks down
+ * when `new Date("not-a-date")` silently produces an `Invalid Date` which
+ * drizzle then serialises to a garbage SQL literal.  To keep retries safe:
+ *
+ * - If a date string is present but parses to `Invalid Date`, this function
+ *   throws an error with `status = 400` and a `{ success: false, error }` body
+ *   so the caller always receives the same deterministic rejection.
+ * - If `from`/`startDate` is strictly after `to`/`endDate`, the range can never
+ *   match any row on any retry — this is also rejected with 400.
+ * - Absent parameters are returned as `undefined` (no filter applied), which is
+ *   idempotent: every retry with no date params sees all rows.
+ *
+ * @param req - Express-compatible request with a `query` map.
+ * @param opts.fromParam  - Query-param name for the lower bound (default `"startDate"`).
+ * @param opts.toParam    - Query-param name for the upper bound (default `"endDate"`).
+ * @throws Error (status=400) when a date string is invalid or the range is inverted.
+ */
+function parseDateFilters(
+  req: { query: Record<string, unknown> },
+  opts: { fromParam?: string; toParam?: string } = {},
+): { startDate?: Date; endDate?: Date } {
+  const { fromParam = "startDate", toParam = "endDate" } = opts;
+
+  const rawFrom = req.query[fromParam] as string | undefined;
+  const rawTo = req.query[toParam] as string | undefined;
+
+  let startDate: Date | undefined;
+  let endDate: Date | undefined;
+
+  if (rawStart) {
+    if (typeof rawStart !== "string") {
+      const err = new Error("`from` or `startDate` must be a valid date string");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+    startDate = new Date(rawStart);
+    if (isNaN(startDate.getTime())) {
+      const err = new Error("Invalid `from` or `startDate` date format");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  if (rawEnd) {
+    if (typeof rawEnd !== "string") {
+      const err = new Error("`to` or `endDate` must be a valid date string");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+    endDate = new Date(rawEnd);
+    if (isNaN(endDate.getTime())) {
+      const err = new Error("Invalid `to` or `endDate` date format");
+      // @ts-ignore custom status property
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  if (startDate && endDate && startDate > endDate) {
+    const err = new Error("`from` date cannot be after `to` date");
+    // @ts-ignore custom status property
+    err.status = 400;
+  if (rawFrom) {
+    const d = new Date(rawFrom);
+    if (Number.isNaN(d.getTime())) {
+      const err = new Error(
+        `Invalid \`${fromParam}\` value "${rawFrom}". Provide an ISO 8601 date string.`,
+      );
+      // @ts-ignore custom status property read by the error-handler middleware
+      err.status = 400;
+      // @ts-ignore
+      err.body = { success: false, error: `Invalid \`${fromParam}\` value "${rawFrom}". Provide an ISO 8601 date string.` };
+      throw err;
+    }
+    startDate = d;
+  }
+
+  if (rawTo) {
+    const d = new Date(rawTo);
+    if (Number.isNaN(d.getTime())) {
+      const err = new Error(
+        `Invalid \`${toParam}\` value "${rawTo}". Provide an ISO 8601 date string.`,
+      );
+      // @ts-ignore
+      err.status = 400;
+      // @ts-ignore
+      err.body = { success: false, error: `Invalid \`${toParam}\` value "${rawTo}". Provide an ISO 8601 date string.` };
+      throw err;
+    }
+    endDate = d;
+  }
+
+  if (startDate && endDate && startDate > endDate) {
+    const err = new Error(
+      `\`${fromParam}\` must not be after \`${toParam}\`.`,
+    );
+    // @ts-ignore
+    err.status = 400;
+    // @ts-ignore
+    err.body = { success: false, error: `\`${fromParam}\` must not be after \`${toParam}\`.` };
+    throw err;
+  }
+
   return { startDate, endDate };
 }
 
@@ -723,15 +859,15 @@ async function fetchAndBuildTransactions(
     milestoneEventsData,
   ] = await Promise.all([
     // ── counts ────────────────────────────────────────────────────────
-    db
+    readDb
       .select({ count: count() })
       .from(schema.payments)
       .where(conds.payments),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.escrowEvents)
       .where(conds.escrowEvents),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.agreementEvents)
       .innerJoin(
@@ -739,7 +875,7 @@ async function fetchAndBuildTransactions(
         eq(schema.agreementEvents.agreementId, schema.agreements.id),
       )
       .where(conds.agreementEvents),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.employees)
       .leftJoin(
@@ -747,7 +883,7 @@ async function fetchAndBuildTransactions(
         eq(schema.employees.agreementId, schema.agreements.id),
       )
       .where(conds.employees),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.milestones)
       .leftJoin(
@@ -756,19 +892,19 @@ async function fetchAndBuildTransactions(
       )
       .where(conds.milestones),
     // ── data ──────────────────────────────────────────────────────────
-    db
+    readDb
       .select()
       .from(schema.payments)
       .where(conds.payments)
       .orderBy(desc(schema.payments.createdAt), desc(schema.payments.id))
       .limit(queryLimit),
-    db
+    readDb
       .select()
       .from(schema.escrowEvents)
       .where(conds.escrowEvents)
       .orderBy(desc(schema.escrowEvents.createdAt), desc(schema.escrowEvents.id))
       .limit(queryLimit),
-    db
+    readDb
       .select({
         id: schema.agreementEvents.id,
         agreementId: schema.agreementEvents.agreementId,
@@ -789,7 +925,7 @@ async function fetchAndBuildTransactions(
       .where(conds.agreementEvents)
       .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
       .limit(queryLimit),
-    db
+    readDb
       .select({
         id: schema.employees.id,
         agreementId: schema.employees.agreementId,
@@ -811,7 +947,7 @@ async function fetchAndBuildTransactions(
       .where(conds.employees)
       .orderBy(desc(schema.employees.createdAt), desc(schema.employees.id))
       .limit(queryLimit),
-    db
+    readDb
       .select({
         id: schema.milestones.id,
         agreementId: schema.milestones.agreementId,
@@ -861,7 +997,7 @@ async function fetchAndBuildTransactions(
 
   const escrowAgreements =
     escrowAgreementIds.length > 0
-      ? await db
+      ? await readDb
           .select({
             id: schema.agreements.id,
             token: schema.agreements.token,
@@ -915,6 +1051,30 @@ async function fetchAndBuildTransactions(
       const isReceived = p.eventType === "PaymentReceived";
       const sign = isReceived ? "+" : "-";
       const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+
+      return {
+        id: p.transactionHash.slice(0, 10),
+        type: p.eventType === "PaymentSent" ? "Payment Sent" : "Payment Received",
+        address: formatAddress(isReceived ? p.from : p.to),
+        date: dateTime.date,
+        time: dateTime.time,
+        token: tokenInfo.name,
+        amount: finalAmount,
+        status: "Completed" as const,
+        tokenIcon: tokenInfo.icon,
+        txHash: p.transactionHash,
+        createdAt: p.createdAt,
+      };
+    }),
+    ...escrowEvents.map((e) => {
+      const dateTime = formatDate(e.createdAt);
+      const tokenAddress = escrowTokenMap.get(e.agreementId) || null;
+      const tokenInfo = getTokenInfo(tokenAddress);
+      const amountStr = formatAmount(e.amount, tokenInfo);
+      const isIncoming = e.eventType === "Released" || e.eventType === "Refunded";
+      const sign = isIncoming ? "+" : "-";
+      const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+
       return {
         id: p.transactionHash.slice(0, 10),
         type: formatEventType(p.eventType),
@@ -927,6 +1087,28 @@ async function fetchAndBuildTransactions(
         tokenIcon: tokenInfo.icon,
         txHash: p.transactionHash,
         createdAt: p.createdAt,
+      };
+    }),
+    ...escrowEvents.map((e) => {
+      const dateTime = formatDate(e.createdAt);
+      const tokenAddress = escrowTokenMap.get(e.agreementId);
+      const tokenInfo = getTokenInfo(tokenAddress);
+      const amountStr = formatAmount(e.amount, tokenInfo);
+      const isIncoming = e.eventType === "Funded";
+      const sign = isIncoming ? "+" : "-";
+      const finalAmount = amountStr !== "-" ? `${sign}${amountStr}` : amountStr;
+      return {
+        id: e.transactionHash.slice(0, 10),
+        type: formatEventType(e.eventType),
+        address: formatAddress(isIncoming ? (e.employer || "N/A") : (e.to || "N/A")),
+        date: dateTime.date,
+        time: dateTime.time,
+        token: tokenInfo.name,
+        amount: finalAmount,
+        status: "Completed" as const,
+        tokenIcon: tokenInfo.icon,
+        txHash: e.transactionHash,
+        createdAt: e.createdAt,
       };
     }),
     ...employeeEvents.map((e) => {
@@ -1050,7 +1232,8 @@ function applySort(
  * - `limit` / `offset`: the requested parameters (clamped)
  */
 function respondPaginated(
-  res: import("express").Response,
+  req: Request,
+  res: Response,
   allTransactions: TransactionItem[],
   total: number,
   limit: number,
@@ -1068,6 +1251,11 @@ function respondPaginated(
     limit,
     offset,
   };
+  applyIndexedCacheHeaders(res, body);
+  if (req.fresh) {
+    res.status(304).end();
+    return;
+  }
   res.json(body);
 }
 
@@ -1076,9 +1264,12 @@ function respondPaginated(
 // Contract:
 // - Accepts `eventTypes` query filter (comma-separated).
 // - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
+// - Accepts optional `from` / `to` ISO 8601 date-range params for idempotent
+//   reconciliation.  Invalid or inverted ranges are rejected with 400 so that
+//   retrying the same malformed request always produces the same deterministic
+//   error response.
 // - Deduplicates agreement events by id.
 // - Employee condition mode: "employer-or-employee".
-// - Does NOT support date-range filtering.
 
 transactionsRouter.get(
   "/transactions/:user_address",
@@ -1087,6 +1278,15 @@ transactionsRouter.get(
       const userAddress = normalizeAddr(req.params.user_address);
       const { limit, offset } = parsePagination(req);
       const eventTypes = parseEventTypes(req);
+      const { startDate, endDate } = parseDateFilters(req);
+
+      // Idempotent date-range validation: `from` / `to` are the supported
+      // aliases on the main endpoint.  Absent params → no date filter (all
+      // rows).  Invalid or inverted ranges → 400 so retries are deterministic.
+      const { startDate, endDate } = parseDateFilters(req, {
+        fromParam: "from",
+        toParam: "to",
+      });
 
       // Validate and parse sort parameters against the allowlist.
       const sortResult = parseSortParams(req);
@@ -1096,7 +1296,12 @@ transactionsRouter.get(
       }
       const { sortBy, sortDir } = sortResult;
 
-      const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined });
+      const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined, startDate, endDate });
+      const conds = buildConditions(userAddress, {
+        eventTypes: eventTypes ?? undefined,
+        startDate,
+        endDate,
+      });
       const { allTransactions, total } = await fetchAndBuildTransactions(
         userAddress,
         conds,
@@ -1104,8 +1309,12 @@ transactionsRouter.get(
         { deduplicateAgreementEvents: true },
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
-    } catch (e) {
+      respondPaginated(req, res, allTransactions, total, limit, offset, sortBy, sortDir);
+    } catch (e: any) {
+      if (e?.status === 400 && e?.body) {
+        res.status(400).json(e.body);
+        return;
+      }
       next(e);
     }
   },
@@ -1114,7 +1323,10 @@ transactionsRouter.get(
 // ── Route: filtered transaction list (with optional date-range) ──────────
 //
 // Contract:
-// - Accepts `startDate` / `endDate` query filters.
+// - Accepts `startDate` / `endDate` query filters (ISO 8601).
+//   Invalid strings or inverted ranges are rejected with 400 so that retrying
+//   the same malformed request always produces the same deterministic error,
+//   keeping the endpoint safe for idempotent reconciliation workflows.
 // - Accepts `sortBy` ("date" | "amount") and `sortDir` ("asc" | "desc") params.
 // - Employee condition mode: "employee-only".
 // - Does NOT deduplicate agreement events.
@@ -1126,6 +1338,9 @@ transactionsRouter.get(
     try {
       const userAddress = normalizeAddr(req.params.user_address);
       const { limit, offset } = parsePagination(req);
+
+      // Idempotent date-range validation.  Absent → no date filter.
+      // Invalid or inverted → 400 so retries are deterministic.
       const { startDate, endDate } = parseDateFilters(req);
 
       // Validate and parse sort parameters against the allowlist.
@@ -1147,10 +1362,13 @@ transactionsRouter.get(
         offset + limit,
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
-    } catch (e) {
+      respondPaginated(req, res, allTransactions, total, limit, offset, sortBy, sortDir);
+    } catch (e: any) {
+      if (e?.status === 400 && e?.body) {
+        res.status(400).json(e.body);
+        return;
+      }
       next(e);
     }
-
   },
 );

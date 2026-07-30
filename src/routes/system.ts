@@ -1,9 +1,9 @@
 import { Router } from "express";
-import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import { provider, getCachedNetworkInfo } from "../starknet/client.js";
 import { checkDbHealth } from "../db/index.js";
+import { StarknetAddress } from "../utils/validation.js";
 
 export const systemRouter = Router();
 
@@ -36,7 +36,7 @@ systemRouter.get("/network/chain_id", async (_req, res, next) => {
 
 systemRouter.get("/account/:address/nonce", async (req, res, next) => {
   try {
-    const address = z.string().min(3).parse(req.params.address);
+    const address = StarknetAddress.parse(req.params.address);
     const nonce = await provider.getNonceForAddress(address, "pending");
     res.json({ address, nonce });
   } catch (e) {

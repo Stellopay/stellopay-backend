@@ -1,12 +1,18 @@
 # Session lifecycle: persistence, expiration, invalidation, observability, and reliability
 
 This document describes the full contract owned by
-[src/auth/session.ts](src/auth/session.ts): how sessions are persisted, how
+[src/auth/session.ts](../../src/auth/session.ts): how sessions are persisted, how
 they expire, how they're invalidated, what side channels (logs/metrics) each
 state transition emits, and what's safely retryable. The goal is to keep the
 runtime behavior, tests, and this doc aligned — see
-[src/auth/session.test.ts](src/auth/session.test.ts) for the tests that pin
+[src/auth/session.test.ts](../../src/auth/session.test.ts) for the tests that pin
 down every rule below.
+
+The cross-module wallet flow is covered by
+[`src/routes/auth.test.ts`](../../src/routes/auth.test.ts): it drives the real
+Express app through challenge, signed verification, bearer logout, replay,
+expiry, and post-revocation rejection. The test uses a deterministic signer
+and replaces only the external RPC/database boundaries.
 
 ## Session authorization contract & security boundaries
 
@@ -100,11 +106,33 @@ Any revoked or rotated token is rejected by `requireSession`.
 revocation state indicates they are no longer active. This is the cleanup path for
 expired or explicitly invalidated sessions.
 
+**Batching contract (issue #316):** The sweep runs in bounded pages of
+`SESSION_SWEEP_BATCH_SIZE` (500) rows. Each iteration:
+
+1. **SELECT** up to 500 token hashes that match the expired-or-revoked predicate.
+2. **DELETE** those specific hashes (with bounded retry, 3 attempts).
+3. Emits a `session.sweep_batch` info log per page.
+4. Repeats until the SELECT returns fewer than 500 rows (last page) or zero rows.
+
+This ensures the DELETE never holds a long-running lock, never bloats the WAL
+stream for replicas, and stays under any configured `statement_timeout`. A
+single invocation may produce zero or more `session.sweep_batch` log lines before
+the final `session.sweep_completed` summary.
+
+### Bulk revocation batching
+
+`revokeAllSessionsForAddress` and `revokeFamily` also operate in bounded pages of
+`SESSION_REVOKE_BATCH_SIZE` (100) rows. Each iteration SELECTs up to 100
+non-revoked token hashes (`revokedAt IS NULL`) for the target address or family,
+then UPDATEs them in a single statement. The loop continues until the SELECT
+returns empty. This prevents a single user or a large token family from causing
+a long-running UPDATE that escalates locks or exhausts the retry budget.
+
 ### Compatibility and scope
 
 This contract is intentionally scoped to the existing module and its current
 callers. The public function signatures remain unchanged, and the behavior above
-is covered by the session tests in [src/auth/session.test.ts](src/auth/session.test.ts).
+is covered by the session tests in [src/auth/session.test.ts](../../src/auth/session.test.ts).
 
 ### Edge cases intentionally out of scope
 

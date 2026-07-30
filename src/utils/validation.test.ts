@@ -3,10 +3,12 @@ import { z } from "zod";
 import {
   StarknetAddress,
   AgreementId,
+  IdempotencyKeySchema,
   parsePagination,
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
   INPUT_PREVIEW_MAX_LENGTH,
+  StrictDecimalString,
   loggedParse,
   formatValidationError,
   isPlainObject,
@@ -14,10 +16,43 @@ import {
   previewInput,
   ValidationError,
   mapZodError,
+  CurrencyCodeSchema,
+  createBillingAmountSchema,
+  BillingAmountSchema,
+  validateBillingInput,
+  validateBillingRequest,
+  SUPPORTED_CURRENCIES,
   type ValidationErrorResponse,
   type ValidationIssue,
 } from "./validation";
+
+describe("StrictDecimalString", () => {
+  it.each(["0", "1", "9".repeat(78)])("accepts canonical amount %s", (value) => {
+    expect(StrictDecimalString.parse(value)).toBe(value);
+  });
+
+  it.each(["", "01", " 1", "1 ", "1.5", "1e3", "9".repeat(79)])(
+    "rejects non-canonical amount %s",
+    (value) => {
+      expect(() => StrictDecimalString.parse(value)).toThrow();
+    },
+  );
+});
 import type { ValidationErrorMetric } from "./validation";
+
+describe("IdempotencyKeySchema", () => {
+  it("accepts bounded ASCII keys", () => {
+    expect(IdempotencyKeySchema.parse("checkout_2026-07-30")).toBe("checkout_2026-07-30");
+    expect(IdempotencyKeySchema.parse("a".repeat(255))).toHaveLength(255);
+  });
+
+  it.each(["", " ", "key with spaces", "key/slash", "a".repeat(256)])(
+    "rejects unsafe key %j",
+    (value) => {
+      expect(IdempotencyKeySchema.safeParse(value).success).toBe(false);
+    },
+  );
+});
 
 // --------------------------------------------------------------------------
 // ValidationError
@@ -35,9 +70,7 @@ describe("ValidationError", () => {
     expect(err.name).toBe("ValidationError");
     expect(err.validator).toBe("test");
     expect(err.message).toBe("something went wrong");
-    expect(err.issues).toEqual([
-      { path: ["name"], message: "too short", code: "too_small" },
-    ]);
+    expect(err.issues).toEqual([{ path: ["name"], message: "too short", code: "too_small" }]);
     expect(err.input).toBe("ab");
   });
 
@@ -796,8 +829,8 @@ describe("formatValidationError", () => {
 // ---- mapZodError ----
 
 describe("mapZodError", () => {
-  it("returns custom code for checksum fail",()=>{
-    try{
+  it("returns custom code for checksum fail", () => {
+    try {
       StarknetAddress.parse("0x4718F5a0FC34Cc1AF16A1cdee98ffB20C31f5cd61d6ab07201858f4287c938d");
     } catch (e) {
       const mapped = mapZodError(e);
@@ -1219,5 +1252,116 @@ describe("isPlainObject", () => {
     expect(isPlainObject("str")).toBe(false);
     expect(isPlainObject(42)).toBe(false);
     expect(isPlainObject(true)).toBe(false);
+  });
+});
+
+// --------------------------------------------------------------------------
+// Billing Request Validation
+// --------------------------------------------------------------------------
+
+describe("Billing Request Validation", () => {
+  describe("CurrencyCodeSchema", () => {
+    it("accepts supported currency codes", () => {
+      for (const currency of SUPPORTED_CURRENCIES) {
+        expect(CurrencyCodeSchema.parse(currency)).toBe(currency);
+      }
+    });
+
+    it("trims whitespace from valid currency code", () => {
+      expect(CurrencyCodeSchema.parse("  USD  ")).toBe("USD");
+    });
+
+    it("rejects unknown currencies", () => {
+      expect(() => CurrencyCodeSchema.parse("XYZ")).toThrow(z.ZodError);
+      expect(() => CurrencyCodeSchema.parse("BTC")).toThrow(z.ZodError);
+    });
+
+    it("rejects invalid format (lowercase, length != 3, numbers)", () => {
+      expect(() => CurrencyCodeSchema.parse("usd")).toThrow(z.ZodError);
+      expect(() => CurrencyCodeSchema.parse("USDD")).toThrow(z.ZodError);
+      expect(() => CurrencyCodeSchema.parse("US")).toThrow(z.ZodError);
+      expect(() => CurrencyCodeSchema.parse("123")).toThrow(z.ZodError);
+    });
+
+    it("rejects empty / blank values", () => {
+      expect(() => CurrencyCodeSchema.parse("")).toThrow(z.ZodError);
+      expect(() => CurrencyCodeSchema.parse("   ")).toThrow(z.ZodError);
+    });
+  });
+
+  describe("BillingAmountSchema", () => {
+    it("accepts valid positive numbers and numeric strings", () => {
+      expect(BillingAmountSchema.parse(100)).toBe(100);
+      expect(BillingAmountSchema.parse("100")).toBe(100);
+      expect(BillingAmountSchema.parse(50.5)).toBe(50.5);
+      expect(BillingAmountSchema.parse("50.5")).toBe(50.5);
+      expect(BillingAmountSchema.parse(1_000_000)).toBe(1_000_000);
+    });
+
+    it("rejects zero amount", () => {
+      expect(() => BillingAmountSchema.parse(0)).toThrow();
+      expect(() => BillingAmountSchema.parse("0")).toThrow();
+    });
+
+    it("rejects negative amounts", () => {
+      expect(() => BillingAmountSchema.parse(-10)).toThrow();
+      expect(() => BillingAmountSchema.parse("-50.5")).toThrow();
+    });
+
+    it("rejects amounts exceeding maximum allowed limit", () => {
+      expect(() => BillingAmountSchema.parse(1_000_001)).toThrow();
+      expect(() => BillingAmountSchema.parse("2000000")).toThrow();
+    });
+
+    it("supports custom maxAmount limit via createBillingAmountSchema", () => {
+      const customSchema = createBillingAmountSchema(500);
+      expect(customSchema.parse(500)).toBe(500);
+      expect(() => customSchema.parse(501)).toThrow();
+    });
+
+    it("rejects non-finite values and invalid string inputs", () => {
+      expect(() => BillingAmountSchema.parse(Infinity)).toThrow();
+      expect(() => BillingAmountSchema.parse(NaN)).toThrow();
+      expect(() => BillingAmountSchema.parse("abc")).toThrow();
+      expect(() => BillingAmountSchema.parse("")).toThrow();
+    });
+  });
+
+  describe("validateBillingInput & validateBillingRequest", () => {
+    it("validates valid input object successfully", () => {
+      const result = validateBillingInput({ currency: "USD", amount: 250 });
+      expect(result).toEqual({ currency: "USD", amount: 250 });
+    });
+
+    it("allows omitting optional fields when not required", () => {
+      const result = validateBillingInput({});
+      expect(result).toEqual({});
+    });
+
+    it("throws ValidationError for invalid currency code", () => {
+      expect(() => validateBillingInput({ currency: "BAD" })).toThrow(ValidationError);
+      try {
+        validateBillingInput({ currency: "BAD" });
+      } catch (err: any) {
+        expect(err.status).toBe(400);
+        expect(err.message).toContain("Unsupported currency code 'BAD'");
+      }
+    });
+
+    it("throws ValidationError for invalid billing amount", () => {
+      expect(() => validateBillingInput({ amount: -100 })).toThrow(ValidationError);
+      try {
+        validateBillingInput({ amount: -100 });
+      } catch (err: any) {
+        expect(err.status).toBe(400);
+        expect(err.message).toContain("greater than zero");
+      }
+    });
+
+    it("extracts and validates from Express Request object", () => {
+      const req = { query: { currency: "EUR", amount: "500" } };
+      const result = validateBillingRequest(req);
+      expect(result).toEqual({ currency: "EUR", amount: 500 });
+    });
   });
 });

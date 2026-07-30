@@ -92,7 +92,11 @@ vi.mock("drizzle-orm", () => ({
 /* ── imports after mocks are registered ──────────────────────────────────── */
 
 import { analyticsRouter, analyticsAggregationCache } from "./analytics.js";
-import { AnalyticsCache, buildAnalyticsCacheKey } from "../utils/analytics-cache.js";
+import {
+  AnalyticsCache,
+  RedisAnalyticsCache,
+  buildAnalyticsCacheKey,
+} from "../utils/analytics-cache.js";
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -199,6 +203,32 @@ describe("AnalyticsCache unit", () => {
     cache.clear();
     expect(cache.size).toBe(0);
     expect(cache.get("a")).toBeUndefined();
+  });
+});
+
+describe("RedisAnalyticsCache", () => {
+  it("round-trips JSON values with a millisecond TTL", async () => {
+    const values = new Map<string, string>();
+    const redis = {
+      get: vi.fn(async (key: string) => values.get(key) ?? null),
+      set: vi.fn(async (key: string, value: string) => void values.set(key, value)),
+      del: vi.fn(async (key: string) => void values.delete(key)),
+    };
+    const cache = new RedisAnalyticsCache<{ total: number }>(redis, 30_000);
+
+    await cache.set("k", { total: 7 });
+    expect(await cache.get("k")).toEqual({ total: 7 });
+    expect(redis.set).toHaveBeenCalledWith("k", '{"total":7}', "PX", 30_000);
+    await cache.invalidate("k");
+    expect(await cache.get("k")).toBeUndefined();
+  });
+
+  it("turns Redis failures into misses", async () => {
+    const cache = new RedisAnalyticsCache(
+      { get: vi.fn().mockRejectedValue(new Error("offline")), set: vi.fn(), del: vi.fn() },
+      1000,
+    );
+    expect(await cache.get("k")).toBeUndefined();
   });
 });
 

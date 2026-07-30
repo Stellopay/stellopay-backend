@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import fs from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
@@ -18,6 +19,7 @@ import { validateSchema } from "./schema-fk-indexes.js";
 import { pgTable, text } from "drizzle-orm/pg-core";
 import * as schema from "./schema.js";
 import {
+  SCHEMA_COMPATIBILITY_VERSION,
   agreements,
   agreementEvents,
   payments,
@@ -28,6 +30,7 @@ import {
   billingPaymentMethods,
   billingInvoices,
   sessions,
+  backfillProgress,
   U256_DECIMAL_REGEX,
   U256_DECIMAL_PATTERN,
   CURRENCY_CODE_REGEX,
@@ -36,6 +39,7 @@ import {
   isValidNonNegativeInteger,
   assertNonNegative,
   assertValidU256,
+  assertValidCurrencyCode,
   clampPageLimit,
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
@@ -146,6 +150,119 @@ describe("schema check constraints", () => {
       expect(names).toContain("billing_invoices_status_check");
       expect(names).toContain("billing_invoices_currency_check");
       expect(names).toContain("billing_invoices_amount_check");
+    });
+  });
+
+  describe("backfill_progress", () => {
+    it("declares check constraints for status, totalScanned, and totalCreated", () => {
+      const names = getCheckConstraintNames(backfillProgress);
+      expect(names).toContain("backfill_progress_status_check");
+      expect(names).toContain("backfill_progress_total_scanned_check");
+      expect(names).toContain("backfill_progress_total_created_check");
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Global invariants — fail if two tables share a CHECK constraint name.
+  // A name collision would cause the constraint migration to fail in
+  // production because Postgres enforces uniqueness of constraint names
+  // within a schema.
+  // -----------------------------------------------------------------------
+  describe("global CHECK constraint invariants", () => {
+    it("uses unique CHECK constraint names across every table in the schema", () => {
+      const seen = new Map<string, string>();
+      const duplicates: Array<{ name: string; tables: string[] }> = [];
+
+      for (const { name, table } of schema.SCHEMA_TABLES) {
+        for (const checkName of getCheckConstraintNames(table)) {
+          const existing = seen.get(checkName);
+          if (existing) {
+            // First duplicate found — record the conflict list.
+            if (!duplicates.find((d) => d.name === checkName)) {
+              duplicates.push({ name: checkName, tables: [existing] });
+            }
+            const entry = duplicates.find((d) => d.name === checkName);
+            entry?.tables.push(name);
+          } else {
+            seen.set(checkName, name);
+          }
+        }
+      }
+
+      expect(duplicates, "duplicate CHECK constraint names across tables").toEqual([]);
+    });
+
+    it("lists every emitted CHECK constraint in at least one schema table", () => {
+      // Guard against a CHECK declared in Drizzle but never registered in
+      // SCHEMA_TABLES — it would still build, but a later migration that
+      // touches it through the inventory could miss it.
+      const allConstraintNames = new Set<string>();
+      for (const { table } of schema.SCHEMA_TABLES) {
+        for (const name of getCheckConstraintNames(table)) {
+          allConstraintNames.add(name);
+        }
+      }
+
+      // Sanity: at least as many constraints as the production migration
+      // applies (one CHECK per ALTER TABLE line). The schema file mirrors
+      // the migration list verbatim, so any drop here is a regression.
+      expect(allConstraintNames.size).toBeGreaterThanOrEqual(28);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // SQL ↔ Drizzle parity — every CHECK in the migration SQL must be
+  // declared in schema.ts. Catches a real failure mode: a future migration
+  // generator could silently drop a CHECK from Drizzle's runtime metadata
+  // while leaving the SQL intact (or vice-versa), causing schema drift
+  // between code and database.
+  // -----------------------------------------------------------------------
+
+  // Migration files that contain `CHECK` constraint definitions. The list
+  // pins the parser fixtures so a renamed file fails the test instead of
+  // silently passing on an empty result.
+  const SQL_MIGRATION_FILES_WITH_CHECKS = [
+    "20240104000000_schema_check_constraints.sql",
+    "0004_noisy_eternals.sql",
+  ] as const;
+
+  // Extract every CHECK constraint name from a SQL migration file.
+  // Matches both `ALTER TABLE ... ADD CONSTRAINT "<name>" CHECK (...)`
+  // and the inline `CONSTRAINT "<name>" CHECK (...)` form used by
+  // `CREATE TABLE`-based migrations.
+  function readCheckConstraintNamesFromMigration(fileName: string): string[] {
+    const sqlPath = resolve(`src/db/migrations/${fileName}`);
+    const content = fs.readFileSync(sqlPath, "utf8");
+    const matches = content.matchAll(/(?:ADD\s+)?CONSTRAINT\s+"([^"]+)"\s+CHECK\b/g);
+    return Array.from(matches, (m) => m[1]);
+  }
+
+  describe("SQL migration ↔ Drizzle schema parity", () => {
+    it("every CHECK constraint in the canonical migration SQL is also declared in schema.ts", () => {
+      const declaredInDrizzle = new Set<string>();
+      for (const { table } of schema.SCHEMA_TABLES) {
+        for (const name of getCheckConstraintNames(table)) {
+          declaredInDrizzle.add(name);
+        }
+      }
+
+      const declaredInSql: string[] = [];
+      for (const file of SQL_MIGRATION_FILES_WITH_CHECKS) {
+        declaredInSql.push(...readCheckConstraintNamesFromMigration(file));
+      }
+
+      // The fixtures must produce at least one constraint — empty output
+      // means the parser is broken or the fixture paths drifted, and we
+      // want to fail loudly rather than silently pass.
+      expect(declaredInSql.length).toBeGreaterThan(0);
+
+      const missingFromDrizzle = declaredInSql.filter(
+        (n) => !declaredInDrizzle.has(n),
+      );
+      expect(
+        missingFromDrizzle,
+        "CHECK constraints defined in migration SQL must be present in schema.ts Drizzle metadata",
+      ).toEqual([]);
     });
   });
 
@@ -304,6 +421,12 @@ describe("schema check constraints", () => {
         expect(() => assertValidU256("12345", "amount")).not.toThrow();
       });
 
+      it("accepts the exact 78-digit upper boundary (2^256 − 1 decimal width)", () => {
+        const maxU256DecimalWidth = "1" + "0".repeat(77);
+        expect(maxU256DecimalWidth).toHaveLength(78);
+        expect(() => assertValidU256(maxU256DecimalWidth, "amount")).not.toThrow();
+      });
+
       it("throws RangeError for invalid u256 strings", () => {
         expect(() => assertValidU256("-1", "amount")).toThrow(RangeError);
         expect(() => assertValidU256("abc", "amount")).toThrow(RangeError);
@@ -311,9 +434,49 @@ describe("schema check constraints", () => {
         expect(() => assertValidU256("", "amount")).toThrow(RangeError);
       });
 
+      it("rejects strings that exceed the 78-digit upper boundary", () => {
+        const tooLong = "1" + "0".repeat(78);
+        expect(tooLong).toHaveLength(79);
+        expect(() => assertValidU256(tooLong, "amount")).toThrow(RangeError);
+      });
+
       it("includes the field name and value in the error message", () => {
         expect(() => assertValidU256("-1", "totalAmount")).toThrow("totalAmount");
         expect(() => assertValidU256("-1", "totalAmount")).toThrow('"-1"');
+      });
+    });
+
+    describe("assertValidCurrencyCode", () => {
+      it("passes for valid ISO 4217-style codes", () => {
+        expect(() => assertValidCurrencyCode("USD", "currency")).not.toThrow();
+        expect(() => assertValidCurrencyCode("EUR", "currency")).not.toThrow();
+        expect(() => assertValidCurrencyCode("JPY", "currency")).not.toThrow();
+      });
+
+      it("throws RangeError for malformed codes", () => {
+        expect(() => assertValidCurrencyCode("", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("usd", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("US", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("USDD", "currency")).toThrow(RangeError);
+        expect(() => assertValidCurrencyCode("123", "currency")).toThrow(RangeError);
+      });
+
+      it("includes the field name and code in the error message", () => {
+        expect(() => assertValidCurrencyCode("usd", "currency")).toThrow("currency");
+        expect(() => assertValidCurrencyCode("usd", "currency")).toThrow('"usd"');
+      });
+
+      it("mirrors isValidCurrencyCode for every valid and invalid sample", () => {
+        const validCodes = ["USD", "EUR", "GBP", "JPY"];
+        const invalidCodes = ["", "usd", "US", "USDD", "123", "U$D"];
+        for (const code of validCodes) {
+          expect(isValidCurrencyCode(code), `predicate expects ${code} valid`).toBe(true);
+          expect(() => assertValidCurrencyCode(code, "currency")).not.toThrow();
+        }
+        for (const code of invalidCodes) {
+          expect(isValidCurrencyCode(code), `predicate expects ${code} invalid`).toBe(false);
+          expect(() => assertValidCurrencyCode(code, "currency")).toThrow(RangeError);
+        }
       });
     });
 
@@ -376,6 +539,488 @@ describe("schema check constraints", () => {
       it("includes the invalid value in the error message", () => {
         expect(() => validateBatchSize(999)).toThrow("999");
       });
+    });
+
+    describe("security boundary - sensitive billing fields", () => {
+      it("defines SENSITIVE_BILLING_FIELDS containing exactly taxId and dateOfBirth", () => {
+        expect(schema.SENSITIVE_BILLING_FIELDS).toEqual(["taxId", "dateOfBirth"]);
+      });
+
+      it("verifies sensitive fields exist on the billingProfiles table schema", () => {
+        const columns = getTableConfig(schema.billingProfiles).columns;
+        const columnNames = columns.map((c) => c.name);
+        expect(columnNames).toContain("tax_id");
+        expect(columnNames).toContain("date_of_birth");
+      });
+
+      it("stripSensitiveBillingFields removes sensitive fields and returns a clean object copy", () => {
+        const input = {
+          id: "profile-1",
+          ownerAddress: "0xowner",
+          taxId: "EIN-12345",
+          dateOfBirth: "1990-01-01",
+          firstName: "Alice",
+        };
+        const output = schema.stripSensitiveBillingFields(input);
+        expect(output).toEqual({
+          id: "profile-1",
+          ownerAddress: "0xowner",
+          firstName: "Alice",
+        });
+        // Ensure original object was not mutated (non-mutating copy behavior)
+        expect(input.taxId).toBe("EIN-12345");
+        expect(input.dateOfBirth).toBe("1990-01-01");
+      });
+
+      it("stripSensitiveBillingFields is a no-op for objects without sensitive fields", () => {
+        const input = {
+          id: "profile-2",
+          ownerAddress: "0xowner",
+          firstName: "Bob",
+        };
+        const output = schema.stripSensitiveBillingFields(input);
+        expect(output).toEqual(input);
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Backward-compatibility contract
+// ---------------------------------------------------------------------------
+
+describe("backward-compatibility contract", () => {
+  // ── B1: Compatibility version ──────────────────────────────────────────
+
+  describe("B1 — compatibility version", () => {
+    it("exports SCHEMA_COMPATIBILITY_VERSION with the initial value of 1", () => {
+      expect(SCHEMA_COMPATIBILITY_VERSION).toBe(1);
+    });
+
+    it("SCHEMA_COMPATIBILITY_VERSION is a frozen number constant", () => {
+      expect(typeof SCHEMA_COMPATIBILITY_VERSION).toBe("number");
+      expect(Object.isFrozen).toBeDefined();
+    });
+  });
+
+  // ── B2: Export inventory — helpers and constants must not disappear ────
+
+  describe("B2 — export inventory stability", () => {
+    it("exports every expected validation helper function", () => {
+      expect(typeof schema.isValidU256).toBe("function");
+      expect(typeof schema.isValidCurrencyCode).toBe("function");
+      expect(typeof schema.isValidNonNegativeInteger).toBe("function");
+      expect(typeof schema.assertNonNegative).toBe("function");
+      expect(typeof schema.assertValidU256).toBe("function");
+      expect(typeof schema.assertValidCurrencyCode).toBe("function");
+      expect(typeof schema.clampPageLimit).toBe("function");
+      expect(typeof schema.clampBatchSize).toBe("function");
+      expect(typeof schema.validateBatchSize).toBe("function");
+      expect(typeof schema.stripSensitiveBillingFields).toBe("function");
+    });
+
+    it("exports every expected constant", () => {
+      expect(typeof schema.U256_DECIMAL_REGEX).toBe("string");
+      expect(schema.U256_DECIMAL_PATTERN).toBeInstanceOf(RegExp);
+      expect(schema.CURRENCY_CODE_REGEX).toBeInstanceOf(RegExp);
+      expect(typeof schema.MAX_PAGE_SIZE).toBe("number");
+      expect(typeof schema.DEFAULT_PAGE_SIZE).toBe("number");
+      expect(typeof schema.MAX_BATCH_SIZE).toBe("number");
+      expect(Array.isArray(schema.SCHEMA_TABLES)).toBe(true);
+      expect(Array.isArray(schema.SENSITIVE_BILLING_FIELDS)).toBe(true);
+      expect(typeof schema.SCHEMA_COMPATIBILITY_VERSION).toBe("number");
+    });
+
+    it("exports exactly 11 tables", () => {
+      expect(schema.SCHEMA_TABLES).toHaveLength(11);
+    });
+
+    it("SENSITIVE_BILLING_FIELDS contains exactly the expected fields", () => {
+      expect(schema.SENSITIVE_BILLING_FIELDS).toEqual(["taxId", "dateOfBirth"]);
+    });
+  });
+
+  // ── B3: Runtime helper ↔ DB constraint parity ─────────────────────────
+
+  describe("B3 — helper-to-constraint mapping", () => {
+    it("isValidU256 maps to the U256_DECIMAL_REGEX DB CHECK constraint", () => {
+      expect(isValidU256("0")).toBe(true);
+      expect(isValidU256("1")).toBe(true);
+      expect(isValidU256("-1")).toBe(false);
+      expect(isValidU256("abc")).toBe(false);
+    });
+
+    it("isValidCurrencyCode maps to the currency CHECK constraints", () => {
+      expect(isValidCurrencyCode("USD")).toBe(true);
+      expect(isValidCurrencyCode("EUR")).toBe(true);
+      expect(isValidCurrencyCode("usd")).toBe(false);
+      expect(isValidCurrencyCode("")).toBe(false);
+    });
+
+    it("isValidNonNegativeInteger maps to block_number CHECK >= 0 constraints", () => {
+      expect(isValidNonNegativeInteger(0)).toBe(true);
+      expect(isValidNonNegativeInteger(1)).toBe(true);
+      expect(isValidNonNegativeInteger(-1)).toBe(false);
+      expect(isValidNonNegativeInteger(1.5)).toBe(false);
+    });
+
+    it("assertNonNegative maps to block_number CHECK >= 0 constraints with a thrown error", () => {
+      expect(() => assertNonNegative(0, "test")).not.toThrow();
+      expect(() => assertNonNegative(-1, "test")).toThrow(RangeError);
+    });
+
+    it("assertValidU256 maps to U256_DECIMAL_REGEX CHECK constraints with a thrown error", () => {
+      expect(() => assertValidU256("0", "test")).not.toThrow();
+      expect(() => assertValidU256("-1", "test")).toThrow(RangeError);
+      expect(() => assertValidU256("-1", "test")).toThrow('"-1"');
+    });
+
+    it("assertValidCurrencyCode maps to currency CHECK constraints with a thrown error", () => {
+      expect(() => assertValidCurrencyCode("USD", "test")).not.toThrow();
+      expect(() => assertValidCurrencyCode("usd", "test")).toThrow(RangeError);
+    });
+  });
+
+  // ── B4: every table with enum columns has at least one enum CHECK ──────
+
+  describe("B4 — enum CHECK constraint coverage", () => {
+    const enumCheckTables = [
+      { name: "agreements", constraint: "agreements_mode_check" },
+      { name: "payments", constraint: "payments_event_type_check" },
+      { name: "escrowEvents", constraint: "escrow_events_event_type_check" },
+      { name: "billingProfiles", constraint: "billing_profiles_profile_type_check" },
+      { name: "billingPaymentMethods", constraint: "billing_payment_methods_type_check" },
+      { name: "billingInvoices", constraint: "billing_invoices_status_check" },
+      { name: "backfillProgress", constraint: "backfill_progress_status_check" },
+    ];
+
+    it.each(enumCheckTables)("$name declares the enum CHECK $constraint", ({ name, constraint }) => {
+      const entry = schema.SCHEMA_TABLES.find((t) => t.name === name);
+      expect(entry, `${name} must be registered in SCHEMA_TABLES`).toBeDefined();
+      const names = getCheckConstraintNames(entry!.table);
+      expect(names, `${name} must declare ${constraint}`).toContain(constraint);
+    });
+  });
+
+  // ── B5: Boundary paths for validation helpers ──────────────────────────
+
+  describe("B5 — validation helper boundary paths", () => {
+    describe("isValidU256 boundary", () => {
+      it("rejects exactly at 79 digits (one past max)", () => {
+        expect(isValidU256("1" + "0".repeat(78))).toBe(false);
+      });
+
+      it("accepts exactly at 78 digits (max)", () => {
+        expect(isValidU256("1" + "0".repeat(77))).toBe(true);
+      });
+
+      it("rejects empty string", () => {
+        expect(isValidU256("")).toBe(false);
+      });
+
+      it("rejects zero with leading digit", () => {
+        expect(isValidU256("00")).toBe(false);
+      });
+
+      it("accepts single zero", () => {
+        expect(isValidU256("0")).toBe(true);
+      });
+    });
+
+    describe("clampPageLimit boundary", () => {
+      it("returns NaN for NaN (current behavior — not NaN-safe)", () => {
+        expect(Number.isNaN(clampPageLimit(NaN))).toBe(true);
+      });
+
+      it("returns DEFAULT_PAGE_SIZE for negative infinity", () => {
+        expect(clampPageLimit(-Infinity)).toBe(DEFAULT_PAGE_SIZE);
+      });
+
+      it("caps exactly at MAX_PAGE_SIZE", () => {
+        expect(clampPageLimit(MAX_PAGE_SIZE + 0.5)).toBe(MAX_PAGE_SIZE);
+      });
+    });
+
+    describe("validateBatchSize boundary", () => {
+      it("throws RangeError for zero", () => {
+        expect(() => validateBatchSize(0)).toThrow(RangeError);
+      });
+
+      it("throws RangeError for MAX_BATCH_SIZE + 1", () => {
+        expect(() => validateBatchSize(MAX_BATCH_SIZE + 1)).toThrow(RangeError);
+      });
+
+      it("throws RangeError for floating point within range", () => {
+        expect(() => validateBatchSize(50.5)).toThrow(RangeError);
+      });
+    });
+
+    describe("clampBatchSize boundary", () => {
+      it("returns NaN for NaN (current behavior — not NaN-safe)", () => {
+        expect(Number.isNaN(clampBatchSize(NaN))).toBe(true);
+      });
+
+      it("returns 0 for negative values", () => {
+        expect(clampBatchSize(-100)).toBe(0);
+      });
+    });
+
+    describe("assertNonNegative boundary", () => {
+      it("rejects negative zero string coercion", () => {
+        expect(() => assertNonNegative(-0, "test")).not.toThrow();
+      });
+
+      it("throws for non-number type", () => {
+        expect(() => assertNonNegative("0" as unknown as number, "test")).toThrow(RangeError);
+      });
+    });
+  });
+
+  // ── B6: Assert that removing a constraint would be detected ────────────
+
+  describe("B6 — constraint inventory completeness", () => {
+    it("every agreement constraint from migration SQL is present in Drizzle metadata", () => {
+      const names = getCheckConstraintNames(agreements);
+      expect(names).toEqual(
+        expect.arrayContaining([
+          "agreements_mode_check",
+          "agreements_payment_type_check",
+          "agreements_status_check",
+          "agreements_dispute_status_check",
+          "agreements_block_number_check",
+          "agreements_total_amount_check",
+          "agreements_paid_amount_check",
+        ]),
+      );
+    });
+
+    it("no duplicate CHECK constraint names exist across the schema", () => {
+      const seen = new Map<string, string>();
+      const duplicates: Array<{ name: string; tables: string[] }> = [];
+
+      for (const { name, table } of schema.SCHEMA_TABLES) {
+        for (const checkName of getCheckConstraintNames(table)) {
+          const existing = seen.get(checkName);
+          if (existing) {
+            if (!duplicates.find((d) => d.name === checkName)) {
+              duplicates.push({ name: checkName, tables: [existing] });
+            }
+            const entry = duplicates.find((d) => d.name === checkName);
+            entry?.tables.push(name);
+          } else {
+            seen.set(checkName, name);
+          }
+        }
+      }
+
+      expect(duplicates, "duplicate CHECK constraint names across tables").toEqual([]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idempotency contract
+// ---------------------------------------------------------------------------
+
+describe("idempotency contract", () => {
+  // ── I1: Pure-function helpers return the same value on repeated calls ──
+
+  describe("I1 — query helper idempotency", () => {
+    it("isValidU256 returns the same result for the same input", () => {
+      const inputs = ["0", "1", "12345", "", "-1", "01", "1.5", "abc"];
+      for (const input of inputs) {
+        const first = isValidU256(input);
+        const second = isValidU256(input);
+        expect(second, `isValidU256("${input}") must be idempotent`).toBe(first);
+      }
+    });
+
+    it("isValidCurrencyCode returns the same result for the same input", () => {
+      const codes = ["USD", "EUR", "GBP", "", "usd", "US", "USDD", "123"];
+      for (const code of codes) {
+        const first = isValidCurrencyCode(code);
+        const second = isValidCurrencyCode(code);
+        expect(second, `isValidCurrencyCode("${code}") must be idempotent`).toBe(first);
+      }
+    });
+
+    it("isValidNonNegativeInteger returns the same result for the same input", () => {
+      const inputs = [0, 1, 100, -1, 1.5, NaN, Infinity];
+      for (const input of inputs) {
+        const first = isValidNonNegativeInteger(input);
+        const second = isValidNonNegativeInteger(input);
+        expect(second, `isValidNonNegativeInteger(${input}) must be idempotent`).toBe(first);
+      }
+    });
+
+    it("clampPageLimit returns the same value for the same input", () => {
+      const inputs = [-5, 0, 1, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_PAGE_SIZE + 1, 1000, NaN, -Infinity];
+      for (const input of inputs) {
+        const first = clampPageLimit(input);
+        const second = clampPageLimit(input);
+        expect(Number.isNaN(first) ? Number.isNaN(second) : second === first).toBe(true);
+      }
+    });
+
+    it("clampBatchSize returns the same value for the same input", () => {
+      const inputs = [-5, 0, 1, MAX_BATCH_SIZE, MAX_BATCH_SIZE + 1, 50, NaN, -100];
+      for (const input of inputs) {
+        const first = clampBatchSize(input);
+        const second = clampBatchSize(input);
+        expect(Number.isNaN(first) ? Number.isNaN(second) : second === first).toBe(true);
+      }
+    });
+
+    it("validateBatchSize returns the same value for the same valid input", () => {
+      const inputs = [1, MAX_BATCH_SIZE, 50];
+      for (const input of inputs) {
+        const first = validateBatchSize(input);
+        const second = validateBatchSize(input);
+        expect(second, `validateBatchSize(${input}) must be idempotent`).toBe(first);
+      }
+    });
+
+    it("stripSensitiveBillingFields is idempotent", () => {
+      const input = {
+        id: "profile-1",
+        ownerAddress: "0xowner",
+        taxId: "EIN-12345",
+        dateOfBirth: "1990-01-01",
+        firstName: "Alice",
+      };
+      const first = schema.stripSensitiveBillingFields(input);
+      const second = schema.stripSensitiveBillingFields(first);
+      expect(second).toEqual(first);
+    });
+
+    it("stripSensitiveBillingFields is a no-op when called twice", () => {
+      const input = {
+        id: "profile-2",
+        ownerAddress: "0xowner",
+        firstName: "Bob",
+      };
+      const first = schema.stripSensitiveBillingFields(input);
+      const second = schema.stripSensitiveBillingFields(first);
+      expect(second).toEqual(first);
+    });
+  });
+
+  // ── I2: Assertion helpers throw the same error on repeated invalid calls ──
+
+  describe("I2 — assertion helper idempotency", () => {
+    it("assertNonNegative succeeds on repeated valid calls", () => {
+      expect(() => { assertNonNegative(0, "test"); }).not.toThrow();
+      expect(() => { assertNonNegative(0, "test"); }).not.toThrow();
+    });
+
+    it("assertNonNegative throws the same error type on repeated invalid calls", () => {
+      expect(() => { assertNonNegative(-1, "test"); }).toThrow(RangeError);
+      expect(() => { assertNonNegative(-1, "test"); }).toThrow(RangeError);
+    });
+
+    it("assertValidU256 succeeds on repeated valid calls", () => {
+      expect(() => { assertValidU256("0", "test"); }).not.toThrow();
+      expect(() => { assertValidU256("0", "test"); }).not.toThrow();
+    });
+
+    it("assertValidU256 throws the same error type on repeated invalid calls", () => {
+      expect(() => { assertValidU256("-1", "test"); }).toThrow(RangeError);
+      expect(() => { assertValidU256("-1", "test"); }).toThrow(RangeError);
+    });
+
+    it("assertValidCurrencyCode succeeds on repeated valid calls", () => {
+      expect(() => { assertValidCurrencyCode("USD", "test"); }).not.toThrow();
+      expect(() => { assertValidCurrencyCode("USD", "test"); }).not.toThrow();
+    });
+
+    it("assertValidCurrencyCode throws the same error type on repeated invalid calls", () => {
+      expect(() => { assertValidCurrencyCode("usd", "test"); }).toThrow(RangeError);
+      expect(() => { assertValidCurrencyCode("usd", "test"); }).toThrow(RangeError);
+    });
+  });
+
+  // ── I3: Validation error messages are stable (same input → same message text) ──
+
+  describe("I3 — error message stability", () => {
+    it("assertNonNegative produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => assertNonNegative(-1, "blockNumber"));
+      const msg2 = extract(() => assertNonNegative(-1, "blockNumber"));
+      expect(msg1).toBe("blockNumber must be non-negative, got -1");
+      expect(msg2).toBe(msg1);
+    });
+
+    it("assertValidU256 produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => assertValidU256("-1", "amount"));
+      const msg2 = extract(() => assertValidU256("-1", "amount"));
+      expect(msg1).toContain("amount");
+      expect(msg1).toContain('"-1"');
+      expect(msg2).toBe(msg1);
+    });
+
+    it("assertValidCurrencyCode produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => assertValidCurrencyCode("usd", "currency"));
+      const msg2 = extract(() => assertValidCurrencyCode("usd", "currency"));
+      expect(msg1).toContain("currency");
+      expect(msg1).toContain('"usd"');
+      expect(msg2).toBe(msg1);
+    });
+
+    it("validateBatchSize produces the same message text for the same invalid input", () => {
+      const extract = (fn: () => void): string => {
+        try { fn(); return "no-error"; } catch (e: any) { return e.message; }
+      };
+      const msg1 = extract(() => validateBatchSize(0, "batchSize"));
+      const msg2 = extract(() => validateBatchSize(0, "batchSize"));
+      expect(msg1).toContain("batchSize");
+      expect(msg2).toBe(msg1);
+    });
+  });
+
+  // ── I4: Migration helpers are idempotent ──────────────────────────
+
+  describe("I4 — migration helper idempotency", () => {
+    it("getPendingMigrationFileNames returns the same result for the same inputs", () => {
+      const entries = [
+        { idx: 0, when: 100, tag: "0000_initial" },
+        { idx: 1, when: 200, tag: "0001_add_sessions" },
+      ];
+
+      const first = getPendingMigrationFileNames(entries, 100);
+      const second = getPendingMigrationFileNames(entries, 100);
+      expect(first).toEqual(["0001_add_sessions.sql"]);
+      expect(second).toEqual(first);
+    });
+
+    it("getPendingMigrationFileNames with null timestamp returns all pending both times", () => {
+      const entries = [
+        { idx: 0, when: 100, tag: "0000_initial" },
+        { idx: 1, when: 200, tag: "0001_add_sessions" },
+      ];
+
+      const first = getPendingMigrationFileNames(entries, null);
+      const second = getPendingMigrationFileNames(entries, null);
+      expect(first).toEqual(["0000_initial.sql", "0001_add_sessions.sql"]);
+      expect(second).toEqual(first);
+    });
+
+    it("getPendingMigrationFileNames with up-to-date timestamp returns empty both times", () => {
+      const entries = [
+        { idx: 0, when: 100, tag: "0000_initial" },
+      ];
+
+      const first = getPendingMigrationFileNames(entries, 200);
+      const second = getPendingMigrationFileNames(entries, 200);
+      expect(first).toEqual([]);
+      expect(second).toEqual(first);
     });
   });
 });

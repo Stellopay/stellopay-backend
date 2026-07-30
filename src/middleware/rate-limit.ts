@@ -4,6 +4,7 @@ import rateLimit, {
   ipKeyGenerator,
 } from "express-rate-limit";
 import type { Request, Response } from "express";
+import { IdempotencyKeySchema } from "../utils/validation.js";
 
 // ---------------------------------------------------------------------------
 // Idempotency-Key support
@@ -29,11 +30,7 @@ export const X_IDEMPOTENT_REPLAYED_HEADER = "X-Idempotent-Replayed";
 export function getIdempotencyKey(req: Request): string | undefined {
   const value = req.headers[IDEMPOTENCY_KEY_HEADER.toLowerCase()];
   if (typeof value !== "string" || value.length === 0) return undefined;
-  // Enforce a safe character set for idempotency keys: alphanumerics, hyphen, underscore.
-  // Reject keys containing whitespace or control characters to avoid injection risks.
-  const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9_-]{1,255}$/;
-  if (!IDEMPOTENCY_KEY_REGEX.test(value)) return undefined;
-  return value;
+  return IdempotencyKeySchema.safeParse(value).success ? value : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +118,15 @@ export interface MakeLimiterOptions {
    * see the store limitation note on {@link makeLimiter}.
    */
   store?: Store;
+  /**
+   * Optional cost function to determine the weight of the request.
+   * Useful for batching or pagination where a single request consumes
+   * multiple tokens. The limiter scales the effective max requests inversely
+   * to the cost.
+   *
+   * Requests where the cost alone exceeds `max` are immediately throttled.
+   */
+  cost?: (req: Request) => number | Promise<number>;
   /**
    * Enable idempotency-key deduplication. When `true`, requests with the same
    * `Idempotency-Key` header **and** the same client IP are deduplicated:
@@ -282,7 +288,20 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
 
   const baseLimiter = rateLimit({
     windowMs,
-    max,
+    limit: options.cost
+      ? async (req: Request, res: Response) => {
+          const baseMax = max;
+          try {
+            const c = await options.cost!(req);
+            if (c <= 0) return baseMax;
+            if (c > baseMax) return 0;
+            return Math.floor(baseMax / c);
+          } catch (err) {
+            console.error(`[rate-limit] cost function threw for limiter="${name}":`, err);
+            return baseMax;
+          }
+        }
+      : max,
     message,
     // Disable legacy `X-RateLimit-*` headers and the draft standard
     // `RateLimit-*` headers. Clients should rely on `Retry-After` (set

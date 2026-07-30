@@ -21,20 +21,12 @@ vi.mock("nodemailer", () => ({
   default: { createTransport: () => ({ sendMail }) },
 }));
 
-import { makeLimiter } from "../middleware/rate-limit";
 import { contactRouter } from "./contact";
 
 function makeApp() {
   const app = express();
   app.set("trust proxy", 1);
   app.use(express.json());
-  const contactLimiter = makeLimiter({
-    name: "contact",
-    windowMs: envMock.RATE_LIMIT_CONTACT_WINDOW_MS,
-    max: envMock.RATE_LIMIT_CONTACT_MAX,
-    message: "Too many contact form submissions. Please try again later.",
-  });
-  app.use("/api/v1/contact", contactLimiter);
   app.use("/api/v1", contactRouter);
   return app;
 }
@@ -58,6 +50,7 @@ describe("POST /contact/send-message", () => {
   it("rejects missing fields with 400 and does not send", async () => {
     const res = await request(makeApp())
       .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.1")
       .send({ firstName: "Ada" });
     expect(res.status).toBe(400);
     expect(sendMail).not.toHaveBeenCalled();
@@ -66,6 +59,7 @@ describe("POST /contact/send-message", () => {
   it("rejects an oversized message with 400", async () => {
     const res = await request(makeApp())
       .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.2")
       .send({ ...valid, message: "x".repeat(5001) });
     expect(res.status).toBe(400);
     expect(sendMail).not.toHaveBeenCalled();
@@ -74,12 +68,16 @@ describe("POST /contact/send-message", () => {
   it("rejects an invalid email with 400", async () => {
     const res = await request(makeApp())
       .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.3")
       .send({ ...valid, email: "not-an-email" });
     expect(res.status).toBe(400);
   });
 
   it("dev-mode without credentials returns success without sending", async () => {
-    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
+    const res = await request(makeApp())
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.4")
+      .send(valid);
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(sendMail).not.toHaveBeenCalled();
@@ -90,7 +88,10 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_USER = "sender@gmail.com";
     envMock.EMAIL_PASSWORD = "app-password";
     // CONTACT_RECIPIENT_EMAIL intentionally left unset
-    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
+    const res = await request(makeApp())
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.5")
+      .send(valid);
     expect(res.status).toBe(503);
     expect(sendMail).not.toHaveBeenCalled();
   });
@@ -101,6 +102,7 @@ describe("POST /contact/send-message", () => {
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     const res = await request(makeApp())
       .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.6")
       .send({ ...valid, message: "<script>alert(1)</script>" });
 
     expect(res.status).toBe(200);
@@ -116,7 +118,10 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_PASSWORD = "app-password";
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     sendMail.mockRejectedValueOnce(new Error("smtp down"));
-    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
+    const res = await request(makeApp())
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.7")
+      .send(valid);
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/Failed to send/);
   });
@@ -127,7 +132,10 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_PASSWORD = "app-password";
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     sendMail.mockRejectedValueOnce(new Error("smtp down"));
-    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
+    const res = await request(makeApp())
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.8")
+      .send(valid);
     expect(res.status).toBe(500);
     expect(res.body.details).toBeUndefined();
   });
@@ -137,33 +145,54 @@ describe("POST /contact/send-message", () => {
     envMock.EMAIL_PASSWORD = "app-password";
     envMock.CONTACT_RECIPIENT_EMAIL = "team@stellopay.com";
     sendMail.mockRejectedValueOnce("smtp exploded"); // a thrown string, not an Error
-    const res = await request(makeApp()).post("/api/v1/contact/send-message").send(valid);
+    const res = await request(makeApp())
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.0.9")
+      .send(valid);
     expect(res.status).toBe(500);
   });
 });
 
 describe("Contact endpoint rate limiting", () => {
   it("allows requests up to the configured limit", async () => {
-    envMock.RATE_LIMIT_CONTACT_MAX = 3;
     const app = makeApp();
 
-    // First 3 requests should succeed
+    // First 3 requests should succeed (default max). Use a unique IP
+    // to avoid cross-test contamination from the module-scoped limiter.
     for (let i = 0; i < 3; i++) {
-      const res = await request(app).post("/api/v1/contact/send-message").send(valid);
+      const res = await request(app)
+        .post("/api/v1/contact/send-message")
+        .set("X-Forwarded-For", "10.0.1.1")
+        .send(valid);
       expect(res.status).toBe(200);
     }
   });
 
   it("returns 429 with standard error envelope when limit is exceeded", async () => {
-    envMock.RATE_LIMIT_CONTACT_MAX = 2;
     const app = makeApp();
 
-    // First 2 requests succeed
-    await request(app).post("/api/v1/contact/send-message").send(valid).expect(200);
-    await request(app).post("/api/v1/contact/send-message").send(valid).expect(200);
+    // First 3 requests succeed (default max) from a unique IP
+    await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.1.2")
+      .send(valid)
+      .expect(200);
+    await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.1.2")
+      .send(valid)
+      .expect(200);
+    await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.1.2")
+      .send(valid)
+      .expect(200);
 
-    // Third request exceeds limit
-    const res = await request(app).post("/api/v1/contact/send-message").send(valid);
+    // Fourth request exceeds the default limit (max=3)
+    const res = await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.1.2")
+      .send(valid);
     expect(res.status).toBe(429);
     expect(res.body).toEqual({
       error: "Too many contact form submissions. Please try again later.",
@@ -172,10 +201,19 @@ describe("Contact endpoint rate limiting", () => {
   });
 
   it("enforces rate limiting per IP address", async () => {
-    envMock.RATE_LIMIT_CONTACT_MAX = 1;
     const app = makeApp();
 
-    // Client A exhausts their single request
+    // Client A exhausts their 3 requests
+    await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "198.51.100.1")
+      .send(valid)
+      .expect(200);
+    await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "198.51.100.1")
+      .send(valid)
+      .expect(200);
     await request(app)
       .post("/api/v1/contact/send-message")
       .set("X-Forwarded-For", "198.51.100.1")
@@ -197,11 +235,14 @@ describe("Contact endpoint rate limiting", () => {
   });
 
   it("preserves existing contact endpoint behaviour for valid requests", async () => {
-    envMock.RATE_LIMIT_CONTACT_MAX = 10;
     const app = makeApp();
 
-    // Valid request should still succeed with rate limiter applied
-    const res = await request(app).post("/api/v1/contact/send-message").send(valid);
+    // Valid request should still succeed with rate limiter applied.
+    // Use a unique IP to avoid cross-test contamination.
+    const res = await request(app)
+      .post("/api/v1/contact/send-message")
+      .set("X-Forwarded-For", "10.0.1.3")
+      .send(valid);
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
   });

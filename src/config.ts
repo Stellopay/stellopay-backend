@@ -23,6 +23,9 @@ export const EnvSchema = z
     /** Database connection string for indexed data (required for startup and health checks). */
     POSTGRES_CONNECTION_STRING: z.string().url(),
 
+    /** Optional read-only replica; primary is used when unset. */
+    POSTGRES_READ_REPLICA_CONNECTION_STRING: z.string().url().optional(),
+
     // ═════════════════════════════════════════════════════════════════════
     // OPTIONAL — fall back to documented defaults when unset.
     // ═════════════════════════════════════════════════════════════════════
@@ -146,8 +149,75 @@ export const EnvSchema = z
       .positive()
       .optional()
       .default(200),
+
+    // Optional Redis endpoint for sharing rate-limit counters across replicas.
+    REDIS_URL: z.string().url().optional(),
     // Trust proxy for correct client IP detection (set to number of proxies or 'true' for single proxy)
     TRUST_PROXY: z.string().optional().default("1"),
+
+    // Comma-separated list of admin addresses for privileged routes.
+    ADMIN_ADDRESSES: z
+      .string()
+      .optional()
+      .default("")
+      .transform((s) =>
+        s
+          .split(",")
+          .map((a) => a.trim().toLowerCase())
+          .filter((a) => a.length > 0),
+      ),
+
+    // Analytics aggregation in-process cache TTL (milliseconds).
+    // Repeated identical requests within this window hit the in-memory cache
+    // instead of re-running expensive aggregation queries. Default is 30 s
+    // (≈ 2–5 Starknet blocks) which is conservative enough that a re-fetch after
+    // a new block will see up-to-date data within a reasonable time.
+    ANALYTICS_CACHE_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(30_000),
+
+    // Optional shared cache for analytics responses. When unset, the route
+    // uses its existing in-process cache.
+    REDIS_URL: z.string().url().optional(),
+
+    // Session token lifetime in milliseconds (sliding expiry) — default 24 hours
+    SESSION_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(24 * 60 * 60 * 1000),
+
+    // Absolute maximum session lifetime in milliseconds — default 7 days
+    SESSION_MAX_TTL_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(7 * 24 * 60 * 60 * 1000),
+
+    // Feature flag: set to "true" to enable billing profile endpoints.
+    // When false (default) all /billing/* routes return 501 Not Implemented.
+    BILLING_ENABLED: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((v) => v === "true"),
+
+    // Drain timeout for graceful shutdown (milliseconds) — default 10000 (10 seconds)
+    SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(10000),
+
+    // Retry configuration for initial DB connectivity check
+    DB_CONNECTION_RETRY_MAX_ATTEMPTS: z.coerce.number().int().positive().optional().default(5),
+    DB_CONNECTION_RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().optional().default(500),
 
     // Indexed query cache max-age in seconds.
     // Controls Cache-Control: public, max-age=<N> on indexed read responses.
@@ -198,6 +268,28 @@ export const EnvSchema = z
     .positive()
     .optional()
     .default(60_000),
+
+    // Graceful shutdown drain timeout (milliseconds) — default 10 seconds
+    SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(10_000),
+
+    // Feature flag for billing endpoints — default false
+    BILLING_ENABLED: z
+      .string()
+      .optional()
+      .default("false")
+      .transform((v) => v === "true"),
+
+    // Maximum allowed billing amount per request — default 1,000,000
+    MAX_BILLING_AMOUNT: z.coerce
+      .number()
+      .positive()
+      .optional()
+      .default(1_000_000),
 })
   .superRefine((data, ctx) => {
     const isDev =

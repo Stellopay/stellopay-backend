@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { normalizeStarknetAddress } from "./address.js";
+import { env } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -59,6 +60,17 @@ export interface ValidationErrorMetric {
 
 /** Maximum number of characters of an input echoed into diagnostics. */
 export const INPUT_PREVIEW_MAX_LENGTH = 40;
+
+/**
+ * Canonical unsigned decimal strings used for Starknet token amounts.
+ * Amounts stay as strings at the HTTP boundary so callers cannot lose
+ * precision through JavaScript number coercion. Leading zeros and whitespace
+ * are rejected; `0` is the only valid zero representation, and the 78-digit
+ * limit matches the maximum width of a u256 decimal value.
+ */
+export const StrictDecimalString = z
+  .string()
+  .regex(/^(0|[1-9][0-9]{0,77})$/, "must be a canonical decimal string");
 
 /** Lowest status a validation failure may map to. */
 const MIN_VALIDATION_STATUS = 400;
@@ -341,6 +353,47 @@ export function formatValidationError(error: unknown): ValidationErrorResponse {
 // ---------------------------------------------------------------------------
 
 /**
+ * Zod schema for a numeric pagination cursor supplied as a query parameter.
+ *
+ * Cursors in this API are opaque positive-integer strings produced by the
+ * previous page response's `nextCursor` field.  The validator:
+ *
+ *   - Accepts only strings that consist entirely of ASCII digits (`/^\d+$/`),
+ *     so hex values, floats, negative numbers, whitespace-padded values, and
+ *     SQL-injection fragments are all rejected before they reach any query
+ *     builder or database call.
+ *   - Coerces the validated string to a positive integer via `Number()` and
+ *     rejects the result if it is not a safe, positive integer — ruling out
+ *     `"0"`, `"000"` (leading zeros), and values beyond `Number.MAX_SAFE_INTEGER`.
+ *   - Is intentionally narrow: it does NOT accept base64 or any other
+ *     encoding.  If the cursor format changes, a new schema should be added
+ *     rather than broadening this one.
+ *
+ * @example
+ * NumericCursorSchema.parse("42");    // → 42
+ * NumericCursorSchema.parse("0");     // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("abc");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("1.5");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse(" 1 ");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("007");   // throws ZodError: must be a positive integer string with no leading zeros
+ * NumericCursorSchema.parse("1; DROP TABLE agreements;--"); // throws ZodError
+ */
+export const NumericCursorSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/, "cursor must be a positive integer string with no leading zeros")
+  .transform((val, ctx) => {
+    const n = Number(val);
+    if (!Number.isInteger(n) || n <= 0 || !Number.isSafeInteger(n)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "cursor must be a positive integer",
+      });
+      return z.NEVER;
+    }
+    return n;
+  });
+
+/**
  * Zod schema for a Starknet address supplied as a path or query parameter.
  * Accepts a hex string of up to 64 hex characters (the felt width), with or
  * without a 0x prefix, and transforms it to the canonical lookup form via
@@ -392,6 +445,17 @@ export const AgreementId = z
   .string()
   .trim()
   .regex(/^\d+$/, "agreement_id must be a numeric string");
+
+/**
+ * Shared schema for request idempotency keys.
+ *
+ * Keeping this constraint in one place prevents middleware from accepting
+ * different key formats and avoids storing whitespace or control characters
+ * in replay caches.
+ */
+export const IdempotencyKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,255}$/, "Invalid idempotency key");
 
 export const MAX_PAGE_LIMIT = 100;
 
@@ -452,12 +516,6 @@ function clampPaginationField(value: unknown, fallback: number, min: number, max
  * parsePagination({ offset: "-3" });  // { limit: 50, offset: 0 }
  * parsePagination(null);              // { limit: 50, offset: 0 }
  */
-/** @see parsePagination — this exists solely to support its null/"" normalization */
-function coerceNullOrEmptyToUndefined(value: unknown): unknown {
-  if (value === null || value === "") return undefined;
-  return value;
-}
-
 /**
  * Parses and clamps pagination query parameters. Clamping happens server-side
  * so a client cannot request an unbounded, zero, or negative page: `limit` is
@@ -491,4 +549,165 @@ export function parsePagination(query: unknown): {
     limit: clampPaginationField(source.limit, DEFAULT_PAGE_LIMIT, 1, MAX_PAGE_LIMIT),
     offset: clampPaginationField(source.offset, 0, 0, Number.MAX_SAFE_INTEGER),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Billing Request Validation
+// ---------------------------------------------------------------------------
+
+/** Supported currency codes for billing operations. */
+export const SUPPORTED_CURRENCIES = [
+  "USD",
+  "EUR",
+  "GBP",
+  "CAD",
+  "AUD",
+  "JPY",
+  "CHF",
+] as const;
+
+export type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
+
+/**
+ * Zod schema for currency code validation.
+ * Rejects unknown currencies, invalid formats, empty values, and incorrect casing.
+ */
+export const CurrencyCodeSchema = z
+  .string()
+  .trim()
+  .min(1, "Currency code is required")
+  .regex(/^[A-Z]{3}$/, "Invalid currency code format: must be 3 uppercase ASCII letters")
+  .superRefine((val, ctx) => {
+    if (!(SUPPORTED_CURRENCIES as readonly string[]).includes(val)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unsupported currency code '${val}'. Supported currencies: ${SUPPORTED_CURRENCIES.join(", ")}`,
+      });
+    }
+  });
+
+/**
+ * Factory function creating a Zod schema for billing amount validation.
+ * Rejects zero, negative values, null/undefined, NaN, and amounts exceeding maxAmount.
+ */
+export function createBillingAmountSchema(maxAmount: number = env.MAX_BILLING_AMOUNT) {
+  return z
+    .union([z.number(), z.string()])
+    .transform((val, ctx) => {
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (trimmed === "") {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Billing amount is required",
+          });
+          return z.NEVER;
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Billing amount must be a valid finite number",
+          });
+          return z.NEVER;
+        }
+        return parsed;
+      }
+      if (typeof val === "number") {
+        if (!Number.isFinite(val)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Billing amount must be a valid finite number",
+          });
+          return z.NEVER;
+        }
+        return val;
+      }
+      return val;
+    })
+    .pipe(
+      z
+        .number()
+        .gt(0, "Billing amount must be greater than zero")
+        .max(maxAmount, `Billing amount exceeds maximum allowed limit of ${maxAmount}`)
+    );
+}
+
+/** Default BillingAmountSchema using configured MAX_BILLING_AMOUNT. */
+export const BillingAmountSchema = createBillingAmountSchema();
+
+export interface BillingInput {
+  currency?: unknown;
+  amount?: unknown;
+}
+
+export interface BillingValidationOptions {
+  requireCurrency?: boolean;
+  requireAmount?: boolean;
+  maxAmount?: number;
+}
+
+/**
+ * Centralized, reusable billing input validator.
+ * Validates currency code and billing amount against supported rules.
+ */
+export function validateBillingInput(
+  input: BillingInput,
+  options: BillingValidationOptions = {}
+): { currency?: string; amount?: number } {
+  const {
+    requireCurrency = false,
+    requireAmount = false,
+    maxAmount = env.MAX_BILLING_AMOUNT,
+  } = options;
+
+  const result: { currency?: string; amount?: number } = {};
+
+  // Currency validation
+  if (input.currency !== undefined && input.currency !== null && input.currency !== "") {
+    result.currency = loggedParse(
+      CurrencyCodeSchema,
+      input.currency,
+      "BillingCurrencyValidator"
+    );
+  } else if (requireCurrency) {
+    loggedParse(
+      CurrencyCodeSchema,
+      input.currency,
+      "BillingCurrencyValidator"
+    );
+  }
+
+  // Amount validation
+  if (input.amount !== undefined && input.amount !== null && input.amount !== "") {
+    const amountSchema = createBillingAmountSchema(maxAmount);
+    result.amount = loggedParse(
+      amountSchema,
+      input.amount,
+      "BillingAmountValidator"
+    );
+  } else if (requireAmount) {
+    const amountSchema = createBillingAmountSchema(maxAmount);
+    loggedParse(
+      amountSchema,
+      input.amount,
+      "BillingAmountValidator"
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Helper to extract and validate billing input from an Express Request object.
+ */
+export function validateBillingRequest(
+  req: { query?: Record<string, unknown>; body?: Record<string, unknown> },
+  options: BillingValidationOptions = {}
+): { currency?: string; amount?: number } {
+  const input: BillingInput = {
+    currency: req.query?.currency ?? req.body?.currency,
+    amount: req.query?.amount ?? req.body?.amount,
+  };
+  return validateBillingInput(input, options);
 }

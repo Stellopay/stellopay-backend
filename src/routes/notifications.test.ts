@@ -48,21 +48,23 @@ const { dbMock, schemaMock, queryState, USDC_TOKEN_ADDRESS } = vi.hoisted(() => 
     },
     eqValues: [] as string[],
     limitCalls: [] as number[],
+    failure: undefined as Error | undefined,
   };
 
   const db = {
     select: vi.fn(() => ({
       from: vi.fn((table: { __name: TableName }) => {
-        const rows = state.rows[table.__name] ?? [];
+        const result = () =>
+          state.failure ? Promise.reject(state.failure) : Promise.resolve(state.rows[table.__name] ?? []);
         const chainable = {
           orderBy: vi.fn(() => ({
             limit: vi.fn((limit: number) => {
               state.limitCalls.push(limit);
-              return Promise.resolve(rows);
+              return result();
             }),
           })),
           then: (resolve: (value: unknown) => void, reject: (reason?: unknown) => void) =>
-            Promise.resolve(rows).then(resolve, reject),
+            result().then(resolve, reject),
         };
         return { where: vi.fn(() => chainable) };
       }),
@@ -74,6 +76,7 @@ const { dbMock, schemaMock, queryState, USDC_TOKEN_ADDRESS } = vi.hoisted(() => 
 
 vi.mock("../config.js", () => ({
   env: {
+    LOG_FORMAT: "json",
     TOKEN_STRK: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
     TOKEN_USDC: USDC_TOKEN_ADDRESS,
     TOKEN_USDT: "0x02ab8758891e84b968ff11361789070c6b1af2df618d6d2f4a78b0757573c6eb",
@@ -163,6 +166,7 @@ function makeEscrowEvent(
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   queryState.rows.payments = [];
   queryState.rows.agreements = [];
@@ -170,6 +174,7 @@ beforeEach(() => {
   queryState.rows.escrowEvents = [];
   queryState.eqValues = [];
   queryState.limitCalls = [];
+  queryState.failure = undefined;
 });
 
 describe("notification preferences & unread count helpers", () => {
@@ -204,9 +209,120 @@ describe("notification preferences & unread count helpers", () => {
   it("returns zero unread items for an empty list", () => {
     expect(calculateUnreadCount([])).toBe(0);
   });
+
+  it("deduplicates notifications by id when computing unread count", () => {
+    // Regression guard: calculateUnreadCount tracks unique IDs to avoid
+    // double-counting the same notification if it appears twice in the list.
+    const list = [
+      { id: "notif-1", read: false },
+      { id: "notif-2", read: false },
+      { id: "notif-1", read: false }, // duplicate ID
+    ];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+
+  it("counts notifications without id fields individually", () => {
+    // Notifications without an `id` field cannot be deduplicated; each is
+    // counted independently.
+    const list = [
+      { read: false },
+      { read: false },
+      { id: "notif-1", read: false },
+    ];
+    expect(calculateUnreadCount(list)).toBe(3);
+  });
+
+  it("handles mixed types of id (string and number) correctly", () => {
+    const list = [
+      { id: "notif-1", read: false },
+      { id: 123, read: false },
+      { id: "notif-1", read: false }, // duplicate string ID
+      { id: 123, read: false }, // duplicate numeric ID
+    ];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+
+  it("returns zero when duplicate IDs are all read", () => {
+    // Regression guard: a list where every entry is read=true, including
+    // duplicates, must yield 0 — the dedup path must not accidentally count
+    // read items as unread when they appear more than once.
+    const list = [
+      { id: "notif-1", read: true },
+      { id: "notif-1", read: true },
+      { id: "notif-2", read: true },
+    ];
+    expect(calculateUnreadCount(list)).toBe(0);
+  });
+
+  it("ignores missing or malformed read values so they do not inflate unread counts", () => {
+    // Boundary guard: only explicit `read: false` items count as unread.
+    // This keeps replayed or partially hydrated records from being treated
+    // as unread by accident.
+    const list = [
+      { id: "notif-1", read: false },
+      { id: "notif-2" },
+      { id: "notif-3", read: undefined },
+      { id: "notif-4", read: true },
+    ];
+    expect(calculateUnreadCount(list)).toBe(1);
+  });
+
+  it("treats numeric id 0 as a valid deduplication key", () => {
+    // Edge case: id=0 is falsy in JS but must still be tracked as a unique key.
+    const list = [
+      { id: 0, read: false },
+      { id: 0, read: false }, // duplicate of id 0
+      { id: 1, read: false },
+    ];
+    expect(calculateUnreadCount(list)).toBe(2);
+  });
+
+  it("unreadCount always equals the number of items returned when all are unread", () => {
+    // Invariant: since every notification has read=false, calculateUnreadCount
+    // must equal the array length. This is the property the route depends on
+    // to keep `unreadCount` in sync with `total`.
+    const items = [
+      { id: "a", read: false as const },
+      { id: "b", read: false as const },
+      { id: "c", read: false as const },
+    ];
+    expect(calculateUnreadCount(items)).toBe(items.length);
+  });
 });
 
 describe("notifications route", () => {
+  it("emits structured preference and unread-count telemetry for a successful response", async () => {
+    queryState.rows.payments = [makePayment()];
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
+
+    const telemetry = JSON.parse(info.mock.calls[0][0] as string);
+    expect(telemetry).toMatchObject({
+      metric: "notification_preferences_and_unread_count",
+      operation: "notification_feed",
+      status: "success",
+      notification_count: 1,
+      unread_count: 1,
+      preferences_enabled: 4,
+    });
+    expect(telemetry).not.toHaveProperty("user_address");
+  });
+
+  it("emits a structured failure record when notification retrieval fails", async () => {
+    queryState.failure = new Error("database unavailable");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(500);
+
+    expect(JSON.parse(error.mock.calls[0][0] as string)).toMatchObject({
+      metric: "notification_preferences_and_unread_count",
+      operation: "notification_feed",
+      status: "error",
+      error: "database unavailable",
+    });
+  });
+
   it("returns an empty aggregation when no events match the user", async () => {
     const res = await request(makeApp())
       .get("/api/v1/notifications/abc")
@@ -234,6 +350,7 @@ describe("notifications route", () => {
       makeEscrowEvent({ id: "escrow-1", eventType: "Funded" }),
     ];
 
+    const res = await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
     await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
 
     expect(dbMock.select).toHaveBeenCalledTimes(4);
@@ -484,6 +601,157 @@ describe("notifications route", () => {
       .get("/api/v1/notifications/abc")
       .expect(200);
     expect(res.body.notifications[0].message).toBe("Agreement 999: Released of 1000000 tokens");
+  });
+
+  it("preserves the response envelope shape for backward compatibility", async () => {
+    // Backward-compatibility contract: the response must have exactly the
+    // three documented top-level keys, and notifications must be an array.
+    // Older callers destructure this shape and break if keys are renamed.
+    queryState.rows.payments = [makePayment()];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    expect(res.body).toHaveProperty("notifications");
+    expect(res.body).toHaveProperty("total");
+    expect(res.body).toHaveProperty("unreadCount");
+    expect(Array.isArray(res.body.notifications)).toBe(true);
+    expect(typeof res.body.total).toBe("number");
+    expect(typeof res.body.unreadCount).toBe("number");
+  });
+
+  it("preserves the notification item shape with all required fields", async () => {
+    // Backward-compatibility contract: each notification item must have the
+    // seven documented fields. Older callers reference these by name.
+    queryState.rows.payments = [
+      makePayment({
+        id: "test-payment",
+        eventType: "PaymentReceived",
+        transactionHash: "0xtest",
+        amount: "1000000",
+        token: USDC_TOKEN_ADDRESS,
+        createdAt: new Date("2026-07-28T12:00:00Z"),
+      }),
+    ];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    const item = res.body.notifications[0];
+    expect(item).toHaveProperty("id");
+    expect(item).toHaveProperty("title");
+    expect(item).toHaveProperty("message");
+    expect(item).toHaveProperty("read");
+    expect(item).toHaveProperty("date");
+    expect(item).toHaveProperty("type");
+    expect(item).toHaveProperty("txHash");
+
+    expect(typeof item.id).toBe("string");
+    expect(typeof item.title).toBe("string");
+    expect(typeof item.message).toBe("string");
+    expect(typeof item.read).toBe("boolean");
+    expect(typeof item.date).toBe("string");
+    expect(typeof item.type).toBe("string");
+    expect(typeof item.txHash).toBe("string");
+  });
+
+  it("always returns read=false for all notifications (no persistent read state)", async () => {
+    // Backward-compatibility contract: every notification has `read: false`
+    // since server-side read state is not yet persisted. Older callers may
+    // rely on this behavior for client-side unread tracking.
+    queryState.rows.payments = [makePayment(), makePayment({ id: "p2" })];
+    queryState.rows.agreements = [{ id: "1", token: USDC_TOKEN_ADDRESS }];
+    queryState.rows.agreementEvents = [makeAgreementEvent()];
+    queryState.rows.escrowEvents = [makeEscrowEvent()];
+
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    expect(res.body.notifications.length).toBeGreaterThan(0);
+    expect(res.body.notifications.every((n: { read: boolean }) => n.read === false)).toBe(
+      true,
+    );
+  });
+
+  it("returns ISO 8601 timestamp strings in the date field", async () => {
+    // Backward-compatibility contract: date field is an ISO 8601 string.
+    // Older callers parse this with `new Date(item.date)` or similar.
+    queryState.rows.payments = [
+      makePayment({ createdAt: new Date("2026-07-28T14:30:00.000Z") }),
+    ];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    const item = res.body.notifications[0];
+    expect(item.date).toBe("2026-07-28T14:30:00.000Z");
+    // Verify it's a valid ISO 8601 string that Date can parse
+    expect(new Date(item.date).toISOString()).toBe(item.date);
+  });
+
+  it("enforces the documented maximum limit of 50", async () => {
+    // Backward-compatibility contract: limit=50 is the documented max.
+    // Out-of-range values are rejected with 400 rather than silently clamped.
+    await request(makeApp()).get("/api/v1/notifications/abc?limit=50").expect(200);
+    await request(makeApp()).get("/api/v1/notifications/abc?limit=51").expect(400);
+  });
+
+  it("handles case-insensitive and unprefixed Starknet addresses", async () => {
+    // StarknetAddress.parse normalizes various address formats.
+    // Verify that both prefixed and unprefixed hex strings are accepted.
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
+    await request(makeApp())
+      .get("/api/v1/notifications/0x0abc")
+      .expect(200);
+    await request(makeApp())
+      .get("/api/v1/notifications/ABC")
+      .expect(200);
+  });
+
+  it("accepts limit=1 (the minimum documented value) without error", async () => {
+    // Boundary: limit=1 is the smallest valid page size. The Zod schema uses
+    // .positive() which accepts 1. Confirm the route accepts it and returns
+    // the correct envelope shape.
+    queryState.rows.payments = [makePayment(), makePayment({ id: "p2" })];
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc?limit=1")
+      .expect(200);
+    expect(res.body.limit).toBe(1);
+    expect(res.body.notifications).toHaveLength(1);
+    expect(res.body.total).toBe(1);
+    expect(res.body.hasMore).toBe(true);
+  });
+
+  it("unreadCount always equals total in the response (read=false invariant)", async () => {
+    // Invariant: every notification emitted by the route has read=false, so
+    // unreadCount must equal total on every valid response. This is the
+    // property callers rely on when using unreadCount as a badge count.
+    queryState.rows.payments = [makePayment(), makePayment({ id: "p2" }), makePayment({ id: "p3" })];
+    queryState.rows.agreements = [{ id: "1", token: USDC_TOKEN_ADDRESS }];
+    queryState.rows.agreementEvents = [makeAgreementEvent()];
+    queryState.rows.escrowEvents = [makeEscrowEvent()];
+
+    const res = await request(makeApp())
+      .get("/api/v1/notifications/abc")
+      .expect(200);
+
+    expect(res.body.unreadCount).toBe(res.body.total);
+  });
+
+  it("telemetry preferences_enabled is always 4 (all default categories enabled)", async () => {
+    // Regression guard: logNotificationsTelemetry receives
+    // preferences_enabled = Object.values(getDefaultNotificationPreferences()).filter(Boolean).length
+    // which must be exactly 4 (payments + agreements + escrow + disputes).
+    // If getDefaultNotificationPreferences ever changed a default to false,
+    // this test would catch the unintended telemetry regression.
+    queryState.rows.payments = [makePayment()];
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    await request(makeApp()).get("/api/v1/notifications/abc").expect(200);
+
+    const telemetry = JSON.parse(info.mock.calls[0][0] as string);
+    expect(telemetry.preferences_enabled).toBe(4);
   });
 });
 

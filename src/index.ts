@@ -31,6 +31,8 @@ import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
 import { verifyAbiCompatibility } from "./starknet/abi.js";
 import { provider, getEscrowAbi, getAgreementAbi } from "./starknet/client.js";
+import Redis from "ioredis";
+import { RedisStore } from "rate-limit-redis";
 
 export const app = express();
 initLogger();
@@ -84,12 +86,31 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
+// Prometheus scraping is intentionally outside /api/v1. Deployments should
+// restrict this endpoint at the network or ingress layer when metrics are
+// not intended to be public.
+app.get("/metrics", async (_req, res, next) => {
+  try {
+    res.setHeader("Content-Type", metricsRegistry.contentType);
+    res.send(await renderMetrics());
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use(dbReadinessMiddleware);
 
 // Rate limiting: limiters are built via the shared factory so the
 // keyGenerator (IP, honouring trust proxy) and JSON 429 envelope stay
 // consistent. See src/middleware/rate-limit.ts for the in-memory store
 // limitation and the shared-store (Redis) seam.
+const redisClient = env.REDIS_URL ? new Redis(env.REDIS_URL) : undefined;
+const rateLimitStore = redisClient
+  ? new RedisStore({
+      sendCommand: (...args: string[]) =>
+        redisClient.call(args[0]!, ...args.slice(1)),
+    })
+  : undefined;
 
 // Global limiter (looser) — applied to all /api routes; /health is exempt.
 const globalLimiter = makeLimiter({
@@ -97,6 +118,7 @@ const globalLimiter = makeLimiter({
   windowMs: env.RATE_LIMIT_WINDOW_MS,
   max: env.RATE_LIMIT_MAX,
   message: "Too many requests, please try again later.",
+  store: rateLimitStore,
   // Don't count /health requests against the rate limit.
   skip: (req) => req.path === "/health",
 });
@@ -107,6 +129,7 @@ const strictLimiter = makeLimiter({
   windowMs: env.RATE_LIMIT_STRICT_WINDOW_MS,
   max: env.RATE_LIMIT_STRICT_MAX,
   message: "Too many requests from this IP, please try again later.",
+  store: rateLimitStore,
 });
 
 // Contact form limiter (stricter) - prevents spam on the public contact form.
@@ -115,6 +138,7 @@ const contactLimiter = makeLimiter({
   windowMs: env.RATE_LIMIT_CONTACT_WINDOW_MS,
   max: env.RATE_LIMIT_CONTACT_MAX,
   message: "Too many contact form submissions. Please try again later.",
+  store: rateLimitStore,
 });
 
 // Analytics limiter - specific limit for analytics endpoints
@@ -123,6 +147,7 @@ const analyticsLimiter = makeLimiter({
   windowMs: env.RATE_LIMIT_ANALYTICS_WINDOW_MS,
   max: env.RATE_LIMIT_ANALYTICS_MAX,
   message: "Too many analytics requests, please try again later.",
+  store: rateLimitStore,
 });
 
 // Apply global rate limiter to all API routes
@@ -157,8 +182,6 @@ app.use("/api/v1", indexerStatusRouter);
 app.use("/api/v1", reprocessEventsRouter);
 app.use("/api/v1", diagnosticsRouter);
 app.use("/api/v1", backfillEventsRouter);
-// Apply contact-specific rate limiting to contact endpoint
-app.use("/api/v1/contact", contactLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
 app.use("/api/v1", apiV1NotFoundHandler);

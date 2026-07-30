@@ -6,6 +6,7 @@ import {
   boolean,
   timestamp,
   index,
+  uniqueIndex,
   numeric,
   check,
   type PgTableWithColumns,
@@ -24,7 +25,7 @@ import { sql } from "drizzle-orm";
  *
  * | # | Invariant | Rationale |
  * |---|-----------|-----------|
- * | I1 | **Table inventory** — exactly 10 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
+ * | I1 | **Table inventory** — exactly 11 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
  * | I2 | **FK index** — every `*Id` column mapped to `*_id` in SQL has a
  *        btree `index()` unless it is a PK or a documented exclusion
  *        (e.g. `taxId`). See `schema-fk-indexes.ts`. | Joins and filtered queries
@@ -48,6 +49,59 @@ import { sql } from "drizzle-orm";
  *        corresponding runtime validation helper exported from this module
  *        (e.g. `assertValidU256` matches the u256 CHECK). | Callers validate
  *        early to produce actionable errors instead of opaque DB violations. |
+ * | I8 | **Idempotency** — every exported helper is idempotent: calling it
+ *        multiple times with the same arguments produces the same result
+ *        (pure function contract, same-throw contract for assertion helpers). | Retries and
+ *        duplicate delivery must not produce ambiguous outcomes. A caller
+ *        that retries with the same input must observe the same output. |
+ *
+ * ## Idempotency contract
+ *
+ * Every exported function in this module is **idempotent** under the
+ * following rules:
+ *
+ * - **Query helpers** (`isValidU256`, `isValidCurrencyCode`,
+ *   `isValidNonNegativeInteger`, `clampPageLimit`, `clampBatchSize`,
+ *   `validateBatchSize`, `stripSensitiveBillingFields`): calling any of
+ *   these twice with the same arguments returns the same value both times
+ *   (pure-function contract).
+ * - **Assertion helpers** (`assertNonNegative`, `assertValidU256`,
+ *   `assertValidCurrencyCode`): calling any of these twice with the same
+ *   _valid_ arguments succeeds both times; calling them twice with the same
+ *   _invalid_ arguments throws a semantically equivalent error both times
+ *   (same-throw contract — error message may differ by stack trace).
+ * - **Migration helpers** (`getPendingMigrationFileNames`,
+ *   `withMigrationLock`): pure logic and transactional locks ensure the
+ *   migration system is safe to retry. Drizzle's migrator tracks applied
+ *   migrations, so applying the same migration set twice is a no-op.
+ *
+ * ## Backward-compatibility policy
+ *
+ * This module follows strict backward compatibility for the public API
+ * surface. The following are **breaking changes** and MUST bump
+ * {@link SCHEMA_COMPATIBILITY_VERSION}:
+ *
+ * - Removing or renaming any exported table definition
+ * - Removing or renaming any exported runtime validation helper
+ * - Changing the signature (parameter count, types, return type) of any
+ *   exported helper
+ * - Removing or renaming a named CHECK constraint
+ * - Changing the regex or logic in a shared constraint constant
+ *   (`U256_DECIMAL_REGEX`, `CURRENCY_CODE_REGEX`)
+ * - Changing the numeric value of `MAX_PAGE_SIZE`, `DEFAULT_PAGE_SIZE`, or
+ *   `MAX_BATCH_SIZE`
+ * - Removing items from `SENSITIVE_BILLING_FIELDS`
+ *
+ * The following are **safe additive changes** that preserve compatibility:
+ *
+ * - Adding a new table definition (requires entry in {@link SCHEMA_TABLES})
+ * - Adding a new CHECK constraint (must not collide with existing names)
+ * - Adding a new runtime validation helper following existing naming patterns
+ * - Adding a new column with a `DEFAULT` clause to an existing table
+ * - Adding new items to `SENSITIVE_BILLING_FIELDS` (tightening the boundary)
+ *
+ * Version is tracked via {@link SCHEMA_COMPATIBILITY_VERSION} and enforced
+ * by tests in `src/db/migration.test.ts`.
  *
  * ## Adding a new table
  *
@@ -173,6 +227,27 @@ export function assertValidU256(value: string, name: string): void {
   }
 }
 
+/**
+ * Asserts that `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters). Throws a descriptive {@link RangeError} when
+ * the assertion fails.
+ *
+ * Runtime counterpart of the DB-level CHECK constraints using
+ * {@link CURRENCY_CODE_REGEX} (e.g. `billing_profiles_currency_check`,
+ * `billing_invoices_currency_check`). Recording both a non-throwing
+ * `isValidCurrencyCode` and a throwing `assertValidCurrencyCode` mirrors the
+ * `isValidU256` / `assertValidU256` pair so callers can pick the level of
+ * strictness they need.
+ */
+export function assertValidCurrencyCode(code: string, name: string): void {
+  if (!CURRENCY_CODE_REGEX.test(code)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidCurrencyCode", name, value: code, reason: "invalid_format" });
+    throw new RangeError(
+      `${name} must be a valid ISO 4217-style currency code (exactly three uppercase ASCII letters), got "${code}"`,
+    );
+  }
+}
+
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
   "agreements",
@@ -245,6 +320,10 @@ export const agreementEvents = pgTable(
     contractAddressIdx: index("agreement_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("agreement_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("agreement_events_block_number_idx").on(table.blockNumber),
+    transactionPositionKey: uniqueIndex("agreement_events_transaction_position_key").on(
+      table.transactionHash,
+      table.eventIndex,
+    ),
     blockNumberCheck: check(
       "agreement_events_block_number_check",
       sql`${table.blockNumber} >= 0`,
@@ -370,6 +449,7 @@ export const escrowEvents = pgTable(
     contractAddressIdx: index("escrow_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("escrow_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("escrow_events_block_number_idx").on(table.blockNumber),
+    transactionPositionKey: uniqueIndex("escrow_events_transaction_position_key").on(table.id),
     blockNumberCheck: check("escrow_events_block_number_check", sql`${table.blockNumber} >= 0`),
     amountCheck: check(
       "escrow_events_amount_check",
@@ -450,6 +530,34 @@ export const billingProfiles = pgTable(
     ),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Security Boundary - Sensitive Fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields in the billing profiles schema that are sensitive and must be stripped
+ * before returning data through public API routes.
+ */
+export const SENSITIVE_BILLING_FIELDS = ["taxId", "dateOfBirth"] as const;
+
+export type SensitiveBillingFields = typeof SENSITIVE_BILLING_FIELDS[number];
+
+/**
+ * Strips sensitive fields from a billing profile object to enforce a security boundary
+ * and prevent privilege drift.
+ */
+export function stripSensitiveBillingFields<T extends Record<string, any>>(
+  profile: T,
+): Omit<T, SensitiveBillingFields> {
+  const copy = { ...profile };
+  for (const field of SENSITIVE_BILLING_FIELDS) {
+    if (field in copy) {
+      delete copy[field];
+    }
+  }
+  return copy;
+}
 
 /**
  * billing_payment_methods – payment methods attached to a billing profile.
@@ -534,6 +642,8 @@ export const backfillProgress = pgTable(
     jobName: text("job_name").primaryKey(),
     status: text("status").notNull().default("idle"),
     lastCursor: timestamp("last_cursor"),
+    lastBlockNumber: bigint("last_block_number", { mode: "number" }),
+    lastContractAddress: text("last_contract_address"),
     totalScanned: integer("total_scanned").notNull().default(0),
     totalCreated: integer("total_created").notNull().default(0),
     lastError: text("last_error"),
@@ -556,6 +666,47 @@ export const backfillProgress = pgTable(
     ),
   }),
 );
+
+/** Shared durable response cache used by idempotent mutating routes. */
+export const idempotencyKeys = pgTable(
+  "idempotency_keys",
+  {
+    route: text("route").notNull(),
+    key: text("key").notNull(),
+    bodyFingerprint: text("body_fingerprint").notNull(),
+    statusCode: integer("status_code").notNull(),
+    responseBody: jsonb("response_body").notNull().default({}),
+    expiresAt: timestamp("expires_at").notNull(),
+  },
+  (table) => ({
+    primaryKey: primaryKey({ columns: [table.route, table.key] }),
+    expiresAtIdx: index("idempotency_keys_expires_at_idx").on(table.expiresAt),
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Compatibility Version
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema compatibility version.
+ *
+ * Increment this when a **breaking change** is made to the public API surface
+ * of this module (see the backward-compatibility policy in the module header).
+ *
+ * Callers can check this value to guard against unexpected schema drift:
+ *
+ * ```ts
+ * import { SCHEMA_COMPATIBILITY_VERSION } from "./schema.js";
+ * if (SCHEMA_COMPATIBILITY_VERSION < 2) {
+ *   // handle old-format data
+ * }
+ * ```
+ *
+ * - Version `1` — initial stable contract (invariants I1–I7, all tables,
+ *   helpers, and CHECK constraints as of the initial migration set).
+ */
+export const SCHEMA_COMPATIBILITY_VERSION = 1;
 
 // ---------------------------------------------------------------------------
 // Pagination & Batching Constants
@@ -668,5 +819,5 @@ export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any>
   { name: "billingInvoices", table: billingInvoices },
   { name: "sessions", table: sessions },
   { name: "backfillProgress", table: backfillProgress },
+  { name: "idempotencyKeys", table: idempotencyKeys },
 ];
-

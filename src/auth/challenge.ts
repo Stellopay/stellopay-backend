@@ -17,8 +17,8 @@ import { normalizeStarknetAddress } from "../utils/address.js";
  *    - All functions strictly validate inputs before executing state modifications.
  *    - Write paths (`createChallenge`, `buildTypedChallenge`) throw descriptive, non-sensitive errors
  *      when supplied with missing, non-string, whitespace, or malformed input.
- *    - Read/eviction paths (`getChallenge`, `clearChallenge`, `consumeChallenge`) degrade fail-closed,
- *      returning `null` / no-op and logging structured metric events (`invalid_address`).
+ *    - Read/eviction paths (`getChallenge`, `clearChallenge`, `consumeChallenge`, `verifyChallenge`)
+ *      degrade fail-closed, returning `null` / no-op and logging structured metric events (`invalid_address`).
  *
  * 3. Secure Random Nonce Generation & Entropy:
  *    - Nonces are 16-byte (128-bit) CSPRNG values generated using `crypto.randomBytes(16)`.
@@ -28,7 +28,11 @@ import { normalizeStarknetAddress } from "../utils/address.js";
  *    - `CHALLENGE_TTL_MS` is fixed at 5 minutes (300,000 ms).
  *    - Re-issuing an active challenge returns the SAME nonce with the remaining TTL without extending expiration.
  *    - `consumeChallenge` performs atomic read-and-delete to ensure a nonce can be used for verification exactly once.
+ *    - `verifyChallenge` provides an idempotent, early fail-fast nonce check: for the same valid input
+ *      it always returns the same result, allowing safe retry of verification flows.
  *    - Expired nonces cannot be validated, consumed, or replayed.
+ *    - `restoreChallenge` may put a consumed nonce back only after a verified signature whose session
+ *      issuance failed — never after a signature failure (replay stays closed).
  *
  * 5. Telemetry & Non-Sensitivity:
  *    - Emits structured JSON metrics via `console.info`.
@@ -79,6 +83,22 @@ export const challenges = new Map<string, ChallengeRecord>();
 const SWEEP_INTERVAL = 50;
 let creationsSinceSweep = 0;
 
+/**
+ * Max entries inspected per opportunistic sweep. Keeps each sweep O(page)
+ * even when the store approaches `MAX_CHALLENGES`.
+ */
+export const SWEEP_BATCH_SIZE = 500;
+
+/**
+ * Snapshot of keys taken when the current pagination cycle started.
+ * Kept stable across sweeps so entries added or deleted between invocations
+ * never shift the resume position. `null` when no cycle is in progress.
+ */
+let sweepKeysSnapshot: string[] | null = null;
+
+/** Index into `sweepKeysSnapshot` for the next paginated sweep pass. */
+let sweepOffset = 0;
+
 /** Memoized mapping from encoded chain-ID felt → human-readable label. */
 const chainIdCache = new Map<string, string>();
 
@@ -101,15 +121,57 @@ function getChainIdLabel(chainId: string): string {
   }
 }
 
-/** Removes all entries whose TTL has already elapsed as of `now`. */
-function sweepExpiredChallenges(now: number): void {
-  for (const [key, rec] of challenges) {
-    if (now > rec.expiresAtMs) {
-      challenges.delete(key);
-    }
+/**
+ * Removes expired challenge entries.
+ *
+ * Opportunistic sweeps (`full === false`) inspect at most `SWEEP_BATCH_SIZE`
+ * entries from the stable `sweepKeysSnapshot`, then advance `sweepOffset`.
+ * Because the snapshot is captured once per cycle, entries added or deleted
+ * between sweeps never shift the resume position. Last-resort sweeps
+ * (`full === true`) walk the entire store and reset the cycle.
+ */
+function sweepExpiredChallenges(now: number, full = false): void {
+  if (challenges.size === 0) {
+    sweepKeysSnapshot = null;
+    sweepOffset = 0;
+    return;
   }
 
-  sweepOffset = end >= entries.length ? 0 : end;
+  if (full) {
+    for (const [key, rec] of challenges) {
+      if (now > rec.expiresAtMs) challenges.delete(key);
+    }
+    sweepKeysSnapshot = null;
+    sweepOffset = 0;
+    return;
+  }
+
+  // Start a new pagination cycle when there is no active snapshot.
+  if (sweepKeysSnapshot === null) {
+    sweepKeysSnapshot = [...challenges.keys()];
+    sweepOffset = 0;
+  }
+
+  // If the cycle is complete, start a fresh one next time.
+  if (sweepOffset >= sweepKeysSnapshot.length) {
+    sweepKeysSnapshot = null;
+    sweepOffset = 0;
+    return;
+  }
+
+  const end = Math.min(sweepOffset + SWEEP_BATCH_SIZE, sweepKeysSnapshot.length);
+  for (let i = sweepOffset; i < end; i++) {
+    const key = sweepKeysSnapshot[i]!;
+    const rec = challenges.get(key);
+    if (rec && now > rec.expiresAtMs) challenges.delete(key);
+  }
+
+  sweepOffset = end;
+  if (sweepOffset >= sweepKeysSnapshot.length) {
+    // This cycle is done — next sweep will start fresh.
+    sweepKeysSnapshot = null;
+    sweepOffset = 0;
+  }
 }
 
 /** Emits one structured metric line. `console.info` carries the request id. */
@@ -250,6 +312,85 @@ export function consumeChallenge(address: unknown): ChallengeRecord | null {
 }
 
 /**
+ * Puts a previously consumed challenge back into the store so a caller can
+ * retry verification without re-signing.
+ *
+ * Used by `/auth/verify` when signature verification succeeded but session
+ * issuance failed — the caller already proved ownership of the nonce, so
+ * consuming it permanently would strand a valid proof behind a transient
+ * store error.
+ *
+ * Restores only when:
+ * - `address` is a parseable Starknet address,
+ * - the record is still within its TTL, and
+ * - the address slot is empty (never overwrite a newer challenge).
+ *
+ * @returns `true` when the record was restored, otherwise `false`.
+ */
+export function restoreChallenge(address: unknown, record: ChallengeRecord): boolean {
+  const key = normalizeAddressKey(address);
+  if (key === null) return false;
+  if (Date.now() > record.expiresAtMs) return false;
+  if (challenges.has(key)) return false;
+
+  challenges.set(key, { nonce: record.nonce, expiresAtMs: record.expiresAtMs });
+  logChallengeMetric("challenge_restored", {
+    address: key,
+    expires_in_ms: record.expiresAtMs - Date.now(),
+  });
+  return true;
+}
+
+/**
+ * Validates a nonce against the challenge store without consuming it.
+ *
+ * IDEMPOTENT: for the same valid input (`address`, `nonce`) the function
+ * returns the same result until the challenge expires or is consumed.
+ * Calling `verifyChallenge` repeatedly with the same arguments is safe
+ * and does not mutate the store (except lazy eviction of expired entries).
+ *
+ * This provides an early fail-fast check before building typed data
+ * or proceeding with signature verification. A caller can verify the
+ * nonce is still valid, build the typed data, and only then move to
+ * signature verification — without worrying that the nonce was stale.
+ *
+ * @param address - The user's Starknet wallet address
+ * @param nonce   - The nonce string to verify
+ * @returns The challenge record if the nonce is valid and unexpired, otherwise null.
+ */
+export function verifyChallenge(address: unknown, nonce: unknown): ChallengeRecord | null {
+  const key = normalizeAddressKey(address);
+  if (key === null) {
+    logChallengeMetric("challenge_verify_miss", { reason: "invalid_address" });
+    return null;
+  }
+
+  if (!isNonEmptyString(nonce)) {
+    logChallengeMetric("challenge_verify_miss", { reason: "invalid_nonce" });
+    return null;
+  }
+
+  const rec = challenges.get(key);
+  if (!rec) {
+    logChallengeMetric("challenge_verify_miss", { reason: "not_found", address: key });
+    return null;
+  }
+
+  if (rec.nonce !== nonce.trim()) {
+    logChallengeMetric("challenge_verify_miss", { reason: "nonce_mismatch", address: key });
+    return null;
+  }
+
+  if (Date.now() > rec.expiresAtMs) {
+    challenges.delete(key);
+    logChallengeMetric("challenge_expired", { address: key });
+    return null;
+  }
+
+  return rec;
+}
+
+/**
  * Builds the SNIP-12 typed-data challenge a wallet signs to prove ownership.
  *
  * @throws if any input is missing, invalid type, empty, or unparseable address.
@@ -291,6 +432,7 @@ export function buildTypedChallenge(address: unknown, chainId: unknown, nonce: u
 export function clearChallengesForTesting(): void {
   challenges.clear();
   creationsSinceSweep = 0;
+  sweepKeysSnapshot = null;
   sweepOffset = 0;
 }
 

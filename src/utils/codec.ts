@@ -1,7 +1,20 @@
 import { cairo } from "starknet";
 
+export const U256_MAX = (1n << 256n) - 1n;
+
+/** Thrown when a value cannot be represented by a Starknet u256. */
+export class U256OverflowError extends RangeError {
+  constructor(value: bigint) {
+    super(`u256 value out of range: ${value.toString()}`);
+    this.name = "U256OverflowError";
+  }
+}
+
 export function parseU256(value: string) {
   const bn = BigInt(value);
+  if (bn < 0n || bn > U256_MAX) {
+    throw new U256OverflowError(bn);
+  }
   return cairo.uint256(bn);
 }
 
@@ -67,7 +80,7 @@ export const DEFAULT_TOKEN_DECIMALS = 6;
  */
 export function formatTokenAmount(
   raw: string | bigint,
-  decimals: number = DEFAULT_TOKEN_DECIMALS
+  decimals: number = DEFAULT_TOKEN_DECIMALS,
 ): string {
   if (!Number.isInteger(decimals) || decimals < 0) {
     throw new RangeError(`decimals must be a non-negative integer, got ${decimals}`);

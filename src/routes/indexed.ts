@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { db, schema } from "../db/index.js";
+import { readDb, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
 import { defaults, env } from "../config.js";
@@ -13,6 +13,19 @@ import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
  * Source identifier tag returned in indexed route responses.
  */
 export const INDEXED_DATA_SOURCE = "indexed";
+
+export type SyncFreshnessState = "synced" | "empty";
+
+export interface IndexedFreshnessResponse {
+  source: typeof INDEXED_DATA_SOURCE;
+  checkpointBlock: number;
+  freshness: SyncFreshnessState;
+}
+
+export interface IndexedCheckpointResponse {
+  source: typeof INDEXED_DATA_SOURCE;
+  checkpointBlock: number;
+}
 
 /**
  * Hard limit for sub-resources (events, payments, etc.) inside a detail view
@@ -167,27 +180,71 @@ export const authorizeIndexedFreshness = [requireAuth, requireAdmin];
  * This function is pure and deterministic: repeated calls with the same input
  * always produce the same output, making sync checkpoint derivation idempotent.
  *
- * @param records Array of database entities with an optional blockNumber property
- * @returns High-water mark block number, or 0 if records list is empty or lacks block numbers.
+ * Accepts records whose `blockNumber` may be a number, bigint, string, null, or
+ * undefined. Strings are coerced via `Number()` (hex prefixes like `0x` are
+ * handled natively by the JS runtime). Invalid, non-finite, or negative values
+ * are logged and skipped rather than halting the derivation.
+ *
+ * The contract is backward-compatible: invalid or unexpected block numbers do
+ * not produce a runtime error; they are ignored and the checkpoint falls back
+ * to the next valid high-water mark, or `0` when none remain.
+ *
+ * @param records Array of objects with an optional blockNumber property
+ * @returns High-water mark block number, or 0 if records list is empty or lacks valid block numbers.
  */
 export function deriveSyncCheckpoint(
-  records: Array<{ blockNumber?: number | bigint | null }>
+  records: Array<{ blockNumber?: unknown }>
 ): number {
   if (!records || !Array.isArray(records) || records.length === 0) return 0;
   let maxBlock = 0;
   for (const record of records) {
-    if (record && record.blockNumber !== undefined && record.blockNumber !== null) {
-      const bn = typeof record.blockNumber === "bigint" ? Number(record.blockNumber) : Number(record.blockNumber);
-      if (Number.isFinite(bn) && bn >= 0) {
-        if (bn > maxBlock) {
-          maxBlock = bn;
-        }
-      } else {
-        console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: record.blockNumber, reason: "invalid_format_or_negative" });
+    if (!record) continue;
+    const raw = record.blockNumber;
+    if (raw === undefined || raw === null) continue;
+
+    let bn: number;
+    if (typeof raw === "bigint") {
+      bn = Number(raw);
+    } else if (typeof raw === "string") {
+      bn = Number(raw);
+    } else if (typeof raw === "number") {
+      bn = raw;
+    } else {
+      console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: raw, reason: "unexpected_type" });
+      continue;
+    }
+
+    if (Number.isFinite(bn) && bn >= 0) {
+      if (bn > maxBlock) {
+        maxBlock = bn;
       }
+    } else {
+      console.warn({ event: "indexer_checkpoint_invalid_block", blockNumber: raw, reason: "invalid_format_or_negative" });
     }
   }
   return maxBlock;
+}
+
+/**
+ * Shared helper for /indexed/freshness and /indexed/checkpoint.
+ *
+ * Queries the latest 100 agreement event block numbers, derives the high-water
+ * mark, and returns both the raw records and the derived checkpoint so the
+ * caller can reuse them for observability without re-querying.
+ *
+ * Idempotency: this function is deterministic for the same database state.
+ */
+async function resolveCheckpoint(): Promise<{
+  checkpointBlock: number;
+  records: Array<{ blockNumber: unknown }>;
+}> {
+  const records = await readDb
+    .select({ blockNumber: schema.agreementEvents.blockNumber })
+    .from(schema.agreementEvents)
+    .orderBy(desc(schema.agreementEvents.blockNumber))
+    .limit(100);
+  const checkpointBlock = deriveSyncCheckpoint(records);
+  return { checkpointBlock, records };
 }
 
 export const indexedRouter = Router();
@@ -219,26 +276,20 @@ const AgreementSchema = z.object({
  */
 indexedRouter.get(
   "/indexed/freshness",
-  requireAuth,
-  requireAdmin,
+  ...authorizeIndexedFreshness,
   async (_req, res, next) => {
     const startTime = performance.now();
     try {
-      const records = await db
-        .select({ blockNumber: schema.agreementEvents.blockNumber })
-        .from(schema.agreementEvents)
-        .orderBy(desc(schema.agreementEvents.blockNumber))
-        .limit(100);
+      const { checkpointBlock, records } = await resolveCheckpoint();
 
-      const checkpointBlock = deriveSyncCheckpoint(records);
-
-      const body = {
+      const body: IndexedFreshnessResponse = {
         source: INDEXED_DATA_SOURCE,
         checkpointBlock,
         freshness: records.length > 0 ? "synced" : "empty",
       };
 
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
 
       // Observability
@@ -283,25 +334,19 @@ indexedRouter.get(
  */
 indexedRouter.get(
   "/indexed/checkpoint",
-  requireAuth,
-  requireAdmin,
+  ...authorizeIndexedFreshness,
   async (_req, res, next) => {
     const startTime = performance.now();
     try {
-      const records = await db
-        .select({ blockNumber: schema.agreementEvents.blockNumber })
-        .from(schema.agreementEvents)
-        .orderBy(desc(schema.agreementEvents.blockNumber))
-        .limit(100);
+      const { checkpointBlock, records } = await resolveCheckpoint();
 
-      const checkpointBlock = deriveSyncCheckpoint(records);
-
-      const body = {
+      const body: IndexedCheckpointResponse = {
         source: INDEXED_DATA_SOURCE,
         checkpointBlock,
       };
 
       res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
       res.json(body);
 
       // Observability
@@ -348,7 +393,7 @@ indexedRouter.get(
       const { limit, offset } = parsePagination(req.query);
 
       const [agreements, employeeAgreements] = await Promise.all([
-        db
+        readDb
           .select()
           .from(schema.agreements)
           .where(
@@ -364,7 +409,7 @@ indexedRouter.get(
           .limit(limit)
           .offset(offset),
 
-        db
+        readDb
           .select({
             agreement: schema.agreements,
           })
@@ -442,7 +487,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
     }
     const agreementId = AgreementId.parse(req.params.agreement_id);
 
-    const agreement = await db
+    const agreement = await readDb
       .select()
       .from(schema.agreements)
       .where(
@@ -459,23 +504,23 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
     }
 
     const [events, payments, milestones, employees, escrowEvents] = await Promise.all([
-      db.select().from(schema.agreementEvents)
+      readDb.select().from(schema.agreementEvents)
         .where(eq(schema.agreementEvents.agreementId, agreementId))
         .orderBy(desc(schema.agreementEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.payments)
+      readDb.select().from(schema.payments)
         .where(eq(schema.payments.agreementId, agreementId))
         .orderBy(desc(schema.payments.blockNumber)).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.milestones)
+      readDb.select().from(schema.milestones)
         .where(eq(schema.milestones.agreementId, agreementId))
         .orderBy(schema.milestones.milestoneId).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.employees)
+      readDb.select().from(schema.employees)
         .where(eq(schema.employees.agreementId, agreementId))
         .orderBy(schema.employees.employeeIndex).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.escrowEvents)
+      readDb.select().from(schema.escrowEvents)
         .where(eq(schema.escrowEvents.agreementId, agreementId))
         .orderBy(desc(schema.escrowEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
     ]);
@@ -541,7 +586,7 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
     const userAddress = StarknetAddress.parse(req.params.user_address);
     const { limit, offset } = parsePagination(req.query);
 
-    const payments = await db
+    const payments = await readDb
       .select()
       .from(schema.payments)
       .where(or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)))
@@ -597,7 +642,7 @@ indexedRouter.get(
       }
       const agreementId = AgreementId.parse(req.params.agreement_id);
 
-      const escrowEvents = await db
+      const escrowEvents = await readDb
         .select()
         .from(schema.escrowEvents)
         .where(
@@ -659,4 +704,3 @@ indexedRouter.get(
 );
 
 export default indexedRouter;
-

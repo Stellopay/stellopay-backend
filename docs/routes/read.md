@@ -177,23 +177,29 @@ Returns the full agreement details (employer, contributor, amounts, status).
 
 ### `GET /records/cursor/:address`
 
-Returns a deterministic page of records for the requested address.
+Returns a deterministic, idempotent page of records for the requested address.
 
 **Query parameters**
 
 | Param | Type | Default | Notes |
 | ----- | ---- | ------- | ----- |
-| `cursor` | `number` | — | Exclusive cursor from the previous response's `nextCursor`. |
-| `order` | `"asc" \| "desc"` | `"desc"` | Orders by record id. |
+| `cursor` | `string` | — | Exclusive numeric cursor string from previous response's `nextCursor`. Must be a positive integer with no leading zeros. |
+| `order` | `"asc" \| "desc"` | `"desc"` | Orders records deterministically by record `id`. |
 | `limit` | `number` | 50 | Integer between 1 and 100. |
 
-**Behavior**
+**Idempotency & Behavior**
 
-- Without a cursor, the route returns the first page in descending `id` order.
-- With a cursor, the route returns the next page of records strictly after the cursor in the selected order.
-- The cursor is exclusive, so a record at the cursor boundary is not returned again.
-- When the cursor is beyond the available range, the route returns an empty `records` array and `nextCursor: null`.
-- Invalid or malformed cursor input is rejected with a `500` response and an `Invalid cursor` error message.
+- **Idempotent reads**: Repeated deliveries or retried requests with identical parameters (`address`, `cursor`, `order`, `limit`) produce byte-for-byte identical responses.
+- **Deterministic ordering**: Records are sorted strictly by `id` (ascending or descending).
+- **Cursor progression**:
+  - Without a `cursor`, the route returns the first page in the selected `order`.
+  - With a `cursor`, the route returns the next page strictly after the cursor (`id > cursor` for `asc`, `id < cursor` for `desc`).
+  - The cursor is exclusive; records at or before the cursor position in the iteration order are excluded.
+- **Boundary handling**:
+  - In `asc` mode, when `cursor` is greater than or equal to the maximum available record ID, the route returns `{ records: [], nextCursor: null }`.
+  - In `desc` mode, when `cursor` is greater than the maximum record ID or less than or equal to the minimum available record ID, the route returns `{ records: [], nextCursor: null }`.
+- **Validation errors**:
+  - Invalid or malformed cursor strings (e.g. non-numeric, zero, negative, floats, whitespace-padded, SQL injection fragments) or out-of-range limit/order parameters are rejected with a `400` response (`ValidationError`).
 
 **Success response (200):**
 
@@ -202,13 +208,16 @@ Returns a deterministic page of records for the requested address.
   "address": "0xabc",
   "records": [{ "id": 5, "value": "record-5" }],
   "nextCursor": "4",
-  "order": "desc"
+  "order": "desc",
+  "limit": 50,
+  "hasMore": true
 }
 ```
 
-**Auth**
+**Auth & Telemetry**
 
-The route requires an `Authorization: Bearer <address>` header. Missing or mismatched credentials return `401` or `403` respectively.
+- The route requires an `Authorization: Bearer <address>` header. Missing credentials return `401 Unauthorized`; mismatched tokens return `403 Forbidden`.
+- Accepts optional request tracing headers (`Idempotency-Key`, `X-Request-ID`) which are captured in `logReadTelemetry` under `operation: "records_cursor_read"`.
 
 ---
 

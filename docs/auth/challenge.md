@@ -30,14 +30,18 @@ Each is owned by exactly one exported function below.
 | `getChallenge` | `address`: Non-empty parseable Starknet address string | Returns `null` on missing, invalid type, empty, or unparseable input; emits `challenge_miss` / `reason: "invalid_address"`. |
 | `clearChallenge` | `address`: Non-empty parseable Starknet address string | Safe no-op on missing, invalid type, empty, or unparseable input. |
 | `consumeChallenge` | `address`: Non-empty parseable Starknet address string | Returns `null` on missing, invalid type, empty, or unparseable input; performs atomic read-and-delete on valid challenge. |
+| `verifyChallenge` | `address`: Non-empty parseable Starknet address string; `nonce`: Non-empty string | Returns `null` on missing, invalid type, empty, or unparseable input; emits `challenge_verify_miss` / reason code. |
+| `restoreChallenge` | `address`: Non-empty parseable Starknet address string; `record`: ChallengeRecord | Returns `false` on missing, invalid type, empty, or unparseable input. |
 | `buildTypedChallenge` | `address`, `chainId`, `nonce`: Non-empty strings | Throws `Error` if any parameter is missing, invalid type, empty/whitespace, or unparseable. |
 
 ### Security guarantees & replay protection
 
 1. **Atomic Consumption**: `consumeChallenge` reads and deletes the nonce in a single step, preventing concurrent verification race conditions (replay defense).
 2. **Fail-Closed Validation**: Invalid, missing, non-string, or malformed inputs are rejected prior to Map lookups or processing.
-3. **Entropy & Uniqueness**: Nonces are generated via CSPRNG (`crypto.randomBytes(16)`), providing 128 bits of entropy (formatted as 32 hex characters prefixed with `0x`).
-4. **Log Sanitization**: Raw malformed input strings and internal error stack traces are omitted from structured telemetry logs to prevent log injection and memory bloat.
+3. **Early Fail-Fast Verification**: `verifyChallenge` validates the nonce against the store before typed data is built, catching stale/consumed nonces early.
+4. **Idempotent Verification**: `verifyChallenge` returns deterministic results for the same inputs — safe for retry in delivery/verification flows.
+5. **Entropy & Uniqueness**: Nonces are generated via CSPRNG (`crypto.randomBytes(16)`), providing 128 bits of entropy (formatted as 32 hex characters prefixed with `0x`).
+6. **Log Sanitization**: Raw malformed input strings and internal error stack traces are omitted from structured telemetry logs to prevent log injection and memory bloat.
 
 ## Address keying
 
@@ -57,6 +61,8 @@ Anything that is not a parseable Starknet address is **not** a valid key:
 | `getChallenge`        | returns `null`, logs `challenge_miss` / `invalid_address` |
 | `clearChallenge`      | silent no-op                                              |
 | `consumeChallenge`    | returns `null`, logs `challenge_miss` / `invalid_address` |
+| `verifyChallenge`     | returns `null`, logs `challenge_verify_miss` / `invalid_address` |
+| `restoreChallenge`    | returns `false`, no metric                                |
 | `buildTypedChallenge` | **throws** — never sign a payload for an unusable wallet  |
 
 The read paths degrade rather than throw so a malformed body cannot turn into a 500 on the
@@ -106,10 +112,16 @@ sit in the map forever. Every 50th `createChallenge` call therefore initiates a 
 pass that deletes entries whose TTL has already elapsed.
 
 The sweep is **paginated** to bound synchronous work: each invocation checks at most
-`SWEEP_BATCH_SIZE` (500) entries and advances a cursor (`sweepOffset`). The next sweep
-continues from where the previous one stopped, wrapping back to offset 0 after reaching
-the end of the store. This means a single sweep call costs O(SWEEP_BATCH_SIZE) regardless
-of store size.
+`SWEEP_BATCH_SIZE` (500) entries from a stable key snapshot (`sweepKeysSnapshot`) and
+advances a cursor (`sweepOffset`) into it. The next sweep continues from where the
+previous one stopped, starting a fresh snapshot when the previous cycle is complete.
+This means a single sweep call costs O(SWEEP_BATCH_SIZE) regardless of store size.
+
+The snapshot is captured once at the start of each pagination cycle (by copying the
+Map's current keys into `sweepKeysSnapshot`). Because the snapshot is immutable for
+the duration of the cycle, entries added or deleted between sweeps never shift the
+resume position — the cursor is always an index into a fixed array, not a position
+tied to the live-ordered Map.
 
 At `SWEEP_BATCH_SIZE = 500` and a full store of 100,000 entries, a complete pass requires
 200 sweep invocations. At the sweep interval of 50 `createChallenge` calls, a full pass
@@ -152,6 +164,28 @@ concurrent caller sees it already gone.
 `clearChallenge` drops a challenge without reading it, and is a no-op (no metric) when
 there was nothing to delete.
 
+## Verification — `verifyChallenge(address, nonce)`
+
+Validates a nonce against the challenge store without consuming it. Returns the
+`ChallengeRecord` if the nonce is valid and unexpired, otherwise `null`.
+
+**Idempotent.** For the same valid input the function returns the same result
+until the challenge expires or is consumed. This makes it safe to call
+repeatedly in retry/delivery flows.
+
+| Condition | Return value | Metric emitted |
+| --- | --- | --- |
+| Valid, unexpired, matching nonce | `ChallengeRecord` | (none) |
+| Invalid address | `null` | `challenge_verify_miss` / `invalid_address` |
+| Invalid nonce (null, empty, whitespace) | `null` | `challenge_verify_miss` / `invalid_nonce` |
+| Address not found in store | `null` | `challenge_verify_miss` / `not_found` |
+| Nonce does not match stored value | `null` | `challenge_verify_miss` / `nonce_mismatch` |
+| Nonce expired | `null` | `challenge_expired` + lazy eviction |
+
+Use `verifyChallenge` before building typed data to fail fast when the nonce
+is already stale or consumed. Use `consumeChallenge` after signature
+verification to atomically mark the nonce as used and prevent replay.
+
 ## Typed data — `buildTypedChallenge(address, chainId, nonce)`
 
 Builds the SNIP-12 payload the wallet signs:
@@ -182,19 +216,24 @@ caller-supplied string — so log lines for `0xabc`, `0xABC` and the padded form
 correlate to one login attempt, and log cardinality stays bounded by the address space
 rather than by input formatting.
 
-| Metric               | Emitted when                                      | Fields                         |
-| -------------------- | ------------------------------------------------- | ------------------------------ |
-| `challenge_created`  | A new nonce is minted                             | `address`, `expires_in_ms`     |
-| `challenge_replayed` | An active nonce is re-issued on retry             | `address`, `expires_in_ms`     |
-| `challenge_rejected` | The store is full and a new entry was refused     | `reason`, `size`               |
-| `challenge_expired`  | A read found an entry past its TTL and evicted it | `address`                      |
-| `challenge_miss`     | A read found nothing                              | `reason`, `address` when known |
-| `challenge_cleared`  | `clearChallenge` actually deleted something       | `address`                      |
-| `challenge_consumed` | `consumeChallenge` returned a record              | `address`                      |
+| Metric                  | Emitted when                                      | Fields                         |
+| ----------------------- | ------------------------------------------------- | ------------------------------ |
+| `challenge_created`     | A new nonce is minted                             | `address`, `expires_in_ms`     |
+| `challenge_replayed`    | An active nonce is re-issued on retry             | `address`, `expires_in_ms`     |
+| `challenge_rejected`    | The store is full and a new entry was refused     | `reason`, `size`               |
+| `challenge_expired`     | A read found an entry past its TTL and evicted it | `address`                      |
+| `challenge_miss`        | A read found nothing                              | `reason`, `address` when known |
+| `challenge_cleared`     | `clearChallenge` actually deleted something       | `address`                      |
+| `challenge_consumed`    | `consumeChallenge` returned a record              | `address`                      |
+| `challenge_restored`    | `restoreChallenge` restored a consumed nonce      | `address`, `expires_in_ms`     |
+| `challenge_verify_miss` | `verifyChallenge` found an invalid nonce          | `reason`, `address` when known |
 
 `challenge_miss` carries `reason: "not_found" | "invalid_address"`. The
 `invalid_address` case deliberately omits `address` — echoing an unparseable
 caller-supplied string into logs is what would blow up cardinality.
+
+`challenge_verify_miss` carries `reason: "invalid_address" | "invalid_nonce" | "not_found" | "nonce_mismatch"`.
+The `invalid_address` and `invalid_nonce` cases omit `address`.
 
 A successful `getChallenge` emits nothing: the metrics record state _transitions_, not
 call volume.
@@ -219,20 +258,25 @@ than surfacing in production.
    It never deletes the entry unless it is expired (lazy eviction).
 4. `clearChallenge(address)` returns `void` and is always a no-op when there
    was nothing to delete.
-5. `buildTypedChallenge(address, chainId, nonce)` returns a `TypedData` (from
+5. `verifyChallenge(address, nonce)` returns `ChallengeRecord | null`.
+   Idempotent validation that never consumes the nonce. Emits
+   `challenge_verify_miss` with a reason code on failure.
+6. `restoreChallenge(address, record)` returns `boolean`. Puts a consumed
+   nonce back into the store within its TTL if the slot is empty.
+7. `buildTypedChallenge(address, chainId, nonce)` returns a `TypedData` (from
    `starknet`). The wallet field inside `message` is the **canonical** Starknet
    address, not the raw caller-supplied string.
-6. `CHALLENGE_TTL_MS` is `5 * 60 * 1000` (5 minutes), exported as a `const`.
+8. `CHALLENGE_TTL_MS` is `5 * 60 * 1000` (5 minutes), exported as a `const`.
    Changing it changes when every issued nonce expires.
-7. `MAX_CHALLENGES` is `100_000`, exported as a `const`. Changing it changes
+9. `MAX_CHALLENGES` is `100_000`, exported as a `const`. Changing it changes
    the DoS hardening bound.
-8. `challenges` (the `Map`) is exported so tests can assert on store contents
-   and drive the size cap directly. Production code outside this module must
-   go through the functions above; reading the Map directly couples the caller
-   to the internal store type and eviction strategy.
-9. `clearChallengesForTesting()` and `clearChainIdCacheForTesting()` are
-   exported for test isolation only. Calling either in production invalidates
-   every in-flight login or discards a warm cache.
+10. `challenges` (the `Map`) is exported so tests can assert on store contents
+    and drive the size cap directly. Production code outside this module must
+    go through the functions above; reading the Map directly couples the caller
+    to the internal store type and eviction strategy.
+11. `clearChallengesForTesting()` and `clearChainIdCacheForTesting()` are
+    exported for test isolation only. Calling either in production invalidates
+    every in-flight login or discards a warm cache.
 
 **Nonce behaviour.**
 
@@ -286,24 +330,26 @@ than surfacing in production.
 22. The `address` field in every metric is the **canonical** key, never a raw
     caller-supplied string. Log lines for `0xabc`, `0xABC`, and the padded form
     all correlate to one login attempt.
-23. The seven metric names (`challenge_created`, `challenge_replayed`,
+23. The nine metric names (`challenge_created`, `challenge_replayed`,
     `challenge_rejected`, `challenge_expired`, `challenge_miss`,
-    `challenge_cleared`, `challenge_consumed`) and their field shapes are
+    `challenge_cleared`, `challenge_consumed`, `challenge_restored`,
+    `challenge_verify_miss`) and their field shapes are
     part of this contract. Operators and dashboards already depend on them;
     renaming one or changing its payload is a breaking change.
 
 **What counts as a breaking change.** Adding a new export, adding an optional
 field to the `createChallenge` return value (callers use destructuring and
 ignore unknown keys), or relaxing a throw into a return is backward compatible.
-Changing any of the 23 points above — including the nonce format, the TTL
+Changing any of the points above — including the nonce format, the TTL
 value, the expiry comparison operator, the idempotency contract, or a metric
 name — is breaking, and needs a coordinated change in `src/routes/auth.ts` and
 any dashboard or alert that consumes the metric.
 
 ## Test helpers
 
-`clearChallengesForTesting()` empties the store and resets both the sweep counter
-(`creationsSinceSweep`) and the page cursor (`sweepOffset`); `clearChainIdCacheForTesting()`
+`clearChallengesForTesting()` empties the store and resets the sweep counter
+(`creationsSinceSweep`), the snapshot (`sweepKeysSnapshot`), and the page cursor
+(`sweepOffset`); `clearChainIdCacheForTesting()`
 empties the chain-ID memo. Both exist for test isolation only — calling either in production
 would invalidate every in-flight login, reset pagination mid-pass, or discard a warm cache
 for no reason.
@@ -328,12 +374,17 @@ must go through the functions above.
 - Sweep: a valid entry surviving unrelated traffic, an abandoned expired entry being
   evicted without ever being read, and not-yet-expired entries left in place.
 - Batch sweep pagination: the per-invocation page limit (`SWEEP_BATCH_SIZE`), cursor
-  advancement across multiple sweeps, cursor wrap-around after a full pass, graceful
-  handling of an empty store, cursor reset when the store shrinks below the cursor, and
-  the last-resort full sweep when the store is full.
+  advancement across multiple sweeps, snapshot completion and restart after a full pass,
+  graceful handling of an empty store, cursor stability when entries are added between
+  sweeps (drift immunity), and the last-resort full sweep when the store is full.
 - `getChallenge` / `clearChallenge` / `consumeChallenge`: success, expiry boundary,
   not-found and invalid-address misses, silent no-ops, the consume-once replay race, and
   cross-format address resolution.
+- `verifyChallenge`: valid unexpired nonce, expired nonce (with eviction), consumed nonce,
+  wrong nonce on same address, invalid address, invalid nonce type, cross-format address
+  resolution.
+- `restoreChallenge`: restore within TTL when slot empty, expired record, occupied slot,
+  invalid address, non-matching address key.
 
 ## Out of scope
 

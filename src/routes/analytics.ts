@@ -1,12 +1,43 @@
 import { createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
-import { db, schema } from "../db/index.js";
+import { readDb, schema } from "../db/index.js";
 import { asc, eq, and, gt, gte, lte, or, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
-import { AnalyticsCache, buildAnalyticsCacheKey } from "../utils/analytics-cache.js";
+import Redis from "ioredis";
+import {
+  AnalyticsCache,
+  RedisAnalyticsCache,
+  buildAnalyticsCacheKey,
+} from "../utils/analytics-cache.js";
+
+const AnalyticsChartPoint = z.object({
+  month: z.enum(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"]),
+  views: z.number(),
+});
+
+export const AnalyticsResponse = z.object({
+  year: z.number(),
+  data: z.array(AnalyticsChartPoint).length(12),
+  total: z.number(),
+});
+
+export type AnalyticsResponseType = z.infer<typeof AnalyticsResponse>;
+
+function assertAnalyticsResponseShape(payload: AnalyticsResponseType): void {
+  if (process.env.NODE_ENV === "production") return;
+  try {
+    AnalyticsResponse.parse(payload);
+  } catch (e) {
+    if (e instanceof ZodError) {
+      console.error("[analytics] Response shape drift detected:", e.issues);
+    } else {
+      throw e;
+    }
+  }
+}
 
 export const analyticsRouter = Router();
 
@@ -19,6 +50,10 @@ export const ANALYTICS_ROLLUP_BATCH_SIZE = 500;
 export const analyticsAggregationCache = new AnalyticsCache(
   env.ANALYTICS_CACHE_TTL_MS ?? 30_000,
 );
+const redisAnalyticsCache = env.REDIS_URL
+  ? new RedisAnalyticsCache(new Redis(env.REDIS_URL), env.ANALYTICS_CACHE_TTL_MS ?? 30_000)
+  : undefined;
+const analyticsCache = redisAnalyticsCache ?? analyticsAggregationCache;
 
 const MONTH_NAMES = [
   "Jan",
@@ -135,6 +170,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
+       
+      console.error(JSON.stringify(logEntry));
+    } else {
+       
       console.error(JSON.stringify(logEntry));
     } else {
       console.info(JSON.stringify(logEntry));
@@ -149,6 +188,10 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
       `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
 
     if (logEntry.level === "error") {
+       
+      console.error(msg);
+    } else {
+       
       console.error(msg);
     } else {
       console.info(msg);
@@ -234,7 +277,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
     const cacheKey = buildAnalyticsCacheKey(userAddress, { year });
 
-    const cached = analyticsAggregationCache.get(cacheKey);
+    const cached = await Promise.resolve(analyticsCache.get(cacheKey));
     if (cached) {
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(cached);
@@ -279,7 +322,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             : undefined;
 
           const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-          const query = db
+          const query = readDb
             .select({
               id: schema.payments.id,
               createdAt: schema.payments.createdAt,
@@ -319,7 +362,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             : undefined;
 
           const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-          const query = db
+          const query = readDb
             .select({
               id: schema.escrowEvents.id,
               createdAt: schema.escrowEvents.createdAt,
@@ -361,7 +404,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             : undefined;
 
           const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-          const query = db
+          const query = readDb
             .select({
               id: schema.agreementEvents.id,
               createdAt: schema.agreementEvents.createdAt,
@@ -454,32 +497,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
       const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    logAnalyticsTelemetry({
-      operation: "analytics_monthly_rollup",
-      duration_ms: Math.round(duration * 100) / 100,
-      status: "success",
-      request_id: requestId,
-      user_address: userAddress,
-      year,
-      row_counts: {
-        payments: payments.length,
-        escrow_events: escrowEvents.length,
-        agreement_creations: agreementCreations.length,
-      },
-    });
-
-    res.json({
-      year,
-      data: chartData,
-      total: toDisplayNumber(totalRaw),
-    });
-    } finally {
-      inflightRollups.delete(rollupKey);
-    }
-  } catch (e: any) {
-    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-    if (!(e instanceof z.ZodError)) {
+      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
       logAnalyticsTelemetry({
         operation: "analytics_monthly_rollup",
         duration_ms: Math.round(duration * 100) / 100,
@@ -499,36 +517,31 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         data: chartData,
         total: toDisplayNumber(totalRaw),
       };
-
-      analyticsAggregationCache.set(cacheKey, responseBody);
+      await Promise.resolve(analyticsCache.set(cacheKey, responseBody));
 
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(responseBody);
       res.set("ETag", etag);
-
       if (req.headers["if-none-match"] === etag) {
         res.status(304).end();
         return;
       }
-
       res.json(responseBody);
-    } catch (e: unknown) {
-      const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
-      if (!(e instanceof z.ZodError)) {
-        logAnalyticsTelemetry({
-          operation: "analytics_monthly_rollup",
-          duration_ms: Math.round(duration * 100) / 100,
-          status: "error",
-          request_id: requestId,
-          user_address: req.params.user_address,
-          error: e instanceof Error ? e.message : String(e),
-        });
-      }
-      next(e);
-    }
-  } finally {
-    if (rollupKey) {
+    } finally {
       inflightRollups.delete(rollupKey);
     }
+  } catch (error: unknown) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    if (!(error instanceof z.ZodError)) {
+      logAnalyticsTelemetry({
+        operation: "analytics_monthly_rollup",
+        duration_ms: Math.round(duration * 100) / 100,
+        status: "error",
+        request_id: requestId,
+        user_address: req.params.user_address,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    next(error);
   }
 });

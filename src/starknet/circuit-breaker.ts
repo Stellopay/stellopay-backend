@@ -15,7 +15,20 @@
  *             → on failure: resets to OPEN, starting the cooldown again
  */
 
+import {
+  incStarknetMetric,
+  labeledStarknetMetric,
+  setStarknetGauge,
+  STARKNET_METRICS,
+} from "./client-metrics.js";
+
 export type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+
+const CIRCUIT_STATE_VALUE: Record<CircuitState, number> = {
+  CLOSED: 0,
+  OPEN: 1,
+  HALF_OPEN: 2,
+};
 
 export interface CircuitBreakerOptions {
   /** Number of failures in the rolling window that open the circuit. */
@@ -51,6 +64,7 @@ export class EndpointCircuitBreaker {
   constructor(endpointUrl: string, options: CircuitBreakerOptions) {
     this.endpointUrl = endpointUrl;
     this.options = options;
+    this.recordStateMetric("CLOSED");
   }
 
   /** Current circuit state. */
@@ -148,6 +162,13 @@ export class EndpointCircuitBreaker {
   private transitionTo(next: CircuitState): void {
     const previous = this.state;
     this.state = next;
+    this.recordStateMetric(next);
+    incStarknetMetric(
+      labeledStarknetMetric(STARKNET_METRICS.CIRCUIT_BREAKER_TRANSITIONS, {
+        endpoint: this.endpointUrl,
+        transition: `${previous}_to_${next}`,
+      }),
+    );
 
     if (next === "OPEN") {
       this.openedAt = Date.now();
@@ -172,6 +193,15 @@ export class EndpointCircuitBreaker {
       this.consecutiveSuccesses = 0;
       console.info(`[starknet] Circuit breaker CLOSED for ${this.endpointUrl} — endpoint healthy`);
     }
+  }
+
+  private recordStateMetric(state: CircuitState): void {
+    setStarknetGauge(
+      labeledStarknetMetric(STARKNET_METRICS.CIRCUIT_BREAKER_STATE, {
+        endpoint: this.endpointUrl,
+      }),
+      CIRCUIT_STATE_VALUE[state],
+    );
   }
 
   private pruneOldFailures(): void {

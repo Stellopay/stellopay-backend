@@ -262,6 +262,15 @@ block when the first request completes (success or error).
 - Unparseable amounts or malformed DB rows default to zero rather than crashing
   the endpoint with a 500 error.
 
+## Shared cache (optional)
+
+Set `REDIS_URL` to enable the Redis-backed analytics cache across backend
+replicas. It uses the same `buildAnalyticsCacheKey` format and the configured
+`ANALYTICS_CACHE_TTL_MS` expiry. When Redis is unset, the route keeps using the
+in-process cache; Redis connection, serialization, and invalidation failures
+are treated as cache misses so they do not turn into analytics errors. Use a
+private Redis instance and TLS/credentials appropriate for the deployment.
+
 ---
 
 ## Edge cases intentionally out of scope

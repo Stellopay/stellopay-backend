@@ -31,56 +31,18 @@
  *     handlers — they remain exported and documented for future use.
  */
 import { Router } from "express";
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import { z } from "zod";
 import { shortString } from "starknet";
 import { agreementContract, escrowContract, provider } from "../starknet/client.js";
 import { u256ToString, toHexString } from "../utils/codec.js";
 import { env } from "../config.js";
+import { NumericCursorSchema, loggedParse } from "../utils/validation.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
 
 // ---------- validation ----------
 
 const AddressParam = z.string().min(3);
-
-interface TelemetryEntry {
-  operation: string;
-  duration_ms: number;
-  status: "success" | "error";
-  request_id?: string;
-  token?: string;
-  owner?: string;
-  escrow?: string;
-  agreement?: string;
-  agreement_id?: string;
-  error?: string;
-}
-
-function logReadTelemetry(entry: TelemetryEntry) {
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    level: entry.status === "error" ? "error" : "info",
-    ...entry,
-  };
-
-  if (env.LOG_FORMAT === "json") {
-    if (logEntry.level === "error") {
-      console.error(JSON.stringify(logEntry));
-    } else {
-      console.info(JSON.stringify(logEntry));
-    }
-  } else {
-    const msg = `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [read-telemetry] ${
-      logEntry.operation
-    } ${logEntry.status} ${logEntry.duration_ms}ms${
-      logEntry.request_id ? ` [${logEntry.request_id}]` : ""
-    }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-    if (logEntry.level === "error") {
-      console.error(msg);
-    } else {
-      console.info(msg);
-    }
-  }
-}
 
 function asU256FromResult(result: string[]) {
   if (!Array.isArray(result) || result.length < 2) return null;
@@ -375,6 +337,9 @@ interface TelemetryEntry {
   agreement_id?: string;
   /** Number of retry rounds (0 on first-try success, maxAttempts-1 at exhaustion). */
   retries?: number;
+  cursor?: string;
+  order?: string;
+  limit?: number;
   error?: string;
 }
 
@@ -415,6 +380,16 @@ function logReadTelemetry(entry: TelemetryEntry) {
 
 export const readRouter = Router();
 
+/** Send a read-only indexed response with conditional-request support. */
+function sendIndexedResponse(req: Request, res: Response, body: unknown): void {
+  applyIndexedCacheHeaders(res, body);
+  if (req.fresh) {
+    res.status(304).end();
+    return;
+  }
+  res.json(body);
+}
+
 // ---------- token / balances ----------
 
 readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
@@ -424,7 +399,7 @@ readRouter.get("/token/:token/balance/:owner", async (req, res, next) => {
     const token = AddressParam.parse(req.params.token);
     const owner = AddressParam.parse(req.params.owner);
     const balance = await erc20BalanceOf(token, owner);
-    res.json({ token, owner, balance });
+    sendIndexedResponse(req, res, { token, owner, balance });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     logReadTelemetry({
@@ -463,7 +438,7 @@ readRouter.get("/token/:token/decimals", async (req, res, next) => {
       token,
       request_id: res.locals.requestId,
     });
-    res.json({ token, decimals });
+    sendIndexedResponse(req, res, { token, decimals });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     logReadTelemetry({
@@ -501,7 +476,7 @@ readRouter.get("/token/:token/symbol", async (req, res, next) => {
       token,
       request_id: res.locals.requestId,
     });
-    res.json({ token, symbol });
+    sendIndexedResponse(req, res, { token, symbol });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
     logReadTelemetry({
@@ -545,7 +520,7 @@ readRouter.get("/escrow/:address/balance/:agreement_id", async (req, res, next) 
       agreement_id: agreement_id.toString(),
       request_id: requestId,
     });
-    res.json({
+    sendIndexedResponse(req, res, {
       escrow: escrowAddress,
       agreement_id: agreement_id.toString(),
       balance: u256ToString(balance),
@@ -598,7 +573,7 @@ readRouter.get("/escrow/:address/summary/:agreement_id", async (req, res, next) 
       agreement_id: agreement_id.toString(),
       request_id: requestId,
     });
-    res.json({
+    sendIndexedResponse(req, res, {
       escrow: escrowAddress,
       agreement_id: agreement_id.toString(),
       employer: toHexString(employer),
@@ -658,7 +633,7 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
       agreement_id: agreement_id.toString(),
       request_id: requestId,
     });
-    res.json({
+    sendIndexedResponse(req, res, {
       agreement: agreementAddress,
       agreement_id: agreement_id.toString(),
       employer: toHexString(employer),
@@ -688,10 +663,8 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
 });
 
 // -------- cursor-based reads and record ordering --------
-const CursorQuery = z.object({
-  cursor: z.string().optional(),
+const CursorQuery = CursorPaginationSchema.extend({
   order: z.enum(["asc", "desc"]).default("desc"),
-  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 
 interface CursorRecord {
@@ -699,11 +672,32 @@ interface CursorRecord {
   value: string;
 }
 
+const CURSOR_RECORDS: CursorRecord[] = [
+  { id: 1, value: "record-1" },
+  { id: 2, value: "record-2" },
+  { id: 3, value: "record-3" },
+  { id: 4, value: "record-4" },
+  { id: 5, value: "record-5" },
+];
+
+const CURSOR_RECORDS_ASC = [...CURSOR_RECORDS].sort((left, right) => left.id - right.id);
+const CURSOR_RECORDS_DESC = [...CURSOR_RECORDS_ASC].reverse();
+
 function getCursorRecords(): CursorRecord[] {
-  return Array.from({ length: 5 }, (_, index) => ({
-    id: index + 1,
-    value: `record-${index + 1}`,
-  }));
+  return [...CURSOR_RECORDS_ASC];
+}
+
+function orderedCursorRecords(records: CursorRecord[], order: "asc" | "desc") {
+  if (records.length === CURSOR_RECORDS_ASC.length && records.every((record, index) => record.id === CURSOR_RECORDS_ASC[index].id)) {
+    return order === "asc" ? CURSOR_RECORDS_ASC : CURSOR_RECORDS_DESC;
+  }
+
+  return [...records].sort((left, right) => {
+    if (left.id === right.id) {
+      return left.value.localeCompare(right.value);
+    }
+    return order === "asc" ? left.id - right.id : right.id - left.id;
+  });
 }
 
 function paginateCursorRecords(
@@ -712,44 +706,61 @@ function paginateCursorRecords(
   order: "asc" | "desc",
   limit: number,
 ) {
-  const ordered = [...records].sort((left, right) => {
-    return order === "asc" ? left.id - right.id : right.id - left.id;
-  });
-
-  const filtered = ordered.filter((record) => {
-    if (cursor === undefined) return true;
-    return order === "asc" ? record.id > cursor : record.id < cursor;
-  });
-
-  const page = filtered.slice(0, limit);
-  const hasMore = filtered.length > page.length;
-  const nextCursor = page.length > 0 && hasMore ? String(page[page.length - 1].id) : null;
+  const ordered = orderedCursorRecords(records, order);
 
   if (cursor !== undefined && ordered.length > 0) {
-    const boundary = order === "asc" ? ordered[ordered.length - 1].id : ordered[0].id;
-    if (cursor > boundary) {
-      return { records: [], nextCursor: null };
+    const firstId = ordered[0].id;
+    const lastId = ordered[ordered.length - 1].id;
+
+    if (order === "asc" && cursor >= lastId) {
+      return { records: [], nextCursor: null, hasMore: false };
+    }
+    if (order === "desc" && (cursor > firstId || cursor <= lastId)) {
+      return { records: [], nextCursor: null, hasMore: false };
     }
   }
+
+  const startIndex = cursor === undefined
+    ? 0
+    : ordered.findIndex((record) => (order === "asc" ? record.id > cursor : record.id < cursor));
+
+  if (startIndex === -1) {
+    return { records: [], nextCursor: null, hasMore: false };
+  }
+
+  const page = ordered.slice(startIndex, startIndex + limit);
+  const hasMore = startIndex + page.length < ordered.length;
+  const nextCursor = page.length > 0 && hasMore ? String(page[page.length - 1].id) : null;
 
   return {
     records: page,
     nextCursor,
+    hasMore,
   };
 }
 
 readRouter.get("/records/cursor/:address", async (req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId =
+    (req.headers["x-request-id"] as string) ??
+    (req.headers["idempotency-key"] as string) ??
+    res.locals.requestId;
   try {
     const address = AddressParam.parse(req.params.address);
-    const { cursor, order, limit } = CursorQuery.parse(req.query);
-    let parsedCursor: number | undefined;
+    const { cursor, order, limit } = loggedParse(
+      CursorQuery,
+      req.query,
+      "records/cursor:query",
+    );
 
+    // Validate the cursor format before it reaches any query-builder path.
+    // loggedParse throws a ValidationError (status 400) on malformed input,
+    // which the global error handler replays as a clean 400 with a structured
+    // error body — preventing a confusing 500 and blocking injection-adjacent
+    // payloads from reaching the database layer.
+    let parsedCursor: number | undefined;
     if (cursor !== undefined) {
-      const numericCursor = Number(cursor);
-      if (!Number.isInteger(numericCursor) || numericCursor <= 0) {
-        throw new Error("Invalid cursor");
-      }
-      parsedCursor = numericCursor;
+      parsedCursor = loggedParse(NumericCursorSchema, cursor, "records/cursor:cursor");
     }
 
     // explicit security boundary
@@ -764,23 +775,41 @@ readRouter.get("/records/cursor/:address", async (req, res, next) => {
       return res.status(403).json({ error: "Forbidden: privilege check failed" });
     }
 
-    const { records, nextCursor } = paginateCursorRecords(
+    const { records, nextCursor, hasMore } = paginateCursorRecords(
       getCursorRecords(),
       parsedCursor,
       order,
       limit,
     );
 
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logReadTelemetry({
+      operation: "records_cursor_read",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "success",
+      request_id: requestId,
+      cursor,
+      order,
+      limit,
+    });
+
     res.json({
       address,
       records,
       nextCursor,
       order,
+      limit,
+      hasMore,
     });
-  } catch (e) {
-    if (e instanceof z.ZodError || (e instanceof Error && e.message === "Invalid cursor")) {
-      return res.status(500).json({ error: "Invalid cursor" });
-    }
+  } catch (e: any) {
+    const duration = Number(process.hrtime.bigint() - start) / 1_000_000;
+    logReadTelemetry({
+      operation: "records_cursor_read",
+      duration_ms: Math.round(duration * 100) / 100,
+      status: "error",
+      request_id: requestId,
+      error: e?.message || String(e),
+    });
     next(e);
   }
 });

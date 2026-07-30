@@ -65,6 +65,14 @@ export function setStarknetGauge(name: string, value: number): void {
   gauges[name] = value;
 }
 
+/** Return a Prometheus-style metric key with safely escaped label values. */
+export function labeledStarknetMetric(name: string, labels: Record<string, string>): string {
+  const encoded = Object.entries(labels)
+    .map(([key, value]) => `${key}="${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`)
+    .join(",");
+  return `${name}{${encoded}}`;
+}
+
 /**
  * Point-in-time snapshot of every Starknet metric counter and gauge.
  * Returns shallow copies so callers cannot mutate the internal state.
@@ -85,6 +93,17 @@ export function getStarknetMetricsSnapshot(): {
 export function resetStarknetMetrics(): void {
   for (const k of Object.keys(counters)) delete counters[k];
   for (const k of Object.keys(gauges)) delete gauges[k];
+}
+
+/** Build a Prometheus-style metric key without allowing label syntax injection. */
+export function labeledStarknetMetric(
+  name: string,
+  labels: Record<string, string>,
+): string {
+  const encoded = Object.entries(labels)
+    .map(([key, value]) => `${key}="${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`)
+    .join(",");
+  return `${name}{${encoded}}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,4 +165,6 @@ export const STARKNET_METRICS = {
   NETWORK_INFO_FETCHES: "starknet_network_info_fetches_total",
   NETWORK_INFO_DEDUPED: "starknet_network_info_deduped_total",
   NETWORK_INFO_ERRORS: "starknet_network_info_errors_total",
+  CIRCUIT_BREAKER_STATE: "starknet_circuit_breaker_state",
+  CIRCUIT_BREAKER_TRANSITIONS: "starknet_circuit_breaker_transitions_total",
 } as const;
