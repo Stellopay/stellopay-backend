@@ -179,6 +179,10 @@ export const EnvSchema = z
       .optional()
       .default(30_000),
 
+    // Optional shared cache for analytics responses. When unset, the route
+    // uses its existing in-process cache.
+    REDIS_URL: z.string().url().optional(),
+
     // Session token lifetime in milliseconds (sliding expiry) — default 24 hours
     SESSION_TTL_MS: z.coerce
       .number()
