@@ -5,6 +5,10 @@ import {
   snapshotCircuitBreaker,
   type CircuitBreakerOptions,
 } from "./circuit-breaker.js";
+import {
+  getStarknetMetricsSnapshot,
+  resetStarknetMetrics,
+} from "./client-metrics.js";
 
 const ENDPOINT = "https://rpc.example.com";
 
@@ -37,6 +41,23 @@ describe("CircuitOpenError", () => {
   it("exposes endpointUrl", () => {
     const err = new CircuitOpenError(ENDPOINT);
     expect(err.endpointUrl).toBe(ENDPOINT);
+  });
+});
+
+describe("circuit breaker metrics", () => {
+  beforeEach(() => resetStarknetMetrics());
+
+  it("records the current state and every transition with endpoint labels", () => {
+    const breaker = makeBreaker({ failureThreshold: 1 });
+    breaker.recordFailure();
+
+    const { gauges, counters } = getStarknetMetricsSnapshot();
+    expect(gauges['starknet_circuit_breaker_state{endpoint="https://rpc.example.com"}']).toBe(1);
+    expect(
+      counters[
+        'starknet_circuit_breaker_transitions_total{endpoint="https://rpc.example.com",transition="CLOSED_to_OPEN"}'
+      ],
+    ).toBe(1);
   });
 });
 
