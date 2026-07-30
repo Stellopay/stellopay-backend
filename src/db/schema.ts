@@ -6,6 +6,8 @@ import {
   boolean,
   timestamp,
   index,
+  primaryKey,
+  jsonb,
   numeric,
   check,
   type PgTableWithColumns,
@@ -659,6 +661,23 @@ export const backfillProgress = pgTable(
   }),
 );
 
+/** Shared durable response cache used by idempotent mutating routes. */
+export const idempotencyKeys = pgTable(
+  "idempotency_keys",
+  {
+    route: text("route").notNull(),
+    key: text("key").notNull(),
+    bodyFingerprint: text("body_fingerprint").notNull(),
+    statusCode: integer("status_code").notNull(),
+    responseBody: jsonb("response_body").notNull().default({}),
+    expiresAt: timestamp("expires_at").notNull(),
+  },
+  (table) => ({
+    primaryKey: primaryKey({ columns: [table.route, table.key] }),
+    expiresAtIdx: index("idempotency_keys_expires_at_idx").on(table.expiresAt),
+  }),
+);
+
 // ---------------------------------------------------------------------------
 // Compatibility Version
 // ---------------------------------------------------------------------------
@@ -794,5 +813,5 @@ export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any>
   { name: "billingInvoices", table: billingInvoices },
   { name: "sessions", table: sessions },
   { name: "backfillProgress", table: backfillProgress },
+  { name: "idempotencyKeys", table: idempotencyKeys },
 ];
-
