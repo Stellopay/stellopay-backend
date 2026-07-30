@@ -122,14 +122,6 @@ const strictLimiter = makeLimiter({
   message: "Too many requests from this IP, please try again later.",
 });
 
-// Contact form limiter (stricter) - prevents spam on the public contact form.
-const contactLimiter = makeLimiter({
-  name: "contact",
-  windowMs: env.RATE_LIMIT_CONTACT_WINDOW_MS,
-  max: env.RATE_LIMIT_CONTACT_MAX,
-  message: "Too many contact form submissions. Please try again later.",
-});
-
 // Analytics limiter - specific limit for analytics endpoints
 const analyticsLimiter = makeLimiter({
   name: "analytics",
@@ -165,8 +157,6 @@ app.use("/api/v1", indexerStatusRouter);
 app.use("/api/v1", reprocessEventsRouter);
 app.use("/api/v1", diagnosticsRouter);
 app.use("/api/v1", backfillEventsRouter);
-// Apply contact-specific rate limiting to contact endpoint
-app.use("/api/v1/contact", contactLimiter);
 app.use("/api/v1", contactRouter);
 app.use("/api/v1", billingRouter);
 app.use("/api/v1", apiV1NotFoundHandler);
