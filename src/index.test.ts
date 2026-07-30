@@ -19,20 +19,28 @@ describe("GET /ready", () => {
     querySpy.mockRestore();
   });
 
-  it("returns 200 when the database is reachable", async () => {
+  it("returns 200 with latency info when the database is reachable", async () => {
     const response = await request(app).get("/ready");
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ ok: true });
+    expect(response.body.ok).toBe(true);
+    expect(response.body.healthy).toBe(true);
+    expect(response.body).toHaveProperty("latencyMs");
+    expect(typeof response.body.latencyMs).toBe("number");
+    expect(response.body.degraded).toBe(false);
   });
 
-  it("returns 503 when the database health check fails", async () => {
+  it("returns 503 with latency info when the database health check fails", async () => {
     querySpy.mockRejectedValueOnce(new Error("db unavailable"));
 
     const response = await request(app).get("/ready");
 
     expect(response.status).toBe(503);
-    expect(response.body).toEqual({ ok: false });
+    expect(response.body.ok).toBe(false);
+    expect(response.body.healthy).toBe(false);
+    expect(response.body).toHaveProperty("latencyMs");
+    expect(typeof response.body.latencyMs).toBe("number");
+    expect(response.body.degraded).toBe(false);
   });
 });
 

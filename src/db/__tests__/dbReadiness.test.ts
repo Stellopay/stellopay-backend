@@ -1,7 +1,7 @@
 // src/db/__tests__/dbReadiness.test.ts
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { Pool } from 'pg';
 import { waitForDbReadiness } from '../../db/index.js';
-import * as dbModule from '../../db/index.js';
 import { env } from '../../config.js';
 
 beforeEach(() => {
@@ -16,25 +16,38 @@ afterEach(() => {
 });
 
 describe('waitForDbReadiness', () => {
-  it('resolves when DB becomes healthy before max attempts', async () => {
+  let querySpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
     vi.useFakeTimers();
-    const mockHealth = vi.spyOn(dbModule, 'checkDbHealth');
-    mockHealth
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+    querySpy = vi.spyOn(Pool.prototype, 'query');
+  });
+
+  afterEach(() => {
+    querySpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('resolves when DB becomes healthy before max attempts', async () => {
+    querySpy
+      .mockRejectedValueOnce(new Error('db unavailable'))
+      .mockRejectedValueOnce(new Error('db unavailable'))
+      .mockResolvedValueOnce({
+        rows: [{ '?column?': 1 }],
+        command: 'SELECT',
+        rowCount: 1,
+      } as never);
     const promise = waitForDbReadiness();
     await vi.runAllTimersAsync();
     await expect(promise).resolves.toBeUndefined();
-    expect(mockHealth).toHaveBeenCalledTimes(3);
+    expect(querySpy).toHaveBeenCalledTimes(3);
   });
 
   it('rejects after exhausting all attempts', async () => {
-    vi.useFakeTimers();
-    const mockHealth = vi.spyOn(dbModule, 'checkDbHealth').mockResolvedValue(false);
+    querySpy.mockRejectedValue(new Error('db unavailable'));
     const promise = waitForDbReadiness();
     await vi.runAllTimersAsync();
     await expect(promise).rejects.toThrowError(/Unable to connect to database/);
-    expect(mockHealth).toHaveBeenCalledTimes(env.DB_CONNECTION_RETRY_MAX_ATTEMPTS);
+    expect(querySpy).toHaveBeenCalledTimes(env.DB_CONNECTION_RETRY_MAX_ATTEMPTS);
   });
 });

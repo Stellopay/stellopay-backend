@@ -229,6 +229,16 @@ export const EnvSchema = z
       .optional()
       .default(12),
 
+  // DB health-check degraded-latency threshold (milliseconds). When the health
+  // query takes longer than this, checkDbHealth returns degraded: true while
+  // still reporting healthy: true. Set to a large value to effectively disable.
+  DB_HEALTH_DEGRADED_LATENCY_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(5_000),
+
   // Circuit breaker configuration for Starknet RPC calls
   // Failure threshold: number of failures before circuit opens - default 5
   CIRCUIT_BREAKER_FAILURE_THRESHOLD: z.coerce

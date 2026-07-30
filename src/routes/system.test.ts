@@ -123,7 +123,7 @@ describe("systemRouter /system/ready", () => {
   });
 
   it("returns 200 when all dependencies are reachable", async () => {
-    vi.mocked(checkDbHealth).mockResolvedValue(true);
+    vi.mocked(checkDbHealth).mockResolvedValue({ healthy: true, latencyMs: 1, degraded: false });
     const { provider } = await import("../starknet/client.js");
     vi.mocked(provider.getBlockNumber).mockResolvedValue(12345);
     const app = makeApp();
@@ -138,7 +138,7 @@ describe("systemRouter /system/ready", () => {
   });
 
   it("returns 503 when database is unreachable", async () => {
-    vi.mocked(checkDbHealth).mockResolvedValue(false);
+    vi.mocked(checkDbHealth).mockResolvedValue({ healthy: false, latencyMs: 1, degraded: false });
     const { provider } = await import("../starknet/client.js");
     vi.mocked(provider.getBlockNumber).mockResolvedValue(12345);
     const app = makeApp();
@@ -153,7 +153,7 @@ describe("systemRouter /system/ready", () => {
   });
 
   it("returns 503 when RPC is unreachable", async () => {
-    vi.mocked(checkDbHealth).mockResolvedValue(true);
+    vi.mocked(checkDbHealth).mockResolvedValue({ healthy: true, latencyMs: 1, degraded: false });
     const { provider } = await import("../starknet/client.js");
     vi.mocked(provider.getBlockNumber).mockRejectedValue(new Error("RPC unreachable"));
     const app = makeApp();
@@ -168,7 +168,7 @@ describe("systemRouter /system/ready", () => {
   });
 
   it("returns 503 when both dependencies are unreachable", async () => {
-    vi.mocked(checkDbHealth).mockResolvedValue(false);
+    vi.mocked(checkDbHealth).mockResolvedValue({ healthy: false, latencyMs: 1, degraded: false });
     const { provider } = await import("../starknet/client.js");
     vi.mocked(provider.getBlockNumber).mockRejectedValue(new Error("RPC unreachable"));
     const app = makeApp();

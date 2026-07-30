@@ -35,9 +35,66 @@ GET /api/v1/analytics/:user_address?year=<number>
 
 | Header          | Direction | Description                                                      |
 | --------------- | --------- | ---------------------------------------------------------------- |
+| `x-user-address` | request  | Caller's Starknet wallet address (required by `requireAuth`)     |
+| `authorization` | request  | `Bearer <session-token>` issued by `/auth/verify` (required)     |
 | `If-None-Match` | request   | ETag from a previous response; triggers 304 if matched           |
 | `ETag`          | response  | SHA-256 hash of the response payload (truncated to 16 hex chars) |
 | `Cache-Control` | response  | Always `private, max-age=60`                                     |
+
+---
+
+## Authorization
+
+The route is mounted behind `requireAuth`, which resolves the caller's
+Starknet address from the `x-user-address` header and validates the bearer
+session token. A second middleware, `requireAnalyticsOwner`, enforces that the
+authenticated principal may only read rollups for their own address.
+
+### Middleware chain
+
+```
+analyticsRouter.use("/analytics", requireAuth);
+analyticsRouter.get("/analytics/:user_address", requireAnalyticsOwner, handler);
+```
+
+### Contract
+
+1. `requireAuth` runs first. It reads `x-user-address` and `authorization`
+   headers verbatim. On any failure it responds `401 { error: "Unauthorized" }`
+   and does **not** call `next()`. On success it sets `req.auth = { address,
+   token }` and calls `next()`.
+
+2. `requireAnalyticsOwner` runs next. It normalizes both the path parameter
+   (`:user_address`) and the principal's address via
+   `normalizeStarknetAddress` so that padding and casing differences (e.g.
+   `0x1`, `0x0001`, a valid checksum for the same address) cannot cause a
+   false mismatch or a false grant.
+
+   - If the path parameter cannot be normalized (invalid address), the request
+     is passed through to the route handler, which rejects it with `400` via
+     `StarknetAddress.parse`. This keeps a single source of truth for address
+     validation.
+   - If the normalized addresses do not match, the middleware responds
+     `403 { error: "Forbidden" }` and does **not** call `next()`.
+
+### Status matrix
+
+| Condition                                         | Status | Body                        |
+| ------------------------------------------------- | ------ | --------------------------- |
+| No auth headers / invalid session                 | 401    | `{ error: "Unauthorized" }` |
+| Authenticated but `:user_address` ≠ principal     | 403    | `{ error: "Forbidden" }`    |
+| Invalid `:user_address` format                    | 400    | `{ error: "Validation failed", details: [...] }` |
+| Valid request                                     | 200    | `{ year, data, total }`     |
+
+### Security notes
+
+- The cache key includes the normalized user address, so no caller can ever
+  receive data scoped to a different identity (see `docs/routes/analytics.md`,
+  "Idempotency contract" → "In-process aggregation cache").
+- `Cache-Control: private` ensures intermediate caches do not store
+  user-specific financial data.
+- The `requireAnalyticsOwner` middleware is exported from `src/routes/analytics.ts`
+  so it can be reused or tested independently.
 
 ---
 
@@ -91,6 +148,8 @@ No body. ETag matching triggers a 304 via `If-None-Match`.
 | Status | Condition                        | Body                                                                 |
 | ------ | -------------------------------- | -------------------------------------------------------------------- |
 | 400    | Invalid `user_address` or `year` | `{ "error": "Validation failed", "details": [...] }`                 |
+| 401    | Missing/invalid auth headers or session | `{ "error": "Unauthorized" }`                                 |
+| 403    | Principal ≠ requested `:user_address` | `{ "error": "Forbidden" }`                                    |
 | 409    | Duplicate rollup in flight       | `{ "error": "Duplicate rollup in progress — retry after a few seconds" }` |
 | 500    | DB failure or unexpected error   | `{ "error": "<message>" }`                                           |
 
