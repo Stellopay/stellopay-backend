@@ -1,9 +1,35 @@
 import { Router } from "express";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, gte, lte, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { formatTokenAmount, DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
+
+const AnalyticsChartPoint = z.object({
+  month: z.enum(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"]),
+  views: z.number(),
+});
+
+export const AnalyticsResponse = z.object({
+  year: z.number(),
+  data: z.array(AnalyticsChartPoint).length(12),
+  total: z.number(),
+});
+
+export type AnalyticsResponseType = z.infer<typeof AnalyticsResponse>;
+
+function assertAnalyticsResponseShape(payload: AnalyticsResponseType): void {
+  if (process.env.NODE_ENV === "production") return;
+  try {
+    AnalyticsResponse.parse(payload);
+  } catch (e) {
+    if (e instanceof ZodError) {
+      console.error("[analytics] Response shape drift detected:", e.issues);
+    } else {
+      throw e;
+    }
+  }
+}
 
 export const analyticsRouter = Router();
 
@@ -152,11 +178,13 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
     // losslessly rather than by accumulating already-rounded display values.
     const totalRaw = Object.values(monthlyData).reduce((sum, v) => sum + v, 0n);
 
-    res.json({
+    const payload = {
       year,
       data: chartData,
       total: Number(formatTokenAmount(totalRaw, DEFAULT_TOKEN_DECIMALS)),
-    });
+    };
+    assertAnalyticsResponseShape(payload);
+    res.json(payload);
   } catch (e) {
     next(e);
   }

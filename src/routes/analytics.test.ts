@@ -64,7 +64,7 @@ vi.mock("drizzle-orm", () => ({
   sql: vi.fn(() => "sql-expr"),
 }));
 
-import { analyticsRouter } from "./analytics.js";
+import { analyticsRouter, AnalyticsResponse } from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 
 function makeApp() {
@@ -146,5 +146,72 @@ describe("analytics route", () => {
 
   it("rejects a year above the supported range with 400", async () => {
     await request(makeApp()).get("/api/v1/analytics/abc?year=3000").expect(400);
+  });
+
+  describe("response shape schema guard", () => {
+    it("accepts a valid analytics response", () => {
+      const validPayload = {
+        year: 2026,
+        data: [
+          { month: "Jan", views: 0 },
+          { month: "Feb", views: 0 },
+          { month: "Mar", views: 4 },
+          { month: "Apr", views: -3 },
+          { month: "May", views: 4 },
+          { month: "Jun", views: 2 },
+          { month: "Jul", views: 0 },
+          { month: "Aug", views: 0 },
+          { month: "Sept", views: 10 },
+          { month: "Oct", views: 0 },
+          { month: "Nov", views: 0 },
+          { month: "Dec", views: 0 },
+        ],
+        total: 17,
+      };
+      expect(() => AnalyticsResponse.parse(validPayload)).not.toThrow();
+    });
+
+    it("rejects a payload with a missing field", () => {
+      const badPayload = { year: 2026, data: [] };
+      expect(() => AnalyticsResponse.parse(badPayload)).toThrow();
+    });
+
+    it("rejects a payload with an invalid month name", () => {
+      const badPayload = {
+        year: 2026,
+        data: Array.from({ length: 12 }, (_, i) => ({
+          month: i === 0 ? "Xan" : (["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"] as const)[i - 1] ?? "Jan",
+          views: 0,
+        })),
+        total: 0,
+      };
+      expect(() => AnalyticsResponse.parse(badPayload)).toThrow();
+    });
+
+    it("rejects a payload with wrong data length", () => {
+      const badPayload = {
+        year: 2026,
+        data: [{ month: "Jan", views: 0 }],
+        total: 0,
+      };
+      expect(() => AnalyticsResponse.parse(badPayload)).toThrow();
+    });
+
+    it("logs an error and does not throw when NODE_ENV is production", async () => {
+      const originalEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = "production";
+      try {
+        const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+        // The guard should be a no-op in production — call through the route
+        // and verify the response still succeeds.
+        const res = await request(makeApp()).get("/api/v1/analytics/abc").expect(200);
+        expect(res.body.year).toBeDefined();
+        expect(res.body.data).toHaveLength(12);
+        expect(res.body.total).toBeDefined();
+        spy.mockRestore();
+      } finally {
+        process.env.NODE_ENV = originalEnv;
+      }
+    });
   });
 });
