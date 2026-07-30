@@ -2,8 +2,21 @@ import express from "express";
 import nodemailer from "nodemailer";
 import { z } from "zod";
 import { env } from "../config.js";
+import { makeLimiter } from "../middleware/rate-limit.js";
 
 const contactRouter = express.Router();
+
+// Rate limit the public contact form to prevent spam.
+// Default: 3 submissions per hour per IP (configurable via RATE_LIMIT_CONTACT_WINDOW_MS
+// and RATE_LIMIT_CONTACT_MAX env vars).
+contactRouter.use(
+  makeLimiter({
+    name: "contact",
+    windowMs: env.RATE_LIMIT_CONTACT_WINDOW_MS,
+    max: env.RATE_LIMIT_CONTACT_MAX,
+    message: "Too many contact form submissions. Please try again later.",
+  }),
+);
 
 /**
  * Validation schema for the contact form. Trims input and caps each field's

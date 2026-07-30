@@ -1,17 +1,15 @@
 import { Router } from "express";
-import { requireAuth } from "../auth/middleware.js";
+import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
-import { eq } from "drizzle-orm";
-import { provider } from "../starknet/client.js";
-import { toHexString, u256ToString } from "../utils/codec.js";
+import { eq, and, gte, lte, inArray, desc, SQL, or, gt, sql } from "drizzle-orm";
+import { provider, agreementContract, escrowContract } from "../starknet/client.js";
+import { toHexString } from "../utils/codec.js";
 import { normalizeStarknetAddress as normalizeAddress } from "../utils/address.js";
-import { shortString, Contract } from "starknet";
-import { defaults, abiPaths } from "../config.js";
+import { defaults, abiPaths, env } from "../config.js";
 import { loadAbiFromContractClassJsonPath } from "../starknet/abi.js";
-import { agreementContract } from "../starknet/client.js";
-
-const AddressParam = z.string().min(3);
+import { notFoundResponse } from "./not-found.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, parsePagination } from "../utils/validation.js";
 
 /** Maximum number of tx hashes accepted by process_batch in a single request. */
 export const MAX_BATCH_SIZE = 50;
@@ -20,6 +18,11 @@ export const MAX_BATCH_SIZE = 50;
  * Zod schema for a Starknet transaction hash.
  * Accepts the canonical 0x-prefixed hex form (up to 66 chars) as well as the
  * un-padded variant emitted by some RPC providers.
+ *
+ * **Backward-compatibility contract:** This validation schema is frozen. The
+ * pattern (0x-prefixed hex, 1-64 hex characters) and length constraints (3-66
+ * total chars) must be preserved. New validation rules may be added but
+ * existing valid hashes must continue to pass.
  */
 export const TxHashSchema = z
   .string()
@@ -27,12 +30,68 @@ export const TxHashSchema = z
   .max(66)
   .regex(/^0x[0-9a-fA-F]{1,64}$/, "Invalid Starknet transaction hash format");
 
+/**
+ * Envelope schema for batch processing of Starknet transaction receipts.
+ * Validates a non-empty array of Starknet transaction hashes bounded by MAX_BATCH_SIZE.
+ */
+export const BatchProcessEnvelopeSchema = z.object({
+  tx_hashes: z
+    .array(TxHashSchema)
+    .min(1, "tx_hashes must contain at least one hash")
+    .max(
+      MAX_BATCH_SIZE,
+      `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
+    ),
+});
+
 export const eventsRouter = Router();
+
+interface EventTelemetryEntry {
+  operation: "event_ingestion" | "event_envelope_validation" | "event_fanout_delivery";
+  duration_ms: number;
+  status: "success" | "error";
+  tx_hash?: string;
+  batch_size?: number;
+  unique_transactions?: number;
+  duplicates?: number;
+  events_processed?: number;
+  result_status?: TxProcessResult["status"];
+  error?: string;
+}
+
+/** Emits one structured, low-cardinality telemetry event for the ingestion path. */
+function logEventTelemetry(entry: EventTelemetryEntry): void {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: entry.status === "error" ? "error" : "info",
+    ...entry,
+  };
+  if (env.LOG_FORMAT === "json") {
+     
+    (logEntry.level === "error" ? console.error : console.info)(JSON.stringify(logEntry));
+    return;
+  }
+  const message =
+    `[events-telemetry] ${logEntry.operation} ${logEntry.status} ${logEntry.duration_ms}ms` +
+    `${logEntry.tx_hash ? ` tx=${logEntry.tx_hash}` : ""}` +
+    `${logEntry.batch_size !== undefined ? ` batch=${logEntry.batch_size}` : ""}` +
+    `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
+   
+  (logEntry.level === "error" ? console.error : console.info)(message);
+}
 
 /**
  * Normalize a Starknet transaction hash to the canonical 0x + 64-hex form.
  * If the hash is already 66 chars, it is returned as-is to preserve leading
  * zeros; otherwise the hex part is left-padded to 64 characters.
+ *
+ * **Backward-compatibility contract:** This normalization logic is frozen. The
+ * output format (0x + exactly 64 hex characters, lowercase) and padding behavior
+ * must be preserved. All existing normalized hashes must continue to produce the
+ * same output.
+ *
+ * @param hash - Raw transaction hash (may be un-prefixed or un-padded)
+ * @returns Normalized hash in 0x + 64-hex format
  */
 export function normalizeTransactionHash(hash: string): string {
   if (!hash) return "";
@@ -56,7 +115,7 @@ export function normalizeTransactionHash(hash: string): string {
 let workAgreementAbi: any[] | null = null;
 let payrollEscrowAbi: any[] | null = null;
 
-async function getWorkAgreementAbi(): Promise<any[]> {
+export async function getWorkAgreementAbi(): Promise<any[]> {
   if (!workAgreementAbi) {
     if (!abiPaths.agreement) {
       throw new Error("AGREEMENT_CONTRACT_CLASS_JSON path is not configured");
@@ -66,7 +125,7 @@ async function getWorkAgreementAbi(): Promise<any[]> {
   return workAgreementAbi;
 }
 
-async function getPayrollEscrowAbi(): Promise<any[]> {
+export async function getPayrollEscrowAbi(): Promise<any[]> {
   if (!payrollEscrowAbi) {
     if (!abiPaths.escrow) {
       throw new Error("ESCROW_CONTRACT_CLASS_JSON path is not configured");
@@ -82,6 +141,11 @@ async function getPayrollEscrowAbi(): Promise<any[]> {
 
 /**
  * Result returned by {@link processTxReceipt} for a single transaction.
+ *
+ * **Backward-compatibility contract:** This interface shape is frozen. All five
+ * fields and their types must be preserved. New optional fields may be added but
+ * existing fields cannot be removed or have their types changed. The status enum
+ * values ("processed", "no_events", "not_found", "error") are stable.
  */
 export interface TxProcessResult {
   /** Normalised (0x + 64-hex) transaction hash that was processed. */
@@ -155,10 +219,43 @@ async function verifyAndUpdateToken(
  * persistence; both `POST /events/process_tx/:tx_hash` and
  * `POST /events/process_batch` delegate to it.
  *
+ * **Backward-compatibility guarantees:**
+ * - Idempotent: Re-processing the same txHash never creates duplicate rows
+ * - Deterministic row IDs: `{normalizedTxHash}_{eventIndex}` format is frozen
+ * - Status values are stable: "processed", "no_events", "not_found", "error"
+ * - All database writes use `.onConflictDoNothing()` or `.onConflictDoUpdate()`
+ * - Hash normalization behavior is preserved (see {@link normalizeTransactionHash})
+ *
  * @param txHash - Raw transaction hash (will be normalised internally).
  * @returns A {@link TxProcessResult} describing what was stored.
  */
 export async function processTxReceipt(txHash: string): Promise<TxProcessResult> {
+  const start = process.hrtime.bigint();
+  const normalizedTxHash = normalizeTransactionHash(txHash);
+  try {
+    const result = await processTxReceiptUnchecked(txHash);
+    logEventTelemetry({
+      operation: "event_ingestion",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: result.txHash,
+      result_status: result.status,
+      events_processed: result.eventsProcessed,
+    });
+    return result;
+  } catch (error: any) {
+    logEventTelemetry({
+      operation: "event_ingestion",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "error",
+      tx_hash: normalizedTxHash,
+      error: error?.message ?? String(error),
+    });
+    throw error;
+  }
+}
+
+async function processTxReceiptUnchecked(txHash: string): Promise<TxProcessResult> {
   const normalizedTxHash = normalizeTransactionHash(txHash);
 
   // ------------------------------------------------------------------
@@ -205,15 +302,13 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
   }
 
   // ------------------------------------------------------------------
-  // 3. Prepare ABI contract instances for event parsing
+  // 3. Prepare ABI contract instances for event parsing (cached singletons)
   // ------------------------------------------------------------------
-  const wAgreementAbi = await getWorkAgreementAbi();
-  const pEscrowAbi = await getPayrollEscrowAbi();
   const workAgreementAddress = defaults.workAgreementAddress.toLowerCase();
   const payrollEscrowAddress = defaults.payrollEscrowAddress.toLowerCase();
 
-  const workAgreementContract = new Contract(wAgreementAbi, workAgreementAddress, provider);
-  const payrollEscrowContract = new Contract(pEscrowAbi, payrollEscrowAddress, provider);
+  const workAgreementContract = agreementContract(workAgreementAddress);
+  const payrollEscrowContract = escrowContract(payrollEscrowAddress);
 
   const eventLabels: string[] = [];
 
@@ -286,158 +381,146 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
           "DisputeResolved",
         ].includes(eventType)
       ) {
-        try {
+        await db
+          .insert(schema.agreementEvents)
+          .values({
+            id: `${normalizedTxHash}_${i}`,
+            agreementId,
+            contractAddress: fromAddress,
+            eventType,
+            blockNumber: Number(blockNumber),
+            transactionHash: normalizedTxHash,
+            eventIndex: i,
+          })
+          .onConflictDoNothing();
+
+        // On AgreementCreated, also upsert the agreements row
+        if (eventType === "AgreementCreated" && decodedEvent.data) {
+          const employer = normalizeAddress(
+            toHexString(BigInt(decodedEvent.data.employer || eventData[1])),
+          );
+          const contributor = decodedEvent.data.contributor
+            ? normalizeAddress(toHexString(BigInt(decodedEvent.data.contributor || eventData[2])))
+            : null;
+          const tokenFromEvent = normalizeAddress(
+            toHexString(BigInt(decodedEvent.data.token || eventData[3])),
+          );
+          const mode = Number(decodedEvent.data.mode || eventData[4] || 0);
+          const paymentType = Number(
+            decodedEvent.data.payment_type || decodedEvent.data.paymentType || eventData[5] || 0,
+          );
+
           await db
-            .insert(schema.agreementEvents)
+            .insert(schema.agreements)
             .values({
-              id: `${normalizedTxHash}_${i}`,
-              agreementId,
+              id: agreementId,
               contractAddress: fromAddress,
-              eventType,
+              employer,
+              contributor: contributor || null,
+              token: tokenFromEvent,
+              mode,
+              paymentType,
+              status: 0,
+              totalAmount: "0",
+              paidAmount: "0",
+              disputeStatus: 0,
               blockNumber: Number(blockNumber),
               transactionHash: normalizedTxHash,
-              eventIndex: i,
             })
-            .onConflictDoNothing();
+            .onConflictDoUpdate({
+              target: schema.agreements.id,
+              set: { updatedAt: new Date() },
+            });
 
-          // On AgreementCreated, also upsert the agreements row
-          if (eventType === "AgreementCreated" && decodedEvent.data) {
-            const employer = normalizeAddress(
-              toHexString(BigInt(decodedEvent.data.employer || eventData[1])),
-            );
-            const contributor = decodedEvent.data.contributor
-              ? normalizeAddress(toHexString(BigInt(decodedEvent.data.contributor || eventData[2])))
-              : null;
-            const tokenFromEvent = normalizeAddress(
-              toHexString(BigInt(decodedEvent.data.token || eventData[3])),
-            );
-            const mode = Number(decodedEvent.data.mode || eventData[4] || 0);
-            const paymentType = Number(
-              decodedEvent.data.payment_type || decodedEvent.data.paymentType || eventData[5] || 0,
-            );
-
-            await db
-              .insert(schema.agreements)
-              .values({
-                id: agreementId,
-                contractAddress: fromAddress,
-                employer,
-                contributor: contributor || null,
-                token: tokenFromEvent,
-                mode,
-                paymentType,
-                status: 0,
-                totalAmount: "0",
-                paidAmount: "0",
-                disputeStatus: 0,
-                blockNumber: Number(blockNumber),
-                transactionHash: normalizedTxHash,
-              })
-              .onConflictDoUpdate({
-                target: schema.agreements.id,
-                set: { updatedAt: new Date() },
-              });
-
-            // Verify the token against the on-chain contract before responding.
-            // Awaited, not fire and forget, so the authoritative on-chain value
-            // settles the stored row before process_tx returns.
-            sawAgreementCreated = true;
-            const verified = await verifyAndUpdateToken(agreementId, fromAddress, tokenFromEvent);
-            if (!verified) allTokensVerified = false;
-          }
-
-          eventLabels.push(`${eventType}-${agreementId}`);
-        } catch (e) {
-          console.error(`[events] Failed to store ${eventType}:`, e);
+          // Verify the token against the on-chain contract before responding.
+          // Awaited, not fire and forget, so the authoritative on-chain value
+          // settles the stored row before process_tx returns.
+          sawAgreementCreated = true;
+          const verified = await verifyAndUpdateToken(agreementId, fromAddress, tokenFromEvent);
+          if (!verified) allTokensVerified = false;
         }
+
+        eventLabels.push(`${eventType}-${agreementId}`);
       }
 
       // Payment events
       else if (["PaymentSent", "PaymentReceived"].includes(eventType) && decodedEvent.data) {
-        try {
-          const from = normalizeAddress(
-            toHexString(BigInt(decodedEvent.data.from || eventData[1])),
-          );
-          const to = normalizeAddress(toHexString(BigInt(decodedEvent.data.to || eventData[2])));
-          const amount = decodedEvent.data.amount
-            ? typeof decodedEvent.data.amount === "object" &&
-              decodedEvent.data.amount.low &&
-              decodedEvent.data.amount.high
-              ? (
-                  BigInt(decodedEvent.data.amount.low) +
-                  (BigInt(decodedEvent.data.amount.high) << 128n)
-                ).toString()
-              : decodedEvent.data.amount.toString()
-            : eventData.length >= 4
-              ? BigInt(eventData[3]).toString()
-              : "0";
-          const token = normalizeAddress(
-            toHexString(BigInt(decodedEvent.data.token || eventData[4] || eventData[2])),
-          );
+        const from = normalizeAddress(
+          toHexString(BigInt(decodedEvent.data.from || eventData[1])),
+        );
+        const to = normalizeAddress(toHexString(BigInt(decodedEvent.data.to || eventData[2])));
+        const amount = decodedEvent.data.amount
+          ? typeof decodedEvent.data.amount === "object" &&
+            decodedEvent.data.amount.low &&
+            decodedEvent.data.amount.high
+            ? (
+                BigInt(decodedEvent.data.amount.low) +
+                (BigInt(decodedEvent.data.amount.high) << 128n)
+              ).toString()
+            : decodedEvent.data.amount.toString()
+          : eventData.length >= 4
+            ? BigInt(eventData[3]).toString()
+            : "0";
+        const token = normalizeAddress(
+          toHexString(BigInt(decodedEvent.data.token || eventData[4] || eventData[2])),
+        );
 
-          await db
-            .insert(schema.payments)
-            .values({
-              id: `${normalizedTxHash}_${i}`,
-              agreementId,
-              contractAddress: fromAddress,
-              from,
-              to,
-              amount,
-              token,
-              eventType,
-              blockNumber: Number(blockNumber),
-              transactionHash: normalizedTxHash,
-            })
-            .onConflictDoNothing();
+        await db
+          .insert(schema.payments)
+          .values({
+            id: `${normalizedTxHash}_${i}`,
+            agreementId,
+            contractAddress: fromAddress,
+            from,
+            to,
+            amount,
+            token,
+            eventType,
+            blockNumber: Number(blockNumber),
+            transactionHash: normalizedTxHash,
+          })
+          .onConflictDoNothing();
 
-          eventLabels.push(`${eventType}-${agreementId}`);
-        } catch (e) {
-          console.error(`[events] Failed to store payment event:`, e);
-        }
+        eventLabels.push(`${eventType}-${agreementId}`);
       }
 
       // Escrow events
       else if (["Funded", "Released", "Refunded"].includes(eventType) && decodedEvent.data) {
-        try {
-          const employer = decodedEvent.data.employer
-            ? normalizeAddress(toHexString(BigInt(decodedEvent.data.employer)))
-            : "";
-          const to = decodedEvent.data.to
-            ? normalizeAddress(toHexString(BigInt(decodedEvent.data.to)))
-            : null;
-          const amount = decodedEvent.data.amount
-            ? typeof decodedEvent.data.amount === "object" &&
-              decodedEvent.data.amount.low &&
-              decodedEvent.data.amount.high
-              ? (
-                  BigInt(decodedEvent.data.amount.low) +
-                  (BigInt(decodedEvent.data.amount.high) << 128n)
-                ).toString()
-              : decodedEvent.data.amount.toString()
-            : eventData.length >= 3
-              ? BigInt(eventData[2]).toString()
-              : "0";
+        const employer = decodedEvent.data.employer
+          ? normalizeAddress(toHexString(BigInt(decodedEvent.data.employer)))
+          : "";
+        const to = decodedEvent.data.to
+          ? normalizeAddress(toHexString(BigInt(decodedEvent.data.to)))
+          : null;
+        const amount = decodedEvent.data.amount
+          ? typeof decodedEvent.data.amount === "object" &&
+            decodedEvent.data.amount.low &&
+            decodedEvent.data.amount.high
+            ? (
+                BigInt(decodedEvent.data.amount.low) +
+                (BigInt(decodedEvent.data.amount.high) << 128n)
+              ).toString()
+            : decodedEvent.data.amount.toString()
+          : eventData.length >= 3
+            ? BigInt(eventData[2]).toString()
+            : "0";
 
-          await db
-            .insert(schema.escrowEvents)
-            .values({
-              id: `${normalizedTxHash}_${i}`,
-              agreementId,
-              contractAddress: fromAddress,
-              eventType,
-              employer: eventType === "Funded" ? employer : "",
-              to: eventType !== "Funded" ? to : null,
-              amount,
-              blockNumber: Number(blockNumber),
-              transactionHash: normalizedTxHash,
-            })
-            .onConflictDoNothing();
+        await db
+          .insert(schema.escrowEvents)
+          .values({
+            id: `${normalizedTxHash}_${i}`,
+            agreementId,
+            contractAddress: fromAddress,
+            eventType,
+            employer: eventType === "Funded" ? employer : "",
+            to: eventType !== "Funded" ? to : null,
+            amount,
+            blockNumber: Number(blockNumber),
+            transactionHash: normalizedTxHash,
+          })
+          .onConflictDoNothing();
 
-          eventLabels.push(`${eventType}-${agreementId}`);
-        } catch (e) {
-          console.error(`[events] Failed to store escrow event:`, e);
-        }
+        eventLabels.push(`${eventType}-${agreementId}`);
       }
     }
 
@@ -445,55 +528,51 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
     // 4b. Heuristic fallback (ABI decoding unavailable)
     // ----------------------------------------------------------------
     else if (eventData.length >= 6) {
-      try {
-        const hAgreementId = BigInt(eventData[0]).toString();
-        const employer = normalizeAddress(toHexString(BigInt(eventData[1])));
-        const contributor = eventData[2]
-          ? normalizeAddress(toHexString(BigInt(eventData[2])))
-          : null;
-        const token = normalizeAddress(toHexString(BigInt(eventData[3])));
-        const mode = Number(eventData[4]);
-        const paymentType = Number(eventData[5]);
+      const hAgreementId = BigInt(eventData[0]).toString();
+      const employer = normalizeAddress(toHexString(BigInt(eventData[1])));
+      const contributor = eventData[2]
+        ? normalizeAddress(toHexString(BigInt(eventData[2])))
+        : null;
+      const token = normalizeAddress(toHexString(BigInt(eventData[3])));
+      const mode = Number(eventData[4]);
+      const paymentType = Number(eventData[5]);
 
-        await db
-          .insert(schema.agreementEvents)
-          .values({
-            id: `${normalizedTxHash}_${i}`,
-            agreementId: hAgreementId,
-            contractAddress: fromAddress,
-            eventType: "AgreementCreated",
-            blockNumber: Number(blockNumber),
-            transactionHash: normalizedTxHash,
-            eventIndex: i,
-          })
-          .onConflictDoNothing();
+      await db
+        .insert(schema.agreementEvents)
+        .values({
+          id: `${normalizedTxHash}_${i}`,
+          agreementId: hAgreementId,
+          contractAddress: fromAddress,
+          eventType: "AgreementCreated",
+          blockNumber: Number(blockNumber),
+          transactionHash: normalizedTxHash,
+          eventIndex: i,
+        })
+        .onConflictDoNothing();
 
-        await db
-          .insert(schema.agreements)
-          .values({
-            id: hAgreementId,
-            contractAddress: fromAddress,
-            employer,
-            contributor: contributor || null,
-            token,
-            mode,
-            paymentType,
-            status: 0,
-            totalAmount: "0",
-            paidAmount: "0",
-            disputeStatus: 0,
-            blockNumber: Number(blockNumber),
-            transactionHash: normalizedTxHash,
-          })
-          .onConflictDoUpdate({
-            target: schema.agreements.id,
-            set: { updatedAt: new Date() },
-          });
+      await db
+        .insert(schema.agreements)
+        .values({
+          id: hAgreementId,
+          contractAddress: fromAddress,
+          employer,
+          contributor: contributor || null,
+          token,
+          mode,
+          paymentType,
+          status: 0,
+          totalAmount: "0",
+          paidAmount: "0",
+          disputeStatus: 0,
+          blockNumber: Number(blockNumber),
+          transactionHash: normalizedTxHash,
+        })
+        .onConflictDoUpdate({
+          target: schema.agreements.id,
+          set: { updatedAt: new Date() },
+        });
 
-        eventLabels.push(`AgreementCreated-${hAgreementId}`);
-      } catch (e) {
-        console.error(`[events] Failed to store heuristic AgreementCreated:`, e);
-      }
+      eventLabels.push(`AgreementCreated-${hAgreementId}`);
     }
   }
 
@@ -507,23 +586,284 @@ export async function processTxReceipt(txHash: string): Promise<TxProcessResult>
 }
 
 // ---------------------------------------------------------------------------
+// Cursor-based pagination for event listing
+// ---------------------------------------------------------------------------
+
+/**
+ * The decoded form of a pagination cursor. All three fields together form a
+ * total order over `agreement_events` rows that is stable even when new rows
+ * are inserted mid-pagination: `(blockNumber, eventIndex, id)` is strictly
+ * monotone per insert and the `id` (txHash_eventIndex composite) breaks any
+ * remaining ties.
+ *
+ * **Backward-compatibility contract:** This interface shape is frozen. All three
+ * fields and their types must be preserved for cursor decoding to work across
+ * API versions. The encoding format (JSON + base64url) is also frozen.
+ *
+ * @internal — callers only see the opaque base64url string.
+ */
+export interface EventCursorPayload {
+  blockNumber: number;
+  eventIndex: number;
+  id: string;
+}
+
+/**
+ * Encodes a cursor payload to an opaque base64url string that is safe to
+ * include in a URL query parameter without percent-encoding.
+ *
+ * The encoding is intentionally simple (JSON → base64url) so it is easy to
+ * audit and decode in tests, but it is not "guessable" as an incrementable
+ * integer — clients cannot derive internal row IDs from it without already
+ * knowing the `id` value (txHash_eventIndex).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Encoding format (JSON → base64url) is frozen
+ * - Output is always URL-safe (no percent-encoding needed)
+ * - Cursors from older API versions can be decoded by newer versions
+ * - Function signature is frozen
+ */
+export function encodeCursor(payload: EventCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload)).toString("base64url");
+}
+
+/**
+ * Decodes a cursor string produced by {@link encodeCursor}. Returns `null` on
+ * any parse or validation failure so callers can treat a bad cursor as
+ * "no cursor" (first page) rather than throwing a 500.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Gracefully handles malformed input (returns null, never throws)
+ * - Validates all three required fields (blockNumber, eventIndex, id)
+ * - Compatible with cursors from older API versions (same encoding format)
+ * - Function signature is frozen
+ * - Null return value for invalid cursors is stable behavior
+ */
+export function decodeCursor(cursor: string): EventCursorPayload | null {
+  try {
+    const raw = Buffer.from(cursor, "base64url").toString("utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      typeof (parsed as any).blockNumber !== "number" ||
+      typeof (parsed as any).eventIndex !== "number" ||
+      typeof (parsed as any).id !== "string" ||
+      (parsed as any).id.length === 0
+    ) {
+      return null;
+    }
+    return parsed as EventCursorPayload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zod schema for the `GET /events/list` query parameters.
+ *
+ * - `cursor`       — opaque pagination token from a previous response; absent
+ *   on the first page.
+ * - `limit`        — page size, clamped to `[1, MAX_PAGE_LIMIT]`; defaults to
+ *   `DEFAULT_PAGE_LIMIT`.
+ * - `agreement_id` — optional filter: only return events for this agreement.
+ * - `event_type`   — optional filter: only return events of this type.
+ */
+const EventListQuerySchema = z.object({
+  // An absent or empty cursor string both mean "first page".
+  cursor: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.length > 0 ? v : undefined)),
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => {
+      const n = v === undefined ? DEFAULT_PAGE_LIMIT : parseInt(v, 10);
+      if (!Number.isFinite(n) || Number.isNaN(n)) return DEFAULT_PAGE_LIMIT;
+      return Math.min(Math.max(n, 1), MAX_PAGE_LIMIT);
+    }),
+  agreement_id: z.string().min(1).optional(),
+  event_type: z.string().min(1).optional(),
+});
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+/**
+ * GET /events/list
+ *
+ * Returns a stable, cursor-paginated page of agreement events ordered by
+ * `(blockNumber ASC, eventIndex ASC, id ASC)`. This ordering is insertion-
+ * stable: new events inserted after a client starts paginating never cause a
+ * row to appear on two pages or to be skipped.
+ *
+ * **Query parameters**
+ *
+ * | Param          | Default              | Notes                              |
+ * |----------------|----------------------|------------------------------------|
+ * | `cursor`       | _(first page)_       | Opaque token from `nextCursor`     |
+ * | `limit`        | `DEFAULT_PAGE_LIMIT` | Clamped to `[1, MAX_PAGE_LIMIT]`   |
+ * | `agreement_id` | _(all agreements)_   | Filter by agreement                |
+ * | `event_type`   | _(all types)_        | Filter by event type               |
+ *
+ * **Response**
+ * ```json
+ * {
+ *   "events":     [...],
+ *   "nextCursor": "base64url-string | null",
+ *   "hasMore":    true | false,
+ *   "count":      number
+ * }
+ * ```
+ *
+ * `nextCursor` is `null` on the last page. Pass it as `?cursor=` on the next
+ * request to retrieve the following page. The cursor is an opaque base64url
+ * string — do not parse or construct it; its internal format may change.
+ *
+ * **Security**
+ * Cursors encode `(blockNumber, eventIndex, id)` where `id` is the composite
+ * `txHash_eventIndex` primary key. A client cannot infer an internal sequence
+ * from the cursor without already knowing the `id` value. The endpoint is
+ * public (read-only, indexed on-chain data) consistent with the existing
+ * indexed reading routes.
+ */
+eventsRouter.get("/events/list", async (req, res, next) => {
+  try {
+    const query = EventListQuerySchema.safeParse(req.query);
+    if (!query.success) {
+      res.status(400).json({
+        error: "Invalid query parameters",
+        details: query.error.issues,
+      });
+      return;
+    }
+
+    const { cursor, limit, agreement_id, event_type } = query.data;
+
+    // Decode cursor — invalid cursors restart from page 1 (fail-open on client
+    // errors; the response is always a valid first page rather than a 400).
+    const cursorPayload = cursor ? decodeCursor(cursor) : null;
+
+    // Build WHERE conditions
+    const conditions = [];
+
+    if (agreement_id) {
+      conditions.push(eq(schema.agreementEvents.agreementId, agreement_id));
+    }
+    if (event_type) {
+      conditions.push(eq(schema.agreementEvents.eventType, event_type));
+    }
+
+    // Cursor condition: fetch rows strictly after the cursor position using a
+    // tuple comparison on (blockNumber, eventIndex, id). This is the standard
+    // "keyset pagination" pattern — it is index-friendly and stable across
+    // concurrent inserts.
+    //
+    // The SQL equivalent is:
+    //   (block_number, event_index, id) > (?, ?, ?)
+    //
+    // We express it with an explicit OR expansion so Drizzle does not need to
+    // support tuple literals:
+    //   block_number > cursorBlock
+    //   OR (block_number = cursorBlock AND event_index > cursorEventIndex)
+    //   OR (block_number = cursorBlock AND event_index = cursorEventIndex AND id > cursorId)
+    if (cursorPayload) {
+      const { blockNumber: cb, eventIndex: ci, id: cid } = cursorPayload;
+      conditions.push(
+        or(
+          gt(schema.agreementEvents.blockNumber, cb),
+          and(
+            sql`${schema.agreementEvents.blockNumber} = ${cb}`,
+            gt(schema.agreementEvents.eventIndex, ci),
+          ),
+          and(
+            sql`${schema.agreementEvents.blockNumber} = ${cb}`,
+            sql`${schema.agreementEvents.eventIndex} = ${ci}`,
+            gt(schema.agreementEvents.id, cid),
+          ),
+        ),
+      );
+    }
+
+    // Fetch limit + 1 so we can detect whether there is a next page without a
+    // separate COUNT query.
+    const rows = await db
+      .select()
+      .from(schema.agreementEvents)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(
+        schema.agreementEvents.blockNumber,
+        schema.agreementEvents.eventIndex,
+        schema.agreementEvents.id,
+      )
+      .limit(limit + 1);
+
+    const hasMore = rows.length > limit;
+    const events = hasMore ? rows.slice(0, limit) : rows;
+
+    // Build the next cursor from the last row on this page.
+    let nextCursor: string | null = null;
+    if (hasMore && events.length > 0) {
+      const last = events[events.length - 1];
+      nextCursor = encodeCursor({
+        blockNumber: last.blockNumber,
+        eventIndex: last.eventIndex,
+        id: last.id,
+      });
+    }
+
+    res.json({
+      events,
+      nextCursor,
+      hasMore,
+      count: events.length,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
 
 /**
  * POST /events/process_tx/:tx_hash
  *
  * Process a single Starknet transaction: fetch its receipt, decode all events
  * using the on-chain ABIs, and persist them to the database.
+ *
+ * **Authentication:** Requires an active admin session (`requireAuth` +
+ * `requireAdmin`). Ingestion writes `agreements`/`agreementEvents`/`payments`/
+ * `escrowEvents` rows for whatever tx hash the caller supplies and can
+ * overwrite a stored agreement's `token` from the on-chain value — matching
+ * the admin-only gate already used by the sibling ingestion routes in
+ * `backfill-events.ts` and `reprocess-events.ts`.
  */
 eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, next) => {
+  const start = process.hrtime.bigint();
   try {
-    const { tx_hash } = z.object({ tx_hash: z.string() }).parse(req.params);
+    const { tx_hash } = z.object({ tx_hash: TxHashSchema }).parse(req.params);
+    logEventTelemetry({
+      operation: "event_envelope_validation",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: normalizeTransactionHash(tx_hash),
+      batch_size: 1,
+    });
 
     const result = await processTxReceipt(tx_hash);
+    logEventTelemetry({
+      operation: "event_fanout_delivery",
+      duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+      status: "success",
+      tx_hash: result.txHash,
+      batch_size: 1,
+      unique_transactions: 1,
+      events_processed: result.eventsProcessed,
+      result_status: result.status,
+    });
 
     if (result.status === "not_found") {
-      res.status(404).json({ error: "Transaction not found" });
+      notFoundResponse(res, "Transaction not found");
       return;
     }
 
@@ -534,20 +874,31 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
 
     res.json({
       message: `Processed ${result.eventsProcessed} events`,
-      eventsProcessed: result.eventLabels,
+      eventsProcessed: result.eventsProcessed,
       transactionHash: result.txHash,
       tokenVerified: result.tokenVerified,
     });
-  } catch (e) {
-    next(e);
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "error",
+        batch_size: 1,
+        error: error.message,
+      });
+      res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+      return;
+    }
+    next(error);
   }
 });
 
 /**
  * POST /events/process_batch
  *
- * Process multiple Starknet transactions in a single request.  Each tx hash is
- * decoded and persisted independently using the same logic as
+ * Process multiple Starknet transactions in a single request.  Each *unique*
+ * tx hash is decoded and persisted independently using the same logic as
  * `process_tx/:tx_hash` so the operation is fully idempotent – re-submitting
  * the same batch produces no duplicate rows.
  *
@@ -556,57 +907,357 @@ eventsRouter.post("/events/process_tx/:tx_hash", requireAuth, async (req, res, n
  * - A maximum of {@link MAX_BATCH_SIZE} hashes is accepted per request to
  *   prevent unbounded RPC calls and DB writes.
  *
+ * **Within-request deduplication**
+ * Hashes are normalised (see {@link normalizeTransactionHash}) and any hash
+ * that has already appeared earlier in the same `tx_hashes` array is *not*
+ * re-fetched or re-processed – the result from its first occurrence is reused.
+ * This avoids redundant RPC calls and keeps the response `summary` accurate
+ * when a batch contains repeated/duplicated deliveries of the same tx. The
+ * `results` array still has one entry per input hash, in the same order, so
+ * `results[i]` always corresponds to `tx_hashes[i]`. The count of duplicate
+ * occurrences is reported as `summary.duplicates`.
+ *
  * **Response**
  * Returns a `results` array where each entry corresponds to one tx hash and
  * contains `{ txHash, status, eventsProcessed, eventLabels?, error? }`.
  * A per-tx error never aborts the rest of the batch.
+ *
+ * **Authentication:** Requires an active admin session (`requireAuth` +
+ * `requireAdmin`) — see the note on `process_tx/:tx_hash` above; the same
+ * privileged ingestion capability applies per tx hash in the batch.
  */
-eventsRouter.post("/events/process_batch", requireAuth, async (req, res, next) => {
-  try {
-    const { tx_hashes } = z
-      .object({
-        tx_hashes: z
-          .array(TxHashSchema)
-          .min(1, "tx_hashes must contain at least one hash")
-          .max(
-            MAX_BATCH_SIZE,
-            `tx_hashes must contain at most ${MAX_BATCH_SIZE} hashes per request`,
-          ),
-      })
-      .parse(req.body);
+eventsRouter.post(
+  "/events/process_batch",
+  requireAuth,
+  requireAdmin,
+  async (req, res, next) => {
+    const start = process.hrtime.bigint();
+    const batchSize = Array.isArray(req.body?.tx_hashes) ? req.body.tx_hashes.length : 0;
 
-    const results: TxProcessResult[] = [];
+    try {
+      const { tx_hashes } = BatchProcessEnvelopeSchema.parse(req.body);
 
-    for (const txHash of tx_hashes) {
-      try {
-        const result = await processTxReceipt(txHash);
-        results.push(result);
-      } catch (e: any) {
-        // Per-tx errors are captured so they don't abort the rest of the batch
-        results.push({
-          txHash,
-          status: "error",
-          eventsProcessed: 0,
-          eventLabels: [],
-          error: e?.message ?? String(e),
-        });
+      // Deduplicate unique hashes while preserving the first raw hash representation
+      const uniqueEntriesMap = new Map<string, string>();
+      for (const rawHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(rawHash);
+        if (!uniqueEntriesMap.has(normalized)) {
+          uniqueEntriesMap.set(normalized, rawHash);
+        }
       }
+
+      // Concurrent fan-out processing across unique receipts to eliminate sequential bottlenecks
+      const uniqueResults = await Promise.all(
+        Array.from(uniqueEntriesMap.entries()).map(async ([normalized, rawHash]) => {
+          try {
+            const result = await processTxReceipt(rawHash);
+            return [normalized, result] as const;
+          } catch (e: any) {
+            const errorResult: TxProcessResult = {
+              txHash: rawHash,
+              status: "error",
+              eventsProcessed: 0,
+              eventLabels: [],
+              error: e?.message ?? String(e),
+            };
+            return [normalized, errorResult] as const;
+          }
+        }),
+      );
+
+      const resultsByNormalizedHash = new Map<string, TxProcessResult>(uniqueResults);
+
+      logEventTelemetry({
+        operation: "event_envelope_validation",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+      });
+
+      const results: TxProcessResult[] = [];
+      let duplicates = 0;
+      const seenHashes = new Set<string>();
+
+      for (const txHash of tx_hashes) {
+        const normalized = normalizeTransactionHash(txHash);
+        if (seenHashes.has(normalized)) {
+          duplicates++;
+        } else {
+          seenHashes.add(normalized);
+        }
+        results.push(resultsByNormalizedHash.get(normalized)!);
+      }
+
+      const uniqueResultsList = Array.from(resultsByNormalizedHash.values());
+      const totalProcessed = uniqueResultsList.reduce((sum, r) => sum + r.eventsProcessed, 0);
+
+      logEventTelemetry({
+        operation: "event_fanout_delivery",
+        duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+        status: "success",
+        batch_size: tx_hashes.length,
+        unique_transactions: uniqueResults.length,
+        duplicates,
+        events_processed: totalProcessed,
+      });
+
+      res.json({
+        summary: {
+          total: results.length,
+          processed: uniqueResultsList.filter((r) => r.status === "processed").length,
+          noEvents: uniqueResultsList.filter((r) => r.status === "no_events").length,
+          notFound: uniqueResultsList.filter((r) => r.status === "not_found").length,
+          errors: uniqueResultsList.filter((r) => r.status === "error").length,
+          duplicates,
+          totalEventsProcessed: totalProcessed,
+        },
+        results,
+      });
+    } catch (e) {
+      if (e instanceof z.ZodError) {
+        logEventTelemetry({
+          operation: "event_envelope_validation",
+          duration_ms: Number(process.hrtime.bigint() - start) / 1_000_000,
+          status: "error",
+          batch_size: batchSize,
+          error: e.message,
+        });
+        res.status(400).json({ error: "Invalid Starknet transaction hash format" });
+        return;
+      }
+      next(e);
     }
+  },
+);
 
-    const totalProcessed = results.reduce((sum, r) => sum + r.eventsProcessed, 0);
 
-    res.json({
+    // Stats are derived from the unique (deduplicated) results so a hash that
+    // was submitted more than once contributes to the summary exactly once –
+    // otherwise repeated deliveries of the same tx within a batch would look
+    // like independent units of work. `duplicates` accounts for the rest of
+    // `total`: total === processed + noEvents + notFound + errors + duplicates.
+    const uniqueResults = Array.from(resultsByNormalizedHash.values());
+    const errorsCount = uniqueResults.filter((r) => r.status === "error").length;
+    const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
+
+    // Fan-out delivery resilience: return 207 Multi-Status if there were errors, 
+    // signalling partial success to webhook callers so they can retry.
+    res.status(errorsCount > 0 ? 207 : 200).json({
       summary: {
         total: results.length,
-        processed: results.filter((r) => r.status === "processed").length,
-        noEvents: results.filter((r) => r.status === "no_events").length,
-        notFound: results.filter((r) => r.status === "not_found").length,
-        errors: results.filter((r) => r.status === "error").length,
+        processed: uniqueResults.filter((r) => r.status === "processed").length,
+        noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
+        notFound: uniqueResults.filter((r) => r.status === "not_found").length,
+        errors: errorsCount,
+        duplicates,
         totalEventsProcessed: totalProcessed,
+/**
+ * Parse an `eventType` query parameter into a clean array of event type strings.
+ * Supports single strings ("AgreementCreated"), comma-separated values
+ * ("AgreementCreated,PaymentSent"), or multiple query parameters (`?eventType=A&eventType=B`).
+ *
+ * **Backward-compatibility guarantees:**
+ * - Returns empty array for undefined/null/empty input
+ * - Deduplicates event types (returns unique values only)
+ * - Preserves all three input formats (single, comma-separated, array)
+ * - Function signature and return type are frozen
+ *
+ * @param raw - Query parameter value (string, string array, or undefined)
+ * @returns Array of unique event type strings
+ */
+export function parseEventTypeQuery(raw: unknown): string[] {
+  if (raw === undefined || raw === null || raw === "") return [];
+  const items = Array.isArray(raw) ? raw : [raw];
+  const result: string[] = [];
+  for (const item of items) {
+    if (typeof item === "string") {
+      const parts = item.split(",").map((s) => s.trim()).filter(Boolean);
+      result.push(...parts);
+    }
+  }
+  return Array.from(new Set(result));
+}
+
+/**
+ * Parse a `from` or `to` timestamp query parameter into a valid JavaScript `Date` object.
+ * Accepts ISO 8601 strings or numeric timestamp strings.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Returns undefined for undefined/null/empty input
+ * - Supports both ISO 8601 strings and numeric timestamps (seconds or milliseconds)
+ * - Throws z.ZodError on malformed input (never returns invalid Date)
+ * - Function signature frozen: (raw: unknown, paramName: string) => Date | undefined
+ * - Error message format is stable
+ *
+ * @param raw - Query parameter value to parse
+ * @param paramName - Parameter name for error messages
+ * @returns Parsed Date object or undefined
+ * @throws {z.ZodError} If the timestamp format is malformed or invalid.
+ */
+export function parseTimestampQuery(raw: unknown, paramName: string): Date | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+
+  let date: Date;
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) {
+      throw new z.ZodError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: [paramName],
+          message: `Invalid timestamp format for parameter '${paramName}'`,
+        },
+      ]);
+    }
+    // Treat numeric values the same as numeric strings: 10-digit values are
+    // assumed to be seconds, while 13-digit values are treated as milliseconds.
+    date = new Date(raw < 10000000000 ? raw * 1000 : raw);
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+
+    if (/^\d+$/.test(trimmed)) {
+      const num = parseInt(trimmed, 10);
+      // Handles 10-digit epoch timestamps (seconds) vs 13-digit (milliseconds)
+      const normalizedValue = Math.abs(num) < 10000000000 ? num * 1000 : num;
+      date = new Date(normalizedValue);
+    } else {
+      date = new Date(trimmed);
+    }
+  } else {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: [paramName],
+        message: `Invalid timestamp format for parameter '${paramName}'`,
       },
-      results,
+    ]);
+  }
+
+  if (isNaN(date.getTime())) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: [paramName],
+        message: `Invalid timestamp format for parameter '${paramName}'`,
+      },
+    ]);
+  }
+
+  return date;
+}
+
+/**
+ * Validates that `from` timestamp is less than or equal to `to` timestamp.
+ *
+ * **Backward-compatibility guarantees:**
+ * - Passes validation when either parameter is undefined
+ * - Passes validation when from === to (inclusive bounds)
+ * - Throws z.ZodError with stable error message when from > to
+ * - Function signature is frozen
+ * - Error structure matches project-wide Zod error format
+ *
+ * @param from - Optional start timestamp
+ * @param to - Optional end timestamp
+ * @throws {z.ZodError} If `from` is strictly after `to`.
+ */
+export function validateTimeRange(from?: Date, to?: Date): void {
+  if (from && to && from.getTime() > to.getTime()) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ["from"],
+        message: "from timestamp must be less than or equal to to timestamp",
+      },
+    ]);
+  }
+}
+
+/**
+ * GET /events
+ *
+ * Fetch indexed agreement events with optional filtering by event type, time range,
+ * agreement ID, or contract address, pushed down into database queries with pagination.
+ *
+ * Query parameters:
+ * - `eventType`: single string, comma-separated string, or repeated parameter
+ * - `from`: ISO 8601 or numeric timestamp for start bound (inclusive: createdAt >= from)
+ * - `to`: ISO 8601 or numeric timestamp for end bound (inclusive: createdAt <= to)
+ * - `agreement_id` / `agreementId`: optional filter by agreement ID
+ * - `contract_address` / `contractAddress`: optional filter by contract address
+ * - `limit`, `offset`: standard pagination parameters (via parsePagination)
+ */
+eventsRouter.get("/events", async (req, res, next) => {
+  try {
+    const eventTypes = parseEventTypeQuery(req.query.eventType);
+    const fromDate = parseTimestampQuery(req.query.from, "from");
+    const toDate = parseTimestampQuery(req.query.to, "to");
+    validateTimeRange(fromDate, toDate);
+
+    const { limit, offset } = parsePagination(req.query);
+
+    const rawAgreementId = req.query.agreement_id ?? req.query.agreementId;
+    const agreementId = rawAgreementId ? String(rawAgreementId).trim() : undefined;
+
+    const rawContractAddr = req.query.contract_address ?? req.query.contractAddress;
+    const contractAddress = rawContractAddr ? String(rawContractAddr).trim().toLowerCase() : undefined;
+
+    const conditions: SQL[] = [];
+    const agreementEventsTable = schema.agreementEvents as unknown as {
+      eventType?: unknown;
+      createdAt?: unknown;
+      agreementId?: unknown;
+      contractAddress?: unknown;
+    };
+    const eventTypeColumn = agreementEventsTable.eventType ?? "eventType";
+    const createdAtColumn = agreementEventsTable.createdAt ?? "createdAt";
+    const agreementIdColumn = agreementEventsTable.agreementId ?? "agreementId";
+    const contractAddressColumn = agreementEventsTable.contractAddress ?? "contractAddress";
+
+    if (eventTypes.length > 0) {
+      conditions.push(inArray(eventTypeColumn as any, eventTypes));
+    }
+    if (fromDate) {
+      conditions.push(gte(createdAtColumn as any, fromDate));
+    }
+    if (toDate) {
+      conditions.push(lte(createdAtColumn as any, toDate));
+    }
+    if (agreementId) {
+      conditions.push(eq(agreementIdColumn as any, agreementId));
+    }
+    if (contractAddress) {
+      conditions.push(eq(contractAddressColumn as any, contractAddress));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const events = await db
+      .select()
+      .from(schema.agreementEvents)
+      .where(whereClause)
+      .orderBy(desc(schema.agreementEvents.createdAt))
+      .limit(limit)
+      .offset(offset);
+
+    res.json({
+      events,
+      count: events.length,
+      limit,
+      offset,
     });
   } catch (e) {
+    // Envelope validation resilience: standard 400 for structural errors
+    if (e instanceof z.ZodError) {
+      res.status(400).json({ error: "Invalid request envelope" });
+    console.error("[events] GET /events failed", e);
+    if (e instanceof z.ZodError) {
+      res.status(400).json({
+        error: "Validation failed",
+        details: e.issues,
+      });
+      return;
+    }
     next(e);
   }
 });
+

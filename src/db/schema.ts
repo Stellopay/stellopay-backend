@@ -6,16 +6,247 @@ import {
   boolean,
   timestamp,
   index,
+  uniqueIndex,
   numeric,
+  check,
+  type PgTableWithColumns,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 /**
- * Index convention (enforced by schema-consistency.test.ts):
- * Every foreign-key-shaped column — camelCase *Id mapped to SQL *_id (e.g. agreementId,
- * profileId, milestoneId) — must have a btree index declared in this file. Primary keys and
- * non-relational identifiers (e.g. taxId) are excluded. Missing indexes hurt join and filter
+ * # Schema Contract
+ *
+ * This module owns the database schema for the Stellopay backend indexer.
+ * Every table, constraint, and helper exported here is the single source of
+ * truth. Callers in `src/routes/`, `src/auth/`, and test files all read the
+ * same definitions — no divergent copies exist.
+ *
+ * ## Invariants (enforced by `schema-consistency.test.ts`)
+ *
+ * | # | Invariant | Rationale |
+ * |---|-----------|-----------|
+ * | I1 | **Table inventory** — exactly 11 tables are exported. | Prevents orphaned or duplicated Drizzle definitions. |
+ * | I2 | **FK index** — every `*Id` column mapped to `*_id` in SQL has a
+ *        btree `index()` unless it is a PK or a documented exclusion
+ *        (e.g. `taxId`). See `schema-fk-indexes.ts`. | Joins and filtered queries
+ *        against these columns degrade to sequential scans without an index. |
+ * | I3 | **u256 amount CHECK** — every column storing a Cairo `u256` value
+ *        as a decimal string uses the shared
+ *        {@link U256_DECIMAL_REGEX} in its `check()` constraint. | Ensures all
+ *        amount columns use the same validated format; a single regex change
+ *        updates every table consistently. |
+ * | I4 | **Currency CHECK** — every `currency` column uses
+ *        `'^[A-Z]{3}$'` (ISO 4217-style). | Prevents mixed-case or malformed
+ *        currency codes. |
+ * | I5 | **Block-number CHECK** — every `block_number` column has
+ *        `CHECK >= 0`. | Negative block numbers are nonsensical and must be
+ *        rejected at the DB layer. |
+ * | I6 | **Enum CHECK** — every column with a closed set of values
+ *        (mode, status, event_type, profile_type, etc.) carries a
+ *        `CHECK IN (...)` or `CHECK BETWEEN`. | The DB is the last line of
+ *        defence against out-of-range values; application code may have bugs. |
+ * | I7 | **Runtime ↔ DB parity** — every DB CHECK constraint has a
+ *        corresponding runtime validation helper exported from this module
+ *        (e.g. `assertValidU256` matches the u256 CHECK). | Callers validate
+ *        early to produce actionable errors instead of opaque DB violations. |
+ * | I8 | **Idempotency** — every exported helper is idempotent: calling it
+ *        multiple times with the same arguments produces the same result
+ *        (pure function contract, same-throw contract for assertion helpers). | Retries and
+ *        duplicate delivery must not produce ambiguous outcomes. A caller
+ *        that retries with the same input must observe the same output. |
+ *
+ * ## Idempotency contract
+ *
+ * Every exported function in this module is **idempotent** under the
+ * following rules:
+ *
+ * - **Query helpers** (`isValidU256`, `isValidCurrencyCode`,
+ *   `isValidNonNegativeInteger`, `clampPageLimit`, `clampBatchSize`,
+ *   `validateBatchSize`, `stripSensitiveBillingFields`): calling any of
+ *   these twice with the same arguments returns the same value both times
+ *   (pure-function contract).
+ * - **Assertion helpers** (`assertNonNegative`, `assertValidU256`,
+ *   `assertValidCurrencyCode`): calling any of these twice with the same
+ *   _valid_ arguments succeeds both times; calling them twice with the same
+ *   _invalid_ arguments throws a semantically equivalent error both times
+ *   (same-throw contract — error message may differ by stack trace).
+ * - **Migration helpers** (`getPendingMigrationFileNames`,
+ *   `withMigrationLock`): pure logic and transactional locks ensure the
+ *   migration system is safe to retry. Drizzle's migrator tracks applied
+ *   migrations, so applying the same migration set twice is a no-op.
+ *
+ * ## Backward-compatibility policy
+ *
+ * This module follows strict backward compatibility for the public API
+ * surface. The following are **breaking changes** and MUST bump
+ * {@link SCHEMA_COMPATIBILITY_VERSION}:
+ *
+ * - Removing or renaming any exported table definition
+ * - Removing or renaming any exported runtime validation helper
+ * - Changing the signature (parameter count, types, return type) of any
+ *   exported helper
+ * - Removing or renaming a named CHECK constraint
+ * - Changing the regex or logic in a shared constraint constant
+ *   (`U256_DECIMAL_REGEX`, `CURRENCY_CODE_REGEX`)
+ * - Changing the numeric value of `MAX_PAGE_SIZE`, `DEFAULT_PAGE_SIZE`, or
+ *   `MAX_BATCH_SIZE`
+ * - Removing items from `SENSITIVE_BILLING_FIELDS`
+ *
+ * The following are **safe additive changes** that preserve compatibility:
+ *
+ * - Adding a new table definition (requires entry in {@link SCHEMA_TABLES})
+ * - Adding a new CHECK constraint (must not collide with existing names)
+ * - Adding a new runtime validation helper following existing naming patterns
+ * - Adding a new column with a `DEFAULT` clause to an existing table
+ * - Adding new items to `SENSITIVE_BILLING_FIELDS` (tightening the boundary)
+ *
+ * Version is tracked via {@link SCHEMA_COMPATIBILITY_VERSION} and enforced
+ * by tests in `src/db/migration.test.ts`.
+ *
+ * ## Adding a new table
+ *
+ * 1. Define it here with the appropriate CHECK constraints, FK indexes, and
+ *    runtime helpers.
+ * 2. Add an entry to {@link SCHEMA_TABLES} so the table-inventory test stays
+ *    in sync.
+ * 3. Add a CHECK-constraint test in `src/db/migration.test.ts`.
+ * 4. Write a migration in `src/db/migrations/` and register it in
+ *    `src/db/migrations/meta/_journal.json`.
+ * 5. Update `docs/db/schema.md` with the table documentation.
+ *
+ * ## Index convention
+ *
+ * Every foreign-key-shaped column — camelCase `*Id` mapped to SQL `*_id`
+ * (e.g. `agreementId`, `profileId`, `milestoneId`) — must have a btree index
+ * declared in this file. Primary keys and non-relational identifiers
+ * (e.g. `taxId`) are excluded. Missing indexes hurt join and filter
  * performance as tables grow.
+ *
+ * Enforced by `schema-consistency.test.ts` via `schema-fk-indexes.ts`.
+ *
+ * @module schema
  */
+
+// ---------------------------------------------------------------------------
+// Shared constraint helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Regex pattern that matches a valid unsigned-256-bit decimal integer string.
+ * Accepts "0" and any positive integer up to 78 digits (the max decimal width
+ * of 2^256 - 1 is 78 digits). Leading zeros are intentionally rejected to keep
+ * the canonical form unambiguous.
+ *
+ * Used as a DB-level CHECK constraint on every `amount` column that stores a
+ * Cairo u256 value serialised as a decimal string.
+ *
+ * @example
+ *   isValidU256("0")        // true
+ *   isValidU256("12345")    // true
+ *   isValidU256("01")       // false — leading zero
+ *   isValidU256("-1")       // false — negative
+ *   isValidU256("1.5")      // false — decimal
+ */
+export const U256_DECIMAL_REGEX = "^(0|[1-9][0-9]{0,77})$";
+
+/** Compiled pattern for runtime validation — see {@link U256_DECIMAL_REGEX}. */
+export const U256_DECIMAL_PATTERN = new RegExp(U256_DECIMAL_REGEX);
+
+/**
+ * Regex that matches ISO 4217-style currency codes — exactly three uppercase
+ * ASCII letters. Used in CHECK constraints on `currency` columns.
+ *
+ * @example
+ *   isValidCurrencyCode("USD")  // true
+ *   isValidCurrencyCode("usd")  // false — lowercase
+ *   isValidCurrencyCode("US")   // false — too short
+ */
+export const CURRENCY_CODE_REGEX = /^[A-Z]{3}$/;
+
+/**
+ * Returns true when `value` is a canonical decimal string representing a
+ * valid Cairo u256 (0 … 2²⁵⁶−1).
+ *
+ * This is the runtime counterpart of the DB-level CHECK constraint using
+ * {@link U256_DECIMAL_REGEX}. Callers should validate early to produce
+ * actionable errors rather than relying on a database constraint violation.
+ */
+export function isValidU256(value: string): boolean {
+  return U256_DECIMAL_PATTERN.test(value);
+}
+
+/**
+ * Returns true when `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters).
+ *
+ * Runtime counterpart of the DB-level CHECK constraint using
+ * {@link CURRENCY_CODE_REGEX}.
+ */
+export function isValidCurrencyCode(code: string): boolean {
+  return CURRENCY_CODE_REGEX.test(code);
+}
+
+/**
+ * Returns true when `value` is a non-negative integer.
+ */
+export function isValidNonNegativeInteger(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * Asserts that `value` is a non-negative integer. Throws a descriptive
+ * {@link RangeError} when the assertion fails.
+ *
+ * Use this in write-path code to fail fast before a query reaches the
+ * database, making failures easier to catch and retry.
+ */
+export function assertNonNegative(value: number, name: string): void {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "not_an_integer" });
+    throw new RangeError(`${name} must be a non-negative integer, got ${value}`);
+  }
+  if (value < 0) {
+    console.error({ event: "schema_validation_failed", check: "assertNonNegative", name, value, reason: "negative_value" });
+    throw new RangeError(`${name} must be non-negative, got ${value}`);
+  }
+}
+
+/**
+ * Asserts that `value` is a valid u256 decimal string. Throws a descriptive
+ * {@link RangeError} when the assertion fails.
+ *
+ * Use this in write-path code to validate amounts before inserting into
+ * columns guarded by the `U256_DECIMAL_REGEX` CHECK constraint.
+ */
+export function assertValidU256(value: string, name: string): void {
+  if (!U256_DECIMAL_PATTERN.test(value)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidU256", name, value, reason: "invalid_format" });
+    throw new RangeError(
+      `${name} must be a valid u256 decimal string (0 or positive integer up to 78 digits), got "${value}"`,
+    );
+  }
+}
+
+/**
+ * Asserts that `code` is a valid ISO 4217-style currency code (three
+ * uppercase ASCII letters). Throws a descriptive {@link RangeError} when
+ * the assertion fails.
+ *
+ * Runtime counterpart of the DB-level CHECK constraints using
+ * {@link CURRENCY_CODE_REGEX} (e.g. `billing_profiles_currency_check`,
+ * `billing_invoices_currency_check`). Recording both a non-throwing
+ * `isValidCurrencyCode` and a throwing `assertValidCurrencyCode` mirrors the
+ * `isValidU256` / `assertValidU256` pair so callers can pick the level of
+ * strictness they need.
+ */
+export function assertValidCurrencyCode(code: string, name: string): void {
+  if (!CURRENCY_CODE_REGEX.test(code)) {
+    console.error({ event: "schema_validation_failed", check: "assertValidCurrencyCode", name, value: code, reason: "invalid_format" });
+    throw new RangeError(
+      `${name} must be a valid ISO 4217-style currency code (exactly three uppercase ASCII letters), got "${code}"`,
+    );
+  }
+}
 
 // Agreements table - stores agreement creation and status updates
 export const agreements = pgTable(
@@ -42,6 +273,32 @@ export const agreements = pgTable(
     employerIdx: index("agreements_employer_idx").on(table.employer),
     contributorIdx: index("agreements_contributor_idx").on(table.contributor),
     statusIdx: index("agreements_status_idx").on(table.status),
+    // CHECK constraints — reject malformed inputs before they reach application code
+    modeCheck: check("agreements_mode_check", sql`${table.mode} IN (0, 1)`),
+    paymentTypeCheck: check(
+      "agreements_payment_type_check",
+      sql`${table.paymentType} IN (0, 1, 2)`,
+    ),
+    statusCheck: check(
+      "agreements_status_check",
+      sql`${table.status} BETWEEN 0 AND 5`,
+    ),
+    disputeStatusCheck: check(
+      "agreements_dispute_status_check",
+      sql`${table.disputeStatus} IN (0, 1, 2)`,
+    ),
+    blockNumberCheck: check(
+      "agreements_block_number_check",
+      sql`${table.blockNumber} >= 0`,
+    ),
+    totalAmountCheck: check(
+      "agreements_total_amount_check",
+      sql`${table.totalAmount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
+    paidAmountCheck: check(
+      "agreements_paid_amount_check",
+      sql`${table.paidAmount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
   }),
 );
 
@@ -50,7 +307,7 @@ export const agreementEvents = pgTable(
   "agreement_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // AgreementCreated, AgreementActivated, etc.
     blockNumber: bigint("block_number", { mode: "number" }).notNull(),
@@ -63,6 +320,18 @@ export const agreementEvents = pgTable(
     contractAddressIdx: index("agreement_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("agreement_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("agreement_events_block_number_idx").on(table.blockNumber),
+    transactionPositionKey: uniqueIndex("agreement_events_transaction_position_key").on(
+      table.transactionHash,
+      table.eventIndex,
+    ),
+    blockNumberCheck: check(
+      "agreement_events_block_number_check",
+      sql`${table.blockNumber} >= 0`,
+    ),
+    eventIndexCheck: check(
+      "agreement_events_event_index_check",
+      sql`${table.eventIndex} >= 0`,
+    ),
   }),
 );
 
@@ -71,7 +340,7 @@ export const payments = pgTable(
   "payments",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     from: text("from_address").notNull(),
     to: text("to_address").notNull(),
@@ -87,6 +356,15 @@ export const payments = pgTable(
     fromIdx: index("payments_from_idx").on(table.from),
     toIdx: index("payments_to_idx").on(table.to),
     blockNumberIdx: index("payments_block_number_idx").on(table.blockNumber),
+    blockNumberCheck: check("payments_block_number_check", sql`${table.blockNumber} >= 0`),
+    amountCheck: check(
+      "payments_amount_check",
+      sql`${table.amount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
+    eventTypeCheck: check(
+      "payments_event_type_check",
+      sql`${table.eventType} IN ('PaymentSent', 'PaymentReceived')`,
+    ),
   }),
 );
 
@@ -95,7 +373,7 @@ export const milestones = pgTable(
   "milestones",
   {
     id: text("id").primaryKey(), // agreement_id + milestone_id
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     milestoneId: integer("milestone_id").notNull(),
     amount: text("amount").notNull(), // u256 as string
@@ -110,6 +388,12 @@ export const milestones = pgTable(
   (table) => ({
     agreementIdIdx: index("milestones_agreement_id_idx").on(table.agreementId),
     milestoneIdIdx: index("milestones_milestone_id_idx").on(table.milestoneId),
+    milestoneIdCheck: check("milestones_milestone_id_check", sql`${table.milestoneId} >= 0`),
+    blockNumberCheck: check("milestones_block_number_check", sql`${table.blockNumber} >= 0`),
+    amountCheck: check(
+      "milestones_amount_check",
+      sql`${table.amount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
   }),
 );
 
@@ -118,7 +402,7 @@ export const employees = pgTable(
   "employees",
   {
     id: text("id").primaryKey(), // agreement_id + employee_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     employeeAddress: text("employee_address").notNull(),
     employeeIndex: integer("employee_index").notNull(),
@@ -132,6 +416,16 @@ export const employees = pgTable(
   (table) => ({
     agreementIdIdx: index("employees_agreement_id_idx").on(table.agreementId),
     employeeAddressIdx: index("employees_employee_address_idx").on(table.employeeAddress),
+    employeeIndexCheck: check("employees_employee_index_check", sql`${table.employeeIndex} >= 0`),
+    claimedPeriodsCheck: check(
+      "employees_claimed_periods_check",
+      sql`${table.claimedPeriods} >= 0`,
+    ),
+    blockNumberCheck: check("employees_block_number_check", sql`${table.blockNumber} >= 0`),
+    salaryCheck: check(
+      "employees_salary_per_period_check",
+      sql`${table.salaryPerPeriod} ~ ${U256_DECIMAL_REGEX}`,
+    ),
   }),
 );
 
@@ -140,7 +434,7 @@ export const escrowEvents = pgTable(
   "escrow_events",
   {
     id: text("id").primaryKey(), // transaction_hash + event_index
-    agreementId: text("agreement_id").notNull(),
+    agreementId: text("agreement_id").notNull().references(() => agreements.id),
     contractAddress: text("contract_address").notNull(),
     eventType: text("event_type").notNull(), // Funded, Released, Refunded
     employer: text("employer").notNull(),
@@ -155,6 +449,16 @@ export const escrowEvents = pgTable(
     contractAddressIdx: index("escrow_events_contract_address_idx").on(table.contractAddress),
     eventTypeIdx: index("escrow_events_event_type_idx").on(table.eventType),
     blockNumberIdx: index("escrow_events_block_number_idx").on(table.blockNumber),
+    transactionPositionKey: uniqueIndex("escrow_events_transaction_position_key").on(table.id),
+    blockNumberCheck: check("escrow_events_block_number_check", sql`${table.blockNumber} >= 0`),
+    amountCheck: check(
+      "escrow_events_amount_check",
+      sql`${table.amount} ~ ${U256_DECIMAL_REGEX}`,
+    ),
+    eventTypeCheck: check(
+      "escrow_events_event_type_check",
+      sql`${table.eventType} IN ('Funded', 'Released', 'Refunded')`,
+    ),
   }),
 );
 
@@ -208,8 +512,52 @@ export const billingProfiles = pgTable(
   },
   (table) => ({
     ownerAddressIdx: index("billing_profiles_owner_address_idx").on(table.ownerAddress),
+    profileTypeCheck: check(
+      "billing_profiles_profile_type_check",
+      sql`${table.profileType} IN ('Individual', 'Business')`,
+    ),
+    currencyCheck: check(
+      "billing_profiles_currency_check",
+      sql`${table.currency} ~ '^[A-Z]{3}$'`,
+    ),
+    annualRewardLimitCheck: check(
+      "billing_profiles_annual_reward_limit_check",
+      sql`${table.annualRewardLimit} >= 0`,
+    ),
+    usedAmountCheck: check(
+      "billing_profiles_used_amount_check",
+      sql`${table.usedAmount} >= 0`,
+    ),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Security Boundary - Sensitive Fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields in the billing profiles schema that are sensitive and must be stripped
+ * before returning data through public API routes.
+ */
+export const SENSITIVE_BILLING_FIELDS = ["taxId", "dateOfBirth"] as const;
+
+export type SensitiveBillingFields = typeof SENSITIVE_BILLING_FIELDS[number];
+
+/**
+ * Strips sensitive fields from a billing profile object to enforce a security boundary
+ * and prevent privilege drift.
+ */
+export function stripSensitiveBillingFields<T extends Record<string, any>>(
+  profile: T,
+): Omit<T, SensitiveBillingFields> {
+  const copy = { ...profile };
+  for (const field of SENSITIVE_BILLING_FIELDS) {
+    if (field in copy) {
+      delete copy[field];
+    }
+  }
+  return copy;
+}
 
 /**
  * billing_payment_methods – payment methods attached to a billing profile.
@@ -221,7 +569,9 @@ export const billingPaymentMethods = pgTable(
   "billing_payment_methods",
   {
     id: text("id").primaryKey(),
-    profileId: text("profile_id").notNull(), // → billingProfiles.id
+    profileId: text("profile_id").notNull().references(() => billingProfiles.id, {
+      onDelete: "cascade",
+    }),
     type: text("type").notNull(), // bank_account | paypal | crypto | etc.
     // Masked / safe-to-store fields only
     displayName: text("display_name"), // e.g. "Chase ****1234"
@@ -234,6 +584,10 @@ export const billingPaymentMethods = pgTable(
   },
   (table) => ({
     profileIdIdx: index("billing_payment_methods_profile_id_idx").on(table.profileId),
+    typeCheck: check(
+      "billing_payment_methods_type_check",
+      sql`${table.type} IN ('bank_account', 'paypal', 'crypto', 'wire', 'check', 'other')`,
+    ),
   }),
 );
 
@@ -244,7 +598,9 @@ export const billingInvoices = pgTable(
   "billing_invoices",
   {
     id: text("id").primaryKey(),
-    profileId: text("profile_id").notNull(), // → billingProfiles.id
+    profileId: text("profile_id").notNull().references(() => billingProfiles.id, {
+      onDelete: "cascade",
+    }),
     invoiceNumber: text("invoice_number").notNull().unique(),
     amount: numeric("amount", { precision: 18, scale: 6 }).notNull(),
     currency: text("currency").notNull().default("USD"),
@@ -258,8 +614,156 @@ export const billingInvoices = pgTable(
   (table) => ({
     profileIdIdx: index("billing_invoices_profile_id_idx").on(table.profileId),
     statusIdx: index("billing_invoices_status_idx").on(table.status),
+    statusCheck: check(
+      "billing_invoices_status_check",
+      sql`${table.status} IN ('pending', 'paid', 'void')`,
+    ),
+    currencyCheck: check(
+      "billing_invoices_currency_check",
+      sql`${table.currency} ~ '^[A-Z]{3}$'`,
+    ),
+    amountCheck: check("billing_invoices_amount_check", sql`${table.amount} >= 0`),
   }),
 );
+
+
+// ---------------------------------------------------------------------------
+// Backfill Progress
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks the progress of backfill jobs. Each row represents one backfill job
+ * type (employee-events, milestone-events) and stores the last checkpoint,
+ * totals, and status for resume-after-crash semantics.
+ */
+export const backfillProgress = pgTable(
+  "backfill_progress",
+  {
+    jobName: text("job_name").primaryKey(),
+    status: text("status").notNull().default("idle"),
+    lastCursor: timestamp("last_cursor"),
+    lastBlockNumber: bigint("last_block_number", { mode: "number" }),
+    lastContractAddress: text("last_contract_address"),
+    totalScanned: integer("total_scanned").notNull().default(0),
+    totalCreated: integer("total_created").notNull().default(0),
+    lastError: text("last_error"),
+    startedAt: timestamp("started_at"),
+    completedAt: timestamp("completed_at"),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => ({
+    statusCheck: check(
+      "backfill_progress_status_check",
+      sql`${table.status} IN ('idle', 'running', 'completed', 'failed')`,
+    ),
+    totalScannedCheck: check(
+      "backfill_progress_total_scanned_check",
+      sql`${table.totalScanned} >= 0`,
+    ),
+    totalCreatedCheck: check(
+      "backfill_progress_total_created_check",
+      sql`${table.totalCreated} >= 0`,
+    ),
+  }),
+);
+
+/** Shared durable response cache used by idempotent mutating routes. */
+export const idempotencyKeys = pgTable(
+  "idempotency_keys",
+  {
+    route: text("route").notNull(),
+    key: text("key").notNull(),
+    bodyFingerprint: text("body_fingerprint").notNull(),
+    statusCode: integer("status_code").notNull(),
+    responseBody: jsonb("response_body").notNull().default({}),
+    expiresAt: timestamp("expires_at").notNull(),
+  },
+  (table) => ({
+    primaryKey: primaryKey({ columns: [table.route, table.key] }),
+    expiresAtIdx: index("idempotency_keys_expires_at_idx").on(table.expiresAt),
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// Compatibility Version
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema compatibility version.
+ *
+ * Increment this when a **breaking change** is made to the public API surface
+ * of this module (see the backward-compatibility policy in the module header).
+ *
+ * Callers can check this value to guard against unexpected schema drift:
+ *
+ * ```ts
+ * import { SCHEMA_COMPATIBILITY_VERSION } from "./schema.js";
+ * if (SCHEMA_COMPATIBILITY_VERSION < 2) {
+ *   // handle old-format data
+ * }
+ * ```
+ *
+ * - Version `1` — initial stable contract (invariants I1–I7, all tables,
+ *   helpers, and CHECK constraints as of the initial migration set).
+ */
+export const SCHEMA_COMPATIBILITY_VERSION = 1;
+
+// ---------------------------------------------------------------------------
+// Pagination & Batching Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum rows per page across all list endpoints. */
+export const MAX_PAGE_SIZE = 100;
+
+/** Default page size when the caller does not specify a limit. */
+export const DEFAULT_PAGE_SIZE = 50;
+
+/** Maximum batch size for bulk operations (inserts, updates, deletes). */
+export const MAX_BATCH_SIZE = 100;
+
+/**
+ * Clamp a caller-supplied limit to the allowed pagination range [1, MAX_PAGE_SIZE].
+ * Values <= 0 default to DEFAULT_PAGE_SIZE. Values > MAX_PAGE_SIZE are capped.
+ */
+export function clampPageLimit(requested: number): number {
+  if (requested <= 0) return DEFAULT_PAGE_SIZE;
+  return Math.min(requested, MAX_PAGE_SIZE);
+}
+
+/**
+ * Clamp a caller-supplied batch size to the allowed range [1, MAX_BATCH_SIZE].
+ * Values <= 0 or > MAX_BATCH_SIZE are rejected by returning 0 — callers must
+ * validate before proceeding with a bulk operation.
+ *
+ * Prefer {@link validateBatchSize} in new code because it throws a descriptive
+ * error instead of silently returning 0, making failures visible and retryable.
+ */
+export function clampBatchSize(requested: number): number {
+  if (requested <= 0 || requested > MAX_BATCH_SIZE) return 0;
+  return requested;
+}
+
+/**
+ * Validate and return a batch size, throwing a {@link RangeError} when
+ * `requested` is outside [1, {@link MAX_BATCH_SIZE}].
+ *
+ * Unlike {@link clampBatchSize} — which returns 0 on invalid input — this
+ * function fails fast with a descriptive message. This makes it suitable for
+ * user-facing input validation where the caller should know the value was
+ * rejected rather than silently adjusted, and for retry-safe code paths that
+ * need explicit errors rather than silent fallbacks.
+ *
+ * @throws {RangeError} when `requested` is not an integer in [1, MAX_BATCH_SIZE].
+ */
+export function validateBatchSize(requested: number, name?: string): number {
+  if (!Number.isInteger(requested) || requested <= 0 || requested > MAX_BATCH_SIZE) {
+    console.error({ event: "schema_validation_failed", check: "validateBatchSize", name, value: requested, max: MAX_BATCH_SIZE });
+    throw new RangeError(
+      `${name ?? "batchSize"} must be an integer between 1 and ${MAX_BATCH_SIZE}, got ${requested}`,
+    );
+  }
+  return requested;
+}
 
 // Sessions table - stores auth sessions with sliding and absolute expiry
 export const sessions = pgTable(
@@ -284,3 +788,36 @@ export const sessions = pgTable(
     familyIdIdx: index("sessions_family_id_idx").on(table.familyId),
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Schema table inventory — single source of truth for the table list.
+// Used by schema-consistency.test.ts to verify no tables are orphaned or
+// duplicated. Every new table must be added here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Ordered list of every Drizzle table definition exported from this module.
+ *
+ * The order matches the table documentation in {@link docs/db/schema.md}.
+ * Schema-consistency tests assert that `Object.keys(schema)` (minus helpers /
+ * constants) matches this list exactly — preventing orphaned table
+ * definitions and ensuring every new table is registered consciously.
+ *
+ * `any` is intentional for the table type parameter — the tables have
+ * heterogeneous column shapes and this array is consumed only by tests for
+ * inventory verification, not for type-level operations.
+ */
+export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any> }> = [
+  { name: "agreements", table: agreements },
+  { name: "agreementEvents", table: agreementEvents },
+  { name: "payments", table: payments },
+  { name: "milestones", table: milestones },
+  { name: "employees", table: employees },
+  { name: "escrowEvents", table: escrowEvents },
+  { name: "billingProfiles", table: billingProfiles },
+  { name: "billingPaymentMethods", table: billingPaymentMethods },
+  { name: "billingInvoices", table: billingInvoices },
+  { name: "sessions", table: sessions },
+  { name: "backfillProgress", table: backfillProgress },
+  { name: "idempotencyKeys", table: idempotencyKeys },
+];

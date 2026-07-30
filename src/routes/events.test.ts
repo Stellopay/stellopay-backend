@@ -21,6 +21,49 @@ import { z } from "zod";
 
 const parseEventMock = vi.hoisted(() => vi.fn());
 
+const { dbSelectMock, queryState } = vi.hoisted(() => {
+  const state = {
+    eventsRows: [] as any[],
+    lastWhere: null as any,
+    lastLimit: 50,
+    lastOffset: 0,
+  };
+
+  const select = vi.fn(() => ({
+    from: vi.fn(() => ({
+      where: vi.fn((cond) => {
+        state.lastWhere = cond;
+        return {
+          orderBy: vi.fn(() => ({
+            limit: vi.fn((limit) => {
+              state.lastLimit = limit;
+              return {
+                offset: vi.fn((offset) => {
+                  state.lastOffset = offset;
+                  return Promise.resolve(state.eventsRows);
+                }),
+              };
+            }),
+          })),
+        };
+      }),
+      orderBy: vi.fn(() => ({
+        limit: vi.fn((limit) => {
+          state.lastLimit = limit;
+          return {
+            offset: vi.fn((offset) => {
+              state.lastOffset = offset;
+              return Promise.resolve(state.eventsRows);
+            }),
+          };
+        }),
+      })),
+    })),
+  }));
+
+  return { dbSelectMock: select, queryState: state };
+});
+
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
@@ -36,7 +79,7 @@ vi.mock("../db/index.js", () => {
   const update = vi.fn().mockReturnValue({ set });
 
   return {
-    db: { insert, update },
+    db: { insert, update, select: dbSelectMock },
     schema: {
       agreements: "agreements",
       agreementEvents: "agreementEvents",
@@ -46,9 +89,19 @@ vi.mock("../db/index.js", () => {
   };
 });
 
+vi.mock("drizzle-orm", () => ({
+  eq: (col: any, val: any) => ({ type: "eq", col, val }),
+  and: (...conds: any[]) => ({ type: "and", conds }),
+  gte: (col: any, val: any) => ({ type: "gte", col, val }),
+  lte: (col: any, val: any) => ({ type: "lte", col, val }),
+  inArray: (col: any, val: any) => ({ type: "inArray", col, val }),
+  desc: (col: any) => ({ type: "desc", col }),
+}));
+
 vi.mock("../starknet/client.js", () => ({
   provider: { getTransactionReceipt: vi.fn() },
   agreementContract: vi.fn(() => ({
+    parseEvent: parseEventMock,
     // Resolves to the same token as the AgreementCreated fixture so the default
     // path verifies cleanly; the verification tests override this per case.
     get_token: vi
@@ -56,6 +109,9 @@ vi.mock("../starknet/client.js", () => ({
       .mockResolvedValue(
         BigInt("0xdeadbeef00000000000000000000000000000000000000000000000000000002"),
       ),
+  })),
+  escrowContract: vi.fn(() => ({
+    parseEvent: parseEventMock,
   })),
 }));
 
@@ -81,7 +137,7 @@ vi.mock("../config.js", () => ({
     payrollEscrowAddress: "0x06d3599196d6701a79eee56f8bba7a797431b100f6ab4df784514b14b04cb1d4",
   },
   abiPaths: { agreement: "/fake/agreement.json", escrow: "/fake/escrow.json" },
-  env: { NODE_ENV: "test" },
+  env: { NODE_ENV: "test", LOG_FORMAT: "json" },
 }));
 
 vi.mock("../utils/codec.js", () => ({
@@ -95,9 +151,17 @@ vi.mock("../utils/codec.js", () => ({
 
 import express from "express";
 import request from "supertest";
-import { processTxReceipt, eventsRouter } from "./events.js";
+import {
+  processTxReceipt,
+  eventsRouter,
+  parseEventTypeQuery,
+  parseTimestampQuery,
+  validateTimeRange,
+  BatchProcessEnvelopeSchema,
+} from "./events.js";
 import { db } from "../db/index.js";
-import { provider, agreementContract } from "../starknet/client.js";
+import { provider, agreementContract, escrowContract } from "../starknet/client.js";
+import { env } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -194,14 +258,45 @@ function rewireDbInsert() {
 // Tests – shared processor
 // ---------------------------------------------------------------------------
 
+// Named via vi.hoisted so individual tests can override behavior (e.g.
+// simulate requireAdmin rejecting a non-admin caller) with mockImplementationOnce.
+// vi.clearAllMocks() (used throughout this file) clears call history but not
+// the base implementation set here, so the default "always call next()"
+// behavior persists across tests unless explicitly overridden.
+const { mockRequireAuth, mockRequireAdmin } = vi.hoisted(() => ({
+  mockRequireAuth: vi.fn((_req: any, _res: any, next: any) => next()),
+  mockRequireAdmin: vi.fn((_req: any, _res: any, next: any) => next()),
+}));
+
 vi.mock("../auth/middleware.js", () => ({
-  requireAuth: vi.fn((req, res, next) => next()),
-  requireAdmin: vi.fn((req, res, next) => next()),
+  requireAuth: mockRequireAuth,
+  requireAdmin: mockRequireAdmin,
 }));
 describe("processTxReceipt – shared processor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     rewireDbInsert();
+  });
+
+  it("emits structured ingestion telemetry for a successful receipt", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    await processTxReceipt(TX_A);
+
+    const entry = infoSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_ingestion");
+    expect(entry).toMatchObject({
+      status: "success",
+      tx_hash: TX_A,
+      result_status: "processed",
+      events_processed: 1,
+    });
+    expect(entry.duration_ms).toEqual(expect.any(Number));
+    infoSpy.mockRestore();
   });
 
   it("returns not_found when provider returns null", async () => {
@@ -322,6 +417,20 @@ describe("processTxReceipt – batch semantics (per-tx isolation)", () => {
     await expect(processTxReceipt(TX_A)).rejects.toThrow("RPC timeout");
   });
 
+  it("a failing db insert bubbles up so the tx is not falsely marked as success", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(
+      makeAgreementReceipt(TX_A) as any,
+    );
+
+    // Simulate database failure during fan-out delivery
+    vi.mocked(db.insert).mockImplementationOnce(() => {
+      throw new Error("DB Connection Lost");
+    });
+
+    await expect(processTxReceipt(TX_A)).rejects.toThrow("DB Connection Lost");
+  });
+
   it("re-processing the same tx is idempotent (no duplicate rows)", async () => {
     parseEventMock.mockReturnValue(decodedAgreementCreated());
     vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
@@ -409,6 +518,11 @@ describe("Zod input validation schemas", () => {
   it("BatchSchema rejects a batch containing even one invalid hash", () => {
     expect(() => BatchSchema.parse({ tx_hashes: [TX_A, "not-a-hash"] })).toThrow();
   });
+
+  it("BatchProcessEnvelopeSchema validates exported envelope schema correctly", () => {
+    expect(() => BatchProcessEnvelopeSchema.parse({ tx_hashes: [TX_A, TX_B] })).not.toThrow();
+    expect(() => BatchProcessEnvelopeSchema.parse({ tx_hashes: [] })).toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -437,7 +551,10 @@ describe("processTxReceipt – on-chain token verification", () => {
   }
 
   function mockGetToken(impl: () => Promise<bigint>) {
-    vi.mocked(agreementContract).mockReturnValue({ get_token: vi.fn(impl) } as any);
+    vi.mocked(agreementContract).mockReturnValue({
+      parseEvent: parseEventMock,
+      get_token: vi.fn(impl),
+    } as any);
   }
 
   beforeEach(() => {
@@ -498,6 +615,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     rewireDbInsert();
     // Force a deterministic "token matches" path for the default route tests.
     vi.mocked(agreementContract).mockReturnValue({
+      parseEvent: parseEventMock,
       get_token: vi
         .fn()
         .mockResolvedValue(
@@ -523,6 +641,7 @@ describe("events routes – process_tx and process_batch responses", () => {
     const res = await request(makeApp()).post(`/events/process_tx/${TX_A}`).send();
 
     expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ success: false });
     expect(res.body.error).toMatch(/not found/i);
   });
 
@@ -537,5 +656,414 @@ describe("events routes – process_tx and process_batch responses", () => {
     expect(res.status).toBe(200);
     expect(res.body.summary.total).toBe(1);
     expect(res.body.results).toHaveLength(1);
+  });
+
+  it("process_batch returns 400 with a clean error for a malformed envelope", async () => {
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: "not-an-array" }); // Malformed
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid request envelope");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  it("process_batch returns 207 Multi-Status when one or more transactions fail", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any) // Success
+      .mockRejectedValue(new Error("RPC timeout")); // Error for TX_B and its retries
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(207);
+    expect(res.body.summary.total).toBe(2);
+    expect(res.body.summary.processed).toBe(1);
+    expect(res.body.summary.errors).toBe(1);
+  it("process_batch returns 400 with a clean error for malformed hashes", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, "not-a-tx-hash"] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 2 });
+    errorSpy.mockRestore();
+  });
+
+  it("process_tx returns 400 with a clean error for a malformed hash", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    env.LOG_FORMAT = "json";
+    const res = await request(makeApp()).post("/events/process_tx/not-a-tx-hash").send();
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    // Never should have reached the provider with garbage input.
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    const entry = errorSpy.mock.calls
+      .map(([message]) => JSON.parse(message as string))
+      .find((log) => log.operation === "event_envelope_validation");
+    expect(entry).toMatchObject({ status: "error", batch_size: 1 });
+    errorSpy.mockRestore();
+  });
+
+  it("process_tx still works for valid TX_A/TX_B-style hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp()).post(`/events/process_tx/${TX_B}`).send();
+
+    expect(res.status).toBe(200);
+    expect(res.body.transactionHash).toBe(TX_B);
+  });
+
+  it("process_batch dedupes an exact duplicate hash within the same batch", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_A] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.results[0]).toEqual(res.body.results[1]);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch dedupes hashes that differ only by leading-zero padding", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const unpadded = "0xaaaa";
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, unpadded] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(res.body.results).toHaveLength(2);
+    expect(res.body.summary.duplicates).toBe(1);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch reports zero duplicates for all-unique hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_B) as any);
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(200);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledTimes(2);
+    expect(res.body.summary.duplicates).toBe(0);
+    expect(res.body.summary.total).toBe(2);
+  });
+
+  it("process_batch processes unique receipts concurrently via fan-out delivery", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    let fetchCount = 0;
+    vi.mocked(provider.getTransactionReceipt).mockImplementation(async (hash: string) => {
+      fetchCount++;
+      await new Promise((r) => setTimeout(r, 15));
+      return makeAgreementReceipt(hash) as any;
+    });
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary.total).toBe(2);
+    expect(res.body.results).toHaveLength(2);
+    expect(fetchCount).toBe(2);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledWith(TX_A);
+    expect(provider.getTransactionReceipt).toHaveBeenCalledWith(TX_B);
+  });
+
+  it("processTxReceipt reuses cached contract instances from starknet client", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any);
+
+    await processTxReceipt(TX_A);
+
+    expect(vi.mocked(agreementContract)).toHaveBeenCalled();
+    expect(vi.mocked(escrowContract)).toHaveBeenCalled();
+  });
+});
+
+describe("GET /events event-type and time-range filters", () => {
+  function makeApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(eventsRouter);
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryState.eventsRows = [
+      {
+        id: "tx1_0",
+        agreementId: "100",
+        contractAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+        eventType: "AgreementCreated",
+        createdAt: new Date("2026-03-01T12:00:00Z"),
+      },
+      {
+        id: "tx2_0",
+        agreementId: "100",
+        contractAddress: "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd",
+        eventType: "PaymentSent",
+        createdAt: new Date("2026-03-02T12:00:00Z"),
+      },
+    ];
+  });
+
+  describe("Helper Functions", () => {
+    it("parseEventTypeQuery handles strings, comma-separated values, arrays, and deduplication", () => {
+      expect(parseEventTypeQuery(undefined)).toEqual([]);
+      expect(parseEventTypeQuery("AgreementCreated")).toEqual(["AgreementCreated"]);
+      expect(parseEventTypeQuery("AgreementCreated, PaymentSent")).toEqual(["AgreementCreated", "PaymentSent"]);
+      expect(parseEventTypeQuery(["AgreementCreated, PaymentSent", "AgreementActivated", "AgreementCreated"])).toEqual([
+        "AgreementCreated",
+        "PaymentSent",
+        "AgreementActivated",
+      ]);
+    });
+
+    it("parseTimestampQuery correctly parses ISO strings and numeric timestamps", () => {
+      expect(parseTimestampQuery(undefined, "from")).toBeUndefined();
+      expect(parseTimestampQuery("", "from")).toBeUndefined();
+
+      const iso = "2026-01-01T00:00:00.000Z";
+      expect(parseTimestampQuery(iso, "from")?.toISOString()).toBe(iso);
+
+      const ms = 1700000000000;
+      expect(parseTimestampQuery(ms, "from")?.getTime()).toBe(ms);
+
+      const sec = 1700000000;
+      expect(parseTimestampQuery(sec, "from")?.getTime()).toBe(sec * 1000);
+    });
+
+    it("parseTimestampQuery throws ZodError on malformed timestamp string", () => {
+      expect(() => parseTimestampQuery("not-a-date", "from")).toThrow();
+      expect(() => parseTimestampQuery({} as any, "from")).toThrow();
+    });
+
+    it("validateTimeRange passes valid ranges and throws on inverted bounds", () => {
+      const earlier = new Date("2026-01-01");
+      const later = new Date("2026-02-01");
+
+      expect(() => validateTimeRange(earlier, later)).not.toThrow();
+      expect(() => validateTimeRange(earlier, earlier)).not.toThrow();
+      expect(() => validateTimeRange(earlier, undefined)).not.toThrow();
+      expect(() => validateTimeRange(undefined, later)).not.toThrow();
+
+      expect(() => validateTimeRange(later, earlier)).toThrow();
+    });
+  });
+
+  describe("HTTP GET /events filtering integration", () => {
+    it("returns events list with default pagination when no filters are supplied", async () => {
+      const res = await request(makeApp()).get("/events");
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(2);
+      expect(res.body.count).toBe(2);
+      expect(res.body.limit).toBe(50);
+      expect(res.body.offset).toBe(0);
+    });
+
+    it("filters by eventType (single or comma-separated)", async () => {
+      const res = await request(makeApp()).get("/events?eventType=AgreementCreated,PaymentSent");
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(2);
+      expect(queryState.lastWhere).toBeDefined();
+    });
+
+    it("filters by time range (from and to parameters)", async () => {
+      const from = "2026-03-01T00:00:00Z";
+      const to = "2026-03-05T00:00:00Z";
+      const res = await request(makeApp()).get(`/events?from=${from}&to=${to}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toHaveLength(2);
+      expect(queryState.lastWhere).toBeDefined();
+    });
+
+    it("intersects eventType, time-range, agreement_id, and pagination params cleanly", async () => {
+      const from = "2026-03-01T00:00:00Z";
+      const to = "2026-03-05T00:00:00Z";
+      const res = await request(makeApp()).get(
+        `/events?eventType=AgreementCreated&from=${from}&to=${to}&agreement_id=100&limit=10&offset=5`
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.limit).toBe(10);
+      expect(res.body.offset).toBe(5);
+      expect(queryState.lastLimit).toBe(10);
+      expect(queryState.lastOffset).toBe(5);
+      expect(queryState.lastWhere).toBeDefined();
+    });
+
+    it("returns 400 Bad Request when from or to timestamp is malformed", async () => {
+      const res = await request(makeApp()).get("/events?from=invalid-date");
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Validation failed");
+      expect(res.body.details).toBeDefined();
+    });
+
+    it("returns 400 Bad Request when from timestamp is strictly greater than to timestamp", async () => {
+      const res = await request(makeApp()).get(
+        "/events?from=2026-12-31T00:00:00Z&to=2026-01-01T00:00:00Z"
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("Validation failed");
+      expect(res.body.details[0].message).toMatch(/from timestamp must be less than or equal to to timestamp/);
+    });
+
+    it("accepts equal from and to timestamps (inclusive bounds)", async () => {
+      const timestamp = "2026-03-01T12:00:00Z";
+      const res = await request(makeApp()).get(`/events?from=${timestamp}&to=${timestamp}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toBeDefined();
+    });
+
+    it("supports contract_address filter (both snake_case and camelCase)", async () => {
+      const address = "0x067812025b96919b93ea9d63267522467d8b9fef1175a6cf9de84932b674dacd";
+      const res1 = await request(makeApp()).get(`/events?contract_address=${address}`);
+      const res2 = await request(makeApp()).get(`/events?contractAddress=${address}`);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+    });
+
+    it("supports agreement_id filter (both snake_case and camelCase)", async () => {
+      const res1 = await request(makeApp()).get("/events?agreement_id=100");
+      const res2 = await request(makeApp()).get("/events?agreementId=100");
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests – Envelope validation and error handling
+// ---------------------------------------------------------------------------
+
+describe("Envelope validation and error handling", () => {
+  function makeApp() {
+    const app = express();
+    app.use(express.json());
+    app.use(eventsRouter);
+    return app;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rewireDbInsert();
+  });
+
+  it("process_batch returns 400 when tx_hashes array is empty", async () => {
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [] });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("process_batch returns 400 when tx_hashes exceeds MAX_BATCH_SIZE", async () => {
+    const tooMany = Array.from({ length: 51 }, (_, i) => `0x${i.toString(16).padStart(4, "0")}`);
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: tooMany });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("process_batch returns 400 when tx_hashes is missing", async () => {
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({});
+
+    expect(res.status).toBe(400);
+  });
+
+  it("process_batch accepts exactly MAX_BATCH_SIZE hashes", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const maxValid = Array.from({ length: 50 }, () => TX_A);
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: maxValid });
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary.total).toBe(50);
+  });
+
+  it("process_tx normalizes various hash formats consistently", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt).mockResolvedValue(makeAgreementReceipt(TX_A) as any);
+
+    const variants = [
+      "0xaaaa",
+      "0xAAAA",
+      "0x000000000000000000000000000000000000000000000000000000000000aaaa",
+    ];
+
+    for (const variant of variants) {
+      const res = await request(makeApp()).post(`/events/process_tx/${variant}`).send();
+      expect(res.status).toBe(200);
+      expect(res.body.transactionHash).toBe(TX_A); // All normalize to TX_A
+    }
+  });
+
+  it("process_batch summary always satisfies: total = processed + noEvents + notFound + errors + duplicates", async () => {
+    parseEventMock.mockReturnValue(decodedAgreementCreated());
+    vi.mocked(provider.getTransactionReceipt)
+      .mockResolvedValueOnce(makeAgreementReceipt(TX_A) as any) // processed
+      .mockResolvedValueOnce(EMPTY_RECEIPT as any) // noEvents
+      .mockResolvedValueOnce(null as any); // notFound
+
+    const res = await request(makeApp())
+      .post("/events/process_batch")
+      .send({ tx_hashes: [TX_A, TX_B, "0xcccc", TX_A] }); // last is duplicate
+
+    expect(res.status).toBe(200);
+    const { summary } = res.body;
+    expect(summary.total).toBe(
+      summary.processed + summary.noEvents + summary.notFound + summary.errors + summary.duplicates
+    );
+  });
+
+  it("process_tx returns consistent error shape on validation failure", async () => {
+    const res = await request(makeApp()).post("/events/process_tx/invalid-hash").send();
+
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty("error");
+    expect(res.body.error).toBe("Invalid Starknet transaction hash format");
+    expect(typeof res.body.error).toBe("string");
   });
 });

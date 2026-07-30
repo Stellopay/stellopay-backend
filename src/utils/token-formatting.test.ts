@@ -54,6 +54,16 @@ describe("formatTokenAmount", () => {
     expect(formatTokenAmount("42", 0)).toBe("42");
   });
 
+  it("throws a TypeError for out-of-bound or invalid decimals", () => {
+    expect(() => formatTokenAmount("100", -1)).toThrow(TypeError);
+    expect(() => formatTokenAmount("100", -1)).toThrow("Invalid decimals value: -1. Expected an integer between 0 and 30.");
+    expect(() => formatTokenAmount("100", 31)).toThrow(TypeError);
+    expect(() => formatTokenAmount("100", 31)).toThrow("Invalid decimals value: 31. Expected an integer between 0 and 30.");
+    expect(() => formatTokenAmount("100", 1.5)).toThrow(TypeError);
+    expect(() => formatTokenAmount("100", 1.5)).toThrow("Invalid decimals value: 1.5. Expected an integer between 0 and 30.");
+    expect(() => formatTokenAmount(null, -1)).toThrow(TypeError);
+  });
+
   // Regression: BigInt / and % carry the sign, which previously produced
   // output like "-1.-5" and dropped the sign for values between -1 and 0.
   it("formats negative amounts correctly", () => {

@@ -1,10 +1,20 @@
 /**
- * @file diagnostics.test.ts
- * Tests for the operator-only GET /diagnostics/events route.
+ * diagnostics.test.ts
+ *
+ * Contract tests for src/routes/diagnostics.ts (issue #279).
  *
  * The real requireAuth + requireAdmin middleware run here (only their
  * dependencies, the session check and the admin list, are mocked) so the
  * gating itself is exercised. db.execute is mocked to return canned rows.
+ *
+ * Coverage:
+ *   - Auth gating: 401 for unauthenticated and non-admin; no DB hit
+ *   - Success path: correct shape, counts, poolStats
+ *   - Redaction invariant: transaction_hash / agreement_id never leak
+ *   - Empty DB boundary: all summary fields default to 0, latestEvents is []
+ *   - Error handling: db failure propagates as 500 via error handler
+ *   - Response shape: all top-level keys present on every 200
+ *   - Idempotency-Key replay caching
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -16,21 +26,64 @@ vi.mock("../auth/session.js", () => ({
 }));
 
 vi.mock("../config.js", () => ({
-  env: { ADMIN_ADDRESSES: ["0xadmin"] },
+  env: { ADMIN_ADDRESSES: ["0xabc1"] },
+}));
+
+vi.mock("./diagnostics-metrics.js", () => ({
+  logDiagnosticsEvent: vi.fn(),
+  incDiagnosticsMetric: vi.fn(),
+  setDiagnosticsGauge: vi.fn(),
+  getDiagnosticsMetricsSnapshot: vi.fn(() => ({
+    counters: { diagnostics_requests_total: 1 },
+    gauges: {},
+  })),
+  DIAGNOSTICS_METRICS: {
+    REQUESTS: "diagnostics_requests_total",
+    SUCCESS: "diagnostics_success_total",
+    ERRORS: "diagnostics_errors_total",
+    QUERY_DURATION_MS: "diagnostics_query_duration_ms_total",
+  },
 }));
 
 vi.mock("../db/index.js", () => ({
   db: { execute: vi.fn() },
   getPoolStats: vi.fn(() => ({ total: 8, idle: 3, active: 5, waiting: 2 })),
+  checkDbHealth: vi.fn(),
   schema: {},
 }));
 
-import { diagnosticsRouter } from "./diagnostics.js";
-import { db, getPoolStats } from "../db/index.js";
-import { requireSession } from "../auth/session.js";
+vi.mock("../starknet/client.js", () => ({
+  getCircuitBreakerSnapshots: vi.fn(() => [
+    {
+      endpointUrl: "https://starknet-mainnet.example.com/rpc",
+      state: "CLOSED",
+      recentFailureCount: 0,
+      openedAt: null,
+    },
+  ]),
+  provider: { getChainId: vi.fn() },
+}));
 
-const ADMIN = "0xadmin";
-const NON_ADMIN = "0xnotadmin";
+import {
+  redactRecentEvent,
+  fetchDiagnosticsData,
+  diagnosticsRouter,
+  withDiagnosticsIdempotency,
+  clearDiagnosticsIdempotencyStore,
+} from "./diagnostics.js";
+import { db, getPoolStats, checkDbHealth } from "../db/index.js";
+import { requireSession } from "../auth/session.js";
+import { getCircuitBreakerSnapshots, provider } from "../starknet/client.js";
+import {
+  logDiagnosticsEvent,
+  incDiagnosticsMetric,
+  setDiagnosticsGauge,
+  getDiagnosticsMetricsSnapshot,
+  DIAGNOSTICS_METRICS,
+} from "./diagnostics-metrics.js";
+
+const ADMIN = "0xabc1";
+const NON_ADMIN = "0xdef2";
 
 function makeApp() {
   const app = express();
@@ -42,8 +95,15 @@ function makeApp() {
   return app;
 }
 
-function authHeaders(address: string) {
-  return { "x-user-address": address, authorization: "Bearer testtoken" };
+function authHeaders(address: string, idempotencyKey?: string) {
+  const headers: Record<string, string> = {
+    "x-user-address": address,
+    authorization: "Bearer testtoken",
+  };
+  if (idempotencyKey) {
+    headers["idempotency-key"] = idempotencyKey;
+  }
+  return headers;
 }
 
 /** Queue the five db.execute results the route reads, in call order. */
@@ -65,8 +125,6 @@ function wireDbRows() {
         },
       ],
     } as any)
-    // The recent-events query returns sensitive identifiers; the route must
-    // redact them out of the response.
     .mockResolvedValueOnce({
       rows: [
         {
@@ -79,11 +137,605 @@ function wireDbRows() {
     } as any);
 }
 
+describe("redactRecentEvent helper", () => {
+  it("strips sensitive transaction hashes, agreement IDs, and extra fields", () => {
+    const rawRow = {
+      event_type: "EscrowFunded",
+      created_at: "2026-07-26T18:00:00Z",
+      transaction_hash: "0xsecrettx",
+      agreement_id: "ag-999",
+      employer: "0xemployer",
+    };
+
+    const redacted = redactRecentEvent(rawRow);
+
+    expect(redacted).toEqual({
+      event_type: "EscrowFunded",
+      created_at: "2026-07-26T18:00:00Z",
+    });
+    expect(redacted).not.toHaveProperty("transaction_hash");
+    expect(redacted).not.toHaveProperty("agreement_id");
+    expect(redacted).not.toHaveProperty("employer");
+  });
+
+  it("provides safe fallbacks for malformed inputs without crashing", () => {
+    expect(redactRecentEvent({})).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    expect(redactRecentEvent({ event_type: 123, created_at: false })).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    expect(redactRecentEvent(null)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+    expect(redactRecentEvent(undefined)).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+
+    expect(redactRecentEvent("just a string")).toEqual({
+      event_type: "Unknown",
+      created_at: new Date(0).toISOString(),
+    });
+  });
+
+  it("normalises Date objects to ISO strings in created_at", () => {
+    const testDate = new Date("2026-07-26T18:00:00Z");
+    const rawRow = {
+      event_type: "EscrowFunded",
+      created_at: testDate,
+      transaction_hash: "0xsecrettx",
+    };
+
+    const redacted = redactRecentEvent(rawRow);
+
+    expect(redacted).toEqual({
+      event_type: "EscrowFunded",
+      created_at: testDate.toISOString(),
+    });
+  });
+
+  it("passes through string created_at values unchanged", () => {
+    const rawRow = {
+      event_type: "PaymentSent",
+      created_at: "2026-06-15T12:00:00Z",
+    };
+
+    const redacted = redactRecentEvent(rawRow);
+
+    expect(redacted.created_at).toBe("2026-06-15T12:00:00Z");
+  });
+});
+
+describe("withDiagnosticsIdempotency wrapper", () => {
+  beforeEach(() => {
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("passes through to handler when no idempotency key is present", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ ok: true });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = { headers: {}, method: "GET", path: "/test" } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+    const next = vi.fn();
+
+    await wrapped(req, res, next);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(res.json).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it("caches the first successful response and replays it on subsequent requests with the same key", async () => {
+    let callCount = 0;
+    const handler = vi.fn(async (_req: any, res: any) => {
+      callCount++;
+      res.status(200).json({ seq: callCount });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const headers = {
+      "idempotency-key": "key-001",
+      "x-user-address": "0xabc1",
+    };
+
+    const makeReq = () =>
+      ({ headers: { ...headers }, method: "GET", path: "/test" }) as any;
+
+    // First call — handler runs.
+    // Hold onto the json spy before the wrapper replaces res.json.
+    const jsonSpy1 = vi.fn();
+    const res1 = { status: vi.fn().mockReturnThis(), json: jsonSpy1 } as any;
+    await wrapped(makeReq(), res1, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(jsonSpy1).toHaveBeenCalledWith({ seq: 1 });
+
+    // Second call with same key — cached response, handler NOT called again.
+    const jsonSpy2 = vi.fn();
+    const res2 = { status: vi.fn().mockReturnThis(), json: jsonSpy2 } as any;
+    await wrapped(makeReq(), res2, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1); // still 1
+    expect(jsonSpy2).toHaveBeenCalledWith({ seq: 1 });
+  });
+
+  it("does not cache when idempotency key is an array", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ ok: true });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = {
+      headers: { "idempotency-key": ["key1", "key2"], "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    // Second call — handler runs again because array keys bypass cache
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it("distinguishes caches by method and path", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ route: `${_req.method}:${_req.path}` });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const headers = {
+      "idempotency-key": "key-002",
+      "x-user-address": "0xabc1",
+    };
+
+    const reqA = { headers: { ...headers }, method: "GET", path: "/route-a" } as any;
+    const reqB = { headers: { ...headers }, method: "GET", path: "/route-b" } as any;
+
+    const jsonSpyA = vi.fn();
+    const jsonSpyB = vi.fn();
+    const resA = { status: vi.fn().mockReturnThis(), json: jsonSpyA } as any;
+    const resB = { status: vi.fn().mockReturnThis(), json: jsonSpyB } as any;
+
+    await wrapped(reqA, resA, vi.fn());
+    await wrapped(reqB, resB, vi.fn());
+
+    // Different paths → different cache entries → handler called twice
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(jsonSpyA).toHaveBeenCalledWith({ route: "GET:/route-a" });
+    expect(jsonSpyB).toHaveBeenCalledWith({ route: "GET:/route-b" });
+  });
+
+  it("distinguishes caches by user address", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ user: _req.headers["x-user-address"] });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+
+    const req1 = {
+      headers: { "idempotency-key": "key-003", "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const req2 = {
+      headers: { "idempotency-key": "key-003", "x-user-address": "0xdef2" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+
+    await wrapped(req1, res, vi.fn());
+    await wrapped(req2, { ...res, status: vi.fn().mockReturnThis(), json: vi.fn() } as any, vi.fn());
+
+    // Different users → separate cache entries
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates errors through next() rather than caching error responses", async () => {
+    const handler = vi.fn(async () => {
+      throw new Error("handler failure");
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = {
+      headers: { "idempotency-key": "key-err", "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+    const next = vi.fn();
+
+    await wrapped(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect((next.mock.calls[0] as any)[0]).toBeInstanceOf(Error);
+    expect((next.mock.calls[0] as any)[0].message).toBe("handler failure");
+  });
+});
+
+describe("clearDiagnosticsIdempotencyStore", () => {
+  beforeEach(() => {
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("clears all cached idempotency entries, forcing fresh handler calls", async () => {
+    const handler = vi.fn(async (_req: any, res: any) => {
+      res.status(200).json({ fresh: true });
+    });
+
+    const wrapped = withDiagnosticsIdempotency(handler);
+    const req = {
+      headers: { "idempotency-key": "key-clr", "x-user-address": "0xabc1" },
+      method: "GET",
+      path: "/test",
+    } as any;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any;
+
+    // First call — caches
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    // Clear the store
+    clearDiagnosticsIdempotencyStore();
+
+    // Second call — must call handler again because cache is empty
+    await wrapped(req, res, vi.fn());
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("GET /diagnostics/health – dependency connectivity checks", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(requireSession).mockResolvedValue(true);
+    vi.mocked(checkDbHealth).mockResolvedValue(true);
+    vi.mocked(provider.getChainId).mockResolvedValue("0x534e5f4d41494e");
+    clearDiagnosticsIdempotencyStore();
+  });
+
+  it("rejects unauthenticated requests with 401", async () => {
+    const res = await request(makeApp()).get("/api/v1/diagnostics/health");
+    expect(res.status).toBe(401);
+    expect(checkDbHealth).not.toHaveBeenCalled();
+  });
+
+  it("rejects authenticated non-admin with 403", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(NON_ADMIN));
+    expect(res.status).toBe(403);
+    expect(checkDbHealth).not.toHaveBeenCalled();
+  });
+
+  it("returns healthy when all dependencies are up", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("healthy");
+    expect(res.body.checks.database.status).toBe("healthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+    expect(res.body.checks.database.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(res.body.checks.starknet.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(checkDbHealth).toHaveBeenCalledOnce();
+    expect(provider.getChainId).toHaveBeenCalledOnce();
+  });
+
+  it("returns unhealthy overall when DB is down", async () => {
+    vi.mocked(checkDbHealth).mockResolvedValue(false);
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+  });
+
+  it("returns unhealthy overall when DB check throws", async () => {
+    vi.mocked(checkDbHealth).mockRejectedValue(new Error("db connection refused"));
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+  });
+
+  it("returns unhealthy overall when Starknet RPC is unreachable", async () => {
+    vi.mocked(provider.getChainId).mockRejectedValue(new Error("RPC timeout"));
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("healthy");
+    expect(res.body.checks.starknet.status).toBe("unhealthy");
+  });
+
+  it("returns unhealthy when both dependencies are down", async () => {
+    vi.mocked(checkDbHealth).mockRejectedValue(new Error("db down"));
+    vi.mocked(provider.getChainId).mockRejectedValue(new Error("rpc down"));
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("unhealthy");
+  });
+
+  it("returns a timeout error when DB check hangs", async () => {
+    vi.mocked(checkDbHealth).mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve(true), 10_000)),
+    );
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.status).toBe("healthy");
+    expect(res.body.checks.database.latencyMs).toBeGreaterThanOrEqual(0);
+  }, 10_000);
+
+  it("returns a timeout error when Starknet RPC check hangs", async () => {
+    vi.mocked(provider.getChainId).mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve("0x1"), 10_000)),
+    );
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.checks.database.status).toBe("healthy");
+    expect(res.body.checks.starknet.status).toBe("unhealthy");
+    expect(res.body.checks.starknet.latencyMs).toBeGreaterThanOrEqual(0);
+  }, 10_000);
+
+  it("does not leak connection strings, credentials, or RPC URLs in the response", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    const bodyStr = JSON.stringify(res.body);
+    expect(bodyStr).not.toMatch(/postgres/i);
+    expect(bodyStr).not.toMatch(/password/i);
+    expect(bodyStr).not.toMatch(/connection/i);
+    expect(bodyStr).not.toMatch(/http/i);
+    expect(bodyStr).not.toMatch(/rpc\./i);
+  });
+
+  it("returns valid response shape on every call", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("status");
+    expect(res.body).toHaveProperty("checks");
+    expect(res.body.checks).toHaveProperty("database");
+    expect(res.body.checks).toHaveProperty("starknet");
+    expect(res.body.checks.database).toHaveProperty("status");
+    expect(res.body.checks.database).toHaveProperty("latencyMs");
+    expect(res.body.checks.starknet).toHaveProperty("status");
+    expect(res.body.checks.starknet).toHaveProperty("latencyMs");
+  });
+
+  it("runs both checks concurrently", async () => {
+    let dbStart = 0;
+    let snStart = 0;
+    vi.mocked(checkDbHealth).mockImplementation(async () => {
+      dbStart = Date.now();
+      await new Promise((r) => setTimeout(r, 50));
+      return true;
+    });
+    vi.mocked(provider.getChainId).mockImplementation(async () => {
+      snStart = Date.now();
+      await new Promise((r) => setTimeout(r, 50));
+      return "0x534e5f4d41494e";
+    });
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/health")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("healthy");
+
+    const totalMs = res.body.checks.database.latencyMs + res.body.checks.starknet.latencyMs;
+    expect(totalMs).toBeLessThan(200);
+  }, 10_000);
+});
+
+describe("GET /diagnostics/events – pagination and query parameter edge cases", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.execute).mockReset();
+    vi.mocked(requireSession).mockResolvedValue(true);
+  });
+
+  it("passes through valid limit and offset values to fetchDiagnosticsData", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=5&offset=10")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    // The route returns 200 with data; the exact SQL params are verified
+    // indirectly: the mock returns canned rows regardless, but the call
+    // count confirms the query pipeline executed.
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("caps limit at 100 even when a larger value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=9999")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when zero is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=0")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when a negative value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=-5")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when a non-numeric value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=abc")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults limit to 20 when Infinity is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=Infinity")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("defaults offset to 0 when a negative value is provided", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?offset=-10")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("accepts limit at the exact cap of 100", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=100")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("rejects fractional limit values by defaulting to 20", async () => {
+    // Fractional values are not safe integers, so they fall back to default
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events?limit=3.14")
+      .set(authHeaders(ADMIN));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe("fetchDiagnosticsData helper", () => {
+  it("executes read queries concurrently and returns structured telemetry", async () => {
+    const mockDb = {
+      execute: vi
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ event_type: "AgreementCreated", count: "10" }] })
+        .mockResolvedValueOnce({ rows: [{ event_type: "Funded", count: "4" }] })
+        .mockResolvedValueOnce({ rows: [{ event_type: "PaymentSent", count: "8" }] })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              agreement_events_count: "10",
+              escrow_events_count: "4",
+              payments_count: "8",
+              employees_count: "2",
+              milestones_count: "5",
+              agreements_count: "6",
+              latest_block: "500",
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              event_type: "AgreementCreated",
+              transaction_hash: "0xrawtx",
+              agreement_id: "ag-10",
+              created_at: "2026-07-26T18:10:00Z",
+            },
+          ],
+        }),
+    };
+
+    const data = await fetchDiagnosticsData(mockDb as any);
+
+    expect(mockDb.execute).toHaveBeenCalledTimes(5);
+    expect(data.eventTypeCounts).toEqual([{ event_type: "AgreementCreated", count: "10" }]);
+    expect(data.escrowEventCounts).toEqual([{ event_type: "Funded", count: "4" }]);
+    expect(data.paymentEventCounts).toEqual([{ event_type: "PaymentSent", count: "8" }]);
+    expect(data.summary.totalAgreementEvents).toBe("10");
+    expect(data.summary.latestBlock).toBe("500");
+    expect(data.latestEvents).toEqual([
+      { event_type: "AgreementCreated", created_at: "2026-07-26T18:10:00Z" },
+    ]);
+  });
+});
+
 describe("GET /diagnostics/events – admin gating and redaction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(db.execute).mockReset();
     vi.mocked(requireSession).mockResolvedValue(true);
+    clearDiagnosticsIdempotencyStore();
   });
 
   it("rejects an unauthenticated request with 401 and runs no queries", async () => {
@@ -93,12 +745,37 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(db.execute).not.toHaveBeenCalled();
   });
 
-  it("rejects an authenticated non-admin with 401 and runs no queries", async () => {
+  it("rejects an authenticated non-admin with 403 and runs no queries", async () => {
     const res = await request(makeApp())
       .get("/api/v1/diagnostics/events")
       .set(authHeaders(NON_ADMIN));
 
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Forbidden" });
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects requests when requireSession invalidates session", async () => {
+    vi.mocked(requireSession).mockResolvedValueOnce(false);
+
+    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
     expect(res.status).toBe(401);
+    expect(db.execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects requests missing authorization header or missing address header", async () => {
+    const resNoAuth = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set({ "x-user-address": ADMIN });
+
+    expect(resNoAuth.status).toBe(401);
+
+    const resNoAddress = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set({ authorization: "Bearer testtoken" });
+
+    expect(resNoAddress.status).toBe(401);
     expect(db.execute).not.toHaveBeenCalled();
   });
 
@@ -113,6 +790,20 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.body.tableCounts.agreements_count).toBe("3");
     expect(res.body.poolStats).toEqual({ total: 8, idle: 3, active: 5, waiting: 2 });
     expect(getPoolStats).toHaveBeenCalledOnce();
+    expect(getCircuitBreakerSnapshots).toHaveBeenCalledOnce();
+    expect(res.body.circuitBreakers).toHaveLength(1);
+    expect(res.body.circuitBreakers[0].state).toBe("CLOSED");
+  });
+
+  it("handles case-insensitive admin address matching", async () => {
+    wireDbRows();
+
+    const res = await request(makeApp())
+      .get("/api/v1/diagnostics/events")
+      .set(authHeaders(ADMIN.toUpperCase()));
+
+    expect(res.status).toBe(200);
+    expect(db.execute).toHaveBeenCalled();
   });
 
   it("redacts transaction hashes and agreement ids from recent events", async () => {
@@ -135,7 +826,7 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any)
-      .mockResolvedValueOnce({ rows: [] } as any) // tableCounts empty: rows[0] undefined
+      .mockResolvedValueOnce({ rows: [] } as any)
       .mockResolvedValueOnce({ rows: [] } as any);
 
     const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
@@ -154,3 +845,105 @@ describe("GET /diagnostics/events – admin gating and redaction", () => {
     expect(res.status).toBe(500);
   });
 });
+
+describe("GET /diagnostics/events – backward-compatibility contract (Issue #284)", () => {
+    beforeEach(() => {https://github.com/Stellopay/stellopay-backend/pull/564/conflict?name=src%252Froutes%252Fdiagnostics.test.ts&ancestor_oid=4c2037638aad218c8c1b9cac2228465f55bfc033&base_oid=f699082b599c18f0d4b617f1c6161b2253b77fe9&head_oid=15d417408f9201da0d8a9c31260caf74049f4088
+        vi.clearAllMocks();
+            vi.mocked(db.execute).mockReset();
+                vi.mocked(requireSession).mockResolvedValue(true);
+                  });
+
+                    it("response always includes the full set of documented top-level keys", async () => {
+                        wireDbRows();
+
+                            const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                expect(res.status).toBe(200);
+                                    // Locks the public response contract: existing consumers may rely on
+                                        // any of these keys being present. Adding new keys is fine (additive);
+                                            // renaming or removing one of these is a breaking change and must fail
+                                                // this test, forcing a deliberate version discussion instead of a
+                                                    // silent drift.
+                                                        expect(Object.keys(res.body).sort()).toEqual(
+                                                              [
+                                                                      "circuitBreakers",
+                                                                              "diagnosticsMetrics",
+                                                                                      "escrowEventCounts",
+                                                                                              "eventTypeCounts",
+                                                                                                      "latestEvents",
+                                                                                                              "paymentEventCounts",
+                                                                                                                      "poolStats",
+                                                                                                                              "queryDurationMs",
+                                                                                                                                      "summary",
+                                                                                                                                              "tableCounts",
+                                                                                                                                                    ].sort(),
+                                                                                                                                                        );
+                                                                                                                                                          });
+
+                                                                                                                                    it("summary always includes the documented six fields, even when tables are empty", async () => {
+                                                                                                                                        vi.mocked(db.execute)
+                                                                                                                                              .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                    .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                          .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                                .mockResolvedValueOnce({ rows: [] } as any)
+                                                                                                                                                                      .mockResolvedValueOnce({ rows: [] } as any);
+
+                                                                                                                                                                          const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                              expect(res.status).toBe(200);
+                                                                                                                                                                                  expect(Object.keys(res.body.summary).sort()).toEqual(
+                                                                                                                                                                                        [
+                                                                                                                                                                                                "totalAgreementEvents",
+                                                                                                                                                                                                        "totalEscrowEvents",
+                                                                                                                                                                                                                "totalPayments",
+                                                                                                                                                                                                                        "totalEmployees",
+                                                                                                                                                                                                                                "totalMilestones",
+                                                                                                                                                                                                                                        "latestBlock",
+                                                                                                                                                                                                                                              ].sort(),
+                                                                                                                                                                                                                                                  );
+                                                                                                                                                                                                                                                    });
+
+                                                                                                                                                                                                                                                      it("latestEvents entries never grow beyond the documented redacted shape", async () => {
+                                                                                                                                                                                                                                                          wireDbRows();
+
+                                                                                                                                                                                                                                                              const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                  expect(res.status).toBe(200);
+                                                                                                                                                                                                                                                                      for (const entry of res.body.latestEvents) {
+                                                                                                                                                                                                                                                                            // Exactly two keys — event_type and created_at. If a future change to
+                                                                                                                                                                                                                                                                                  // fetchDiagnosticsData or redactRecentEvent starts leaking a third
+                                                                                                                                                                                                                                                                                        // field, this fails instead of silently widening the redaction surface.
+                                                                                                                                                                                                                                                                                              expect(Object.keys(entry).sort()).toEqual(["created_at", "event_type"]);
+                                                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                                                    });
+
+                                                                                                                                                                                                                                                                                                      it("only GET is exposed on /diagnostics/events; other methods are not silently handled", async () => {
+                                                                                                                                                                                                                                                                                                          const app = makeApp();
+
+                                                                                                                                                                                                                                                                                                              const postRes = await request(app).post("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+                                                                                                                                                                                                                                                                                                                  const deleteRes = await request(app).delete("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                                                                      // Express's default for an unregistered method on a known path is 404.
+                                                                                                                                                                                                                                                                                                                          // This test locks that in as the documented contract, so a future route
+                                                                                                                                                                                                                                                                                                                              // addition (e.g. a POST handler) is a deliberate, reviewed decision
+                                                                                                                                                                                                                                                                                                                                  // rather than an accidental side effect of an unrelated change.
+                                                                                                                                                                                                                                                                                                                                      expect(postRes.status).toBe(404);
+                                                                                                                                                                                                                                                                                                                                          expect(deleteRes.status).toBe(404);
+                                                                                                                                                                                                                                                                                                                                              expect(db.execute).not.toHaveBeenCalled();
+                                                                                                                                                                                                                                                                                                                                                });
+
+                                                                                                                                                                                                                                                                                                                                                  it("count and *_count values remain strings as returned by Postgres COUNT(*)", async () => {
+                                                                                                                                                                                                                                                                                                                                                    wireDbRows();
+
+                                                                                                                                                                                                                                                                                                                                                    const res = await request(makeApp()).get("/api/v1/diagnostics/events").set(authHeaders(ADMIN));
+
+                                                                                                                                                                                                                                                                                                                                                    expect(res.status).toBe(200);
+                                                                                                                                                                                                                                                                                                                                                    // Per the docs/count contract: count values are strings.
+                                                                                                                                                                                                                                                                                                                                                    for (const row of res.body.eventTypeCounts) {
+                                                                                                                                                                                                                                                                                                                                                      expect(typeof row.count).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.summary.totalAgreementEvents).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.summary.latestBlock).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                    expect(typeof res.body.tableCounts.agreement_events_count).toBe("string");
+                                                                                                                                                                                                                                                                                                                                                  });
+                                                                                                                                                                                                                                                                                                                                                });

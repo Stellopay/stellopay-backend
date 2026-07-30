@@ -1,21 +1,20 @@
 import { Router } from "express";
 import { z } from "zod";
 import { shortString } from "starknet";
-import { provider } from "../starknet/client.js";
+import { provider, staleProvider } from "../starknet/client.js";
 import { parseU256, toHexString } from "../utils/codec.js";
 import { requireSession } from "../auth/session.js";
 import { env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
-
-const AddressParam = z.string().min(3);
+import { StarknetAddress } from "../utils/validation.js";
 
 const WalletSession = z.object({
-  wallet_address: z.string().min(3),
+  wallet_address: StarknetAddress,
   session_token: z.string().min(10),
 });
 
 const ApproveBody = WalletSession.extend({
-  spender: z.string().min(3),
+  spender: StarknetAddress,
   amount: z.string().min(1),
 });
 
@@ -24,6 +23,7 @@ export interface TokenMetadata {
   name: string;
   symbol: string;
   decimals: number;
+  stale?: boolean;
 }
 
 interface TokenMetadataCacheEntry {
@@ -33,6 +33,7 @@ interface TokenMetadataCacheEntry {
 
 const tokenMetadataCache = new Map<string, TokenMetadataCacheEntry>();
 const tokenMetadataRequests = new Map<string, Promise<TokenMetadata>>();
+const TOKEN_METADATA_BATCH_CONCURRENCY = 8;
 
 function firstCallResult(output: unknown, entrypoint: string): string {
   const result = Array.isArray(output)
@@ -48,13 +49,15 @@ function firstCallResult(output: unknown, entrypoint: string): string {
   return String(result[0]);
 }
 
-async function callTokenField(token: string, entrypoint: string): Promise<string> {
-  const output = await provider.callContract({
+async function callTokenField(token: string, entrypoint: string): Promise<{ value: string; stale: boolean }> {
+  const output = await staleProvider.callContract({
     contractAddress: token,
     entrypoint,
     calldata: [],
   });
-  return firstCallResult(output, entrypoint);
+  const stale = output && typeof output === "object" && "stale" in output && output.stale === true;
+  const value = stale && "value" in output ? output.value : output;
+  return { value: firstCallResult(value, entrypoint), stale };
 }
 
 function decodeTokenText(value: string): string {
@@ -74,9 +77,10 @@ async function fetchTokenMetadata(token: string): Promise<TokenMetadata> {
 
   return {
     token,
-    name: decodeTokenText(name),
-    symbol: decodeTokenText(symbol),
-    decimals: Number(BigInt(decimals)),
+    name: decodeTokenText(name.value),
+    symbol: decodeTokenText(symbol.value),
+    decimals: Number(BigInt(decimals.value)),
+    stale: name.stale || symbol.stale || decimals.stale || undefined,
   };
 }
 
@@ -111,6 +115,33 @@ export async function getTokenMetadata(address: string): Promise<TokenMetadata> 
 
   tokenMetadataRequests.set(token, request);
   return request;
+}
+
+/**
+ * Resolve distinct token metadata entries with bounded concurrency.
+ *
+ * Canonicalization happens before deduplication, so equivalent address
+ * spellings share the existing TTL and in-flight caches. The small worker
+ * batches keep a large notification/transaction page from creating an
+ * unbounded RPC fan-out while retaining parallelism for normal pages.
+ */
+export async function getTokenMetadataBatch(
+  addresses: string[],
+): Promise<Map<string, TokenMetadata>> {
+  const tokens = [...new Set(addresses.map(normalizeStarknetAddress))];
+  const metadata = new Map<string, TokenMetadata>();
+
+  for (let offset = 0; offset < tokens.length; offset += TOKEN_METADATA_BATCH_CONCURRENCY) {
+    const batch = tokens.slice(offset, offset + TOKEN_METADATA_BATCH_CONCURRENCY);
+    const resolved = await Promise.all(
+      batch.map(async (token) => [token, await getTokenMetadata(token)] as const),
+    );
+    for (const [token, value] of resolved) {
+      metadata.set(token, value);
+    }
+  }
+
+  return metadata;
 }
 
 /** Clears token metadata state. Intended for deterministic tests. */
@@ -148,9 +179,17 @@ export const tokenRouter = Router();
 // Get ERC-20 metadata, backed by the configured in-memory TTL cache.
 tokenRouter.get("/token/:address/metadata", async (req, res, next) => {
   try {
-    const tokenAddress = AddressParam.parse(req.params.address);
+    const tokenAddress = normalizeStarknetAddress(req.params.address);
     res.json(await getTokenMetadata(tokenAddress));
-  } catch (e) {
+  } catch (e: any) {
+    if (e.message && e.message.startsWith("Starknet address")) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
+    if (e.message && e.message.includes("Contract not found")) {
+      res.status(404).json({ error: "Token not found" });
+      return;
+    }
     next(e);
   }
 });
@@ -158,9 +197,9 @@ tokenRouter.get("/token/:address/metadata", async (req, res, next) => {
 // Get current allowance
 tokenRouter.get("/token/:address/allowance/:owner/:spender", async (req, res, next) => {
   try {
-    const tokenAddress = AddressParam.parse(req.params.address);
-    const owner = AddressParam.parse(req.params.owner);
-    const spender = AddressParam.parse(req.params.spender);
+    const tokenAddress = normalizeStarknetAddress(req.params.address);
+    const owner = normalizeStarknetAddress(req.params.owner);
+    const spender = normalizeStarknetAddress(req.params.spender);
 
     const { Contract } = await import("starknet");
     const tokenContract = new Contract(ERC20_ABI, tokenAddress, provider);
@@ -173,7 +212,15 @@ tokenRouter.get("/token/:address/allowance/:owner/:spender", async (req, res, ne
       spender,
       allowance: toHexString(allowance),
     });
-  } catch (e) {
+  } catch (e: any) {
+    if (e.message && e.message.startsWith("Starknet address")) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
+    if (e.message && e.message.includes("Contract not found")) {
+      res.status(404).json({ error: "Token not found" });
+      return;
+    }
     next(e);
   }
 });
@@ -181,20 +228,23 @@ tokenRouter.get("/token/:address/allowance/:owner/:spender", async (req, res, ne
 // Prepare approve transaction
 tokenRouter.post("/prepare/token/:address/approve", async (req, res, next) => {
   try {
-    const tokenAddress = AddressParam.parse(req.params.address);
+    const tokenAddress = normalizeStarknetAddress(req.params.address);
     const body = ApproveBody.parse(req.body);
 
+    // Validate session
     if (!(await requireSession(body.wallet_address, body.session_token))) {
       res.status(401).json({ error: "Invalid session" });
       return;
     }
+
+    const spender = body.spender;
 
     const tokenContract = new (await import("starknet")).Contract(
       ERC20_ABI,
       tokenAddress,
       provider,
     );
-    const call = tokenContract.populate("approve", [body.spender, parseU256(body.amount)]);
+    const call = tokenContract.populate("approve", [spender, parseU256(body.amount)]);
     const nonce = await provider.getNonceForAddress(body.wallet_address, "pending");
     const chainId = await provider.getChainId();
     res.json({ call, wallet_address: body.wallet_address, nonce, chain_id: chainId });

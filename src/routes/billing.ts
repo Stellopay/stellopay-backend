@@ -24,6 +24,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { db, schema } from "../db/index.js";
 import { env } from "../config.js";
+import { IdempotencyKeySchema } from "../utils/validation.js";
 
 export const billingRouter = express.Router();
 
@@ -41,7 +42,204 @@ function fail(res: Response, status: number, message: string): void {
   res.status(status).json({ success: false, error: message });
 }
 
-/** Zod schema for the :profileId path param – non-empty string, max 128 chars */
+const BILLING_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+
+type BillingIdempotencyEntry = {
+  createdAt: number;
+  expiresAt: number;
+  bodyFingerprint: string;
+  statusCode: number;
+  responseBody: unknown;
+};
+
+// NOTE: Billing idempotency is currently backed by an in-process TTL cache.
+// If this service is scaled horizontally, this should be moved to a shared store.
+const billingIdempotencyStore = new Map<string, BillingIdempotencyEntry>();
+
+function stableSerialize(value: unknown): string {
+  if (typeof value === "undefined") return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+      left.localeCompare(right),
+    );
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`).join(",")}}`;
+  }
+  return String(value);
+}
+
+function getHeader(req: Request, name: string): string | undefined {
+  const value = req.get(name);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function resolveBillingAccountScope(req: Request): string {
+  for (const headerName of ["x-user-address", "x-account-id", "x-user-id"]) {
+    const value = getHeader(req, headerName);
+    if (value) return value;
+  }
+  return req.ip ?? "anonymous";
+}
+
+function getBillingIdempotencyCacheKey(req: Request, idempotencyKey: string): string {
+  const accountScope = resolveBillingAccountScope(req);
+  const routeKey = req.originalUrl || req.path || "/";
+  const profileId = typeof req.params?.profileId === "string" ? req.params.profileId : "";
+  return `billing:${accountScope}:${req.method}:${routeKey}:${profileId}:${idempotencyKey}`;
+}
+
+function pruneExpiredEntries(now = Date.now()): void {
+  for (const [cacheKey, entry] of billingIdempotencyStore.entries()) {
+    if (entry.expiresAt <= now) {
+      billingIdempotencyStore.delete(cacheKey);
+    }
+  }
+}
+
+export function clearBillingIdempotencyStore(): void {
+  billingIdempotencyStore.clear();
+}
+
+/**
+ * Wrap a mutating billing handler with idempotency support.
+ *
+ * When an Idempotency-Key header is present, the first successful response for
+ * that account/route/body combination is cached for 24 hours. Replays with the
+ * same key and body return the cached response; replays with the same key but a
+ * different body are rejected with 409 Conflict.
+ */
+export function withBillingIdempotency(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
+) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const rawIdempotencyKey =
+      getHeader(req, "Idempotency-Key") ?? getHeader(req, "idempotency-key");
+    const idempotencyKey =
+      rawIdempotencyKey && IdempotencyKeySchema.safeParse(rawIdempotencyKey).success
+        ? rawIdempotencyKey
+        : undefined;
+    const method = req.method.toUpperCase();
+
+    if (!idempotencyKey || ["GET", "HEAD", "OPTIONS"].includes(method)) {
+      await handler(req, res, next);
+      return;
+    }
+
+    const now = Date.now();
+    pruneExpiredEntries(now);
+
+    const cacheKey = getBillingIdempotencyCacheKey(req, idempotencyKey);
+    const existingEntry = billingIdempotencyStore.get(cacheKey);
+
+    if (existingEntry && existingEntry.expiresAt > now) {
+      if (existingEntry.bodyFingerprint !== stableSerialize(req.body)) {
+        fail(res, 409, "Idempotency key already used with a different request body");
+        return;
+      }
+
+      res.status(existingEntry.statusCode).json(existingEntry.responseBody);
+      return;
+    }
+
+    if (existingEntry && existingEntry.expiresAt <= now) {
+      billingIdempotencyStore.delete(cacheKey);
+    }
+
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+    let cachedResponse: BillingIdempotencyEntry | undefined;
+
+    const persistResponse = (body: unknown): void => {
+      if (cachedResponse) {
+        return;
+      }
+      cachedResponse = {
+        createdAt: Date.now(),
+        expiresAt: Date.now() + BILLING_IDEMPOTENCY_TTL_MS,
+        bodyFingerprint: stableSerialize(req.body),
+        statusCode: res.statusCode,
+        responseBody: body,
+      };
+      billingIdempotencyStore.set(cacheKey, cachedResponse);
+    };
+
+    res.json = ((body: unknown) => {
+      persistResponse(body);
+      return originalJson(body);
+    }) as typeof res.json;
+
+    res.send = ((body: unknown) => {
+      if (!cachedResponse) {
+        persistResponse(body);
+      }
+      return originalSend(body);
+    }) as typeof res.send;
+
+    try {
+      await handler(req, res, next);
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Billing math helpers (exported for unit testing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes the reward-limit summary fields from raw profile numeric strings.
+ *
+ * Extracted as a pure function so it can be unit-tested independently of the
+ * database and Express layers. All inputs come from `numeric(18,6)` columns
+ * stored as decimal strings.
+ *
+ * @param annualRewardLimit - Raw `annualRewardLimit` string from the DB (e.g. `"1000.000000"`).
+ * @param usedAmount        - Raw `usedAmount` string from the DB (e.g. `"250.500000"`).
+ * @returns Computed summary fields ready to include in the API response.
+ */
+export function computeBillingSummary(
+  annualRewardLimit: string | null | undefined,
+  usedAmount: string | null | undefined,
+): {
+  annualRewardLimit: number;
+  usedAmount: number;
+  remainingAmount: number;
+  progressPercentage: number;
+} {
+  const limit = parseFloat(annualRewardLimit ?? "0");
+  const used = parseFloat(usedAmount ?? "0");
+  const remaining = Math.max(0, limit - used);
+  const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+
+  return {
+    annualRewardLimit: limit,
+    usedAmount: used,
+    remainingAmount: remaining,
+    progressPercentage: Math.round(progressPct * 100) / 100,
+  };
+}
+
+/**
+ * Builds a single-line display address from individual address components,
+ * filtering out any null/undefined/empty parts.
+ *
+ * Returns `null` when no parts are present so the caller can omit the field
+ * rather than returning an empty string.
+ *
+ * @param parts - Ordered address parts: [street, city, state, zipCode, country].
+ * @returns Comma-joined address string, or `null` if all parts are absent.
+ */
+export function buildFullAddress(parts: Array<string | null | undefined>): string | null {
+  const present = parts.filter(Boolean) as string[];
+  return present.length > 0 ? present.join(", ") : null;
+}
 const profileIdSchema = z.object({
   profileId: z
     .string()
@@ -76,6 +274,18 @@ function requireBillingEnabled(_req: Request, res: Response, next: NextFunction)
 
 // Apply the feature-flag gate to every route in this router
 billingRouter.use("/billing", requireBillingEnabled);
+
+// Mutating billing routes can opt into request replay protection via Idempotency-Key.
+billingRouter.use("/billing", (req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method.toUpperCase())) {
+    next();
+    return;
+  }
+
+  withBillingIdempotency(async (_req, _res, _next) => {
+    next();
+  })(req, res, next);
+});
 
 // ---------------------------------------------------------------------------
 // Strip sensitive fields before returning a profile row to the client.
@@ -168,10 +378,13 @@ billingRouter.get(
       const safe = stripSensitive(profile);
 
       // Compute a convenience fullAddress for UI display
-      const addrParts = [safe.street, safe.city, safe.state, safe.zipCode, safe.country].filter(
-        Boolean,
-      );
-      const fullAddress = addrParts.length ? addrParts.join(", ") : null;
+      const fullAddress = buildFullAddress([
+        safe.street,
+        safe.city,
+        safe.state,
+        safe.zipCode,
+        safe.country,
+      ]);
 
       ok(res, { ...safe, fullAddress });
     } catch (err: any) {
@@ -284,19 +497,13 @@ billingRouter.get(
         return;
       }
 
-      const limit = parseFloat(profile.annualRewardLimit ?? "0");
-      const used = parseFloat(profile.usedAmount ?? "0");
-      const remaining = Math.max(0, limit - used);
-      const progressPct = limit > 0 ? (used / limit) * 100 : 0;
+      const summary = computeBillingSummary(profile.annualRewardLimit, profile.usedAmount);
 
       ok(res, {
         profileId: profile.id,
         profileType: profile.profileType,
-        annualRewardLimit: limit,
-        usedAmount: used,
-        remainingAmount: remaining,
+        ...summary,
         currency: profile.currency,
-        progressPercentage: Math.round(progressPct * 100) / 100,
       });
     } catch (err: any) {
       console.error("[billing] Error fetching billing summary:", err);

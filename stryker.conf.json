@@ -1,0 +1,17 @@
+{
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "testRunner": "vitest",
+  "testFiles": [
+    "src/utils/validation.test.ts",
+    "src/auth/session.test.ts"
+  ],
+  "mutate": [
+    "src/utils/validation.ts",
+    "src/auth/session.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["progress", "clear-text", "html"],
+  "vitest": {
+    "configFile": "vitest.config.ts"
+  }
+}

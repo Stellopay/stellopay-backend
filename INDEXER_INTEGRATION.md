@@ -215,6 +215,88 @@ Shows:
 4. **Check starting block** - Make sure it's not too high (misses old events) or too low (slow initial sync)
 5. **Use manual processing** - For immediate data after transactions, use `/events/process_tx/:tx_hash`
 
+## Chain Reorganization (Reorg) Handling
+
+### What is a reorg?
+
+A chain reorganization occurs when the network replaces one or more blocks at the tip of the chain with a competing fork. Events emitted by the orphaned blocks are no longer canonical and any data indexed from them is **stale and potentially incorrect**.
+
+### Why it matters
+
+If the in-memory agreement index retains data from orphaned blocks, downstream callers (route handlers, authorization logic) could make decisions based on agreements that never actually happened on the canonical chain. This is a **data-integrity risk** — not just a caching concern.
+
+### Current safeguards in `src/starknet/agreement-index.ts`
+
+#### Confirmation depth (`CONFIRMATION_DEPTH`)
+
+A configurable threshold (default **5 blocks**) determines how many blocks near the chain tip are considered *pending*. Data from blocks within this depth of `lastSyncedBlock` should **not** be treated as final by downstream callers making irreversible decisions (e.g. releasing funds, authorizing payouts).
+
+```typescript
+import { getConfirmationDepth, setConfirmationDepth } from "./starknet/agreement-index.js";
+
+// Read the current depth
+const depth = getConfirmationDepth(); // 5
+
+// Override for a chain with different finality characteristics
+setConfirmationDepth(10);
+```
+
+#### Block-level entry tracking
+
+When calling `addAgreementToIndex`, pass the optional `blockNumber` parameter so the index can track which entries came from which block:
+
+```typescript
+addAgreementToIndex(contractAddress, agreementId, employer, contributor, metadata, blockNumber);
+```
+
+Entries added **without** a `blockNumber` are treated as "untracked" and are never affected by rollback operations — this preserves backward compatibility with callers that do not yet pass block numbers.
+
+#### Rolling back after a reorg (`rollbackToBlock`)
+
+When a reorg is detected, call `rollbackToBlock(contractAddress, safeBlock)` to remove all entries from blocks **strictly greater than** `safeBlock` and reset `lastSyncedBlock`:
+
+```typescript
+import { rollbackToBlock } from "./starknet/agreement-index.js";
+
+// A reorg was detected — blocks 103+ are orphaned.
+// Roll back to the last known-good block:
+rollbackToBlock(contractAddress, 102);
+
+// Then re-index from block 103 using the new canonical chain.
+```
+
+#### Surgical removal (`removeAgreementsAtBlock`)
+
+For finer control, `removeAgreementsAtBlock(contractAddress, blockNumber)` removes entries from a single block without affecting `lastSyncedBlock`:
+
+```typescript
+import { removeAgreementsAtBlock } from "./starknet/agreement-index.js";
+
+removeAgreementsAtBlock(contractAddress, 103); // only block 103 entries removed
+```
+
+#### Pending block range (`getPendingBlockRange`)
+
+Returns the range of blocks that are not yet considered final — useful for diagnostics and monitoring:
+
+```typescript
+import { getPendingBlockRange } from "./starknet/agreement-index.js";
+
+const range = getPendingBlockRange(contractAddress);
+// { from: 96, to: 100 } when head is 100 and depth is 5
+```
+
+### Guidance for downstream callers
+
+1. **Always pass `blockNumber`** when adding entries so they can be rolled back if needed.
+2. **Do not treat data from pending blocks as authoritative** for irreversible operations. Use `getPendingBlockRange` to check if a block is within the confirmation window.
+3. **Trigger `rollbackToBlock`** when a reorg is detected (e.g. when the Apibara indexer reports a chain reorganization event).
+4. **Re-index from `safeBlock + 1`** after a rollback to repopulate the index with canonical data.
+
+### Security note
+
+> ⚠️ An unhandled reorg could let stale/superseded event data drive incorrect agreement state. Treat reorg handling as a data-integrity safeguard, not just a performance optimization.
+
 ## Next Steps
 
 If data is still not showing:
