@@ -1003,3 +1003,10 @@ The codebase includes comprehensive verification patterns:
 - **Address Normalization**: `normalizeStarknetAddress` enforces canonical 66-character lower-case hex format and SNIP-23 checksum validation.
 - **Starknet Failover**: `STARKNET_RPC_URL` supports comma-separated RPC endpoints with automatic failover.
 - **Auth Session Family Revocation**: Session token rotation with `familyId` revocation protects against refresh token replay attacks.
+# Metrics
+
+`GET /metrics` exposes the existing process-local auth, billing, diagnostics,
+session, and Starknet snapshots in Prometheus text format. It is mounted
+outside `/api/v1` so a scraper does not need API-version routing. Protect the
+endpoint at the ingress/network layer when operational metrics should not be
+public.
