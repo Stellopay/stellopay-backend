@@ -31,6 +31,7 @@
     "express-rate-limit": "^8.6.1",
     "freebuff": "^0.0.128",
     "helmet": "^8.3.0",
+    "ioredis": "^5.11.1",
     "nodemailer": "^9.0.3",
     "pg": "^8.13.1",
     "starknet": "^10.0.2",
@@ -38,6 +39,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/autocannon": "^7.12.5",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.6",
     "@types/express-rate-limit": "^6.0.0",
@@ -46,6 +48,7 @@
     "@types/pg": "^8.11.10",
     "@types/supertest": "^7.2.1",
     "@vitest/coverage-v8": "^3.2.4",
+    "autocannon": "^7.15.0",
     "drizzle-kit": "^0.31.10",
     "eslint": "^10.8.0",
     "prettier": "^3.9.6",
@@ -53,8 +56,6 @@
     "tsx": "^4.23.1",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.65.0",
-    "vitest": "^3.2.4",
-    "autocannon": "^7.15.0",
-    "@types/autocannon": "^7.12.5"
+    "vitest": "^3.2.4"
   }
 }

@@ -6,7 +6,12 @@ import { asc, eq, and, gt, gte, lte, or, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
-import { AnalyticsCache, buildAnalyticsCacheKey } from "../utils/analytics-cache.js";
+import Redis from "ioredis";
+import {
+  AnalyticsCache,
+  RedisAnalyticsCache,
+  buildAnalyticsCacheKey,
+} from "../utils/analytics-cache.js";
 
 export const analyticsRouter = Router();
 
@@ -19,6 +24,10 @@ export const ANALYTICS_ROLLUP_BATCH_SIZE = 500;
 export const analyticsAggregationCache = new AnalyticsCache(
   env.ANALYTICS_CACHE_TTL_MS ?? 30_000,
 );
+const redisAnalyticsCache = env.REDIS_URL
+  ? new RedisAnalyticsCache(new Redis(env.REDIS_URL), env.ANALYTICS_CACHE_TTL_MS ?? 30_000)
+  : undefined;
+const analyticsCache = redisAnalyticsCache ?? analyticsAggregationCache;
 
 const MONTH_NAMES = [
   "Jan",
@@ -242,7 +251,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
 
     const cacheKey = buildAnalyticsCacheKey(userAddress, { year });
 
-    const cached = analyticsAggregationCache.get(cacheKey);
+    const cached = await Promise.resolve(analyticsCache.get(cacheKey));
     if (cached) {
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(cached);
@@ -482,7 +491,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         data: chartData,
         total: toDisplayNumber(totalRaw),
       };
-      analyticsAggregationCache.set(cacheKey, responseBody);
+      await Promise.resolve(analyticsCache.set(cacheKey, responseBody));
 
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(responseBody);

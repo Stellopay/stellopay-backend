@@ -138,3 +138,40 @@ export class AnalyticsCache<T> {
     return this.store.size;
   }
 }
+
+/** Redis implementation with cache failures isolated from analytics requests. */
+export class RedisAnalyticsCache<T> {
+  constructor(
+    private readonly redis: {
+      get(key: string): Promise<string | null>;
+      set(key: string, value: string, mode: "PX", ttl: number): Promise<unknown>;
+      del(key: string): Promise<unknown>;
+    },
+    private readonly ttlMs: number,
+  ) {}
+
+  async get(key: string): Promise<T | undefined> {
+    try {
+      const value = await this.redis.get(key);
+      return value === null ? undefined : (JSON.parse(value) as T);
+    } catch {
+      return undefined;
+    }
+  }
+
+  async set(key: string, value: T): Promise<void> {
+    try {
+      await this.redis.set(key, JSON.stringify(value), "PX", this.ttlMs);
+    } catch {
+      // Redis is optional; a failed write only causes the next request to miss.
+    }
+  }
+
+  async invalidate(key: string): Promise<void> {
+    try {
+      await this.redis.del(key);
+    } catch {
+      // Best-effort invalidation for an optional cache.
+    }
+  }
+}
