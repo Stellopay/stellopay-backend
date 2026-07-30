@@ -7,7 +7,7 @@ import { normalizeStarknetAddress } from "../utils/address.js";
 import { requireSession } from "../auth/session.js";
 // Removed in-memory index - using database only
 import { db, schema } from "../db/index.js";
-import { eq, and, or, desc, lt } from "drizzle-orm";
+import { eq, and, or, desc, lt, inArray } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { TxHashSchema } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
@@ -58,6 +58,29 @@ const AgreementIdBody = z
     agreement_id: z.coerce.bigint().positive(),
   })
   .and(WalletSession);
+
+const BULK_STATUS_MAX_IDS = 50;
+
+const BulkAgreementId = z
+  .union([
+    z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    z
+      .string()
+      .trim()
+      .max(78)
+      .regex(/^[1-9][0-9]*$/, "must be a positive integer"),
+  ])
+  .transform((value) => BigInt(value));
+
+const BulkAgreementStatusBody = z
+  .object({
+    agreement_ids: z.array(BulkAgreementId).min(1).max(BULK_STATUS_MAX_IDS),
+  })
+  .strict();
+
+type BulkAgreementStatusResult =
+  | { agreement_id: string; found: true; status: number }
+  | { agreement_id: string; found: false; status: null };
 
 const AddMilestoneBody = z
   .object({
@@ -416,6 +439,40 @@ agreementRouter.get("/agreement/:address/get_status/:agreement_id", async (req, 
     const c = agreementContract(address);
     const out = await c.get_status(agreement_id);
     res.json({ agreement_id: agreement_id.toString(), status: Number(out), source: "contract" });
+  } catch (e) {
+    next(e);
+  }
+});
+
+agreementRouter.post("/agreement/:address/bulk-status", async (req, res, next) => {
+  try {
+    const address = AddressParam.parse(req.params.address);
+    const { agreement_ids } = BulkAgreementStatusBody.parse(req.body);
+    const requestedIds = agreement_ids.map((id) => id.toString());
+    const uniqueIds = [...new Set(requestedIds)];
+
+    const agreements = await db
+      .select({
+        id: schema.agreements.id,
+        status: schema.agreements.status,
+      })
+      .from(schema.agreements)
+      .where(
+        and(
+          eq(schema.agreements.contractAddress, address),
+          inArray(schema.agreements.id, uniqueIds),
+        ),
+      );
+
+    const statusesById = new Map(agreements.map((agreement) => [agreement.id, agreement.status]));
+    const results: BulkAgreementStatusResult[] = requestedIds.map((agreementId) => {
+      const status = statusesById.get(agreementId);
+      return status === undefined
+        ? { agreement_id: agreementId, found: false, status: null }
+        : { agreement_id: agreementId, found: true, status };
+    });
+
+    res.json({ results, source: "indexed" });
   } catch (e) {
     next(e);
   }
