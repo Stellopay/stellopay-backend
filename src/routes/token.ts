@@ -32,6 +32,7 @@ interface TokenMetadataCacheEntry {
 
 const tokenMetadataCache = new Map<string, TokenMetadataCacheEntry>();
 const tokenMetadataRequests = new Map<string, Promise<TokenMetadata>>();
+const TOKEN_METADATA_BATCH_CONCURRENCY = 8;
 
 function firstCallResult(output: unknown, entrypoint: string): string {
   const result = Array.isArray(output)
@@ -110,6 +111,33 @@ export async function getTokenMetadata(address: string): Promise<TokenMetadata> 
 
   tokenMetadataRequests.set(token, request);
   return request;
+}
+
+/**
+ * Resolve distinct token metadata entries with bounded concurrency.
+ *
+ * Canonicalization happens before deduplication, so equivalent address
+ * spellings share the existing TTL and in-flight caches. The small worker
+ * batches keep a large notification/transaction page from creating an
+ * unbounded RPC fan-out while retaining parallelism for normal pages.
+ */
+export async function getTokenMetadataBatch(
+  addresses: string[],
+): Promise<Map<string, TokenMetadata>> {
+  const tokens = [...new Set(addresses.map(normalizeStarknetAddress))];
+  const metadata = new Map<string, TokenMetadata>();
+
+  for (let offset = 0; offset < tokens.length; offset += TOKEN_METADATA_BATCH_CONCURRENCY) {
+    const batch = tokens.slice(offset, offset + TOKEN_METADATA_BATCH_CONCURRENCY);
+    const resolved = await Promise.all(
+      batch.map(async (token) => [token, await getTokenMetadata(token)] as const),
+    );
+    for (const [token, value] of resolved) {
+      metadata.set(token, value);
+    }
+  }
+
+  return metadata;
 }
 
 /** Clears token metadata state. Intended for deterministic tests. */

@@ -46,7 +46,12 @@ vi.mock("starknet", async (importOriginal) => {
   };
 });
 
-import { clearTokenMetadataCache, getTokenMetadata, tokenRouter } from "./token.js";
+import {
+  clearTokenMetadataCache,
+  getTokenMetadata,
+  getTokenMetadataBatch,
+  tokenRouter,
+} from "./token.js";
 
 const CANONICAL_TOKEN = `0x${"0".repeat(61)}abc`;
 const CANONICAL_WALLET = `0x${"0".repeat(61)}123`;
@@ -139,6 +144,15 @@ describe("token metadata TTL cache", () => {
 
     expect(second).toBe(first);
     expect(callContract).toHaveBeenCalledTimes(3);
+  });
+
+  it("deduplicates canonical addresses in a bounded metadata batch", async () => {
+    const metadata = await getTokenMetadataBatch(["0xabc", "0x0abc", "0xdef"]);
+
+    expect(metadata.size).toBe(2);
+    expect(metadata.get(CANONICAL_TOKEN)?.symbol).toBe("USDC");
+    expect(metadata.has(`0x${"0".repeat(61)}def`)).toBe(true);
+    expect(callContract).toHaveBeenCalledTimes(6);
   });
 
   it("does not cache a failed metadata lookup", async () => {

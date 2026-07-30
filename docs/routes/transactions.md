@@ -46,6 +46,11 @@ interface TransactionExport {
 
 ## Endpoints
 
+Token metadata callers should use `getTokenMetadataBatch(addresses)` when a page
+contains more than one token. The helper canonicalizes and deduplicates input
+addresses, reuses the existing TTL/in-flight caches, and resolves at most eight
+cache misses concurrently.
+
 1. **Pagination Defaults:** Limit defaults to `50` (capped at `100`). Offset defaults to `0`.
 2. **Filtering Defaults:** Without an explicit `startDate` or `endDate`, the `/filtered` endpoint defaults to bounding all time. If `eventTypes` is provided to the standard endpoint, it acts as an explicit inclusion list.
 3. **Sorting Contract:** Records are primarily sorted by `createdAt` in descending order (newest first). A secondary sort on the literal `transactionHash` is used to break ties predictably.
