@@ -8,17 +8,14 @@ import { requireSession } from "../auth/session.js";
 // Removed in-memory index - using database only
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, lt, inArray } from "drizzle-orm";
-import { StarknetAddress } from "../utils/validation.js";
+import { StarknetAddress, StrictDecimalString } from "../utils/validation.js";
 import { TxHashSchema } from "./events.js";
 import { notFoundResponse } from "./not-found.js";
 
 const AddressParam = StarknetAddress;
 const AgreementIdParam = z.coerce.bigint().positive();
 
-const U256String = z
-  .string()
-  .trim()
-  .regex(/^(0|[1-9][0-9]{0,77})$/, "must be a valid 256-bit unsigned integer string");
+const U256String = StrictDecimalString;
 
 const WalletSession = z.object({
   wallet_address: StarknetAddress,

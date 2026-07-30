@@ -61,6 +61,17 @@ export interface ValidationErrorMetric {
 /** Maximum number of characters of an input echoed into diagnostics. */
 export const INPUT_PREVIEW_MAX_LENGTH = 40;
 
+/**
+ * Canonical unsigned decimal strings used for Starknet token amounts.
+ * Amounts stay as strings at the HTTP boundary so callers cannot lose
+ * precision through JavaScript number coercion. Leading zeros and whitespace
+ * are rejected; `0` is the only valid zero representation, and the 78-digit
+ * limit matches the maximum width of a u256 decimal value.
+ */
+export const StrictDecimalString = z
+  .string()
+  .regex(/^(0|[1-9][0-9]{0,77})$/, "must be a canonical decimal string");
+
 /** Lowest status a validation failure may map to. */
 const MIN_VALIDATION_STATUS = 400;
 
