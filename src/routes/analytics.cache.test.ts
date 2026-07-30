@@ -77,7 +77,7 @@ const { dbMock, schemaMock, queryState } = vi.hoisted(() => {
   return { dbMock: db, schemaMock: schema, queryState: state };
 });
 
-vi.mock("../db/index.js", () => ({ db: dbMock, schema: schemaMock }));
+vi.mock("../db/index.js", () => ({ db: dbMock, readDb: dbMock, schema: schemaMock }));
 
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn((_col: unknown, value: unknown) => ({ type: "eq", value })),
@@ -87,6 +87,22 @@ vi.mock("drizzle-orm", () => ({
   lte: vi.fn(() => ({ type: "lte" })),
   sql: vi.fn(() => "sql-expr"),
   inArray: vi.fn(() => ({ type: "inArray" })),
+}));
+
+vi.mock("../auth/middleware.js", () => ({
+  requireAuth: vi.fn((req: any, _res: any, next: any) => {
+    const header = req.headers["x-user-address"];
+    req.auth = {
+      address: typeof header === "string" ? header : USER_A,
+      token: "testtoken",
+    };
+    next();
+  }),
+  getPrincipal: vi.fn((req: any) => {
+    const auth = req.auth;
+    if (!auth || !auth.address) return null;
+    return auth;
+  }),
 }));
 
 /* ── imports after mocks are registered ──────────────────────────────────── */
@@ -308,7 +324,10 @@ describe("analytics cache — route integration", () => {
     const countAfterA = queryState.selectCallCount;
 
     // USER_B has a different address — must trigger a fresh DB query.
-    await request(app).get(`/api/v1/analytics/${USER_B}?year=2026`).expect(200);
+    await request(app)
+      .get(`/api/v1/analytics/${USER_B}?year=2026`)
+      .set("x-user-address", USER_B)
+      .expect(200);
     expect(queryState.selectCallCount).toBeGreaterThan(countAfterA);
   });
 
@@ -383,7 +402,10 @@ describe("analytics cache — route integration", () => {
 
     await request(app).get(`/api/v1/analytics/${USER_A}?year=2025`).expect(200);
     await request(app).get(`/api/v1/analytics/${USER_A}?year=2026`).expect(200);
-    await request(app).get(`/api/v1/analytics/${USER_B}?year=2026`).expect(200);
+    await request(app)
+      .get(`/api/v1/analytics/${USER_B}?year=2026`)
+      .set("x-user-address", USER_B)
+      .expect(200);
 
     // Each of the three unique (address, year) combos should be a separate cache slot.
     const keyA25 = buildAnalyticsCacheKey(USER_A, { year: 2025 });

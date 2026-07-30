@@ -1,9 +1,10 @@
+import express, { Request, Response, NextFunction } from "express";
 import { createHash } from "node:crypto";
-import { Router } from "express";
-import { z } from "zod";
+import { z, ZodError } from "zod";
 import { readDb, schema } from "../db/index.js";
 import { asc, eq, and, gt, gte, lte, or, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
+import { normalizeStarknetAddress } from "../utils/address.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
 import { env } from "../config.js";
 import Redis from "ioredis";
@@ -12,6 +13,7 @@ import {
   RedisAnalyticsCache,
   buildAnalyticsCacheKey,
 } from "../utils/analytics-cache.js";
+import { requireAuth, getPrincipal } from "../auth/middleware.js";
 
 const AnalyticsChartPoint = z.object({
   month: z.enum(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"]),
@@ -39,7 +41,7 @@ function assertAnalyticsResponseShape(payload: AnalyticsResponseType): void {
   }
 }
 
-export const analyticsRouter = Router();
+export const analyticsRouter = express.Router();
 
 // ---------------------------------------------------------------------------
 // Constants & Inflight State
@@ -170,10 +172,6 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
 
   if (env.LOG_FORMAT === "json") {
     if (logEntry.level === "error") {
-       
-      console.error(JSON.stringify(logEntry));
-    } else {
-       
       console.error(JSON.stringify(logEntry));
     } else {
       console.info(JSON.stringify(logEntry));
@@ -188,10 +186,6 @@ function logAnalyticsTelemetry(entry: AnalyticsTelemetryEntry) {
       `${logEntry.error ? ` error=${logEntry.error}` : ""}`;
 
     if (logEntry.level === "error") {
-       
-      console.error(msg);
-    } else {
-       
       console.error(msg);
     } else {
       console.info(msg);
@@ -261,10 +255,69 @@ function computeETag(payload: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// Authorization
+// ---------------------------------------------------------------------------
+
+/**
+ * Middleware: verify the authenticated principal is allowed to read the
+ * analytics rollup for the `:user_address` in the path.
+ *
+ * Contract:
+ * - Must run AFTER {@link requireAuth} (which sets `req.auth`).
+ * - Normalizes both the path param and the principal's address via
+ *   `normalizeStarknetAddress` so padding/casing differences cannot cause a
+ *   false mismatch or a false grant.
+ * - If the path param cannot be normalized (invalid address), the request is
+ *   passed through to the route handler, which will reject it with 400 via
+ *   `StarknetAddress.parse`. This keeps a single source of truth for address
+ *   validation.
+ * - If the addresses do not match, responds `403 { error: "Forbidden" }` and
+ *   does NOT call `next()`.
+ *
+ * @see docs/routes/analytics.md — "Authorization"
+ */
+export function requireAnalyticsOwner(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const principal = getPrincipal(req);
+  if (!principal) {
+    // requireAuth should have denied this already; if we reach here without a
+    // principal it is a wiring mistake — let the handler surface it as 500.
+    next();
+    return;
+  }
+
+  let requestedAddress: string;
+  try {
+    requestedAddress = normalizeStarknetAddress(req.params.user_address);
+  } catch {
+    // Invalid address format — let the handler's StarknetAddress.parse
+    // produce the 400 so there is one validation source of truth.
+    next();
+    return;
+  }
+
+  const principalAddress = normalizeStarknetAddress(principal.address);
+  if (requestedAddress !== principalAddress) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  next();
+}
+
+// ---------------------------------------------------------------------------
 // Route Handler: GET /analytics/:user_address
 // ---------------------------------------------------------------------------
 
-analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
+analyticsRouter.use("/analytics", requireAuth);
+
+analyticsRouter.get(
+  "/analytics/:user_address",
+  requireAnalyticsOwner,
+  async (req, res, next) => {
   const start = process.hrtime.bigint();
   const requestId: string | undefined = res.locals.requestId;
 
@@ -518,7 +571,6 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
         total: toDisplayNumber(totalRaw),
       };
       await Promise.resolve(analyticsCache.set(cacheKey, responseBody));
-
       res.set("Cache-Control", "private, max-age=60");
       const etag = computeETag(responseBody);
       res.set("ETag", etag);

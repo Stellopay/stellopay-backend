@@ -53,7 +53,7 @@ const { dbMock, schemaMock, queryState } = vi.hoisted(() => {
   return { dbMock: db, schemaMock: schema, queryState: state };
 });
 
-vi.mock("../db/index.js", () => ({ db: dbMock, schema: schemaMock }));
+vi.mock("../db/index.js", () => ({ db: dbMock, readDb: dbMock, schema: schemaMock }));
 
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn((_column: unknown, value: unknown) => {
@@ -75,6 +75,22 @@ vi.mock("drizzle-orm", () => ({
   gt: vi.fn((_column: unknown, value: unknown) => ({ type: "gt", value })),
 }));
 
+vi.mock("../auth/middleware.js", () => ({
+  requireAuth: vi.fn((req: any, _res: any, next: any) => {
+    const header = req.headers["x-user-address"];
+    req.auth = {
+      address: typeof header === "string" ? header : USER,
+      token: "testtoken",
+    };
+    next();
+  }),
+  getPrincipal: vi.fn((req: any) => {
+    const auth = req.auth;
+    if (!auth || !auth.address) return null;
+    return auth;
+  }),
+}));
+
 import {
   analyticsRouter,
   parseBigIntSafe,
@@ -83,9 +99,12 @@ import {
   ANALYTICS_ROLLUP_BATCH_SIZE,
   collectAnalyticsRollupBatches,
   analyticsAggregationCache,
+  requireAnalyticsOwner,
+  AnalyticsResponse,
 } from "./analytics.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
 import { env } from "../config.js";
+import { requireAuth } from "../auth/middleware.js";
 
 const USER = "0x0000000000000000000000000000000000000000000000000000000000000abc";
 
@@ -661,5 +680,41 @@ describe("analytics helper unit tests & input hardening", () => {
         process.env.NODE_ENV = originalEnv;
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authorization boundary — requireAnalyticsOwner
+// ---------------------------------------------------------------------------
+describe("analytics authorization", () => {
+  it("returns 403 when the principal does not own the requested address", async () => {
+    const res = await request(makeApp())
+      .get(`/api/v1/analytics/${USER}?year=2026`)
+      .set("x-user-address", "0x0000000000000000000000000000000000000000000000000000000000000def")
+      .expect(403);
+
+    expect(res.body.error).toBe("Forbidden");
+  });
+
+  it("returns 401 when requireAuth denies the request", async () => {
+    vi.mocked(requireAuth).mockImplementationOnce((_req: any, res: any, _next: any) => {
+      res.status(401).json({ error: "Unauthorized" });
+    });
+
+    const res = await request(makeApp()).get(`/api/v1/analytics/${USER}?year=2026`).expect(401);
+    expect(res.body.error).toBe("Unauthorized");
+  });
+
+  it("normalizes addresses so padding/casing differences do not cause false denials", async () => {
+    const res = await request(makeApp())
+      .get("/api/v1/analytics/abc?year=2026")
+      .set("x-user-address", USER)
+      .expect(200);
+
+    expect(res.body.year).toBe(2026);
+  });
+
+  it("requireAnalyticsOwner is exported and callable", () => {
+    expect(typeof requireAnalyticsOwner).toBe("function");
   });
 });

@@ -72,7 +72,7 @@ const { dbMock, schemaMock, queryState } = vi.hoisted(() => {
   return { dbMock: db, schemaMock: schema, queryState: state };
 });
 
-vi.mock("../db/index.js", () => ({ db: dbMock, schema: schemaMock }));
+vi.mock("../db/index.js", () => ({ db: dbMock, readDb: dbMock, schema: schemaMock }));
 
 vi.mock("drizzle-orm", () => ({
   eq: vi.fn((_column: unknown, value: unknown) => ({ type: "eq", value })),
@@ -88,6 +88,22 @@ vi.mock("drizzle-orm", () => ({
   }),
   sql: vi.fn(() => "sql-expr"),
   inArray: vi.fn(() => ({ type: "inArray" })),
+}));
+
+vi.mock("../auth/middleware.js", () => ({
+  requireAuth: vi.fn((req: any, _res: any, next: any) => {
+    const header = req.headers["x-user-address"];
+    req.auth = {
+      address: typeof header === "string" ? header : USER,
+      token: "testtoken",
+    };
+    next();
+  }),
+  getPrincipal: vi.fn((req: any) => {
+    const auth = req.auth;
+    if (!auth || !auth.address) return null;
+    return auth;
+  }),
 }));
 
 import { analyticsRouter, analyticsAggregationCache } from "./analytics.js";
