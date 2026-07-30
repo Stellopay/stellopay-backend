@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import request from "supertest";
 import express from "express";
 import crypto from "node:crypto";
+import { Account, type TypedData } from "starknet";
 
 const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock, mockProvider } = vi.hoisted(() => {
   const mockState = {
@@ -96,7 +97,14 @@ const { dbMock, schemaMock, mockState, eqMock, orMock, ltMock, isNotNullMock, mo
   return { dbMock: db, schemaMock: schema, mockState, eqMock, orMock, ltMock, isNotNullMock, mockProvider };
 });
 
-vi.mock("../db/index.js", () => ({ db: dbMock, schema: schemaMock }));
+vi.mock("../db/index.js", () => ({
+  db: dbMock,
+  schema: schemaMock,
+  checkDbHealth: vi.fn().mockResolvedValue(true),
+  getPoolStats: vi.fn().mockReturnValue({ total: 0, idle: 0, active: 0, waiting: 0 }),
+  closePool: vi.fn().mockResolvedValue(undefined),
+  waitForDbReadiness: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("../db/schema.js", () => ({ sessions: schemaMock.sessions }));
 vi.mock("drizzle-orm", () => ({
   eq: eqMock,
@@ -123,6 +131,11 @@ vi.mock("../config.js", () => ({
 vi.mock("../starknet/client.js", () => ({
   provider: mockProvider,
   getCachedNetworkInfo: vi.fn().mockResolvedValue({ chainId: "0x534e5f5345504f4c4941" }),
+  getEscrowAbi: vi.fn().mockReturnValue([]),
+  getAgreementAbi: vi.fn().mockReturnValue([]),
+  getCircuitBreakerSnapshots: vi.fn().mockReturnValue([]),
+  agreementContract: vi.fn(),
+  escrowContract: vi.fn(),
 }));
 
 import { authRouter, rebuildAdminSet } from "./auth.js";
@@ -133,6 +146,7 @@ import {
 } from "./auth-metrics.js";
 import { lockouts } from "../auth/lockout.js";
 import { clearChallengesForTesting } from "../auth/challenge.js";
+import { app } from "../index.js";
 
 /**
  * Issue #193: locks the authorization contract for every route on this
@@ -342,6 +356,52 @@ describe("Auth Routes Integration", () => {
       .set("Authorization", `Bearer ${sessionToken}`);
 
     expect(logoutPostLogoutRes.status).toBe(401);
+  });
+
+  it("covers the wallet lifecycle through the real app with signed and invalidated requests", async () => {
+    const address = "0x123456789abcdef";
+    const signer = new Account({ provider: mockProvider as any, address, signer: "0x1" });
+
+    const challenge = await request(app)
+      .post("/api/v1/auth/challenge")
+      .send({ address })
+      .expect(200);
+    const signature = await signer.signMessage(challenge.body.typed_data as TypedData);
+    mockProvider.verifyMessageInStarknet.mockResolvedValue(true);
+
+    const verified = await request(app)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: [signature.r.toString(), signature.s.toString()] })
+      .expect(200);
+    const token = verified.body.session_token as string;
+
+    await request(app)
+      .post("/api/v1/auth/logout")
+      .set("x-user-address", address)
+      .set("authorization", `Bearer ${token}`)
+      .expect(200);
+
+    await request(app)
+      .post("/api/v1/auth/logout")
+      .set("x-user-address", address)
+      .set("authorization", `Bearer ${token}`)
+      .expect(401);
+
+    await request(app)
+      .post("/api/v1/auth/verify")
+      .send({ address, signature: [signature.r.toString(), signature.s.toString()] })
+      .expect(400);
+
+    const expiredAddress = "0x123456789abcdf0";
+    await request(app)
+      .post("/api/v1/auth/challenge")
+      .send({ address: expiredAddress })
+      .expect(200);
+    vi.advanceTimersByTime(300_001);
+    await request(app)
+      .post("/api/v1/auth/verify")
+      .send({ address: expiredAddress, signature: ["0x1", "0x2"] })
+      .expect(400);
   });
 
   it("rejects verify once the challenge TTL has elapsed", async () => {
@@ -996,7 +1056,6 @@ describe("Auth Routes Integration", () => {
       expect(second.body.error).toBe("Unauthorized");
     });
   });
-});
 });
 
 // ---------------------------------------------------------------------------
