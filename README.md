@@ -280,7 +280,14 @@ route tests mock the DB/RPC layer.
 pnpm test            # run the suite once
 pnpm test:watch      # watch mode
 pnpm test:coverage   # run with a coverage report
+pnpm mutation:test   # run the scoped Stryker mutation baseline
 ```
+
+Mutation testing is initially scoped to `src/utils/validation.ts` and
+`src/auth/session.ts`, using their dedicated Vitest suites. Stryker reports
+the score in the terminal and writes an HTML report under `reports/mutation`.
+Run it locally with `pnpm mutation:test`; future work can expand the file
+scope and add a CI score threshold without making this baseline a gate.
 
 Coverage thresholds (95% statements/lines/functions, 90% branches) are enforced on
 the core auth/codec modules. CI (`.github/workflows/ci.yml`) runs the lint, build,
@@ -996,4 +1003,3 @@ The codebase includes comprehensive verification patterns:
 - **Address Normalization**: `normalizeStarknetAddress` enforces canonical 66-character lower-case hex format and SNIP-23 checksum validation.
 - **Starknet Failover**: `STARKNET_RPC_URL` supports comma-separated RPC endpoints with automatic failover.
 - **Auth Session Family Revocation**: Session token rotation with `familyId` revocation protects against refresh token replay attacks.
-
