@@ -211,6 +211,25 @@ describe("indexer freshness and sync checkpoint authorization boundary", () => {
     expect(res.body.freshness).toBe("synced");
   });
 
+  it("boundary: invalid checkpoint block numbers are skipped and still return 0/empty", async () => {
+    state.rows.agreementEvents = [
+      { blockNumber: null },
+      { blockNumber: "not-a-number" },
+      { blockNumber: { obj: true } },
+    ];
+
+    const res = await request(makeApp())
+      .get("/api/v1/indexed/freshness")
+      .set("x-user-address", ADMIN_ADDRESS)
+      .set("Authorization", `Bearer ${VALID_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.source).toBe(INDEXED_DATA_SOURCE);
+    expect(res.body.checkpointBlock).toBe(0);
+    expect(res.body.freshness).toBe("empty");
+    expect(res.headers["x-indexer-sync-checkpoint"]).toBe("0");
+  });
+
   it("exports authorizeIndexedFreshness middleware array", () => {
     expect(Array.isArray(authorizeIndexedFreshness)).toBe(true);
     expect(authorizeIndexedFreshness.length).toBe(2);

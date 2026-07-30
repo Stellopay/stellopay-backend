@@ -43,38 +43,6 @@ import { NumericCursorSchema, loggedParse } from "../utils/validation.js";
 
 const AddressParam = z.string().min(3);
 
-
-function logReadTelemetry(entry: TelemetryEntry) {
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    level: entry.status === "error" ? "error" : "info",
-    ...entry,
-  };
-
-  if (env.LOG_FORMAT === "json") {
-    if (logEntry.level === "error") {
-       
-      console.error(JSON.stringify(logEntry));
-    } else {
-       
-      console.info(JSON.stringify(logEntry));
-    }
-  } else {
-    const msg = `[${logEntry.timestamp}] ${logEntry.level.toUpperCase()} [read-telemetry] ${
-      logEntry.operation
-    } ${logEntry.status} ${logEntry.duration_ms}ms${
-      logEntry.request_id ? ` [${logEntry.request_id}]` : ""
-    }${logEntry.error ? ` error=${logEntry.error}` : ""}`;
-    if (logEntry.level === "error") {
-       
-      console.error(msg);
-    } else {
-       
-      console.info(msg);
-    }
-  }
-}
-
 function asU256FromResult(result: string[]) {
   if (!Array.isArray(result) || result.length < 2) return null;
   return { low: result[0], high: result[1] };
@@ -684,10 +652,8 @@ readRouter.get("/agreement/:address/summary/:agreement_id", async (req, res, nex
 });
 
 // -------- cursor-based reads and record ordering --------
-const CursorQuery = z.object({
-  cursor: z.string().optional(),
+const CursorQuery = CursorPaginationSchema.extend({
   order: z.enum(["asc", "desc"]).default("desc"),
-  limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 
 interface CursorRecord {
@@ -695,11 +661,32 @@ interface CursorRecord {
   value: string;
 }
 
+const CURSOR_RECORDS: CursorRecord[] = [
+  { id: 1, value: "record-1" },
+  { id: 2, value: "record-2" },
+  { id: 3, value: "record-3" },
+  { id: 4, value: "record-4" },
+  { id: 5, value: "record-5" },
+];
+
+const CURSOR_RECORDS_ASC = [...CURSOR_RECORDS].sort((left, right) => left.id - right.id);
+const CURSOR_RECORDS_DESC = [...CURSOR_RECORDS_ASC].reverse();
+
 function getCursorRecords(): CursorRecord[] {
-  return Array.from({ length: 5 }, (_, index) => ({
-    id: index + 1,
-    value: `record-${index + 1}`,
-  }));
+  return [...CURSOR_RECORDS_ASC];
+}
+
+function orderedCursorRecords(records: CursorRecord[], order: "asc" | "desc") {
+  if (records.length === CURSOR_RECORDS_ASC.length && records.every((record, index) => record.id === CURSOR_RECORDS_ASC[index].id)) {
+    return order === "asc" ? CURSOR_RECORDS_ASC : CURSOR_RECORDS_DESC;
+  }
+
+  return [...records].sort((left, right) => {
+    if (left.id === right.id) {
+      return left.value.localeCompare(right.value);
+    }
+    return order === "asc" ? left.id - right.id : right.id - left.id;
+  });
 }
 
 function paginateCursorRecords(
@@ -708,36 +695,36 @@ function paginateCursorRecords(
   order: "asc" | "desc",
   limit: number,
 ) {
-  const ordered = [...records].sort((left, right) => {
-    if (left.id === right.id) {
-      return left.value.localeCompare(right.value);
-    }
-    return order === "asc" ? left.id - right.id : right.id - left.id;
-  });
+  const ordered = orderedCursorRecords(records, order);
 
   if (cursor !== undefined && ordered.length > 0) {
-    const minId = Math.min(...ordered.map((r) => r.id));
-    const maxId = Math.max(...ordered.map((r) => r.id));
-    if (order === "asc" && cursor >= maxId) {
-      return { records: [], nextCursor: null };
+    const firstId = ordered[0].id;
+    const lastId = ordered[ordered.length - 1].id;
+
+    if (order === "asc" && cursor >= lastId) {
+      return { records: [], nextCursor: null, hasMore: false };
     }
-    if (order === "desc" && (cursor > maxId || cursor <= minId)) {
-      return { records: [], nextCursor: null };
+    if (order === "desc" && (cursor > firstId || cursor <= lastId)) {
+      return { records: [], nextCursor: null, hasMore: false };
     }
   }
 
-  const filtered = ordered.filter((record) => {
-    if (cursor === undefined) return true;
-    return order === "asc" ? record.id > cursor : record.id < cursor;
-  });
+  const startIndex = cursor === undefined
+    ? 0
+    : ordered.findIndex((record) => (order === "asc" ? record.id > cursor : record.id < cursor));
 
-  const page = filtered.slice(0, limit);
-  const hasMore = filtered.length > page.length;
+  if (startIndex === -1) {
+    return { records: [], nextCursor: null, hasMore: false };
+  }
+
+  const page = ordered.slice(startIndex, startIndex + limit);
+  const hasMore = startIndex + page.length < ordered.length;
   const nextCursor = page.length > 0 && hasMore ? String(page[page.length - 1].id) : null;
 
   return {
     records: page,
     nextCursor,
+    hasMore,
   };
 }
 
@@ -777,7 +764,7 @@ readRouter.get("/records/cursor/:address", async (req, res, next) => {
       return res.status(403).json({ error: "Forbidden: privilege check failed" });
     }
 
-    const { records, nextCursor } = paginateCursorRecords(
+    const { records, nextCursor, hasMore } = paginateCursorRecords(
       getCursorRecords(),
       parsedCursor,
       order,
@@ -800,6 +787,8 @@ readRouter.get("/records/cursor/:address", async (req, res, next) => {
       records,
       nextCursor,
       order,
+      limit,
+      hasMore,
     });
   } catch (e: any) {
     const duration = Number(process.hrtime.bigint() - start) / 1_000_000;

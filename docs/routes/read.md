@@ -208,7 +208,9 @@ Returns a deterministic, idempotent page of records for the requested address.
   "address": "0xabc",
   "records": [{ "id": 5, "value": "record-5" }],
   "nextCursor": "4",
-  "order": "desc"
+  "order": "desc",
+  "limit": 50,
+  "hasMore": true
 }
 ```
 
