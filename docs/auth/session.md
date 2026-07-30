@@ -1,11 +1,11 @@
 # Session lifecycle: persistence, expiration, invalidation, observability, and reliability
 
 This document describes the full contract owned by
-[src/auth/session.ts](src/auth/session.ts): how sessions are persisted, how
+[src/auth/session.ts](../../src/auth/session.ts): how sessions are persisted, how
 they expire, how they're invalidated, what side channels (logs/metrics) each
 state transition emits, and what's safely retryable. The goal is to keep the
 runtime behavior, tests, and this doc aligned — see
-[src/auth/session.test.ts](src/auth/session.test.ts) for the tests that pin
+[src/auth/session.test.ts](../../src/auth/session.test.ts) for the tests that pin
 down every rule below.
 
 The cross-module wallet flow is covered by
@@ -132,7 +132,7 @@ a long-running UPDATE that escalates locks or exhausts the retry budget.
 
 This contract is intentionally scoped to the existing module and its current
 callers. The public function signatures remain unchanged, and the behavior above
-is covered by the session tests in [src/auth/session.test.ts](src/auth/session.test.ts).
+is covered by the session tests in [src/auth/session.test.ts](../../src/auth/session.test.ts).
 
 ### Edge cases intentionally out of scope
 

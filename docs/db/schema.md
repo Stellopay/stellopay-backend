@@ -1,6 +1,6 @@
 # Database Schema
 
-> Source of truth: [`src/db/schema.ts`](../src/db/schema.ts). The Drizzle table
+> Source of truth: [`src/db/schema.ts`](../../src/db/schema.ts). The Drizzle table
 > definitions, CHECK constraints, FK indexes, and runtime validation helpers
 > exported from that module drive every query, migration, and test.
 
