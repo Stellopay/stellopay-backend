@@ -1,12 +1,19 @@
 ﻿import { getChecksumAddress } from "starknet";
-import { describe, expect, it } from "vitest";
-import { normalizeStarknetAddress } from "./address.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  clearAddressNormalizationCache,
+  normalizeStarknetAddress,
+} from "./address.js";
 
 const zeroAddress = `0x${"0".repeat(64)}`;
 const oneAddress = `0x${"0".repeat(63)}1`;
 const fullAddress = `0x${"a".repeat(64)}`;
 
 describe("normalizeStarknetAddress", () => {
+  beforeEach(() => {
+    clearAddressNormalizationCache();
+  });
+
   it("normalizes missing prefixes, mixed case, whitespace, and short values", () => {
     expect(normalizeStarknetAddress("1")).toBe(oneAddress);
     expect(normalizeStarknetAddress("  0XABC  ")).toBe(`0x${"0".repeat(61)}abc`);
@@ -47,6 +54,22 @@ describe("normalizeStarknetAddress", () => {
     expect(() => normalizeStarknetAddress("")).toThrow(/required/);
     expect(() => normalizeStarknetAddress("0xgg")).toThrow(/hex/);
     expect(() => normalizeStarknetAddress(`0x1${"0".repeat(64)}`)).toThrow(/exceeds/);
+  });
+
+  it("reuses normalized values for repeated inputs", () => {
+    const first = normalizeStarknetAddress("0x0001");
+    const second = normalizeStarknetAddress("0x0001");
+    expect(second).toBe(first);
+  });
+
+  it("bounds cached entries while retaining the newest value", () => {
+    for (let index = 0; index < 1_025; index += 1) {
+      normalizeStarknetAddress(`0x${index.toString(16)}`);
+    }
+
+    expect(normalizeStarknetAddress("0x400")).toBe(
+      `0x${"0".repeat(61)}400`,
+    );
   });
 
   describe("checksum validation", () => {

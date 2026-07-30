@@ -25,6 +25,7 @@
  * the user **is** the employee (`employee-only`).
  */
 import { Router } from "express";
+import type { Request, Response } from "express";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { eq, and, or, desc, gte, lte, inArray, sql, count } from "drizzle-orm";
@@ -37,6 +38,7 @@ import {
   getTokenInfo as resolveTokenInfo,
   type TokenInfo,
 } from "../utils/token-formatting.js";
+import { applyIndexedCacheHeaders } from "../utils/cache-headers.js";
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -1230,7 +1232,8 @@ function applySort(
  * - `limit` / `offset`: the requested parameters (clamped)
  */
 function respondPaginated(
-  res: import("express").Response,
+  req: Request,
+  res: Response,
   allTransactions: TransactionItem[],
   total: number,
   limit: number,
@@ -1248,6 +1251,11 @@ function respondPaginated(
     limit,
     offset,
   };
+  applyIndexedCacheHeaders(res, body);
+  if (req.fresh) {
+    res.status(304).end();
+    return;
+  }
   res.json(body);
 }
 
@@ -1301,7 +1309,7 @@ transactionsRouter.get(
         { deduplicateAgreementEvents: true },
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
+      respondPaginated(req, res, allTransactions, total, limit, offset, sortBy, sortDir);
     } catch (e: any) {
       if (e?.status === 400 && e?.body) {
         res.status(400).json(e.body);
@@ -1354,7 +1362,7 @@ transactionsRouter.get(
         offset + limit,
       );
 
-      respondPaginated(res, allTransactions, total, limit, offset, sortBy, sortDir);
+      respondPaginated(req, res, allTransactions, total, limit, offset, sortBy, sortDir);
     } catch (e: any) {
       if (e?.status === 400 && e?.body) {
         res.status(400).json(e.body);
