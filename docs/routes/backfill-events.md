@@ -61,6 +61,16 @@ the persisted checkpoint.
   the DB transaction boundary — each batch and its checkpoint commit
   atomically.
 
+## Lag metric and alerting
+
+`backfill_lag_blocks{job,contract}` reports the difference between the current
+Starknet chain head and the last block persisted for each backfill job. The
+gauge is refreshed when progress is read and after each checkpoint advances.
+RPC failures are counted in `backfill_lag_rpc_errors_total` and do not fail the
+backfill itself. Alert when lag remains above the normal batch window (for
+example, more than 100 blocks for 15 minutes), adjusting the threshold for the
+configured indexing interval and expected chain throughput.
+
 ## Backward-compatibility contract (Issue #264)
 
 1. **Input alias stability** — `before`, `resumeToken`, and `cursor` are
