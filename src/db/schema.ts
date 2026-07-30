@@ -636,6 +636,8 @@ export const backfillProgress = pgTable(
     jobName: text("job_name").primaryKey(),
     status: text("status").notNull().default("idle"),
     lastCursor: timestamp("last_cursor"),
+    lastBlockNumber: bigint("last_block_number", { mode: "number" }),
+    lastContractAddress: text("last_contract_address"),
     totalScanned: integer("total_scanned").notNull().default(0),
     totalCreated: integer("total_created").notNull().default(0),
     lastError: text("last_error"),
@@ -795,4 +797,3 @@ export const SCHEMA_TABLES: Array<{ name: string; table: PgTableWithColumns<any>
   { name: "sessions", table: sessions },
   { name: "backfillProgress", table: backfillProgress },
 ];
-

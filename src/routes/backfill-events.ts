@@ -3,6 +3,12 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { z } from "zod";
 import { db, schema } from "../db/index.js";
 import { sql, eq } from "drizzle-orm";
+import { provider } from "../starknet/client.js";
+import {
+  incStarknetMetric,
+  labeledStarknetMetric,
+  setStarknetGauge,
+} from "../starknet/client-metrics.js";
 
 export const backfillEventsRouter = Router();
 
@@ -36,6 +42,7 @@ export const RESULTS_PREVIEW_SIZE = 10;
  * matches what is actually durable in `agreement_events`.
  */
 export const BACKFILL_CHECKPOINT_BATCH_SIZE = 100;
+export const BACKFILL_LAG_METRIC = "backfill_lag_blocks";
 
 // ---------------------------------------------------------------------------
 // Resume token freshness bounds (Issue #263)
@@ -60,6 +67,27 @@ export const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000; // 60 seconds
 // ---------------------------------------------------------------------------
 
 export type BackfillJobName = "employee-events" | "milestone-events";
+
+/** Refresh lag observability without allowing an RPC outage to stop a backfill. */
+async function updateBackfillLag(
+  jobName: BackfillJobName,
+  lastBlockNumber: number | null | undefined,
+  contractAddress: string | null | undefined,
+): Promise<void> {
+  try {
+    const chainHead = await provider.getBlockNumber();
+    const lag = Math.max(0, chainHead - (lastBlockNumber ?? 0));
+    setStarknetGauge(
+      labeledStarknetMetric(BACKFILL_LAG_METRIC, {
+        job: jobName,
+        contract: contractAddress ?? "unknown",
+      }),
+      lag,
+    );
+  } catch {
+    incStarknetMetric("backfill_lag_rpc_errors_total");
+  }
+}
 
 export const EMPLOYEE_BACKFILL_JOB: BackfillJobName = "employee-events";
 export const MILESTONE_BACKFILL_JOB: BackfillJobName = "milestone-events";
@@ -261,6 +289,8 @@ export async function upsertBackfillProgress(
   fields: {
     status?: string;
     lastCursor?: Date | null;
+    lastBlockNumber?: number | null;
+    lastContractAddress?: string | null;
     totalScanned?: number;
     totalCreated?: number;
     lastError?: string | null;
@@ -309,6 +339,8 @@ export async function getBackfillProgress(
 ): Promise<{
   status: string;
   lastCursor: Date | null;
+  lastBlockNumber: number | null;
+  lastContractAddress: string | null;
   totalScanned: number;
   totalCreated: number;
   lastError: string | null;
@@ -324,6 +356,8 @@ export async function getBackfillProgress(
   return {
     status: row.status,
     lastCursor: row.lastCursor,
+    lastBlockNumber: row.lastBlockNumber,
+    lastContractAddress: row.lastContractAddress,
     totalScanned: row.totalScanned,
     totalCreated: row.totalCreated,
     lastError: row.lastError,
@@ -384,6 +418,7 @@ export async function performBackfill(
       persistedTotalScanned = progress.totalScanned;
       persistedTotalCreated = progress.totalCreated;
     }
+    await updateBackfillLag(jobName, progress?.lastBlockNumber, progress?.lastContractAddress);
   }
 
   const conditions = sql`1=1`;
@@ -483,11 +518,19 @@ export async function performBackfill(
           totalScanned: batchTotalScanned + batch.length,
           totalCreated: batchCreatedCount + batchCreated,
           lastCursor: batchCursor,
+          lastBlockNumber: Number(lastRow.block_number),
+          lastContractAddress: String(lastRow.contract_address),
         });
 
         batchCreatedCount += batchCreated;
         batchTotalScanned += batch.length;
       });
+
+      await updateBackfillLag(
+        jobName,
+        Number(batch[batch.length - 1].block_number),
+        String(batch[batch.length - 1].contract_address),
+      );
 
       const insertedIds = new Set(insertedRows.map((r) => String(r.id)));
 

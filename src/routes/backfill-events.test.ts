@@ -33,6 +33,10 @@ vi.mock("../config.js", () => ({
   env: { ADMIN_ADDRESSES: ["0xabc1"] },
 }));
 
+vi.mock("../starknet/client.js", () => ({
+  provider: { getBlockNumber: vi.fn().mockResolvedValue(1200) },
+}));
+
 const { dbMock, schemaMock, store } = vi.hoisted(() => {
   interface AgreementEventRow {
     id: string;
@@ -48,6 +52,8 @@ const { dbMock, schemaMock, store } = vi.hoisted(() => {
     jobName: string;
     status: string;
     lastCursor: Date | null;
+    lastBlockNumber: number | null;
+    lastContractAddress: string | null;
     totalScanned: number;
     totalCreated: number;
     lastError: string | null;
@@ -245,6 +251,8 @@ import {
   getBackfillProgress,
 } from "./backfill-events.js";
 import { requireSession } from "../auth/session.js";
+import { provider } from "../starknet/client.js";
+import { getStarknetMetricsSnapshot, resetStarknetMetrics } from "../starknet/client-metrics.js";
 
 const ADMIN = "0xabc1";
 const NON_ADMIN = "0xdef2";
@@ -313,8 +321,26 @@ function makeDescendingRows(count: number, idOffset = 0) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetStarknetMetrics();
+  vi.mocked(provider.getBlockNumber).mockResolvedValue(1200);
   store.reset();
   vi.mocked(requireSession).mockResolvedValue(true);
+});
+
+describe("backfill lag metrics", () => {
+  it("records chain-head lag with job and contract labels", async () => {
+    queueRows([makeRow(1)]);
+    vi.mocked(provider.getBlockNumber).mockResolvedValue(1200);
+
+    const response = await request(makeApp())
+      .post("/api/v1/backfill/employee-events")
+      .set(authHeaders(ADMIN));
+
+    expect(response.status).toBe(200);
+    expect(getStarknetMetricsSnapshot().gauges[
+      'backfill_lag_blocks{job="employee-events",contract="0xcontract"}'
+    ]).toBe(199);
+  });
 });
 
 interface JobConfig {
@@ -789,5 +815,4 @@ describe("Edge cases", () => {
     expect(res.body.results[0].status).toBe("skipped");
   });
 });
-
 

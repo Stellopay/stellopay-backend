@@ -65,6 +65,14 @@ export function setStarknetGauge(name: string, value: number): void {
   gauges[name] = value;
 }
 
+/** Return a Prometheus-style metric key with safely escaped label values. */
+export function labeledStarknetMetric(name: string, labels: Record<string, string>): string {
+  const encoded = Object.entries(labels)
+    .map(([key, value]) => `${key}="${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`)
+    .join(",");
+  return `${name}{${encoded}}`;
+}
+
 /**
  * Point-in-time snapshot of every Starknet metric counter and gauge.
  * Returns shallow copies so callers cannot mutate the internal state.
