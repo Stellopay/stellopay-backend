@@ -84,6 +84,15 @@ The schema enforces eight invariants (I1–I8), verified by
   be declared in Drizzle's metadata (`schema.ts`). The test suite detects drift
   between these two representations.
 
+## Read replica routing
+
+Set `POSTGRES_READ_REPLICA_CONNECTION_STRING` to route the read-only analytics,
+transactions, and indexed-data handlers through a separate pool. When unset,
+`readDb` is an alias for the primary database and behavior is unchanged. The
+write and read-after-write-sensitive routes continue using `db` so callers do
+not observe replica lag immediately after a mutation. `getReadPoolStats()`
+reports the active read pool without exposing connection details.
+
 ## Tables
 
 | Table | SQL Name | Description |

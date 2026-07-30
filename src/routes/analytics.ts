@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
-import { db, schema } from "../db/index.js";
+import { readDb, schema } from "../db/index.js";
 import { asc, eq, and, gt, gte, lte, or, sql } from "drizzle-orm";
 import { StarknetAddress } from "../utils/validation.js";
 import { DEFAULT_TOKEN_DECIMALS } from "../utils/codec.js";
@@ -287,7 +287,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             : undefined;
 
           const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-          const query = db
+          const query = readDb
             .select({
               id: schema.payments.id,
               createdAt: schema.payments.createdAt,
@@ -327,7 +327,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             : undefined;
 
           const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-          const query = db
+          const query = readDb
             .select({
               id: schema.escrowEvents.id,
               createdAt: schema.escrowEvents.createdAt,
@@ -369,7 +369,7 @@ analyticsRouter.get("/analytics/:user_address", async (req, res, next) => {
             : undefined;
 
           const whereCondition = cursorFilter ? and(baseFilter, cursorFilter) : baseFilter;
-          const query = db
+          const query = readDb
             .select({
               id: schema.agreementEvents.id,
               createdAt: schema.agreementEvents.createdAt,

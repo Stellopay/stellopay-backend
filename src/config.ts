@@ -23,6 +23,9 @@ export const EnvSchema = z
     /** Database connection string for indexed data (required for startup and health checks). */
     POSTGRES_CONNECTION_STRING: z.string().url(),
 
+    /** Optional read-only replica; primary is used when unset. */
+    POSTGRES_READ_REPLICA_CONNECTION_STRING: z.string().url().optional(),
+
     // ═════════════════════════════════════════════════════════════════════
     // OPTIONAL — fall back to documented defaults when unset.
     // ═════════════════════════════════════════════════════════════════════
