@@ -31,6 +31,7 @@ import { accessLogMiddleware } from "./middleware/access-log.js";
 import { requestIdMiddleware } from "./middleware/request-id.js";
 import { verifyAbiCompatibility } from "./starknet/abi.js";
 import { provider, getEscrowAbi, getAgreementAbi } from "./starknet/client.js";
+import { metricsRegistry, renderMetrics } from "./observability/metrics.js";
 
 export const app = express();
 initLogger();
@@ -83,6 +84,18 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "1mb" }));
+
+// Prometheus scraping is intentionally outside /api/v1. Deployments should
+// restrict this endpoint at the network or ingress layer when metrics are
+// not intended to be public.
+app.get("/metrics", async (_req, res, next) => {
+  try {
+    res.setHeader("Content-Type", metricsRegistry.contentType);
+    res.send(await renderMetrics());
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.use(dbReadinessMiddleware);
 
