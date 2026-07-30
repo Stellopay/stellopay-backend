@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   StarknetAddress,
   AgreementId,
+  IdempotencyKeySchema,
   parsePagination,
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
@@ -25,6 +26,20 @@ import {
 } from "./validation";
 import type { ValidationErrorMetric } from "./validation";
 
+describe("IdempotencyKeySchema", () => {
+  it("accepts bounded ASCII keys", () => {
+    expect(IdempotencyKeySchema.parse("checkout_2026-07-30")).toBe("checkout_2026-07-30");
+    expect(IdempotencyKeySchema.parse("a".repeat(255))).toHaveLength(255);
+  });
+
+  it.each(["", " ", "key with spaces", "key/slash", "a".repeat(256)])(
+    "rejects unsafe key %j",
+    (value) => {
+      expect(IdempotencyKeySchema.safeParse(value).success).toBe(false);
+    },
+  );
+});
+
 // --------------------------------------------------------------------------
 // ValidationError
 // --------------------------------------------------------------------------
@@ -41,9 +56,7 @@ describe("ValidationError", () => {
     expect(err.name).toBe("ValidationError");
     expect(err.validator).toBe("test");
     expect(err.message).toBe("something went wrong");
-    expect(err.issues).toEqual([
-      { path: ["name"], message: "too short", code: "too_small" },
-    ]);
+    expect(err.issues).toEqual([{ path: ["name"], message: "too short", code: "too_small" }]);
     expect(err.input).toBe("ab");
   });
 
@@ -802,8 +815,8 @@ describe("formatValidationError", () => {
 // ---- mapZodError ----
 
 describe("mapZodError", () => {
-  it("returns custom code for checksum fail",()=>{
-    try{
+  it("returns custom code for checksum fail", () => {
+    try {
       StarknetAddress.parse("0x4718F5a0FC34Cc1AF16A1cdee98ffB20C31f5cd61d6ab07201858f4287c938d");
     } catch (e) {
       const mapped = mapZodError(e);

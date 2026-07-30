@@ -4,6 +4,7 @@ import { requireAuth, requireAdmin } from "../auth/middleware.js";
 import { db, getPoolStats, checkDbHealth } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import { getCircuitBreakerSnapshots, provider } from "../starknet/client.js";
+import { IdempotencyKeySchema } from "../utils/validation.js";
 import {
   logDiagnosticsEvent,
   incDiagnosticsMetric,
@@ -50,8 +51,12 @@ export function withDiagnosticsIdempotency(
   handler: (req: Request, res: Response, next: NextFunction) => Promise<void> | void,
 ) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const rawIdempotencyKey = req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
     const idempotencyKey =
-      req.headers["idempotency-key"] || req.headers["Idempotency-Key"];
+      typeof rawIdempotencyKey === "string" &&
+      IdempotencyKeySchema.safeParse(rawIdempotencyKey).success
+        ? rawIdempotencyKey
+        : undefined;
 
     if (!idempotencyKey || Array.isArray(idempotencyKey)) {
       await handler(req, res, next);

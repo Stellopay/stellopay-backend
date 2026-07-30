@@ -12,6 +12,7 @@ exported:
 |---|---|---|
 | `StarknetAddress` | `z.ZodString` → transform | Parse + normalize a Starknet hex address |
 | `AgreementId` | `z.ZodString` | Parse a numeric-string agreement identifier |
+| `IdempotencyKeySchema` | `z.ZodString` | Validate bounded ASCII replay keys |
 | `parsePagination` | function | Clamp `limit`/`offset` query params to safe defaults |
 | `loggedParse` | function | Parse + log structured diagnostics on failure |
 | `formatValidationError` | function | Map a caught error to the standard API JSON shape |
@@ -116,6 +117,17 @@ StarknetAddress.parse("")              // throws ZodError
 AgreementId.parse("42")     // "42"
 AgreementId.parse("00042")  // "00042"
 AgreementId.parse("12ab")   // throws ZodError
+```
+
+### `IdempotencyKeySchema`
+
+Idempotency keys must be 1–255 characters and contain only ASCII letters,
+digits, hyphens, or underscores. The same schema is used by rate-limit,
+billing, and diagnostics middleware so invalid keys bypass replay caching.
+
+```typescript
+IdempotencyKeySchema.parse("checkout_2026-07-30"); // accepted
+IdempotencyKeySchema.safeParse("key with spaces").success; // false
 ```
 
 ## Pagination
