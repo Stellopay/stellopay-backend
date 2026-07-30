@@ -139,8 +139,8 @@ describe("schema contract invariants", () => {
       expect(exportedTableNames.sort()).toEqual(schemaTableNames.sort());
     });
 
-    it("has exactly 11 tables", () => {
-      expect(schema.SCHEMA_TABLES).toHaveLength(11);
+    it("has exactly 12 tables", () => {
+      expect(schema.SCHEMA_TABLES).toHaveLength(12);
     });
 
     it("every SCHEMA_TABLES entry has a defined table reference", () => {

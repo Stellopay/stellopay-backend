@@ -99,6 +99,13 @@ The schema enforces eight invariants (I1–I8), verified by
 | `billingInvoices` | `billing_invoices` | Invoice records |
 | `sessions` | `sessions` | Auth sessions with sliding and absolute expiry |
 | `backfillProgress` | `backfill_progress` | Backfill job progress tracking |
+| `idempotencyKeys` | `idempotency_keys` | Durable 24-hour response replay records |
+
+Idempotency records are keyed by `(route, key)` and include the request body
+fingerprint, response status, response body, and expiry timestamp. The unique
+primary key gives billing and diagnostics handlers a shared database-level
+claim point; expired rows can be removed by a scheduled cleanup query using the
+`expires_at` index.
 
 ## Security Boundary (Sensitive Fields)
 
