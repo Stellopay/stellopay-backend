@@ -320,6 +320,24 @@ critical advisories, then runs linting, build, and tests.
 
 All automation lives in `.github/workflows/ci.yml`.
 
+#### SBOM Generation (release builds only)
+
+A CycloneDX 1.5 software bill of materials (SBOM) is generated automatically on
+every tag push (tags matching `v*`). The SBOM is produced from `pnpm-lock.yaml`
+using `@cyclonedx/cyclonedx-npm`, verified for well-formedness via
+`scripts/verify-sbom.ts`, and uploaded as a GitHub Actions artifact named
+`sbom-<tag>`.
+
+To download the SBOM for a given release, go to the Actions tab, select the
+workflow run for the tag, and download the `sbom-<tag>` artifact.
+
+To generate and verify an SBOM locally:
+
+```bash
+npx @cyclonedx/cyclonedx-npm --spec-version 1.5 --output-format JSON --output-file bom.json
+pnpm tsx scripts/verify-sbom.ts bom.json
+```
+
 #### Push / PR job (`test`)
 
 Runs on every push and pull request targeting `main`, and on manual dispatch. It:
