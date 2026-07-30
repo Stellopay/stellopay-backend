@@ -13,6 +13,32 @@ import {
   buildAnalyticsCacheKey,
 } from "../utils/analytics-cache.js";
 
+const AnalyticsChartPoint = z.object({
+  month: z.enum(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"]),
+  views: z.number(),
+});
+
+export const AnalyticsResponse = z.object({
+  year: z.number(),
+  data: z.array(AnalyticsChartPoint).length(12),
+  total: z.number(),
+});
+
+export type AnalyticsResponseType = z.infer<typeof AnalyticsResponse>;
+
+function assertAnalyticsResponseShape(payload: AnalyticsResponseType): void {
+  if (process.env.NODE_ENV === "production") return;
+  try {
+    AnalyticsResponse.parse(payload);
+  } catch (e) {
+    if (e instanceof ZodError) {
+      console.error("[analytics] Response shape drift detected:", e.issues);
+    } else {
+      throw e;
+    }
+  }
+}
+
 export const analyticsRouter = Router();
 
 // ---------------------------------------------------------------------------
