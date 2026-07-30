@@ -129,6 +129,11 @@ const RETRYABLE_METHODS = new Set<string>([
  * cause unbounded latency.
  */
 const MAX_FAILOVER_ATTEMPTS = starknetRpcUrls.length;
+const RPC_RESPONSE_CACHE_TTL_MS = 30_000;
+const RPC_RESPONSE_CACHE_MAX_ENTRIES = 256;
+
+type RpcResponseCacheEntry = { value: unknown; expiresAt: number };
+const rpcResponseCache = new Map<string, RpcResponseCacheEntry>();
 
 const rpcProviders = starknetRpcUrls.map((nodeUrl) => new RpcProvider({ nodeUrl }));
 
@@ -225,6 +230,43 @@ function cloneRpcValue(value: unknown): unknown {
   return value;
 }
 
+function rpcResponseCacheKey(method: string | symbol, args: unknown[]): string | undefined {
+  try {
+    return `${String(method)}:${JSON.stringify(args, (_key, value: unknown) =>
+      typeof value === "bigint" ? `${value}n` : value,
+    )}`;
+  } catch {
+    // Cyclic/custom request arguments are not cacheable, but remain valid RPC
+    // inputs for the normal failover path.
+    return undefined;
+  }
+}
+
+function getCachedRpcResponse(key: string): unknown | undefined {
+  const entry = rpcResponseCache.get(key);
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    rpcResponseCache.delete(key);
+    return undefined;
+  }
+  rpcResponseCache.delete(key);
+  rpcResponseCache.set(key, entry);
+  return cloneRpcValue(entry.value);
+}
+
+function cacheRpcResponse(key: string, value: unknown): void {
+  rpcResponseCache.delete(key);
+  rpcResponseCache.set(key, {
+    value: cloneRpcValue(value),
+    expiresAt: Date.now() + RPC_RESPONSE_CACHE_TTL_MS,
+  });
+  while (rpcResponseCache.size > RPC_RESPONSE_CACHE_MAX_ENTRIES) {
+    const oldest = rpcResponseCache.keys().next().value;
+    if (oldest === undefined) break;
+    rpcResponseCache.delete(oldest);
+  }
+}
+
 /**
  * Validates that the contract address string is a non-empty hex value.
  *
@@ -270,9 +312,13 @@ export function validateStarknetAddress(address: string): void {
 async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
+  allowStaleFallback = false,
 ): Promise<unknown> {
   const methodName = String(method);
   const isFeeQuote = methodName === "estimateFee";
+  const responseCacheKey = isRetryableMethod(method)
+    ? rpcResponseCacheKey(method, args)
+    : undefined;
 
   incStarknetMetric(STARKNET_METRICS.RPC_REQUESTS);
   if (isFeeQuote) {
@@ -325,6 +371,9 @@ async function invokeWithFailover(
       }
 
       breaker.recordSuccess();
+      if (responseCacheKey !== undefined) {
+        cacheRpcResponse(responseCacheKey, result);
+      }
 
       logStarknetEvent("debug", "starknet.rpc.success", {
         method: methodName,
@@ -361,6 +410,16 @@ async function invokeWithFailover(
       method: methodName,
       error: lastError instanceof Error ? lastError.message : String(lastError),
     });
+  }
+
+  const allCircuitsOpen =
+    circuitBreakers.length > 0 && circuitBreakers.every((breaker) => breaker.currentState === "OPEN");
+  if (allowStaleFallback && allCircuitsOpen && responseCacheKey !== undefined) {
+    const cached = getCachedRpcResponse(responseCacheKey);
+    if (cached !== undefined) {
+      console.warn(`[starknet] Serving cached ${methodName} response while all RPC circuits are OPEN`);
+      return { value: cached, stale: true };
+    }
   }
 
   throw lastError;
@@ -451,26 +510,33 @@ export class ChainIdMismatchError extends Error {
  * calls for the same cached data share a single in-flight RPC request rather
  * than fanning out N identical calls during a cache miss.
  */
-const methodCache = new Map<string | symbol, (...args: unknown[]) => Promise<unknown>>();
-
-export const provider = new Proxy(rpcProviders[0]!, {
-  get(_target, prop, _receiver) {
-    if (prop === "then") {
-      return undefined;
-    }
-    const active = rpcProviders[healthyRpcIndex]!;
-    const value = Reflect.get(active, prop, active);
-    if (typeof value === "function") {
-      let cachedFn = methodCache.get(prop);
-      if (!cachedFn) {
-        cachedFn = (...args: unknown[]) => invokeWithFailover(prop, args);
-        methodCache.set(prop, cachedFn);
+function createProviderProxy(allowStaleFallback: boolean): RpcProvider {
+  const methodCache = new Map<string | symbol, (...args: unknown[]) => Promise<unknown>>();
+  return new Proxy(rpcProviders[0]!, {
+    get(_target, prop, _receiver) {
+      if (prop === "then") {
+        return undefined;
       }
-      return cachedFn;
-    }
-    return value;
-  },
-}) as RpcProvider;
+      const active = rpcProviders[healthyRpcIndex]!;
+      const value = Reflect.get(active, prop, active);
+      if (typeof value === "function") {
+        let cachedFn = methodCache.get(prop);
+        if (!cachedFn) {
+          cachedFn = (...args: unknown[]) => invokeWithFailover(prop, args, allowStaleFallback);
+          methodCache.set(prop, cachedFn);
+        }
+        return cachedFn;
+      }
+      return value;
+    },
+  }) as RpcProvider;
+}
+
+/** Normal provider: never serves stale data. */
+export const provider = createProviderProxy(false);
+
+/** Opt-in read provider: may return `{ value, stale: true }` during outages. */
+export const staleProvider = createProviderProxy(true);
 
 // The contract-class JSON paths are fixed at startup, so each ABI is parsed
 // from disk once and the result is memoized for every later call.
@@ -777,6 +843,7 @@ export function resetRpcFailoverForTests(): void {
   healthyRpcIndex = 0;
   cachedHealthyIndex = -1;
   cachedFailoverOrder = undefined;
+  rpcResponseCache.clear();
 }
 
 /**

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { shortString } from "starknet";
-import { provider } from "../starknet/client.js";
+import { provider, staleProvider } from "../starknet/client.js";
 import { parseU256, toHexString } from "../utils/codec.js";
 import { requireSession } from "../auth/session.js";
 import { env } from "../config.js";
@@ -23,6 +23,7 @@ export interface TokenMetadata {
   name: string;
   symbol: string;
   decimals: number;
+  stale?: boolean;
 }
 
 interface TokenMetadataCacheEntry {
@@ -48,13 +49,15 @@ function firstCallResult(output: unknown, entrypoint: string): string {
   return String(result[0]);
 }
 
-async function callTokenField(token: string, entrypoint: string): Promise<string> {
-  const output = await provider.callContract({
+async function callTokenField(token: string, entrypoint: string): Promise<{ value: string; stale: boolean }> {
+  const output = await staleProvider.callContract({
     contractAddress: token,
     entrypoint,
     calldata: [],
   });
-  return firstCallResult(output, entrypoint);
+  const stale = output && typeof output === "object" && "stale" in output && output.stale === true;
+  const value = stale && "value" in output ? output.value : output;
+  return { value: firstCallResult(value, entrypoint), stale };
 }
 
 function decodeTokenText(value: string): string {
@@ -74,9 +77,10 @@ async function fetchTokenMetadata(token: string): Promise<TokenMetadata> {
 
   return {
     token,
-    name: decodeTokenText(name),
-    symbol: decodeTokenText(symbol),
-    decimals: Number(BigInt(decimals)),
+    name: decodeTokenText(name.value),
+    symbol: decodeTokenText(symbol.value),
+    decimals: Number(BigInt(decimals.value)),
+    stale: name.stale || symbol.stale || decimals.stale || undefined,
   };
 }
 

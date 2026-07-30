@@ -570,6 +570,29 @@ describe("Circuit breaker integration", () => {
     expect(snap[0].recentFailureCount).toBe(2);
   });
 
+  it("serves a fresh cached read when every RPC circuit is OPEN", async () => {
+    const client = await loadClientWithRpcUrls("https://primary.example/rpc");
+    client.resetRpcFailoverForTests();
+    client.resetCircuitBreakersForTests();
+
+    const [primary] = mockRpcProviders;
+    primary!.getBlock.mockResolvedValueOnce({ block_number: 42 });
+    await expect(client.provider.getBlock("latest")).resolves.toEqual({ block_number: 42 });
+
+    primary!.getBlock.mockRejectedValue(new Error("RPC unavailable"));
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("RPC unavailable");
+    // The second failure opens the circuit; the just-fetched value is then
+    // returned as the bounded stale-read fallback.
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("RPC unavailable");
+    expect(client.getCircuitBreakerSnapshots()[0].state).toBe("OPEN");
+
+    await expect(client.staleProvider.getBlock("latest")).resolves.toEqual({
+      value: { block_number: 42 },
+      stale: true,
+    });
+    expect(primary!.getBlock).toHaveBeenCalledTimes(3);
+  });
+
   it("probe call succeeds and closes the circuit after cooldown", async () => {
     const client = await loadClientWithRpcUrls("https://primary.example/rpc");
     client.resetRpcFailoverForTests();
