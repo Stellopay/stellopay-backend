@@ -5,6 +5,8 @@ import {
   toHexString,
   formatTokenAmount,
   DEFAULT_TOKEN_DECIMALS,
+  U256_MAX,
+  U256OverflowError,
 } from "./codec";
 
 describe("parseU256", () => {
@@ -19,6 +21,19 @@ describe("parseU256", () => {
     const r = parseU256(value.toString()) as { low: unknown; high: unknown };
     expect(BigInt(r.low as never)).toBe(7n);
     expect(BigInt(r.high as never)).toBe(1n);
+  });
+
+  it("accepts the maximum representable value", () => {
+    expect(parseU256(U256_MAX.toString())).toBeTruthy();
+  });
+
+  it("throws a distinct error for values outside the u256 range", () => {
+    expect(() => parseU256((U256_MAX + 1n).toString())).toThrow(U256OverflowError);
+    expect(() => parseU256("-1")).toThrow(U256OverflowError);
+  });
+
+  it("keeps the existing native error path for malformed values", () => {
+    expect(() => parseU256("not-a-number")).toThrow(SyntaxError);
   });
 });
 
@@ -103,7 +118,7 @@ describe("formatTokenAmount", () => {
   it("formats the full u256 max without precision loss", () => {
     const u256Max = (1n << 256n) - 1n;
     expect(formatTokenAmount(u256Max)).toBe(
-      "115792089237316195423570985008687907853269984665640564039457584007913129.639935"
+      "115792089237316195423570985008687907853269984665640564039457584007913129.639935",
     );
   });
 
@@ -124,7 +139,7 @@ describe("Fuzz testing round-trip (encode/decode)", () => {
     const MAX_U256 = (1n << 256n) - 1n;
     const MAX_U128 = (1n << 128n) - 1n;
     const iterations = 10000;
-    
+
     for (let i = 0; i < iterations; i++) {
       let randomBigInt = 0n;
       // Generate random up to 256 bits by appending 32 random bits at a time
@@ -137,11 +152,11 @@ describe("Fuzz testing round-trip (encode/decode)", () => {
       if (i === 1) randomBigInt = MAX_U256;
       if (i === 2) randomBigInt = MAX_U128;
       if (i === 3) randomBigInt = 1n << 128n; // min value in high part
-      
+
       const str = randomBigInt.toString();
       const parsed = parseU256(str);
       const back = u256ToString(parsed);
-      
+
       expect(back).toBe(str);
     }
   });
