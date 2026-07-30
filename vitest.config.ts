@@ -35,6 +35,7 @@ export default defineConfig({
         "src/starknet/agreement-index.ts",
         "scripts/check-env-sync.ts",
         "scripts/lint-migrations.ts",
+        "scripts/verify-sbom.ts",
       ],
       thresholds: {
         lines: 95,
