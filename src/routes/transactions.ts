@@ -27,7 +27,7 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { z } from "zod";
-import { db, schema } from "../db/index.js";
+import { readDb, schema } from "../db/index.js";
 import { eq, and, or, desc, gte, lte, inArray, sql, count } from "drizzle-orm";
 import { agreementContract } from "../starknet/client.js";
 import { toHexString } from "../utils/codec.js";
@@ -859,15 +859,15 @@ async function fetchAndBuildTransactions(
     milestoneEventsData,
   ] = await Promise.all([
     // ── counts ────────────────────────────────────────────────────────
-    db
+    readDb
       .select({ count: count() })
       .from(schema.payments)
       .where(conds.payments),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.escrowEvents)
       .where(conds.escrowEvents),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.agreementEvents)
       .innerJoin(
@@ -875,7 +875,7 @@ async function fetchAndBuildTransactions(
         eq(schema.agreementEvents.agreementId, schema.agreements.id),
       )
       .where(conds.agreementEvents),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.employees)
       .leftJoin(
@@ -883,7 +883,7 @@ async function fetchAndBuildTransactions(
         eq(schema.employees.agreementId, schema.agreements.id),
       )
       .where(conds.employees),
-    db
+    readDb
       .select({ count: count() })
       .from(schema.milestones)
       .leftJoin(
@@ -892,19 +892,19 @@ async function fetchAndBuildTransactions(
       )
       .where(conds.milestones),
     // ── data ──────────────────────────────────────────────────────────
-    db
+    readDb
       .select()
       .from(schema.payments)
       .where(conds.payments)
       .orderBy(desc(schema.payments.createdAt), desc(schema.payments.id))
       .limit(queryLimit),
-    db
+    readDb
       .select()
       .from(schema.escrowEvents)
       .where(conds.escrowEvents)
       .orderBy(desc(schema.escrowEvents.createdAt), desc(schema.escrowEvents.id))
       .limit(queryLimit),
-    db
+    readDb
       .select({
         id: schema.agreementEvents.id,
         agreementId: schema.agreementEvents.agreementId,
@@ -925,7 +925,7 @@ async function fetchAndBuildTransactions(
       .where(conds.agreementEvents)
       .orderBy(desc(schema.agreementEvents.createdAt), desc(schema.agreementEvents.id))
       .limit(queryLimit),
-    db
+    readDb
       .select({
         id: schema.employees.id,
         agreementId: schema.employees.agreementId,
@@ -947,7 +947,7 @@ async function fetchAndBuildTransactions(
       .where(conds.employees)
       .orderBy(desc(schema.employees.createdAt), desc(schema.employees.id))
       .limit(queryLimit),
-    db
+    readDb
       .select({
         id: schema.milestones.id,
         agreementId: schema.milestones.agreementId,
@@ -997,7 +997,7 @@ async function fetchAndBuildTransactions(
 
   const escrowAgreements =
     escrowAgreementIds.length > 0
-      ? await db
+      ? await readDb
           .select({
             id: schema.agreements.id,
             token: schema.agreements.token,

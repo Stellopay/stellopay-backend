@@ -23,47 +23,42 @@ function maskConnectionString(connectionString: string): string {
   }
 }
 
-// Create connection pool with proper error handling.
-let pool: Pool;
-try {
-  const connectionString = env.POSTGRES_CONNECTION_STRING;
-
-  if (!connectionString || typeof connectionString !== "string") {
-    console.warn("[db] POSTGRES_CONNECTION_STRING not set, database features will be unavailable");
-    pool = new Pool({
-      connectionString: "postgresql://localhost:5432/stellopay_indexer",
-      ...poolTuning,
+function createPool(connectionString: string | undefined, label: string, tuning = poolTuning): Pool {
+  try {
+    if (!connectionString) console.warn(`[db] ${label} connection string not set, using local fallback`);
+    const url = new URL(connectionString ?? "postgresql://localhost:5432/stellopay_indexer");
+    if (url.password === null || url.password === undefined) url.password = "";
+    const createdPool = new Pool({ connectionString: url.toString(), ...tuning });
+    createdPool.on("error", (error: Error & { code?: string }) => {
+      console.error(`[db] Unexpected ${label} pool error`, {
+        message: error.message,
+        code: error.code,
+        stack: error.stack,
+      });
     });
-  } else {
-    const url = new URL(connectionString);
-    if (url.password === null || url.password === undefined) {
-      url.password = "";
-    }
-
-    pool = new Pool({
-      connectionString: url.toString(),
-      ...poolTuning,
+    return createdPool;
+  } catch (error) {
+    console.error(`[db] Failed to initialize ${label} connection pool`, {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return new Pool({
+      connectionString: "postgresql://localhost:5432/stellopay_indexer",
+      ...tuning,
     });
   }
-} catch (error) {
-  console.error("[db] Failed to initialize connection pool", {
-    message: error instanceof Error ? error.message : String(error),
-  });
-  pool = new Pool({
-    connectionString: "postgresql://localhost:5432/stellopay_indexer",
-    ...poolTuning,
-  });
 }
 
-pool.on("error", (error: Error & { code?: string }) => {
-  console.error("[db] Unexpected pool error", {
-    message: error.message,
-    code: error.code,
-    stack: error.stack,
-  });
-});
+const pool = createPool(env.POSTGRES_CONNECTION_STRING, "primary");
+const readPool = env.POSTGRES_READ_REPLICA_CONNECTION_STRING
+  ? createPool(env.POSTGRES_READ_REPLICA_CONNECTION_STRING, "read replica", {
+      ...poolTuning,
+      max: Math.max(1, Math.floor(env.DB_POOL_MAX / 2)),
+    })
+  : null;
 
 export const db = drizzle(pool, { schema });
+/** Read-only queries use the replica when configured, otherwise the primary. */
+export const readDb = drizzle(readPool ?? pool, { schema });
 export { schema };
 
 /** Current utilization counters for the shared Postgres connection pool. */
@@ -81,14 +76,23 @@ export interface PoolStats {
  * details are included, and reading the snapshot does not acquire a client.
  */
 export function getPoolStats(): PoolStats {
-  const total = pool.totalCount;
-  const idle = pool.idleCount;
+  return getStatsForPool(pool);
+}
+
+/** Returns the replica pool snapshot, or the primary snapshot when disabled. */
+export function getReadPoolStats(): PoolStats {
+  return getStatsForPool(readPool ?? pool);
+}
+
+function getStatsForPool(activePool: Pool): PoolStats {
+  const total = activePool.totalCount;
+  const idle = activePool.idleCount;
 
   return {
     total,
     idle,
     active: total - idle,
-    waiting: pool.waitingCount,
+    waiting: activePool.waitingCount,
   };
 }
 
@@ -133,6 +137,7 @@ export async function waitForDbReadiness(): Promise<void> {
 export async function closePool(): Promise<void> {
   console.log("[db] Closing Postgres connection pool...");
   await pool.end();
+  if (readPool && readPool !== pool) await readPool.end();
   console.log("[db] Postgres connection pool closed.");
 }
 

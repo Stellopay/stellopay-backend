@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { db, schema } from "../db/index.js";
+import { readDb, schema } from "../db/index.js";
 import { eq, and, or, desc } from "drizzle-orm";
 import { StarknetAddress, AgreementId, parsePagination } from "../utils/validation.js";
 import { defaults, env } from "../config.js";
@@ -238,7 +238,7 @@ async function resolveCheckpoint(): Promise<{
   checkpointBlock: number;
   records: Array<{ blockNumber: unknown }>;
 }> {
-  const records = await db
+  const records = await readDb
     .select({ blockNumber: schema.agreementEvents.blockNumber })
     .from(schema.agreementEvents)
     .orderBy(desc(schema.agreementEvents.blockNumber))
@@ -393,7 +393,7 @@ indexedRouter.get(
       const { limit, offset } = parsePagination(req.query);
 
       const [agreements, employeeAgreements] = await Promise.all([
-        db
+        readDb
           .select()
           .from(schema.agreements)
           .where(
@@ -409,7 +409,7 @@ indexedRouter.get(
           .limit(limit)
           .offset(offset),
 
-        db
+        readDb
           .select({
             agreement: schema.agreements,
           })
@@ -487,7 +487,7 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
     }
     const agreementId = AgreementId.parse(req.params.agreement_id);
 
-    const agreement = await db
+    const agreement = await readDb
       .select()
       .from(schema.agreements)
       .where(
@@ -504,23 +504,23 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
     }
 
     const [events, payments, milestones, employees, escrowEvents] = await Promise.all([
-      db.select().from(schema.agreementEvents)
+      readDb.select().from(schema.agreementEvents)
         .where(eq(schema.agreementEvents.agreementId, agreementId))
         .orderBy(desc(schema.agreementEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.payments)
+      readDb.select().from(schema.payments)
         .where(eq(schema.payments.agreementId, agreementId))
         .orderBy(desc(schema.payments.blockNumber)).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.milestones)
+      readDb.select().from(schema.milestones)
         .where(eq(schema.milestones.agreementId, agreementId))
         .orderBy(schema.milestones.milestoneId).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.employees)
+      readDb.select().from(schema.employees)
         .where(eq(schema.employees.agreementId, agreementId))
         .orderBy(schema.employees.employeeIndex).limit(MAX_INTERNAL_LIMIT),
 
-      db.select().from(schema.escrowEvents)
+      readDb.select().from(schema.escrowEvents)
         .where(eq(schema.escrowEvents.agreementId, agreementId))
         .orderBy(desc(schema.escrowEvents.blockNumber)).limit(MAX_INTERNAL_LIMIT),
     ]);
@@ -586,7 +586,7 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
     const userAddress = StarknetAddress.parse(req.params.user_address);
     const { limit, offset } = parsePagination(req.query);
 
-    const payments = await db
+    const payments = await readDb
       .select()
       .from(schema.payments)
       .where(or(eq(schema.payments.from, userAddress), eq(schema.payments.to, userAddress)))
@@ -642,7 +642,7 @@ indexedRouter.get(
       }
       const agreementId = AgreementId.parse(req.params.agreement_id);
 
-      const escrowEvents = await db
+      const escrowEvents = await readDb
         .select()
         .from(schema.escrowEvents)
         .where(
@@ -704,4 +704,3 @@ indexedRouter.get(
 );
 
 export default indexedRouter;
-
