@@ -312,6 +312,7 @@ export function validateStarknetAddress(address: string): void {
 async function invokeWithFailover(
   method: string | symbol,
   args: unknown[],
+  allowStaleFallback = false,
 ): Promise<unknown> {
   const methodName = String(method);
   const isFeeQuote = methodName === "estimateFee";
@@ -413,11 +414,11 @@ async function invokeWithFailover(
 
   const allCircuitsOpen =
     circuitBreakers.length > 0 && circuitBreakers.every((breaker) => breaker.currentState === "OPEN");
-  if (allCircuitsOpen && responseCacheKey !== undefined) {
+  if (allowStaleFallback && allCircuitsOpen && responseCacheKey !== undefined) {
     const cached = getCachedRpcResponse(responseCacheKey);
     if (cached !== undefined) {
       console.warn(`[starknet] Serving cached ${methodName} response while all RPC circuits are OPEN`);
-      return cached;
+      return { value: cached, stale: true };
     }
   }
 
@@ -509,26 +510,33 @@ export class ChainIdMismatchError extends Error {
  * calls for the same cached data share a single in-flight RPC request rather
  * than fanning out N identical calls during a cache miss.
  */
-const methodCache = new Map<string | symbol, (...args: unknown[]) => Promise<unknown>>();
-
-export const provider = new Proxy(rpcProviders[0]!, {
-  get(_target, prop, _receiver) {
-    if (prop === "then") {
-      return undefined;
-    }
-    const active = rpcProviders[healthyRpcIndex]!;
-    const value = Reflect.get(active, prop, active);
-    if (typeof value === "function") {
-      let cachedFn = methodCache.get(prop);
-      if (!cachedFn) {
-        cachedFn = (...args: unknown[]) => invokeWithFailover(prop, args);
-        methodCache.set(prop, cachedFn);
+function createProviderProxy(allowStaleFallback: boolean): RpcProvider {
+  const methodCache = new Map<string | symbol, (...args: unknown[]) => Promise<unknown>>();
+  return new Proxy(rpcProviders[0]!, {
+    get(_target, prop, _receiver) {
+      if (prop === "then") {
+        return undefined;
       }
-      return cachedFn;
-    }
-    return value;
-  },
-}) as RpcProvider;
+      const active = rpcProviders[healthyRpcIndex]!;
+      const value = Reflect.get(active, prop, active);
+      if (typeof value === "function") {
+        let cachedFn = methodCache.get(prop);
+        if (!cachedFn) {
+          cachedFn = (...args: unknown[]) => invokeWithFailover(prop, args, allowStaleFallback);
+          methodCache.set(prop, cachedFn);
+        }
+        return cachedFn;
+      }
+      return value;
+    },
+  }) as RpcProvider;
+}
+
+/** Normal provider: never serves stale data. */
+export const provider = createProviderProxy(false);
+
+/** Opt-in read provider: may return `{ value, stale: true }` during outages. */
+export const staleProvider = createProviderProxy(true);
 
 // The contract-class JSON paths are fixed at startup, so each ABI is parsed
 // from disk once and the result is memoized for every later call.

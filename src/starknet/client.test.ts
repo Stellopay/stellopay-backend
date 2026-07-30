@@ -583,10 +583,13 @@ describe("Circuit breaker integration", () => {
     await expect(client.provider.getBlock("latest")).rejects.toThrow("RPC unavailable");
     // The second failure opens the circuit; the just-fetched value is then
     // returned as the bounded stale-read fallback.
-    await expect(client.provider.getBlock("latest")).resolves.toEqual({ block_number: 42 });
+    await expect(client.provider.getBlock("latest")).rejects.toThrow("RPC unavailable");
     expect(client.getCircuitBreakerSnapshots()[0].state).toBe("OPEN");
 
-    await expect(client.provider.getBlock("latest")).resolves.toEqual({ block_number: 42 });
+    await expect(client.staleProvider.getBlock("latest")).resolves.toEqual({
+      value: { block_number: 42 },
+      stale: true,
+    });
     expect(primary!.getBlock).toHaveBeenCalledTimes(3);
   });
 
