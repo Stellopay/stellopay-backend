@@ -8,6 +8,7 @@ import {
   MAX_PAGE_LIMIT,
   DEFAULT_PAGE_LIMIT,
   INPUT_PREVIEW_MAX_LENGTH,
+  StrictDecimalString,
   loggedParse,
   formatValidationError,
   isPlainObject,
@@ -24,6 +25,19 @@ import {
   type ValidationErrorResponse,
   type ValidationIssue,
 } from "./validation";
+
+describe("StrictDecimalString", () => {
+  it.each(["0", "1", "9".repeat(78)])("accepts canonical amount %s", (value) => {
+    expect(StrictDecimalString.parse(value)).toBe(value);
+  });
+
+  it.each(["", "01", " 1", "1 ", "1.5", "1e3", "9".repeat(79)])(
+    "rejects non-canonical amount %s",
+    (value) => {
+      expect(() => StrictDecimalString.parse(value)).toThrow();
+    },
+  );
+});
 import type { ValidationErrorMetric } from "./validation";
 
 describe("IdempotencyKeySchema", () => {

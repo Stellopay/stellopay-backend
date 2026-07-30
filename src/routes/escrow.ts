@@ -49,6 +49,7 @@ import { db, schema } from "../db/index.js";
 import { eq, and } from "drizzle-orm";
 
 import { normalizeStarknetAddress } from "../utils/address.js";
+import { StrictDecimalString } from "../utils/validation.js";
 
 /**
  * Zod schema that normalises a Starknet address from a route parameter.
@@ -107,9 +108,7 @@ const AgreementIdBody = z
  * Coerces a body field (string or number) to a non-negative decimal string
  * for token amounts sent in request payloads.
  */
-const AmountBody = z
-  .union([z.string().trim().regex(/^\d+$/), z.number().int().nonnegative()])
-  .transform((value) => String(value));
+const AmountBody = StrictDecimalString;
 
 /**
  * Request body for `POST /prepare/escrow/:address/fund_agreement`.
