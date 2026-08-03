@@ -2,11 +2,11 @@ import { Router } from "express";
 import { z } from "zod";
 import { shortString } from "starknet";
 import { provider, staleProvider } from "../starknet/client.js";
-import { parseU256, toHexString } from "../utils/codec.js";
+import { parseU256, toHexString, U256_MAX } from "../utils/codec.js";
 import { requireSession } from "../auth/session.js";
 import { env } from "../config.js";
 import { normalizeStarknetAddress } from "../utils/address.js";
-import { StarknetAddress } from "../utils/validation.js";
+import { StarknetAddress, StrictDecimalString } from "../utils/validation.js";
 
 const WalletSession = z.object({
   wallet_address: StarknetAddress,
@@ -15,7 +15,13 @@ const WalletSession = z.object({
 
 const ApproveBody = WalletSession.extend({
   spender: StarknetAddress,
-  amount: z.string().min(1),
+  amount: StrictDecimalString.refine(
+    (val) => {
+      const bn = BigInt(val);
+      return bn >= 0n && bn <= U256_MAX;
+    },
+    { message: `amount exceeds u256 max value (${U256_MAX.toString()})` },
+  ),
 });
 
 export interface TokenMetadata {
