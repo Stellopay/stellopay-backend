@@ -34,6 +34,8 @@ import { provider, getEscrowAbi, getAgreementAbi } from "./starknet/client.js";
 import Redis from "ioredis";
 import { RedisStore } from "rate-limit-redis";
 
+const API_VERSION = "1";
+
 export const app = express();
 initLogger();
 
@@ -85,6 +87,13 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "1mb" }));
+
+// Attach API-Version header to every /api/v1 response so clients can
+// detect future version migrations programmatically.
+app.use("/api/v1", (_req, res, next) => {
+  res.setHeader("API-Version", API_VERSION);
+  next();
+});
 
 // Prometheus scraping is intentionally outside /api/v1. Deployments should
 // restrict this endpoint at the network or ingress layer when metrics are
