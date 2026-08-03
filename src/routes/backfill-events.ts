@@ -45,6 +45,28 @@ export const BACKFILL_CHECKPOINT_BATCH_SIZE = 100;
 export const BACKFILL_LAG_METRIC = "backfill_lag_blocks";
 
 // ---------------------------------------------------------------------------
+// Backfill observability metric name constants (Issue #260)
+// ---------------------------------------------------------------------------
+
+/** Counter: incremented when an explicit resume token (before/resumeToken/cursor) is used. */
+export const BACKFILL_EXPLICIT_RESUME_METRIC = "backfill_explicit_resume_total";
+
+/** Counter: incremented when auto-resume loads a persisted checkpoint cursor. */
+export const BACKFILL_AUTO_RESUME_METRIC = "backfill_auto_resume_total";
+
+/** Counter: incremented when a backfill runs for a job that has never been run before. */
+export const BACKFILL_FIRST_RUN_METRIC = "backfill_first_run_total";
+
+/** Counter: incremented on every backfill error (non-ZodError). */
+export const BACKFILL_ERROR_METRIC = "backfill_errors_total";
+
+/** Gauge: replay window size in ms between resumeDate and now, set per backfill execution. */
+export const BACKFILL_REPLAY_WINDOW_MS_METRIC = "backfill_replay_window_ms";
+
+/** Counter: incremented when a resume token is rejected for being too far in the future. */
+export const BACKFILL_FUTURE_TOKEN_METRIC = "backfill_future_token_rejected_total";
+
+// ---------------------------------------------------------------------------
 // Resume token freshness bounds (Issue #263)
 // ---------------------------------------------------------------------------
 
@@ -181,6 +203,7 @@ export function validateResumeTokenFreshness(date: Date): void {
   const tokenTime = date.getTime();
 
   if (tokenTime > now + CLOCK_SKEW_TOLERANCE_MS) {
+    incStarknetMetric(BACKFILL_FUTURE_TOKEN_METRIC);
     console.warn({ event: "backfill_resume_token_future", tokenTime, now, tolerance: CLOCK_SKEW_TOLERANCE_MS });
     throw new z.ZodError([
       {
@@ -409,10 +432,16 @@ export async function performBackfill(
   let resumeDate: Date | null = explicitCursor ?? null;
   let persistedTotalScanned = 0;
   let persistedTotalCreated = 0;
-  if (!resumeDate) {
+  let resumeSource: "explicit" | "auto" | "first-run";
+  if (resumeDate) {
+    resumeSource = "explicit";
+  } else {
     const progress = await getBackfillProgress(jobName);
     if (progress?.lastCursor) {
       resumeDate = progress.lastCursor;
+      resumeSource = "auto";
+    } else {
+      resumeSource = "first-run";
     }
     if (progress) {
       persistedTotalScanned = progress.totalScanned;
@@ -420,6 +449,32 @@ export async function performBackfill(
     }
     await updateBackfillLag(jobName, progress?.lastBlockNumber, progress?.lastContractAddress);
   }
+
+  // --- Observability: resume token resolution (Issue #260) ---
+  const replayWindowMs = resumeDate ? Math.max(0, Date.now() - resumeDate.getTime()) : 0;
+  console.info({
+    event: "backfill_resume_token_resolved",
+    job: jobName,
+    source: resumeSource,
+    resumeDate: resumeDate?.toISOString() ?? null,
+    replayWindowMs,
+    limit,
+  });
+
+  // Increment the appropriate resume-source counter.
+  if (resumeSource === "explicit") {
+    incStarknetMetric(BACKFILL_EXPLICIT_RESUME_METRIC);
+  } else if (resumeSource === "auto") {
+    incStarknetMetric(BACKFILL_AUTO_RESUME_METRIC);
+  } else {
+    incStarknetMetric(BACKFILL_FIRST_RUN_METRIC);
+  }
+
+  // Set replay window gauge.
+  setStarknetGauge(
+    labeledStarknetMetric(BACKFILL_REPLAY_WINDOW_MS_METRIC, { job: jobName }),
+    replayWindowMs,
+  );
 
   const conditions = sql`1=1`;
   if (agreementId) {
@@ -479,8 +534,10 @@ export async function performBackfill(
     // Start from persisted totals when resuming, otherwise start from 0
     let batchCreatedCount = persistedTotalCreated;
     let batchTotalScanned = persistedTotalScanned;
+    let batchIndex = 0;
 
     for (const batch of batches) {
+      batchIndex++;
       const insertValues = batch.map((row) => {
         const eventId = buildBackfillEventId(
           String(row.transaction_hash),
@@ -499,6 +556,7 @@ export async function performBackfill(
       });
 
       let insertedRows: any[] = [];
+      let batchCursor: Date;
       await db.transaction(async (tx) => {
         insertedRows = await tx
           .insert(schema.agreementEvents)
@@ -511,7 +569,7 @@ export async function performBackfill(
 
         // Update progress checkpoint atomically with the inserts
         const lastRow = batch[batch.length - 1];
-        const batchCursor = new Date(lastRow.created_at);
+        batchCursor = new Date(lastRow.created_at);
 
         await upsertBackfillProgress(tx, jobName, {
           status: "running",
@@ -531,6 +589,18 @@ export async function performBackfill(
         Number(batch[batch.length - 1].block_number),
         String(batch[batch.length - 1].contract_address),
       );
+
+      // --- Observability: batch checkpoint log (Issue #260) ---
+      console.info({
+        event: "backfill_batch_checkpoint",
+        job: jobName,
+        batch: batchIndex,
+        batchSize: batch.length,
+        batchCreated: insertedRows.length,
+        cumulativeScanned: batchTotalScanned,
+        cumulativeCreated: batchCreatedCount,
+        batchCursor: batchCursor.toISOString(),
+      });
 
       const insertedIds = new Set(insertedRows.map((r) => String(r.id)));
 
@@ -622,6 +692,8 @@ backfillEventsRouter.post(
         res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
       }
+      incStarknetMetric(BACKFILL_ERROR_METRIC);
+      console.error({ event: "backfill_error", job: EMPLOYEE_BACKFILL_JOB, error: e?.message ?? String(e) });
       try {
         await upsertBackfillProgress(db, EMPLOYEE_BACKFILL_JOB, {
           status: "failed",
@@ -655,6 +727,8 @@ backfillEventsRouter.post(
         res.status(400).json({ error: e.issues?.[0]?.message || "Invalid request parameters" });
         return;
       }
+      incStarknetMetric(BACKFILL_ERROR_METRIC);
+      console.error({ event: "backfill_error", job: MILESTONE_BACKFILL_JOB, error: e?.message ?? String(e) });
       try {
         await upsertBackfillProgress(db, MILESTONE_BACKFILL_JOB, {
           status: "failed",
