@@ -247,6 +247,40 @@ async function resolveCheckpoint(): Promise<{
   return { checkpointBlock, records };
 }
 
+// ---------------------------------------------------------------------------
+// HEAD method support
+// ---------------------------------------------------------------------------
+
+/**
+ * HEAD handler wrapper that allows a GET handler to respond to HEAD requests
+ * by intercepting `res.json` and suppressing the response body while preserving
+ * all headers (including Cache-Control, ETag, x-indexer-sync-checkpoint).
+ *
+ * Express's default app.head() behavior delegates HEAD → GET automatically,
+ * but that path still serializes the full response body before discarding it.
+ * This wrapper avoids that serialization overhead by replacing `res.json` with
+ * `res.end()` for the duration of the handler, making it suitable for CDN and
+ * monitoring probes that issue HEAD requests to validate cache freshness.
+ *
+ * The original `res.json` is restored after the handler completes so that
+ * subsequent middleware and error handlers behave normally.
+ */
+function headCapable(handler: (...args: any[]) => Promise<void>): (...args: any[]) => Promise<void> {
+  return async (req: any, res: any, next: any) => {
+    const origJson = res.json.bind(res);
+    res.json = (body: any) => {
+      res.setHeader("Content-Length", String(Buffer.byteLength(JSON.stringify(body))));
+      res.end();
+      return res;
+    };
+    try {
+      await handler(req, res, next);
+    } finally {
+      res.json = origJson;
+    }
+  };
+}
+
 export const indexedRouter = Router();
 
 // Output Schemas for Contract Hardening
@@ -258,6 +292,10 @@ const AgreementSchema = z.object({
   mode: z.number().optional(),
   createdAt: z.date().or(z.string()).optional(),
 }).passthrough();
+
+// ===========================================================================
+// /indexed/freshness
+// ===========================================================================
 
 /**
  * GET /indexed/freshness
@@ -274,48 +312,67 @@ const AgreementSchema = z.object({
  * Idempotency: This endpoint is read-only. Repeated requests with the same
  * underlying database state produce identical responses.
  */
+const freshnessHandler = async (_req: any, res: any, next: any) => {
+  const startTime = performance.now();
+  try {
+    const { checkpointBlock, records } = await resolveCheckpoint();
+
+    const body: IndexedFreshnessResponse = {
+      source: INDEXED_DATA_SOURCE,
+      checkpointBlock,
+      freshness: records.length > 0 ? "synced" : "empty",
+    };
+
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+    applyIndexedCacheHeaders(res, body, indexedCacheOptions);
+    res.json(body);
+
+    // Observability
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    if (records.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+    if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+    logIndexedEvent("info", INDEXED_OPS.FRESHNESS, {
+      durationMs,
+      syncCheckpoint: checkpointBlock,
+      freshness: body.freshness,
+      httpStatus: 200,
+    });
+  } catch (e: any) {
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    incIndexedMetric(INDEXED_METRICS.ERRORS);
+    logIndexedEvent("error", INDEXED_OPS.FRESHNESS, {
+      durationMs,
+      httpStatus: 500,
+      error: e?.message,
+    });
+    next(e);
+  }
+};
+
 indexedRouter.get(
   "/indexed/freshness",
   ...authorizeIndexedFreshness,
-  async (_req, res, next) => {
-    const startTime = performance.now();
-    try {
-      const { checkpointBlock, records } = await resolveCheckpoint();
-
-      const body: IndexedFreshnessResponse = {
-        source: INDEXED_DATA_SOURCE,
-        checkpointBlock,
-        freshness: records.length > 0 ? "synced" : "empty",
-      };
-
-      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
-      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
-      res.json(body);
-
-      // Observability
-      const durationMs = Math.round(performance.now() - startTime);
-      incIndexedMetric(INDEXED_METRICS.REQUESTS);
-      if (records.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
-      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
-      logIndexedEvent("info", INDEXED_OPS.FRESHNESS, {
-        durationMs,
-        syncCheckpoint: checkpointBlock,
-        freshness: body.freshness,
-        httpStatus: 200,
-      });
-    } catch (e: any) {
-      const durationMs = Math.round(performance.now() - startTime);
-      incIndexedMetric(INDEXED_METRICS.REQUESTS);
-      incIndexedMetric(INDEXED_METRICS.ERRORS);
-      logIndexedEvent("error", INDEXED_OPS.FRESHNESS, {
-        durationMs,
-        httpStatus: 500,
-        error: e?.message,
-      });
-      next(e);
-    }
-  },
+  freshnessHandler,
 );
+
+/**
+ * HEAD /indexed/freshness
+ *
+ * Mirrors GET /indexed/freshness without serializing a response body.
+ * Useful for CDN probes and monitoring tools that only need cache headers
+ * (Cache-Control, ETag) to validate freshness.
+ */
+indexedRouter.head(
+  "/indexed/freshness",
+  ...authorizeIndexedFreshness,
+  headCapable(freshnessHandler),
+);
+
+// ===========================================================================
+// /indexed/checkpoint
+// ===========================================================================
 
 /**
  * GET /indexed/checkpoint
@@ -332,46 +389,63 @@ indexedRouter.get(
  * Idempotency: This endpoint is read-only. Repeated requests with the same
  * underlying database state produce identical responses.
  */
+const checkpointHandler = async (_req: any, res: any, next: any) => {
+  const startTime = performance.now();
+  try {
+    const { checkpointBlock, records } = await resolveCheckpoint();
+
+    const body: IndexedCheckpointResponse = {
+      source: INDEXED_DATA_SOURCE,
+      checkpointBlock,
+    };
+
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+    applyIndexedCacheHeaders(res, body, indexedCacheOptions);
+    res.json(body);
+
+    // Observability
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    if (records.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+    if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+    logIndexedEvent("info", INDEXED_OPS.CHECKPOINT, {
+      durationMs,
+      syncCheckpoint: checkpointBlock,
+      httpStatus: 200,
+    });
+  } catch (e: any) {
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    incIndexedMetric(INDEXED_METRICS.ERRORS);
+    logIndexedEvent("error", INDEXED_OPS.CHECKPOINT, {
+      durationMs,
+      httpStatus: 500,
+      error: e?.message,
+    });
+    next(e);
+  }
+};
+
 indexedRouter.get(
   "/indexed/checkpoint",
   ...authorizeIndexedFreshness,
-  async (_req, res, next) => {
-    const startTime = performance.now();
-    try {
-      const { checkpointBlock, records } = await resolveCheckpoint();
-
-      const body: IndexedCheckpointResponse = {
-        source: INDEXED_DATA_SOURCE,
-        checkpointBlock,
-      };
-
-      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
-      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
-      res.json(body);
-
-      // Observability
-      const durationMs = Math.round(performance.now() - startTime);
-      incIndexedMetric(INDEXED_METRICS.REQUESTS);
-      if (records.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
-      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
-      logIndexedEvent("info", INDEXED_OPS.CHECKPOINT, {
-        durationMs,
-        syncCheckpoint: checkpointBlock,
-        httpStatus: 200,
-      });
-    } catch (e: any) {
-      const durationMs = Math.round(performance.now() - startTime);
-      incIndexedMetric(INDEXED_METRICS.REQUESTS);
-      incIndexedMetric(INDEXED_METRICS.ERRORS);
-      logIndexedEvent("error", INDEXED_OPS.CHECKPOINT, {
-        durationMs,
-        httpStatus: 500,
-        error: e?.message,
-      });
-      next(e);
-    }
-  },
+  checkpointHandler,
 );
+
+/**
+ * HEAD /indexed/checkpoint
+ *
+ * Mirrors GET /indexed/checkpoint without serializing a response body.
+ */
+indexedRouter.head(
+  "/indexed/checkpoint",
+  ...authorizeIndexedFreshness,
+  headCapable(checkpointHandler),
+);
+
+// ===========================================================================
+// /indexed/agreements/:contract_address/user/:user_address
+// ===========================================================================
 
 /**
  * GET /indexed/agreements/:contract_address/user/:user_address
@@ -379,97 +453,113 @@ indexedRouter.get(
  * Retrieves all agreements associated with a specific user (as employer, contributor,
  * or payroll employee).
  */
+const agreementsForUserHandler = async (req: any, res: any, next: any) => {
+  const startTime = performance.now();
+  try {
+    const contractAddress = StarknetAddress.parse(req.params.contract_address);
+    if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
+      res.status(400).json({ error: "Invalid contract address for agreements" });
+      return;
+    }
+    const userAddress = StarknetAddress.parse(req.params.user_address);
+    const { limit, offset } = parsePagination(req.query);
+
+    const [agreements, employeeAgreements] = await Promise.all([
+      readDb
+        .select()
+        .from(schema.agreements)
+        .where(
+          and(
+            eq(schema.agreements.contractAddress, contractAddress),
+            or(
+              eq(schema.agreements.employer, userAddress),
+              eq(schema.agreements.contributor, userAddress),
+            ),
+          ),
+        )
+        .orderBy(desc(schema.agreements.createdAt))
+        .limit(limit)
+        .offset(offset),
+
+      readDb
+        .select({
+          agreement: schema.agreements,
+        })
+        .from(schema.agreements)
+        .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
+        .where(
+          and(
+            eq(schema.agreements.contractAddress, contractAddress),
+            eq(schema.employees.employeeAddress, userAddress),
+            eq(schema.agreements.mode, 1),
+          ),
+        )
+        .orderBy(desc(schema.agreements.createdAt))
+        .limit(limit),
+    ]);
+
+    const allAgreements = [...agreements, ...employeeAgreements.map((e: any) => e.agreement)];
+    const uniqueAgreements = [...new Map(allAgreements.map((a: any) => [a.id, a])).values()];
+    const pagedAgreements = uniqueAgreements.slice(0, limit);
+
+    const checkpointBlock = deriveSyncCheckpoint(allAgreements);
+
+    const body = {
+      agreements: z.array(AgreementSchema).parse(pagedAgreements),
+      count: pagedAgreements.length,
+      source: INDEXED_DATA_SOURCE,
+    };
+
+    res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
+    applyIndexedCacheHeaders(res, body, indexedCacheOptions);
+    res.json(body);
+
+    // Observability
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    if (pagedAgreements.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
+    if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
+    logIndexedEvent("info", INDEXED_OPS.AGREEMENTS_FOR_USER, {
+      durationMs,
+      syncCheckpoint: checkpointBlock,
+      count: pagedAgreements.length,
+      httpStatus: 200,
+      contractAddress,
+      userAddress,
+    });
+  } catch (e: any) {
+    const durationMs = Math.round(performance.now() - startTime);
+    incIndexedMetric(INDEXED_METRICS.REQUESTS);
+    incIndexedMetric(INDEXED_METRICS.ERRORS);
+    logIndexedEvent("error", INDEXED_OPS.AGREEMENTS_FOR_USER, {
+      durationMs,
+      httpStatus: 500,
+      error: e?.message,
+      contractAddress: req.params.contract_address,
+      userAddress: req.params.user_address,
+    });
+    next(e);
+  }
+};
+
 indexedRouter.get(
   "/indexed/agreements/:contract_address/user/:user_address",
-  async (req, res, next) => {
-    const startTime = performance.now();
-    try {
-      const contractAddress = StarknetAddress.parse(req.params.contract_address);
-      if (contractAddress === normalizeStarknetAddress(defaults.payrollEscrowAddress)) {
-        res.status(400).json({ error: "Invalid contract address for agreements" });
-        return;
-      }
-      const userAddress = StarknetAddress.parse(req.params.user_address);
-      const { limit, offset } = parsePagination(req.query);
-
-      const [agreements, employeeAgreements] = await Promise.all([
-        readDb
-          .select()
-          .from(schema.agreements)
-          .where(
-            and(
-              eq(schema.agreements.contractAddress, contractAddress),
-              or(
-                eq(schema.agreements.employer, userAddress),
-                eq(schema.agreements.contributor, userAddress),
-              ),
-            ),
-          )
-          .orderBy(desc(schema.agreements.createdAt))
-          .limit(limit)
-          .offset(offset),
-
-        readDb
-          .select({
-            agreement: schema.agreements,
-          })
-          .from(schema.agreements)
-          .innerJoin(schema.employees, eq(schema.agreements.id, schema.employees.agreementId))
-          .where(
-            and(
-              eq(schema.agreements.contractAddress, contractAddress),
-              eq(schema.employees.employeeAddress, userAddress),
-              eq(schema.agreements.mode, 1),
-            ),
-          )
-          .orderBy(desc(schema.agreements.createdAt))
-          .limit(limit),
-      ]);
-
-      const allAgreements = [...agreements, ...employeeAgreements.map((e) => e.agreement)];
-      const uniqueAgreements = [...new Map(allAgreements.map((a) => [a.id, a])).values()];
-      const pagedAgreements = uniqueAgreements.slice(0, limit);
-
-      const checkpointBlock = deriveSyncCheckpoint(allAgreements);
-
-      const body = {
-        agreements: z.array(AgreementSchema).parse(pagedAgreements),
-        count: pagedAgreements.length,
-        source: INDEXED_DATA_SOURCE,
-      };
-
-      res.setHeader("x-indexer-sync-checkpoint", String(checkpointBlock));
-      applyIndexedCacheHeaders(res, body, indexedCacheOptions);
-      res.json(body);
-
-      // Observability
-      const durationMs = Math.round(performance.now() - startTime);
-      incIndexedMetric(INDEXED_METRICS.REQUESTS);
-      if (pagedAgreements.length > 0) incIndexedMetric(INDEXED_METRICS.ROWS_FOUND);
-      if (checkpointBlock > 0) incIndexedMetric(INDEXED_METRICS.SYNC_CHECKPOINT_OBSERVED);
-      logIndexedEvent("info", INDEXED_OPS.AGREEMENTS_FOR_USER, {
-        durationMs,
-        syncCheckpoint: checkpointBlock,
-        count: pagedAgreements.length,
-        httpStatus: 200,
-        contractAddress,
-        userAddress,
-      });
-    } catch (e: any) {
-      const durationMs = Math.round(performance.now() - startTime);
-      incIndexedMetric(INDEXED_METRICS.REQUESTS);
-      incIndexedMetric(INDEXED_METRICS.ERRORS);
-      logIndexedEvent("error", INDEXED_OPS.AGREEMENTS_FOR_USER, {
-        durationMs,
-        httpStatus: 500,
-        error: e?.message,
-        contractAddress: req.params.contract_address,
-        userAddress: req.params.user_address,
-      });
-      next(e);
-    }
-  },
+  agreementsForUserHandler,
 );
+
+/**
+ * HEAD /indexed/agreements/:contract_address/user/:user_address
+ *
+ * Mirrors GET .../agreements/.../user/... without serializing a response body.
+ */
+indexedRouter.head(
+  "/indexed/agreements/:contract_address/user/:user_address",
+  headCapable(agreementsForUserHandler),
+);
+
+// ===========================================================================
+// /indexed/agreement/:contract_address/:agreement_id
+// ===========================================================================
 
 /**
  * GET /indexed/agreement/:contract_address/:agreement_id
@@ -477,7 +567,7 @@ indexedRouter.get(
  * Retrieves full details for a single agreement including related events, payments,
  * milestones, employees, and escrow events.
  */
-indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (req, res, next) => {
+const agreementDetailHandler = async (req: any, res: any, next: any) => {
   const startTime = performance.now();
   try {
     const contractAddress = StarknetAddress.parse(req.params.contract_address);
@@ -573,7 +663,20 @@ indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", async (r
     });
     next(e);
   }
-});
+};
+
+indexedRouter.get("/indexed/agreement/:contract_address/:agreement_id", agreementDetailHandler);
+
+/**
+ * HEAD /indexed/agreement/:contract_address/:agreement_id
+ *
+ * Mirrors GET .../agreement/... without serializing a response body.
+ */
+indexedRouter.head("/indexed/agreement/:contract_address/:agreement_id", headCapable(agreementDetailHandler));
+
+// ===========================================================================
+// /indexed/payments/user/:user_address
+// ===========================================================================
 
 /**
  * GET /indexed/payments/user/:user_address
@@ -624,6 +727,10 @@ indexedRouter.get("/indexed/payments/user/:user_address", async (req, res, next)
     next(e);
   }
 });
+
+// ===========================================================================
+// /indexed/escrow/:contract_address/balance/:agreement_id
+// ===========================================================================
 
 /**
  * GET /indexed/escrow/:contract_address/balance/:agreement_id

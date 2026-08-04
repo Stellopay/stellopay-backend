@@ -9,7 +9,11 @@ export const systemRouter = Router();
 
 let cachedVersionPayload: { version: string } | null = null;
 
-systemRouter.get("/system/version", async (_req, res, next) => {
+// ===========================================================================
+// /system/version
+// ===========================================================================
+
+const versionHandler = async (_req: any, res: any, next: any) => {
   try {
     if (!cachedVersionPayload) {
       const pkgPath = path.resolve(process.cwd(), "package.json");
@@ -22,9 +26,35 @@ systemRouter.get("/system/version", async (_req, res, next) => {
   } catch (e) {
     next(e);
   }
+};
+
+systemRouter.get("/system/version", versionHandler);
+
+/**
+ * HEAD /system/version
+ *
+ * Mirrors GET /system/version without a response body. Useful for monitoring
+ * probes and CDN cache-validation requests.
+ */
+systemRouter.head("/system/version", async (req: any, res: any, next: any) => {
+  const origJson = res.json.bind(res);
+  res.json = (body: any) => {
+    res.setHeader("Content-Length", String(Buffer.byteLength(JSON.stringify(body))));
+    res.end();
+    return res;
+  };
+  try {
+    await versionHandler(req, res, next);
+  } finally {
+    res.json = origJson;
+  }
 });
 
-systemRouter.get("/network/chain_id", async (_req, res, next) => {
+// ===========================================================================
+// /network/chain_id
+// ===========================================================================
+
+const chainIdHandler = async (_req: any, res: any, next: any) => {
   try {
     const { chainId, specVersion } = await getCachedNetworkInfo();
     res.setHeader("Cache-Control", "public, max-age=300");
@@ -32,7 +62,32 @@ systemRouter.get("/network/chain_id", async (_req, res, next) => {
   } catch (e) {
     next(e);
   }
+};
+
+systemRouter.get("/network/chain_id", chainIdHandler);
+
+/**
+ * HEAD /network/chain_id
+ *
+ * Mirrors GET /network/chain_id without a response body.
+ */
+systemRouter.head("/network/chain_id", async (req: any, res: any, next: any) => {
+  const origJson = res.json.bind(res);
+  res.json = (body: any) => {
+    res.setHeader("Content-Length", String(Buffer.byteLength(JSON.stringify(body))));
+    res.end();
+    return res;
+  };
+  try {
+    await chainIdHandler(req, res, next);
+  } finally {
+    res.json = origJson;
+  }
 });
+
+// ===========================================================================
+// /account/:address/nonce
+// ===========================================================================
 
 systemRouter.get("/account/:address/nonce", async (req, res, next) => {
   try {
@@ -44,9 +99,17 @@ systemRouter.get("/account/:address/nonce", async (req, res, next) => {
   }
 });
 
+// ===========================================================================
+// /system/live
+// ===========================================================================
+
 systemRouter.get("/system/live", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+// ===========================================================================
+// /system/ready
+// ===========================================================================
 
 systemRouter.get("/system/ready", async (_req, res, next) => {
   try {
