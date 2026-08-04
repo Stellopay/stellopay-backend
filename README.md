@@ -1028,3 +1028,9 @@ session, and Starknet snapshots in Prometheus text format. It is mounted
 outside `/api/v1` so a scraper does not need API-version routing. Protect the
 endpoint at the ingress/network layer when operational metrics should not be
 public.
+
+
+## Operational Documentation
+
+- [EVENTS_PROCESSING.md](./EVENTS_PROCESSING.md) -- Event processing guide including the operator runbook for reprocess and backfill routes.
+- [INDEXER_INTEGRATION.md](./INDEXER_INTEGRATION.md) -- Indexer setup, status checks, and troubleshooting.
