@@ -463,3 +463,167 @@ POST /api/v1/backfill/milestone-events
 1. Verify `POSTGRES_CONNECTION_STRING` is set and well-formed.
 2. Confirm PostgreSQL is running and the `stellopay_indexer` database exists.
 3. Ensure the DB user has `INSERT`, `SELECT`, and `UPDATE` privileges.
+
+
+---
+
+## Runbook
+
+This section provides operator-facing guidance for the reprocess and backfill
+routes. For the detailed API reference, see Methods 4-8 above; for indexer
+context, see [INDEXER_INTEGRATION.md](./INDEXER_INTEGRATION.md).
+
+### When to Use Which
+
+| Scenario | Use | Why |
+|---|---|---|
+| A known transaction's events are missing after the indexer caught up | `POST /reprocess-events/tx/:tx_hash` | Fetches on-chain receipt for a single tx; idempotent |
+| Multiple known transactions need re-decoding | `POST /reprocess-events/batch` | Batch variant with per-tx error isolation |
+| Status-change events are still tagged as `AgreementStatusChange` | `POST /reprocess-events/status-changes` | Decodes status-change rows that weren't resolved on first pass |
+| `employees` or `milestones` rows exist but no `EmployeeAdded`/`MilestoneAdded` event appears | `POST /backfill/employee-events` or `/backfill/milestone-events` | Synthesises missing event rows from existing data |
+| You don't know which transactions are affected | `GET /diagnostics/events` first, then decide | Diagnostics give aggregate counts to identify gaps |
+
+**Reprocess vs. Backfill**:
+
+- **Reprocess** re-reads on-chain data from the RPC provider. Use when the
+  transaction exists on-chain but wasn't indexed correctly.
+- **Backfill** creates synthetic events from the database. Use when the
+  indexer missed a historical migration and the raw on-chain data is already
+  represented in the `employees`/`milestones` tables.
+
+### How to Trigger Safely
+
+All reprocess and backfill routes require **both** `requireAuth` (valid session
+token) and `requireAdmin` (address in `ADMIN_ADDRESSES`).
+**These endpoints should never be exposed publicly** -- keep them behind a VPN,
+firewall, or internal network.
+
+#### Step 1 -- Authenticate
+
+```bash
+# Get a challenge
+CHALLENGE=$(curl -sS http://localhost:4000/api/v1/auth/challenge \
+  -H 'content-type: application/json' \
+  -d '{"address":"0xYOUR_ADMIN_ADDRESS"}')
+
+# Sign the typed_data with your wallet, then verify
+SESSION=$(curl -sS http://localhost:4000/api/v1/auth/verify \
+  -H 'content-type: application/json' \
+  -d '{"address":"0xYOUR_ADMIN_ADDRESS","signature":[...]}')
+
+TOKEN=$(echo "$SESSION" | jq -r '.session_token')
+```
+
+#### Step 2 -- Check current state
+
+```bash
+# Aggregate diagnostics -- no tx hashes exposed
+curl -sS http://localhost:4000/api/v1/diagnostics/events \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS" | jq .
+```
+
+#### Step 3 -- Execute the operation
+
+**Single transaction reprocess:**
+
+```bash
+curl -sS -X POST http://localhost:4000/api/v1/reprocess-events/tx/0xTX_HASH \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS" | jq .
+```
+
+**Status-change reprocess (small batch first):**
+
+```bash
+# Start with a small limit to estimate the scope
+curl -sS -X POST 'http://localhost:4000/api/v1/reprocess-events/status-changes?limit=10' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS" | jq .
+```
+
+**Backfill (restricted to one agreement first):**
+
+```bash
+curl -sS -X POST 'http://localhost:4000/api/v1/backfill/employee-events?agreementId=agr_123&limit=100' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS" | jq .
+```
+
+> **Always start small** -- use `limit`, `agreementId`, or single-tx endpoints
+> before running at full scale. All operations are **idempotent** (`ON CONFLICT
+> DO NOTHING`), so you can safely re-run them.
+
+### How to Monitor Progress
+
+1. **Watch backend logs** -- structured JSON logs include `request_id`,
+   `tx_hash`, and `events_processed` counts for every operation.
+
+2. **Check diagnostics between batches:**
+
+```bash
+# Run before
+curl -sS http://localhost:4000/api/v1/diagnostics/events \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS" | jq '.counts'
+
+# ... run reprocess / backfill ...
+
+# Run after and compare
+curl -sS http://localhost:4000/api/v1/diagnostics/events \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS" | jq '.counts'
+```
+
+3. **For large backfill runs**, monitor the response incrementally. Each
+   response reports `totalScanned` and `created` counts, so you can track
+   progress across successive invocations.
+
+### How to Verify Correctness
+
+1. **Idempotency check**: Re-run the same operation. A correct run produces
+   zero new events on the second invocation:
+
+```bash
+# First run
+curl -sS -X POST 'http://localhost:4000/api/v1/backfill/employee-events?limit=5000' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS"
+# Expected: {"message":"Backfilled 3 EmployeeAdded events","created":3,...}
+
+# Second run -- should be a no-op
+curl -sS -X POST 'http://localhost:4000/api/v1/backfill/employee-events?limit=5000' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "x-user-address: 0xYOUR_ADMIN_ADDRESS"
+# Expected: {"message":"Backfilled 0 EmployeeAdded events","created":0,...}
+```
+
+2. **Check the database directly** -- query `agreement_events` for synthetic
+   entries (identifiable by `_backfill_` in the event ID):
+
+```sql
+-- Verify backfill events exist
+SELECT event_id, event_type, transaction_hash, event_index
+FROM agreement_events
+WHERE event_id LIKE '%_backfill_%'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+3. **For reprocess operations**, compare `eventsProcessed` in the response
+   against the expected event count.
+
+4. **Cross-reference with the indexer** -- see
+   [INDEXER_INTEGRATION.md](./INDEXER_INTEGRATION.md) for checking whether the
+   indexer has caught up to the block containing the transaction.
+
+### Common Issues
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| `401 Unauthorized` | Missing or expired session token | Re-authenticate via `/auth/challenge` then `/auth/verify` |
+| `403 Forbidden` | Address not in `ADMIN_ADDRESSES` | Check `ADMIN_ADDRESSES` env var |
+| `not_found` status in response | Transaction not on chain or wrong network | Verify the tx hash on the block explorer |
+| `no_events` status in response | Transaction has no events matching the configured ABIs | This is normal for e.g. pure transfers |
+| Backfill creates 0 events | All rows already have matching event entries | Expected -- operation is a no-op |
+| `429 Too Many Requests` | Rate limit hit | Wait and retry; reduce batch sizes
