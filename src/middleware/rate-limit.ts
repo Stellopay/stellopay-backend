@@ -142,6 +142,21 @@ export interface MakeLimiterOptions {
    * @default false
    */
   idempotent?: boolean;
+  /**
+   * Opt-in to the draft IETF standard RateLimit-* response headers.
+   *
+   * When `true`, every response from this limiter carries
+   * `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`
+   * headers in addition to the existing `Retry-After` on 429s.
+   * Clients that want to proactively back off before hitting the limit
+   * can read these headers without polling.
+   *
+   * The default remains `false` — existing callers that do not
+   * opt in see no change in response headers.
+   *
+   * @default false
+   */
+  exposeStandardHeaders?: boolean;
 }
 
 /** Default message used when a caller does not supply one. */
@@ -231,7 +246,7 @@ function getEnvOverride(name: string, suffix: string): string | undefined {
  * ```
  */
 export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandler {
-  let { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent } = options;
+  let { windowMs, max, message = DEFAULT_MESSAGE, skip, store, name, idempotent, exposeStandardHeaders } = options;
 
   // ---- Input validation ---------------------------------------------------
   if (!name || typeof name !== "string") {
@@ -307,7 +322,7 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
     // `RateLimit-*` headers. Clients should rely on `Retry-After` (set
     // explicitly in the handler below) rather than implementation-specific
     // count/remaining headers whose semantics vary across stores and versions.
-    standardHeaders: false,
+    standardHeaders: exposeStandardHeaders ?? false,
     legacyHeaders: false,
     // Delegate to keyByIp instead of re-implementing the same fallback/warn
     // logic inline. Keeping a single implementation means the "unknown"
