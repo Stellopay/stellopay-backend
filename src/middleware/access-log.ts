@@ -156,6 +156,89 @@ export function getMetrics(): Readonly<AccessLogMetrics> {
 /** Reset all metrics counters (for use in tests). */
 export function resetMetrics(): void {
   metrics = { totalRequests: 0, requestsByStatus: {}, requestsByPath: {}, totalDurationMs: 0 };
+  resetDurationHistogram();
+}
+
+// ---------------------------------------------------------------------------
+// Duration histogram
+// ---------------------------------------------------------------------------
+
+/**
+ * A single bucket in the `http_request_duration_seconds` histogram,
+ * keyed by `method` × `route` × `statusClass`.
+ */
+export interface DurationHistogramBucket {
+  /** HTTP method, e.g. GET / POST. */
+  method: string;
+  /** Normalised route pattern (from `req.route?.path ?? req.path`). */
+  route: string;
+  /** Status-code class: `1xx`, `2xx`, `3xx`, `4xx`, or `5xx`. */
+  statusClass: string;
+  /** Total observations in this bucket. */
+  count: number;
+  /** Cumulative duration in seconds. */
+  sumSeconds: number;
+  /** Shortest observed duration in this bucket (seconds). */
+  minSeconds: number;
+  /** Longest observed duration in this bucket (seconds). */
+  maxSeconds: number;
+}
+
+let durationHistogram: Map<string, DurationHistogramBucket> = new Map();
+
+function statusClass(status: number): string {
+  if (status < 200) return "1xx";
+  if (status < 300) return "2xx";
+  if (status < 400) return "3xx";
+  if (status < 500) return "4xx";
+  return "5xx";
+}
+
+function histogramKey(method: string, route: string, sc: string): string {
+  return `${method}:${route}:${sc}`;
+}
+
+function recordDuration(method: string, route: string, status: number, durationSeconds: number): void {
+  const sc = statusClass(status);
+  const key = histogramKey(method, route, sc);
+  let bucket = durationHistogram.get(key);
+  if (!bucket) {
+    bucket = {
+      method,
+      route,
+      statusClass: sc,
+      count: 0,
+      sumSeconds: 0,
+      minSeconds: Infinity,
+      maxSeconds: -Infinity,
+    };
+    durationHistogram.set(key, bucket);
+  }
+  bucket.count += 1;
+  bucket.sumSeconds += durationSeconds;
+  if (durationSeconds < bucket.minSeconds) bucket.minSeconds = durationSeconds;
+  if (durationSeconds > bucket.maxSeconds) bucket.maxSeconds = durationSeconds;
+}
+
+/**
+ * Return a snapshot of the current duration histogram, sorted by
+ * method → route → statusClass for stable output.
+ */
+export function getDurationHistogram(): DurationHistogramBucket[] {
+  return Array.from(durationHistogram.values())
+    .map((b) => ({ ...b }))
+    .sort((a, b) => {
+      const byMethod = a.method.localeCompare(b.method);
+      if (byMethod !== 0) return byMethod;
+      const byRoute = a.route.localeCompare(b.route);
+      if (byRoute !== 0) return byRoute;
+      return a.statusClass.localeCompare(b.statusClass);
+    });
+}
+
+/** Clear all histogram data (for use in tests). */
+export function resetDurationHistogram(): void {
+  durationHistogram.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +321,10 @@ export function validateCorrelationId(id: unknown): string | null {
  *   after the status code and duration are both known.
  * - Never logs request/response bodies, `Authorization` headers, or any
  *   other header — only the fields in {@link AccessLogEntry}.
+ * - Records the per-request duration into the
+ *   {@link DurationHistogramBucket} histogram, labelled by method, normalised
+ *   route, and status-code class, for aggregate latency queries
+ *   (p50/p95/p99).
  *
  * Security boundary
  * -----------------
@@ -318,6 +405,10 @@ export function accessLogMiddleware(req: Request, res: Response, next: NextFunct
       const pathKey = req.route?.path ?? req.path;
       metrics.requestsByPath[pathKey] = (metrics.requestsByPath[pathKey] ?? 0) + 1;
       metrics.totalDurationMs += durationMs;
+
+      // Record duration into the labelled histogram for aggregate queries.
+      const durationSeconds = durationMs / 1000;
+      recordDuration(req.method, pathKey, res.statusCode, durationSeconds);
 
       const contentLength =
         typeof res.getHeader === "function"
