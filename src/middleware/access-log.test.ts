@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
 import request from "supertest";
-import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics, seenRequestIds, REDACTED_VALUE, validateCorrelationId, MAX_CACHE_SIZE } from "./access-log.js";
+import { accessLogMiddleware, redactSensitiveParams, getMetrics, resetMetrics, seenRequestIds, REDACTED_VALUE, validateCorrelationId, MAX_CACHE_SIZE, getDurationHistogram, resetDurationHistogram } from "./access-log.js";
 import { requestIdMiddleware } from "./request-id.js";
 
 // ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ describe("redactSensitiveParams", () => {
   });
 
   it("returns only path portion for a malformed URL with extra '?'", () => {
-    // Multiple '?' characters — the URL constructor will reject
+    // Multiple '?' characters make the URL unparseable by new URL()
     const result = redactSensitiveParams("/path?token=abc?extra=malformed");
     expect(result).not.toContain("abc");
   });
@@ -171,7 +171,7 @@ describe("redactSensitiveParams", () => {
 });
 
 // ---------------------------------------------------------------------------
-// accessLogMiddleware — integration tests
+// accessLogMiddleware — success path
 // ---------------------------------------------------------------------------
 
 describe("accessLogMiddleware — success path", () => {
@@ -182,6 +182,7 @@ describe("accessLogMiddleware — success path", () => {
     app = makeApp();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
     resetMetrics();
+    resetDurationHistogram();
   });
 
   afterEach(() => {
@@ -542,6 +543,7 @@ describe("accessLogMiddleware — standalone (no requestIdMiddleware)", () => {
     app = makeStandaloneApp();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
     resetMetrics();
+    resetDurationHistogram();
   });
 
   afterEach(() => {
@@ -638,6 +640,7 @@ describe("getMetrics / resetMetrics", () => {
     app = makeApp();
     consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
     resetMetrics();
+    resetDurationHistogram();
   });
 
   afterEach(() => {
@@ -682,6 +685,138 @@ describe("getMetrics / resetMetrics", () => {
     const m = getMetrics();
     expect(m.totalRequests).toBe(1);
     expect(m.requestsByStatus[200]).toBe(1);
+  });
+
+  it("resets the duration histogram alongside metrics", () => {
+    // resetMetrics must also clear the histogram.
+    const histogram = getDurationHistogram();
+    expect(histogram).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Duration histogram
+// ---------------------------------------------------------------------------
+
+describe("getDurationHistogram / resetDurationHistogram", () => {
+  let app: express.Express;
+  let consoleInfoSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    app = makeApp();
+    consoleInfoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    resetMetrics();
+    resetDurationHistogram();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns an empty array when no requests have been processed", () => {
+    expect(getDurationHistogram()).toEqual([]);
+  });
+
+  it("records a single GET /test 200 into one histogram bucket", async () => {
+    await request(app).get("/test");
+
+    const histogram = getDurationHistogram();
+    expect(histogram).toHaveLength(1);
+
+    const bucket = histogram[0];
+    expect(bucket.method).toBe("GET");
+    expect(bucket.route).toBe("/test");
+    expect(bucket.statusClass).toBe("2xx");
+    expect(bucket.count).toBe(1);
+    expect(bucket.sumSeconds).toBeGreaterThan(0);
+    expect(bucket.minSeconds).toBeGreaterThan(0);
+    expect(bucket.maxSeconds).toBeGreaterThan(0);
+    // min ≤ max must hold.
+    expect(bucket.minSeconds).toBeLessThanOrEqual(bucket.maxSeconds);
+  });
+
+  it("aggregates multiple requests into the same bucket", async () => {
+    await request(app).get("/test");
+    await request(app).get("/test");
+    await request(app).get("/test");
+
+    const histogram = getDurationHistogram();
+    expect(histogram).toHaveLength(1);
+    expect(histogram[0].count).toBe(3);
+  });
+
+  it("buckets by status-code class (2xx vs 4xx vs 5xx)", async () => {
+    await request(app).get("/test");        // 200 → 2xx
+    await request(app).get("/bad-request"); // 400 → 4xx
+    await request(app).get("/error");       // 500 → 5xx
+
+    const histogram = getDurationHistogram();
+    expect(histogram).toHaveLength(3);
+
+    const statusClasses = histogram.map((b) => b.statusClass).sort();
+    expect(statusClasses).toEqual(["2xx", "4xx", "5xx"]);
+  });
+
+  it("buckets by method (GET vs POST)", async () => {
+    await request(app).get("/test");
+    await request(app).post("/test-body").send({});
+
+    const histogram = getDurationHistogram();
+    // GET /test 2xx and POST /test-body 2xx → 2 buckets
+    expect(histogram.length).toBeGreaterThanOrEqual(2);
+
+    const getBuckets = histogram.filter((b) => b.method === "GET");
+    const postBuckets = histogram.filter((b) => b.method === "POST");
+    expect(getBuckets.length).toBeGreaterThanOrEqual(1);
+    expect(postBuckets.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("excludes health and ready endpoints from histogram", async () => {
+    await request(app).get("/health");
+    await request(app).get("/ready");
+    await request(app).get("/test");
+
+    const histogram = getDurationHistogram();
+    // Only /test should be recorded.
+    for (const bucket of histogram) {
+      expect(bucket.route).not.toBe("/health");
+      expect(bucket.route).not.toBe("/ready");
+    }
+    expect(histogram.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("resetDurationHistogram clears all data", async () => {
+    await request(app).get("/test");
+    expect(getDurationHistogram()).not.toEqual([]);
+
+    resetDurationHistogram();
+    expect(getDurationHistogram()).toEqual([]);
+  });
+
+  it("resetMetrics also clears the histogram", async () => {
+    await request(app).get("/test");
+    expect(getDurationHistogram()).not.toEqual([]);
+
+    resetMetrics();
+    expect(getDurationHistogram()).toEqual([]);
+  });
+
+  it("records 204 (2xx) correctly in the histogram", async () => {
+    await request(app).get("/no-content");
+
+    const histogram = getDurationHistogram();
+    expect(histogram).toHaveLength(1);
+    expect(histogram[0].statusClass).toBe("2xx");
+    expect(histogram[0].route).toBe("/no-content");
+  });
+
+  it("records 302 (3xx) correctly in the histogram", async () => {
+    await request(app).get("/redirect");
+
+    const histogram = getDurationHistogram();
+    const redirectBucket = histogram.find((b) => b.statusClass === "3xx");
+    expect(redirectBucket).toBeDefined();
+    expect(redirectBucket!.count).toBe(1);
   });
 });
 
