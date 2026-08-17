@@ -2,7 +2,6 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { env } from "../config.js";
 import * as schema from "./schema.js";
-import * as dbModule from "./index.js";
 
 // Pool tuning shared across whichever connection string we end up using.
 // Bounded size plus idle/connection timeouts keep a stuck DB from exhausting the pool.
@@ -146,8 +145,6 @@ export async function waitForDbReadiness(): Promise<void> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = await checkDbHealth();
     if (result.healthy) {
-    const healthy = await dbModule.checkDbHealth();
-    if (healthy) {
       return;
     }
     if (attempt < maxAttempts) {
