@@ -163,13 +163,35 @@ When `REDIS_URL` is configured but Redis is down:
 
 ## Idempotency-Key Deduplication
 
-When a limiter is configured with `idempotent: true`:
+When a limiter is configured with `idempotent: true`, requests carrying an
+`Idempotency-Key` header are deduplicated against the shared
+`idempotency_keys` Postgres table (`src/middleware/idempotency-store.ts`).
+Because the table is shared by every application process, the same key is
+recognised across instances/replicas — a duplicate request is never
+re-processed by a second process.
 
-- Requests with the same `Idempotency-Key` header and client IP are
-  deduplicated within the limiter window.
-- The first occurrence is counted; subsequent identical-key requests replay
-  the first request's outcome.
-- Replayed requests carry the `X-Idempotent-Replayed: true` response header.
+Contract:
+
+- **Identity** — the deduplication scope is `limiter name + client IP + key`;
+  requests without an `Idempotency-Key` header bypass idempotency entirely.
+- **First request** — atomically claims the key (the `(route, key)` primary
+  key decides the single winner under concurrency) and runs the downstream
+  operation exactly once.
+- **Identical retry** — replays the stored response (status code + JSON body)
+  and sets `X-Idempotent-Replayed: true`. Replays do not count against the
+  rate limit.
+- **Different body, same key** — deterministic `409 Conflict`
+  (`"Idempotency key already used with a different request body"`).
+- **In-flight duplicate** — deterministic `409 Conflict`
+  (`"Request with this idempotency key is already being processed"`).
+- **Downstream 5xx** — the record is marked failed and the key becomes
+  retryable, so a transient failure never poisons a retry.
+- **Retention** — records expire after 24 hours (enforced on access and by a
+  periodic sweep); an expired key becomes eligible again.
+- **Fail-closed** — if the database is unreachable the request is rejected
+  with `503` rather than proceeding without idempotency protection. This is
+  separate from the rate limiter's own fail-open `passOnStoreError`
+  behaviour, which is unchanged.
 
 If retried requests are unexpectedly throttled, ensure the client is
 sending the **same** `Idempotency-Key` header on retries.

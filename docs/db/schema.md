@@ -58,7 +58,7 @@ The schema enforces eight invariants (I1–I8), verified by
 
 | # | Invariant | Enforcement |
 |---|-----------|-------------|
-| I1 | **Table inventory** — exactly 11 tables. | `schema-consistency.test.ts` |
+| I1 | **Table inventory** — exactly 12 tables. | `schema-consistency.test.ts` |
 | I2 | **FK index** — every `*Id` column mapped to `*_id` has a btree index. | `schema-fk-indexes.ts` |
 | I3 | **u256 amount CHECK** — every u256 column uses `U256_DECIMAL_REGEX`. | `migration.test.ts` |
 | I4 | **Currency CHECK** — every currency column uses `'^[A-Z]{3}$'`. | `migration.test.ts` |
@@ -111,10 +111,14 @@ reports the active read pool without exposing connection details.
 | `idempotencyKeys` | `idempotency_keys` | Durable 24-hour response replay records |
 
 Idempotency records are keyed by `(route, key)` and include the request body
-fingerprint, response status, response body, and expiry timestamp. The unique
-primary key gives billing and diagnostics handlers a shared database-level
-claim point; expired rows can be removed by a scheduled cleanup query using the
-`expires_at` index.
+fingerprint, lifecycle `status` (`in_progress` / `completed` / `failed`),
+response status, response body, and expiry timestamp. The unique primary key
+gives the rate-limit middleware (and any other caller) a shared
+cross-instance claim point: exactly one concurrent request wins the INSERT,
+every other request observes the existing row and is replayed or rejected
+deterministically. Expired rows are removed by a periodic cleanup query using
+the `expires_at` index; failed records are re-claimable so transient failures
+do not poison retries.
 
 ### Event ingestion identity
 

@@ -5,6 +5,11 @@ import rateLimit, {
 } from "express-rate-limit";
 import type { Request, Response } from "express";
 import { IdempotencyKeySchema } from "../utils/validation.js";
+import {
+  IdempotencyStore,
+  computeFingerprint,
+  type ClaimResult,
+} from "./idempotency-store.js";
 
 // ---------------------------------------------------------------------------
 // Idempotency-Key support
@@ -130,14 +135,22 @@ export interface MakeLimiterOptions {
   /**
    * Enable idempotency-key deduplication. When `true`, requests with the same
    * `Idempotency-Key` header **and** the same client IP are deduplicated:
-   * only the first occurrence counts against the rate limit; subsequent
-   * identical-key requests replay the first request's outcome.
+   * only the first request runs the downstream operation; subsequent
+   * identical-key requests replay the first request's stored response (or
+   * receive a deterministic `409` when the request body differs or the
+   * operation is still in flight).
    *
-   * Idempotency state lives in an in-memory `Map` scoped to the limiter
-   * instance and expires after `windowMs`. For distributed deployments you
-   * should provide a shared `store` and extend the idempotency tracking to
-   * use the same backend — see the out-of-scope note in
-   * {@link makeLimiter}.
+   * Idempotency state is persisted in the shared `idempotency_keys` database
+   * table, so deduplication works across processes/replicas and survives
+   * restarts. Records are retained for 24 hours (see
+   * {@link ../middleware/idempotency-store.ts | idempotency-store}). The
+   * persistence path fails **closed**: if the database is unreachable, the
+   * request is rejected with `503` rather than silently proceeding without
+   * idempotency protection. This is independent of the rate limiter's own
+   * fail-open `passOnStoreError` behaviour, which is unchanged.
+   *
+   * Requests without an `Idempotency-Key` header bypass idempotency
+   * entirely and behave exactly as if `idempotent` were `false`.
    *
    * @default false
    */
@@ -337,68 +350,118 @@ export function makeLimiter(options: MakeLimiterOptions): RateLimitRequestHandle
     return baseLimiter;
   }
 
-  // ---- Idempotency-key deduplication wrapper --------------------------------
-  // Idempotency records are stored in an in-memory Map scoped to this limiter
-  // instance. Entries are cleaned up after windowMs.
-  const idempotencyCache = new Map<string, { outcome: "allowed" | "throttled" }>();
+  // ---- Persistent idempotency-key deduplication wrapper ----------------------
+  // Idempotency state lives in the shared `idempotency_keys` database table,
+  // so duplicate requests are recognised across processes/replicas rather
+  // than only within this limiter instance. The unique (route, key) primary
+  // key decides the single winner under concurrency; every other request is
+  // replayed the stored response or rejected deterministically. See
+  // ./idempotency-store.ts for the lifecycle, retention, and fail-closed
+  // semantics.
+  const idempotencyStore = new IdempotencyStore();
 
-  let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
-
-  function startCleanup(): void {
-    if (cleanupTimer) return;
-    cleanupTimer = setInterval(() => {
-      idempotencyCache.clear();
-    }, windowMs);
-    if (cleanupTimer?.unref) cleanupTimer.unref();
-  }
-
-  function recordIdempotency(req: Request, outcome: "allowed" | "throttled"): void {
-    const idKey = getIdempotencyKey(req);
-    if (!idKey) return;
-    startCleanup();
-    idempotencyCache.set(`${name}:${keyByIp(req)}:${idKey}`, { outcome });
-  }
-
-  return (req: Request, res: Response, next: () => void) => {
+  // express-rate-limit's handler type also carries resetKey/getKey helpers;
+  // forward them so callers that manage keys programmatically keep working.
+  const handler = (async (req: Request, res: Response, next: () => void) => {
     const idKey = getIdempotencyKey(req);
     if (!idKey) {
       baseLimiter(req, res, next);
       return;
     }
 
-    const cacheKey = `${name}:${keyByIp(req)}:${idKey}`;
-    const existing = idempotencyCache.get(cacheKey);
+    // Idempotency scope: limiter name + resolved client IP. This preserves the
+    // previous in-memory identity semantics — the same key from the same
+    // client on the same limiter deduplicates, while unrelated clients (or
+    // routes behind different limiters) can never collide on a key.
+    const route = `${name}:${keyByIp(req)}`;
+    const fingerprint = computeFingerprint(req.body);
 
-    // Known idempotency key: replay the previous outcome without touching the
-    // rate-limit store (no increment, no double-counting).
-    if (existing) {
-      res.setHeader(X_IDEMPOTENT_REPLAYED_HEADER, "true");
-      if (existing.outcome === "throttled") {
-        res.setHeader("Retry-After", retryAfter);
-        res.status(429).json({ error: message });
-        return;
-      }
-      next();
+    let claim: ClaimResult;
+    try {
+      claim = await idempotencyStore.claim(route, idKey, fingerprint);
+    } catch (error) {
+      // FAIL-CLOSED: if we cannot establish whether this key was already
+      // processed, we must not run the downstream operation (it could
+      // double-execute a payment-adjacent side effect). This is separate
+      // from the rate limiter's own fail-open `passOnStoreError` behaviour,
+      // which is unchanged.
+      console.error(`[rate-limit] idempotency claim failed for limiter="${name}"`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res.status(503).json({ error: "Idempotency store unavailable, please retry later." });
       return;
     }
 
-    // Track the outcome produced by the rate limiter.
-    const wrappedNext = () => {
-      recordIdempotency(req, "allowed");
-      next();
-    };
-
-    // Intercept 429 responses from the base limiter's handler.
-    const originalJson = res.json.bind(res);
-    res.json = function (body: unknown) {
-      // The handler calls res.status(429).json(...) only when throttling.
-      // Record the throttled outcome before sending the response.
-      if (res.statusCode === 429) {
-        recordIdempotency(req, "throttled");
+    // Completed with an identical request: replay the stored response without
+    // touching the rate-limit store (no increment, no double-counting).
+    if (claim.outcome === "replay") {
+      res.setHeader(X_IDEMPOTENT_REPLAYED_HEADER, "true");
+      if (claim.statusCode === 429) {
+        res.setHeader(RETRY_AFTER_HEADER, retryAfter);
       }
-      return originalJson(body);
+      res.status(claim.statusCode).json(claim.responseBody);
+      return;
+    }
+
+    // Completed with a materially different request body: never silently
+    // execute the new payload under an old key.
+    if (claim.outcome === "conflict") {
+      res.status(409).json({ error: "Idempotency key already used with a different request body" });
+      return;
+    }
+
+    // Another request currently holds the key (or the store could not
+    // establish a safe state): do not execute.
+    if (claim.outcome === "in_progress") {
+      res.status(409).json({ error: "Request with this idempotency key is already being processed" });
+      return;
+    }
+
+    // This request won the claim — run the base limiter, then the downstream
+    // handler, capturing the response so the record can be completed (or
+    // marked failed when the operation returns a 5xx).
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+    let captured = false;
+
+    const captureResponse = (body: unknown): void => {
+      if (captured) return;
+      captured = true;
+      const statusCode = res.statusCode;
+      // Fire-and-forget: the response is sent immediately; the record write
+      // happens concurrently. If the write fails the record stays
+      // in_progress and expires after the TTL, so a retry within the TTL
+      // receives 409 rather than re-executing — no duplicate downstream
+      // operation can occur.
+      void (async () => {
+        try {
+          if (statusCode >= 500) {
+            await idempotencyStore.fail(route, idKey);
+          } else {
+            await idempotencyStore.complete(route, idKey, statusCode, body ?? {});
+          }
+        } catch (error) {
+          console.error(`[rate-limit] idempotency persistence failed for limiter="${name}"`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })();
     };
 
-    baseLimiter(req, res, wrappedNext);
-  };
+    res.json = ((body: unknown) => {
+      captureResponse(body);
+      return originalJson(body);
+    }) as typeof res.json;
+
+    res.send = ((body: unknown) => {
+      captureResponse(body);
+      return originalSend(body);
+    }) as typeof res.send;
+
+    baseLimiter(req, res, next);
+  }) as RateLimitRequestHandler;
+
+  handler.resetKey = baseLimiter.resetKey.bind(baseLimiter);
+  handler.getKey = baseLimiter.getKey.bind(baseLimiter);
+  return handler;
 }

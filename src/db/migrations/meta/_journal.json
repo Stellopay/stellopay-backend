@@ -50,6 +50,20 @@
       "when": 1785087699130,
       "tag": "0003_slow_sally_floyd",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786000000000,
+      "tag": "0005_idempotency_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786000000001,
+      "tag": "20260820000000_idempotency_key_status",
+      "breakpoints": true
     }
   ]
 }

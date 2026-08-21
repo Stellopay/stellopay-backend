@@ -631,8 +631,10 @@ describe("backward-compatibility contract", () => {
       expect(typeof schema.SCHEMA_COMPATIBILITY_VERSION).toBe("number");
     });
 
-    it("exports exactly 11 tables", () => {
-      expect(schema.SCHEMA_TABLES).toHaveLength(11);
+    it("exports exactly 12 tables", () => {
+      // Matches schema-consistency.test.ts; the `idempotencyKeys` table is the
+      // 12th registered table.
+      expect(schema.SCHEMA_TABLES).toHaveLength(12);
     });
 
     it("SENSITIVE_BILLING_FIELDS contains exactly the expected fields", () => {
@@ -1113,6 +1115,10 @@ describe("migration CLI", () => {
     expect(log).toHaveBeenCalledWith("20240102000000_faulty_blue_blade.sql");
     expect(log).toHaveBeenCalledWith("20240103000000_hard_onslaught.sql");
     expect(log).toHaveBeenCalledWith("20240104000000_schema_check_constraints.sql");
+    expect(log).toHaveBeenCalledWith("0003_slow_sally_floyd.sql");
+    expect(log).toHaveBeenCalledWith("0004_noisy_eternals.sql");
+    expect(log).toHaveBeenCalledWith("0005_idempotency_keys.sql");
+    expect(log).toHaveBeenCalledWith("20260820000000_idempotency_key_status.sql");
     expect(end).toHaveBeenCalledOnce();
   });
 
