@@ -22,7 +22,7 @@ const {
   isNotNullMock,
 } = vi.hoisted(() => {
   const mockState = {
-    sessions: [] as any[],
+    sessions: [] as Record<string, unknown>[],
   };
 
   const schema = {
@@ -39,19 +39,19 @@ const {
     },
   };
 
-  const eqMock = (col: string, val: any) => (row: any) => row[col] === val;
-  const orMock = (...fns: Array<(row: any) => boolean>) => (row: any) => fns.some((fn) => fn(row));
-  const ltMock = (col: string, val: Date) => (row: any) =>
+  const eqMock = (col: string, val: unknown) => (row: Record<string, unknown>) => row[col] === val;
+  const orMock = (...fns: Array<(row: Record<string, unknown>) => boolean>) => (row: Record<string, unknown>) => fns.some((fn) => fn(row));
+  const ltMock = (col: string, val: Date) => (row: Record<string, unknown>) =>
     row[col] instanceof Date ? row[col].getTime() < val.getTime() : false;
-  const isNotNullMock = (col: string) => (row: any) =>
+  const isNotNullMock = (col: string) => (row: Record<string, unknown>) =>
     row[col] !== null && row[col] !== undefined;
 
   const db = {
-    transaction: async (cb: (tx: any) => Promise<any>) => {
+    transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
       return cb(db);
     },
-    insert: (table: any) => ({
-      values: async (data: any) => {
+    insert: (table: unknown) => ({
+      values: async (data: Record<string, unknown>) => {
         mockState.sessions.push({
           ...data,
           revokedAt: data.revokedAt || null,
@@ -63,8 +63,8 @@ const {
     }),
     select: () => {
       const selectChain = {
-        from: (table: any) => selectChain,
-        where: (conditionFn: (row: any) => boolean) => {
+        from: (table: unknown) => selectChain,
+        where: (conditionFn: (row: Record<string, unknown>) => boolean) => {
           selectChain._conditionFn = conditionFn;
           return selectChain;
         },
@@ -73,9 +73,9 @@ const {
           selectChain._limitVal = n;
           return selectChain;
         },
-        _conditionFn: (() => true) as (row: any) => boolean,
+        _conditionFn: (() => true) as (row: Record<string, unknown>) => boolean,
         _limitVal: undefined as number | undefined,
-        then: (resolve: any) => {
+        then: (resolve: (value: unknown) => void) => {
           const filtered = mockState.sessions.filter(selectChain._conditionFn);
           const result =
             selectChain._limitVal !== undefined
@@ -86,9 +86,9 @@ const {
       };
       return selectChain;
     },
-    update: (table: any) => ({
-      set: (updateData: any) => ({
-        where: async (conditionFn: (row: any) => boolean) => {
+    update: (table: unknown) => ({
+      set: (updateData: Record<string, unknown>) => ({
+        where: async (conditionFn: (row: Record<string, unknown>) => boolean) => {
           for (const row of mockState.sessions) {
             if (conditionFn(row)) {
               Object.assign(row, updateData);
@@ -97,11 +97,11 @@ const {
         },
       }),
     }),
-    delete: (table: any) => ({
-      where: (conditionFn: (row: any) => boolean) => ({
-        returning: async (returningFields: any) => {
-          const matching: any[] = [];
-          const remaining: any[] = [];
+    delete: (table: unknown) => ({
+      where: (conditionFn: (row: Record<string, unknown>) => boolean) => ({
+        returning: async (returningFields: Record<string, unknown>) => {
+          const matching: Record<string, unknown>[] = [];
+          const remaining: Record<string, unknown>[] = [];
           for (const row of mockState.sessions) {
             if (conditionFn(row)) {
               matching.push(row);
@@ -111,7 +111,7 @@ const {
           }
           mockState.sessions = remaining;
           return matching.map((row) => {
-            const ret: any = {};
+            const ret: Record<string, unknown> = {};
             for (const key of Object.keys(returningFields)) {
               ret[key] = row[key];
             }
@@ -140,9 +140,9 @@ vi.mock("drizzle-orm", () => ({
   or: orMock,
   lt: ltMock,
   isNotNull: isNotNullMock,
-  isNull: (col: string) => (row: any) => row[col] === null || row[col] === undefined,
-  and: (...fns: Array<(row: any) => boolean>) => (row: any) => fns.every((fn) => fn(row)),
-  inArray: (col: string, values: string[]) => (row: any) => values.includes(row[col]),
+  isNull: (col: string) => (row: Record<string, unknown>) => row[col] === null || row[col] === undefined,
+  and: (...fns: Array<(row: Record<string, unknown>) => boolean>) => (row: Record<string, unknown>) => fns.every((fn) => fn(row)),
+  inArray: (col: string, values: string[]) => (row: Record<string, unknown>) => values.includes(row[col]),
 }));
 
 import {
@@ -859,9 +859,9 @@ describe("sessions", () => {
     const { token } = await createSession("0xRetryRevoke");
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           if (attempts === 1) throw new Error("synthetic transient revoke failure");
           // On the second attempt, fall back to the original mock behaviour so
@@ -894,9 +894,9 @@ describe("sessions", () => {
     const { token } = await createSession("0xExhaustRevoke");
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           throw new Error("synthetic permanent revoke failure");
         },
@@ -989,9 +989,9 @@ describe("sessions", () => {
     const familyId = mockState.sessions[0].familyId;
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           if (attempts === 1) throw new Error("synthetic family retry");
           await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
@@ -1012,9 +1012,9 @@ describe("sessions", () => {
     const { token } = await createSession("0xalladdrretry");
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           if (attempts === 1) throw new Error("synthetic all retry");
           await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
@@ -1041,9 +1041,9 @@ describe("sessions", () => {
 
     const originalDelete = dbMock.delete;
     let attempts = 0;
-    dbMock.delete = (table: any) => ({
-      where: (_cond: any) => ({
-        returning: async (_fields: any) => {
+    dbMock.delete = (table: unknown) => ({
+      where: (_cond: Record<string, unknown>) => ({
+        returning: async (_fields: Record<string, unknown>) => {
           attempts++;
           if (attempts === 1) throw new Error("synthetic sweep retry");
           // Second attempt succeeds with a fixed, deterministic row set.
@@ -1110,8 +1110,8 @@ describe("sessions", () => {
     vi.useRealTimers();
     const originalInsert = dbMock.insert;
     let attempts = 0;
-    dbMock.insert = (table: any) => ({
-      values: async (_data: any) => {
+    dbMock.insert = (table: unknown) => ({
+      values: async (_data: Record<string, unknown>) => {
         attempts++;
         throw new Error("synthetic single-attempt insert");
       },
@@ -1189,9 +1189,9 @@ describe("sessions", () => {
     const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           if (attempts === 1) throw new Error("synthetic hash retry");
           await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
@@ -1214,9 +1214,9 @@ describe("sessions", () => {
     const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           throw new Error("synthetic permanent hash failure");
         },
@@ -1243,9 +1243,9 @@ describe("sessions", () => {
     await createSession("0xAddrRetry");
     const originalUpdate = dbMock.update;
     let attempts = 0;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           attempts++;
           if (attempts === 1) throw new Error("synthetic addr retry");
           await originalUpdate(table).set({ revokedAt: new Date() }).where(_cond);
@@ -1266,9 +1266,9 @@ describe("sessions", () => {
     vi.useRealTimers();
     await createSession("0xAddrExhaust");
     const originalUpdate = dbMock.update;
-    dbMock.update = (table: any) => ({
-      set: (_data: any) => ({
-        where: async (_cond: any) => {
+    dbMock.update = (table: unknown) => ({
+      set: (_data: Record<string, unknown>) => ({
+        where: async (_cond: Record<string, unknown>) => {
           throw new Error("synthetic permanent addr failure");
         },
       }),

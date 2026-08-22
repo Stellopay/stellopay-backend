@@ -57,7 +57,7 @@ function canonical(hexSuffix: string): string {
 let infoSpy: ReturnType<typeof vi.spyOn>;
 
 /** Metric objects emitted during the current test, oldest first. */
-function metrics(): Record<string, any>[] {
+function metrics(): Record<string, unknown>[] {
   return infoSpy.mock.calls
     .map(([line]) => {
       try {
@@ -66,7 +66,7 @@ function metrics(): Record<string, any>[] {
         return null;
       }
     })
-    .filter((entry): entry is Record<string, any> => entry !== null && "metric" in entry);
+    .filter((entry): entry is Record<string, unknown> => entry !== null && "metric" in entry);
 }
 
 function metricNames(): string[] {
@@ -758,7 +758,7 @@ describe("verifyChallenge", () => {
 
     const invalidNonces = [null, undefined, "", "   ", 123, {}];
     for (const badNonce of invalidNonces) {
-      expect(verifyChallenge("0xabcd", badNonce as any)).toBeNull();
+      expect(verifyChallenge("0xabcd", badNonce as never)).toBeNull();
     }
     expect(metrics().every((m) => m.metric === "challenge_verify_miss" && m.reason === "invalid_nonce")).toBe(
       true,
@@ -833,10 +833,10 @@ describe("Nonce Challenge Security and Validation Contract Boundary", () => {
     const invalidTypes = [12345, true, false, {}, { address: "0x1" }, ["0x1"]];
 
     for (const input of invalidTypes) {
-      expect(() => createChallenge(input as any)).toThrow(/parseable Starknet address/);
-      expect(getChallenge(input as any)).toBeNull();
-      expect(consumeChallenge(input as any)).toBeNull();
-      expect(() => buildTypedChallenge(input as any, CHAIN_ID_SEPOLIA, "0xnonce")).toThrow(
+      expect(() => createChallenge(input as never)).toThrow(/parseable Starknet address/);
+      expect(getChallenge(input as never)).toBeNull();
+      expect(consumeChallenge(input as never)).toBeNull();
+      expect(() => buildTypedChallenge(input as never, CHAIN_ID_SEPOLIA, "0xnonce")).toThrow(
         /parseable Starknet address/,
       );
     }
@@ -846,13 +846,13 @@ describe("Nonce Challenge Security and Validation Contract Boundary", () => {
     const invalidInputs = [null, undefined, "", "   ", 123, {}];
 
     for (const badChainId of invalidInputs) {
-      expect(() => buildTypedChallenge(ADDR_CANONICAL, badChainId as any, "0xnonce")).toThrow(
+      expect(() => buildTypedChallenge(ADDR_CANONICAL, badChainId as never, "0xnonce")).toThrow(
         /chainId must be a non-empty string/,
       );
     }
 
     for (const badNonce of invalidInputs) {
-      expect(() => buildTypedChallenge(ADDR_CANONICAL, CHAIN_ID_SEPOLIA, badNonce as any)).toThrow(
+      expect(() => buildTypedChallenge(ADDR_CANONICAL, CHAIN_ID_SEPOLIA, badNonce as never)).toThrow(
         /nonce must be a non-empty string/,
       );
     }
