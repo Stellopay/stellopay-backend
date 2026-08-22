@@ -415,7 +415,11 @@ export const requireAuth = async (
  * @see {@link getPrincipal} — reads req.auth with absent check
  */
 export const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
+  incAuthMetric(AUTH_METRICS.ADMIN_REQUESTS);
+  
   if (res.locals.adminAuthorized) {
+    incAuthMetric(AUTH_METRICS.ADMIN_IDEMPOTENT_HITS);
+    logAuthMiddlewareEvent("debug", "auth.admin.cached");
     next();
     return;
   }

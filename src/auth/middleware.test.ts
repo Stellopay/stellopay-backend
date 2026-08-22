@@ -151,7 +151,7 @@ describe("Auth Middleware", () => {
     });
 
     it("is idempotent: empty req.auth object falls through to header validation", async () => {
-      mockReq.auth = {} as any;
+      mockReq.auth = {} as never;
       mockReq.headers = {
         "x-user-address": "0xuser",
         authorization: "Bearer valid_token",
@@ -330,7 +330,7 @@ describe("Auth Middleware", () => {
     });
 
     it("returns 401 if req.auth is set to a non-object (defensive against runtime shape drift)", () => {
-      mockReq.auth = "malformed" as any;
+      mockReq.auth = "malformed" as never;
       requireAdmin(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
@@ -530,12 +530,12 @@ describe("Auth Middleware", () => {
     });
 
     it("returns null when req.auth is null (defensive against runtime shape drift)", () => {
-      mockReq.auth = null as any;
+      mockReq.auth = null as never;
       expect(getPrincipal(mockReq as Request)).toBeNull();
     });
 
     it("returns null when req.auth.address is null", () => {
-      mockReq.auth = { address: null as any, token: "testtoken" };
+      mockReq.auth = { address: null as never, token: "testtoken" };
       expect(getPrincipal(mockReq as Request)).toBeNull();
     });
 
