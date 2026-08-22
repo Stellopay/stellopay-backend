@@ -8,6 +8,7 @@ import {
   incStarknetMetric,
   labeledStarknetMetric,
   setStarknetGauge,
+  STARKNET_METRICS,
 } from "../starknet/client-metrics.js";
 
 export const backfillEventsRouter = Router();
@@ -85,7 +86,7 @@ async function updateBackfillLag(
       lag,
     );
   } catch {
-    incStarknetMetric("backfill_lag_rpc_errors_total");
+    incStarknetMetric(STARKNET_METRICS.BACKFILL_LAG_RPC_ERRORS);
   }
 }
 
