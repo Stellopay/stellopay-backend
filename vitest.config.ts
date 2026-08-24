@@ -38,6 +38,7 @@ export default defineConfig({
         "scripts/check-env-sync.ts",
         "scripts/lint-migrations.ts",
         "scripts/verify-sbom.ts",
+        "scripts/check-docs-links.ts",
       ],
       thresholds: {
         lines: 95,

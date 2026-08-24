@@ -1,307 +1,416 @@
 /**
- * Link-checking test for docs/ markdown files.
+ * Tests for the docs link checker (scripts/check-docs-links.ts).
  *
- * Walks every `.md` file under `docs/`, extracts all markdown links
- * (`[text](target)`), and verifies that internal links (relative paths or
- * links to other files in the repo) resolve to real files on disk.
- *
- * External URLs (http/https) are collected but not fetched — they are
- * reported as informational only.
+ * Two layers:
+ *  1. Unit tests over exported helpers using temporary fixtures.
+ *  2. Repository integration tests that scan the real docs/ tree and assert
+ *     zero broken internal links (the invariant the CI guard enforces).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import {
+  collectMarkdownFiles,
+  extractLinks,
+  resolveTarget,
+  checkLink,
+  isExternalUrl,
+  isMailto,
+  isFragmentOnly,
+  runCheckDocsLinks,
+  formatReport,
+  type MarkdownLink,
+} from "./check-docs-links.js";
 
 // ---------------------------------------------------------------------------
-// Types
+// Fixture helpers
 // ---------------------------------------------------------------------------
 
-interface MarkdownLink {
-  /** The display text of the link. */
-  text: string;
-  /** The raw target (URL or path). */
-  target: string;
-  /** The file where this link was found (relative to the repo root). */
-  sourceFile: string;
-  /** 1-based line number where the link text starts. */
-  line: number;
+const tmpDirs: string[] = [];
+
+function makeTmpRepo(files: Record<string, string>): { root: string; docsDir: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "docs-links-"));
+  tmpDirs.push(root);
+  const docsDir = path.join(root, "docs");
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content);
+  }
+  return { root, docsDir };
 }
 
-interface BrokenLink {
-  link: MarkdownLink;
-  reason: string;
-}
-
-interface CheckResult {
-  /** Absolute path to the scanned file. */
-  filePath: string;
-  /** Links found in the file. */
-  links: MarkdownLink[];
-  /** Links whose targets could not be resolved. */
-  brokenLinks: BrokenLink[];
-}
+afterEach(() => {
+  for (const dir of tmpDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // ---------------------------------------------------------------------------
-// Helpers
+// CLI (proves the exit-code contract the CI guard relies on)
 // ---------------------------------------------------------------------------
 
-const REPO_ROOT = path.resolve(import.meta.dirname, "..");
-const DOCS_DIR = path.join(REPO_ROOT, "docs");
+describe("check-docs-links CLI", () => {
+  const scriptPath = path.resolve(import.meta.dirname, "check-docs-links.ts");
+  const tsxBin = path.resolve(import.meta.dirname, "../node_modules/.bin/tsx");
 
-/**
- * Recursively lists all `.md` files under `dir`.
- */
-function collectMarkdownFiles(dir: string): string[] {
-  const results: string[] = [];
+  /** Runs the module's top-level CLI block in-process with a forged argv. */
+  async function runCliInProcess(cliArgs: string[]): Promise<{
+    exitCode: number | undefined;
+    stdout: string;
+    stderr: string;
+  }> {
+    vi.resetModules();
+    const captured = { exitCode: undefined as number | undefined, stdout: "", stderr: "" };
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      captured.exitCode = code;
+      return undefined as never;
+    }) as typeof process.exit);
+    const logSpy = vi.spyOn(console, "log").mockImplementation((msg: string) => {
+      captured.stdout += msg;
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation((msg: string) => {
+      captured.stderr += msg;
+    });
 
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      results.push(...collectMarkdownFiles(fullPath));
-    } else if (entry.isFile() && entry.name.endsWith(".md")) {
-      results.push(fullPath);
+    const prevArgv = process.argv;
+    process.argv = [prevArgv[0] ?? "node", scriptPath, ...cliArgs];
+    try {
+      await import("./check-docs-links.js");
+    } finally {
+      process.argv = prevArgv;
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+      errSpy.mockRestore();
     }
+    return captured;
   }
 
-  return results;
-}
+  it("exits 0 and prints a success report when all links resolve (in-process)", async () => {
+    const { root, docsDir } = makeTmpRepo({
+      "docs/a.md": "[ok](./b.md)",
+      "docs/b.md": "",
+    });
 
-/**
- * Regex that matches CommonMark inline links: `[text](target)`.
- *
- * It handles:
- *  - basic links: [label](url)
- *  - links with titles: [label](url "title")
- *  - reference-style links are NOT matched (handled separately below).
- *  - escaped brackets within the text part.
- *
- * Reference: https://spec.commonmark.org/0.30/#links
- */
-const INLINE_LINK_RE = /(?<!!)\[([^\]]*?)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/g;
+    const result = await runCliInProcess(["--docs", docsDir]);
 
-/**
- * Regex matching reference-style link definitions:
- *   [ref]: target "optional title"
- */
-const REF_DEF_RE = /^\[([^\]]+)\]:\s*(\S+)(?:\s+"[^"]*")?\s*$/gm;
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("✓ All internal documentation links resolve.");
+  });
+  it("exits 1 and reports broken links to stderr when a link is broken (in-process)", async () => {
+    const { root } = makeTmpRepo({
+      "docs/a.md": "[ghost](./missing.md)",
+    });
 
-/**
- * Regex matching inline reference links: [text][ref] or [text][]
- */
-const REF_LINK_RE = /(?<!!)\[([^\]]+)\](?!\s*\()(?:\s*\[([^\]]*)\])?/g;
+    const result = await runCliInProcess(["--docs", path.join(root, "docs")]);
 
-/**
- * Escape regex-sensitive characters in a string.
- */
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("Found 1 broken internal link(s)");
+    expect(result.stderr).toContain("./missing.md");
+  });
 
-/**
- * Extract all markdown links (inline + reference-style) from a file.
- */
-function extractLinks(filePath: string): MarkdownLink[] {
-  const content = fs.readFileSync(filePath, "utf-8");
-  const lines = content.split("\n");
-  const sourceFile = path.relative(REPO_ROOT, filePath);
-  const links: MarkdownLink[] = [];
+  it("exits 0 and prints a success report when all links resolve (spawned tsx)", () => {
+    const { root, docsDir } = makeTmpRepo({
+      "docs/a.md": "[ok](./b.md)",
+      "docs/b.md": "",
+    });
 
-  // --- Pass 1: Inline links [text](target) ---
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    let match: RegExpExecArray | null;
-    INLINE_LINK_RE.lastIndex = 0;
+    const proc = spawnSync(tsxBin, [scriptPath, "--docs", docsDir], {
+      encoding: "utf-8",
+      cwd: root,
+    });
 
-    while ((match = INLINE_LINK_RE.exec(line)) !== null) {
-      const text = match[1] ?? "";
-      const target = match[2] ?? "";
+    expect(proc.status).toBe(0);
+    expect(proc.stdout).toContain("✓ All internal documentation links resolve.");
+  });
 
-      // Skip empty targets and fragment-only links (same-page anchors).
-      if (!target) continue;
+  it("exits 1 and reports broken links to stderr when a link is broken (spawned tsx)", () => {
+    const { root, docsDir } = makeTmpRepo({
+      "docs/a.md": "[ghost](./missing.md)",
+    });
 
-      links.push({ text, target, sourceFile, line: i + 1 });
-    }
-  }
+    const proc = spawnSync(tsxBin, [scriptPath, "--docs", docsDir], {
+      encoding: "utf-8",
+      cwd: root,
+    });
 
-  // --- Pass 2: Reference definitions [ref]: target ---
-  const refDefinitions = new Map<string, string>();
-  REF_DEF_RE.lastIndex = 0;
-  let defMatch: RegExpExecArray | null;
-  while ((defMatch = REF_DEF_RE.exec(content)) !== null) {
-    refDefinitions.set(defMatch[1]!.toLowerCase(), defMatch[2]!);
-  }
-
-  // --- Pass 3: Reference links [text][ref] or [text][] ---
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    REF_LINK_RE.lastIndex = 0;
-    let refMatch: RegExpExecArray | null;
-
-    while ((refMatch = REF_LINK_RE.exec(line)) !== null) {
-      const text = refMatch[1] ?? "";
-      const refKey = (refMatch[2] || text).toLowerCase();
-      const target = refDefinitions.get(refKey);
-
-      // Skip unresolved refs (could be defined in another file — out of scope).
-      if (!target) continue;
-
-      links.push({ text, target, sourceFile, line: i + 1 });
-    }
-  }
-
-  return links;
-}
-
-/**
- * Returns `true` when `target` is an external URL (http/https).
- */
-function isExternalUrl(target: string): boolean {
-  return /^https?:\/\//i.test(target);
-}
-
-/**
- * Returns `true` when `target` is a mailto: link.
- */
-function isMailto(target: string): boolean {
-  return /^mailto:/i.test(target);
-}
-
-/**
- * Returns `true` when `target` is a fragment-only link (`#section`).
- */
-function isFragmentOnly(target: string): boolean {
-  return target.startsWith("#");
-}
-
-/**
- * Given a link target found in `sourceFile`, resolve it to an absolute path.
- * Returns the resolved path or `null` if the target cannot be resolved.
- *
- * Resolution rules:
- *  - External URLs → null (skip validation)
- *  - `mailto:` links → null (skip validation)
- *  - Fragment-only → resolved to the source file itself
- *  - Absolute paths (starting with `/`) → resolved from REPO_ROOT
- *  - Relative paths → resolved relative to the source file's directory
- *  - Targets with `#fragment` → fragment stripped before file resolution
- */
-function resolveTarget(target: string, sourceFile: string): string | null {
-  if (isExternalUrl(target) || isMailto(target)) return null;
-
-  if (isFragmentOnly(target)) {
-    return path.resolve(REPO_ROOT, sourceFile);
-  }
-
-  // Strip fragment for file resolution.
-  const hashIdx = target.indexOf("#");
-  const filePart = hashIdx >= 0 ? target.slice(0, hashIdx) : target;
-
-  // Empty file part with a fragment (e.g. "#section") → same file.
-  if (!filePart) {
-    return path.resolve(REPO_ROOT, sourceFile);
-  }
-
-  if (filePart.startsWith("/")) {
-    return path.resolve(REPO_ROOT, "." + filePart);
-  }
-
-  return path.resolve(path.dirname(path.join(REPO_ROOT, sourceFile)), filePart);
-}
-
-/**
- * Check a single link target for validity.
- * Returns `null` if the link is valid, or a `BrokenLink` if broken.
- */
-function checkLink(link: MarkdownLink): BrokenLink | null {
-  const resolved = resolveTarget(link.target, link.sourceFile);
-
-  // External URLs and mailto: links are skipped.
-  if (resolved === null) return null;
-
-  // Check that the resolved path stays within the repo (no traversal escape).
-  if (!resolved.startsWith(REPO_ROOT + path.sep) && resolved !== REPO_ROOT) {
-    return { link, reason: `target resolves outside repo: ${resolved}` };
-  }
-
-  // Check that the target file exists.
-  if (!fs.existsSync(resolved)) {
-    return { link, reason: `target not found: ${link.target} → ${resolved}` };
-  }
-
-  return null;
-}
+    expect(proc.status).toBe(1);
+    expect(proc.stderr).toContain("Found 1 broken internal link(s)");
+    expect(proc.stderr).toContain("./missing.md");
+  });
+});
 
 // ---------------------------------------------------------------------------
-// Tests
+// Unit tests
+// ---------------------------------------------------------------------------
+
+describe("collectMarkdownFiles", () => {
+  it("recursively collects .md files and ignores other extensions", () => {
+    const { docsDir } = makeTmpRepo({
+      "docs/a.md": "# A",
+      "docs/sub/b.md": "# B",
+      "docs/c.txt": "not markdown",
+      "docs/d.json": "{}",
+    });
+
+    const files = collectMarkdownFiles(docsDir)
+      .map((f) => path.basename(f))
+      .sort();
+    expect(files).toEqual(["a.md", "b.md"]);
+  });
+});
+
+describe("extractLinks", () => {
+  it("extracts inline links with line numbers", () => {
+    const { docsDir } = makeTmpRepo({
+      "docs/a.md": ["intro", "[guide](./sub/b.md)", "", '[titled](./x.md "the title")'].join("\n"),
+      "docs/x.md": "",
+      "docs/sub/b.md": "",
+    });
+
+    const links = extractLinks(path.join(docsDir, "a.md"));
+    expect(links).toHaveLength(2);
+    expect(links[0]).toMatchObject({ text: "guide", target: "./sub/b.md", line: 2 });
+    expect(links[1]).toMatchObject({ text: "titled", target: "./x.md", line: 4 });
+  });
+
+  it("extracts reference-style links via their definitions", () => {
+    const { docsDir } = makeTmpRepo({
+      "docs/a.md": [
+        "See the [guide][ref-one] and the [other][] .",
+        "",
+        "[ref-one]: ./b.md",
+        "[other]: ./c.md",
+      ].join("\n"),
+      "docs/b.md": "",
+      "docs/c.md": "",
+    });
+
+    const links = extractLinks(path.join(docsDir, "a.md"));
+    // Usage sites plus the reference definitions themselves (the definitions
+    // also match the reference-link pattern — pre-existing extractor behavior).
+    expect(links).toHaveLength(4);
+    expect(links.filter((l) => l.text === "guide")[0]).toMatchObject({ target: "./b.md", line: 1 });
+    expect(links.filter((l) => l.text === "other")[0]).toMatchObject({ target: "./c.md", line: 1 });
+  });
+
+  it("does not treat images as links and skips unresolved refs", () => {
+    const { docsDir } = makeTmpRepo({
+      "docs/a.md": ["![alt](./img.png)", "[dangling][nowhere]"].join("\n"),
+    });
+
+    const links = extractLinks(path.join(docsDir, "a.md"));
+    expect(links).toHaveLength(0);
+  });
+});
+
+describe("target classification helpers", () => {
+  it("classifies external URLs, mailto and fragments", () => {
+    expect(isExternalUrl("https://example.com")).toBe(true);
+    expect(isExternalUrl("http://example.com")).toBe(true);
+    expect(isExternalUrl("./local.md")).toBe(false);
+    expect(isMailto("mailto:a@b.c")).toBe(true);
+    expect(isMailto("./local.md")).toBe(false);
+    expect(isFragmentOnly("#section")).toBe(true);
+    expect(isFragmentOnly("./file.md#section")).toBe(false);
+  });
+});
+
+describe("resolveTarget", () => {
+  const repoRoot = path.resolve("/fake-repo");
+
+  it("returns null for external URLs and mailto links", () => {
+    expect(resolveTarget("https://example.com", "docs/a.md", repoRoot)).toBeNull();
+    expect(resolveTarget("mailto:a@b.c", "docs/a.md", repoRoot)).toBeNull();
+  });
+
+  it("resolves fragment-only links to the source file", () => {
+    expect(resolveTarget("#section", "docs/a.md", repoRoot)).toBe(
+      path.resolve(repoRoot, "docs/a.md"),
+    );
+  });
+
+  it("strips fragments before resolving files", () => {
+    expect(resolveTarget("b.md#section", "docs/a.md", repoRoot)).toBe(
+      path.resolve(repoRoot, "docs/b.md"),
+    );
+  });
+
+  it("resolves absolute paths against the repo root", () => {
+    expect(resolveTarget("/src/config.ts", "docs/a.md", repoRoot)).toBe(
+      path.resolve(repoRoot, "src/config.ts"),
+    );
+  });
+
+  it("resolves relative paths against the source file directory", () => {
+    expect(resolveTarget("./sibling.md", "docs/sub/a.md", repoRoot)).toBe(
+      path.resolve(repoRoot, "docs/sub/sibling.md"),
+    );
+    expect(resolveTarget("../../src/index.ts", "docs/sub/a.md", repoRoot)).toBe(
+      path.resolve(repoRoot, "src/index.ts"),
+    );
+  });
+});
+
+describe("checkLink", () => {
+  const repoRoot = "/tmp-fake-repo-root";
+
+  const link = (overrides: Partial<MarkdownLink>): MarkdownLink => ({
+    text: "label",
+    target: "./missing.md",
+    sourceFile: "docs/a.md",
+    line: 1,
+    ...overrides,
+  });
+
+  it("returns null for external and mailto targets", () => {
+    expect(checkLink(link({ target: "https://x.y" }), repoRoot)).toBeNull();
+    expect(checkLink(link({ target: "mailto:x@y.z" }), repoRoot)).toBeNull();
+  });
+
+  it("flags targets resolving outside the repo", () => {
+    const result = checkLink(link({ target: "../../outside.md" }), repoRoot);
+    expect(result?.reason).toContain("outside repo");
+  });
+
+  it("flags missing targets", () => {
+    // Resolve inside a real directory but to a non-existent file.
+    const existingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "docs-links-missing-"));
+    try {
+      const result = checkLink(link({ target: "./nope.md" }), existingRoot);
+      expect(result?.reason).toContain("target not found");
+      expect(result?.link.target).toBe("./nope.md");
+    } finally {
+      fs.rmSync(existingRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null for a valid internal target", () => {
+    const existingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "docs-links-valid-"));
+    try {
+      fs.mkdirSync(path.join(existingRoot, "docs"), { recursive: true });
+      fs.writeFileSync(path.join(existingRoot, "docs", "real.md"), "x");
+      const result = checkLink(link({ target: "./real.md" }), existingRoot);
+      expect(result).toBeNull();
+    } finally {
+      fs.rmSync(existingRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Orchestration & reporting
+// ---------------------------------------------------------------------------
+
+describe("runCheckDocsLinks", () => {
+  it("aggregates counts and broken links across the tree", async () => {
+    const { root, docsDir } = await Promise.resolve(
+      makeTmpRepo({
+        "docs/README.md": [
+          "Start: [install](./setup.md)",
+          "External: [site](https://example.com)",
+          "Mail: [mail](mailto:team@example.com)",
+          "Broken: [ghost](./ghost.md)",
+        ].join("\n"),
+        "docs/setup.md": "Back: [home](README.md)",
+      }),
+    );
+
+    const result = runCheckDocsLinks(docsDir, root);
+
+    expect(result.filesChecked).toBe(2);
+    expect(result.totalLinks).toBe(5);
+    expect(result.internalLinks).toBe(3);
+    expect(result.externalLinks).toBe(2); // https + mailto
+    expect(result.brokenLinks).toHaveLength(1);
+    expect(result.brokenLinks[0]?.link.target).toBe("./ghost.md");
+    expect(result.brokenLinks[0]?.reason).toContain("target not found");
+  });
+
+  it("handles a missing docs directory gracefully", () => {
+    const result = runCheckDocsLinks("/nonexistent-docs-dir");
+    expect(result.filesChecked).toBe(0);
+    expect(result.brokenLinks).toHaveLength(0);
+  });
+});
+
+describe("formatReport", () => {
+  it("formats a success report", () => {
+    const output = formatReport({
+      filesChecked: 3,
+      totalLinks: 10,
+      internalLinks: 7,
+      externalLinks: 3,
+      brokenLinks: [],
+    });
+    expect(output).toContain("Checked 3 markdown file(s)");
+    expect(output).toContain("✓ All internal documentation links resolve.");
+  });
+
+  it("formats a failure report with file:line detail", () => {
+    const output = formatReport({
+      filesChecked: 3,
+      totalLinks: 10,
+      internalLinks: 7,
+      externalLinks: 3,
+      brokenLinks: [
+        {
+          link: { text: "ghost", target: "./ghost.md", sourceFile: "docs/a.md", line: 4 },
+          reason: "target not found: ./ghost.md → /repo/docs/ghost.md",
+        },
+      ],
+    });
+    expect(output).toContain("❌ Found 1 broken internal link(s)");
+    expect(output).toContain("docs/a.md:4 → [ghost](./ghost.md)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repository integration (what CI enforces)
 // ---------------------------------------------------------------------------
 
 describe("docs/ markdown link integrity", () => {
-  const mdFiles = collectMarkdownFiles(DOCS_DIR);
+  const result = runCheckDocsLinks();
 
-  if (mdFiles.length === 0) {
+  if (result.filesChecked === 0) {
     // In a real checkout this should never happen, but handle gracefully.
     it("no markdown files found under docs/", () => {
-      // This is a legitimate pass condition — nothing to validate.
-      expect(mdFiles).toHaveLength(0);
+      expect(result.filesChecked).toBe(0);
     });
     return;
   }
 
-  const allResults: CheckResult[] = [];
-
-  for (const filePath of mdFiles) {
-    const links = extractLinks(filePath);
-    const brokenLinks: BrokenLink[] = [];
-
-    for (const link of links) {
-      const broken = checkLink(link);
-      if (broken) brokenLinks.push(broken);
-    }
-
-    allResults.push({ filePath, links, brokenLinks });
-  }
-
   // Test 1: every doc file is covered by at least one check
   it("covers every .md file under docs/", () => {
-    expect(allResults.length).toBeGreaterThanOrEqual(1);
+    expect(result.filesChecked).toBeGreaterThanOrEqual(1);
   });
 
   // Test 2: no broken internal links
   it("has zero broken internal links", () => {
-    const allBroken: BrokenLink[] = [];
-    for (const result of allResults) {
-      allBroken.push(...result.brokenLinks);
-    }
-
-    const report = allBroken
+    const report = result.brokenLinks
       .map(
         (b) =>
           `  ${b.link.sourceFile}:${b.link.line} → [${b.link.text}](${b.link.target}): ${b.reason}`,
       )
       .join("\n");
 
-    expect(allBroken, `Found ${allBroken.length} broken link(s):\n${report}`).toHaveLength(0);
+    expect(
+      result.brokenLinks,
+      `Found ${result.brokenLinks.length} broken link(s):\n${report}`,
+    ).toHaveLength(0);
   });
 
   // Test 3: informational — report external link count
   it("reports external link summary (informational)", () => {
-    let totalLinks = 0;
-    let externalLinks = 0;
-    let internalLinks = 0;
-
-    for (const result of allResults) {
-      for (const link of result.links) {
-        totalLinks++;
-        if (isExternalUrl(link.target) || isMailto(link.target)) {
-          externalLinks++;
-        } else {
-          internalLinks++;
-        }
-      }
-    }
-
     // This assertion always passes; it's here to surface the counts in test output.
-    expect({ totalLinks, internalLinks, externalLinks }).toBeDefined();
+    expect({
+      totalLinks: result.totalLinks,
+      internalLinks: result.internalLinks,
+      externalLinks: result.externalLinks,
+    }).toBeDefined();
   });
 });
