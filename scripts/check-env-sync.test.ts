@@ -34,6 +34,48 @@ describe("check-env-sync", () => {
       const keys = extractConfigEnvKeys(code);
       expect(keys).toEqual([]);
     });
+
+    it("extracts keys when z.object is chained with superRefine (as in src/config.ts)", () => {
+      const code = `
+        import { z } from "zod";
+        export const EnvSchema = z
+          .object({
+            VAR_ONE: z.string(),
+            VAR_TWO: z.number().default(42),
+          })
+          .superRefine((data, ctx) => {
+            if (!data.VAR_ONE) {
+              ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["VAR_ONE"] });
+            }
+          });
+      `;
+      const keys = extractConfigEnvKeys(code);
+      expect(keys).toEqual(["VAR_ONE", "VAR_TWO"]);
+    });
+
+    it("extracts keys from a multi-step builder chain", () => {
+      const code = `
+        import { z } from "zod";
+        export const EnvSchema = z
+          .object({ VAR_ONE: z.string() })
+          .refine(() => true)
+          .transform((v) => v);
+      `;
+      expect(extractConfigEnvKeys(code)).toEqual(["VAR_ONE"]);
+    });
+
+    it("deduplicates keys redeclared in the object literal, keeping first-occurrence order", () => {
+      const code = `
+        import { z } from "zod";
+        export const EnvSchema = z.object({
+          VAR_ONE: z.string().optional(),
+          VAR_TWO: z.string().optional(),
+          VAR_ONE: z.string().optional().default("x"),
+        });
+      `;
+      const keys = extractConfigEnvKeys(code);
+      expect(keys).toEqual(["VAR_ONE", "VAR_TWO"]);
+    });
   });
 
   describe("extractExampleEnvKeys", () => {

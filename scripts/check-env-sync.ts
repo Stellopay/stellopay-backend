@@ -20,17 +20,41 @@ export function extractConfigEnvKeys(fileContent: string): string[] {
   const sourceFile = ts.createSourceFile("config.ts", fileContent, ts.ScriptTarget.Latest, true);
   const keys: string[] = [];
 
+  /**
+   * Finds the schema's object literal from a call expression initializer.
+   *
+   * Handles chained builders — e.g. `z.object({ ... }).superRefine(...)` or
+   * `z.object({ ... }).refine(...).transform(...)` — by walking down the
+   * member-expression chain when the call's own first argument is not the
+   * object literal (for `.superRefine(fn)` the argument is a function).
+   */
+  function findSchemaObjectLiteral(node: ts.Expression): ts.ObjectLiteralExpression | undefined {
+    if (!ts.isCallExpression(node) || node.arguments.length === 0) {
+      return undefined;
+    }
+
+    const firstArg = node.arguments[0];
+    if (ts.isObjectLiteralExpression(firstArg)) {
+      return firstArg;
+    }
+
+    // z.object({...}).superRefine(...) → recurse into `z.object({...})`.
+    if (ts.isPropertyAccessExpression(node.expression)) {
+      return findSchemaObjectLiteral(node.expression.expression);
+    }
+
+    return undefined;
+  }
+
   function visit(node: ts.Node) {
     if (
       ts.isVariableDeclaration(node) &&
       ts.isIdentifier(node.name) &&
       node.name.text === "EnvSchema" &&
-      node.initializer &&
-      ts.isCallExpression(node.initializer)
+      node.initializer
     ) {
-      const call = node.initializer;
-      if (call.arguments.length > 0 && ts.isObjectLiteralExpression(call.arguments[0])) {
-        const obj = call.arguments[0];
+      const obj = findSchemaObjectLiteral(node.initializer);
+      if (obj) {
         for (const prop of obj.properties) {
           if (ts.isPropertyAssignment(prop) || ts.isShorthandPropertyAssignment(prop)) {
             if (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) {
@@ -44,7 +68,11 @@ export function extractConfigEnvKeys(fileContent: string): string[] {
   }
 
   visit(sourceFile);
-  return keys;
+
+  // The schema may declare a key more than once (a duplicate property in the
+  // object literal). Zod keeps the last value but lists each key once, in
+  // first-occurrence order — mirror that so key sets compare cleanly.
+  return [...new Set(keys)];
 }
 
 /**
