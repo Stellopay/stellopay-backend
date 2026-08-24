@@ -338,6 +338,32 @@ npx @cyclonedx/cyclonedx-npm --spec-version 1.5 --output-format JSON --output-fi
 pnpm tsx scripts/verify-sbom.ts bom.json
 ```
 
+#### Repository guards
+
+Three standalone guard scripts run in a dedicated `guards` job on every pull
+request and every push to `main`. They only need `pnpm install` plus `tsx` —
+they do not depend on `tsc` or the test suite — so they keep working even while
+the main build pipeline is being repaired. Each can also be run locally:
+
+```bash
+pnpm check:env         # scripts/check-env-sync.ts
+pnpm check:migrations  # scripts/lint-migrations.ts
+pnpm check:docs        # scripts/check-docs-links.ts
+```
+
+| Guard | What it enforces | Status |
+| --- | --- | --- |
+| `check:env` | Every variable in the `EnvSchema` (`src/config.ts`) has a documented entry in `env.example`, and vice versa — the environment contract cannot drift silently. | **Blocking** |
+| `check:docs` | Every internal link in `docs/*.md` resolves to a real file in the repository. External URLs are counted but never fetched. | **Blocking** |
+| `check:migrations` | Migration filenames follow the timestamp-prefix convention (`13–14` digits + `_` + name, e.g. `20240101123000_add_users.sql`). | **Advisory** until the pre-existing misnamed migrations are renamed (separate migration-hygiene issue); flips to blocking afterwards. |
+
+Rationale: `check:env` and `check:docs` block because the tree is currently
+clean against them and they validate exact, deterministic properties (key-set
+equality; file existence) with effectively zero false-positive risk. A blocking
+guard on a dirty tree gets disabled rather than respected, which is why
+`check:migrations` starts advisory — its findings stay visible in every CI run —
+and becomes blocking as soon as the backlog it reports is fixed.
+
 #### Push / PR job (`test`)
 
 Runs on every push and pull request targeting `main`, and on manual dispatch. It:
