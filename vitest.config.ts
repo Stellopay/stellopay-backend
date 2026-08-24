@@ -13,6 +13,7 @@ export default defineConfig({
       CORS_ORIGIN: "http://localhost:3000",
       STARKNET_RPC_URL: "https://starknet-sepolia.public.invalid/rpc",
       POSTGRES_CONNECTION_STRING: "postgresql://postgres:postgres@localhost:5432/stellopay_indexer",
+      LOG_REDACT_QUERY_PARAMS: "token,signature,secret",
     },
     coverage: {
       provider: "v8",
@@ -21,6 +22,7 @@ export default defineConfig({
       // coverage of the DB/RPC-bound routes is a larger follow-up.
       include: [
         "src/utils/codec.ts",
+        "src/auth/lockout.ts",
         "src/auth/session.ts",
         "src/auth/challenge.ts",
         "src/config.ts",

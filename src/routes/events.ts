@@ -1031,26 +1031,6 @@ eventsRouter.post(
 );
 
 
-    // Stats are derived from the unique (deduplicated) results so a hash that
-    // was submitted more than once contributes to the summary exactly once –
-    // otherwise repeated deliveries of the same tx within a batch would look
-    // like independent units of work. `duplicates` accounts for the rest of
-    // `total`: total === processed + noEvents + notFound + errors + duplicates.
-    const uniqueResults = Array.from(resultsByNormalizedHash.values());
-    const errorsCount = uniqueResults.filter((r) => r.status === "error").length;
-    const totalProcessed = uniqueResults.reduce((sum, r) => sum + r.eventsProcessed, 0);
-
-    // Fan-out delivery resilience: return 207 Multi-Status if there were errors, 
-    // signalling partial success to webhook callers so they can retry.
-    res.status(errorsCount > 0 ? 207 : 200).json({
-      summary: {
-        total: results.length,
-        processed: uniqueResults.filter((r) => r.status === "processed").length,
-        noEvents: uniqueResults.filter((r) => r.status === "no_events").length,
-        notFound: uniqueResults.filter((r) => r.status === "not_found").length,
-        errors: errorsCount,
-        duplicates,
-        totalEventsProcessed: totalProcessed,
 /**
  * Parse an `eventType` query parameter into a clean array of event type strings.
  * Supports single strings ("AgreementCreated"), comma-separated values
@@ -1246,9 +1226,6 @@ eventsRouter.get("/events", async (req, res, next) => {
       offset,
     });
   } catch (e) {
-    // Envelope validation resilience: standard 400 for structural errors
-    if (e instanceof z.ZodError) {
-      res.status(400).json({ error: "Invalid request envelope" });
     console.error("[events] GET /events failed", e);
     if (e instanceof z.ZodError) {
       res.status(400).json({

@@ -917,6 +917,55 @@ This prevents:
 - Spam campaigns targeting the contact form
 - Brute force attacks on authentication endpoints
 
+#### Account Lockout & multi-instance deployment
+
+Failed authentication attempts are tracked per wallet address. After
+`MAX_FAILURES = 5` consecutive failures (`src/auth/lockout.ts`), the address is
+locked out for `LOCKOUT_MS = 15 minutes`. Lockout state is stored in a pluggable
+`LockoutStore` with two implementations:
+
+| Store | When to use | Survives restart | Shared across replicas |
+| --- | --- | --- | --- |
+| `InMemoryLockoutStore` (default) | Single-instance or tests | No | No |
+| `RedisLockoutStore` | Multi-instance production | Yes | Yes |
+
+**Multi-instance deployments must provision Redis.** Set `REDIS_URL` to a
+Redis instance reachable by all replicas. When `REDIS_URL` is set, the
+application automatically uses `RedisLockoutStore` for both rate limiting
+and account lockout. Without Redis, each replica keeps its own in-memory
+counter, which means an attacker spreading attempts across N replicas gets
+N× the allowed attempts before any single instance sees a lockout.
+
+**Fail-open policy.** When Redis is unavailable (outage, timeout, connection
+refused), the lockout store **fails open**: `isLockedOut()` returns `false`
+and write failures are silently absorbed. This matches the rate limiter's
+existing fail-open precedent (`passOnStoreError: true` in
+`src/middleware/rate-limit.ts:180–186`). The rationale:
+
+1. **Consistency** — operators already expect degraded-to-open on Redis
+   failure from the rate limiter.
+2. **Worst case is unchanged** — without Redis, every instance already fails
+   open (each has its own in-memory counter). Failing open during a Redis
+   outage is no worse than the status quo.
+3. **Availability** — credential-guessing protection is a defence-in-depth
+   control, not the sole authentication gate. The cryptographic signature
+   challenge remains strong regardless.
+
+**Bounded growth.** `InMemoryLockoutStore` entries expire after `LOCKOUT_MS`
+via lazy TTL-based eviction (verified by tests). `RedisLockoutStore` keys
+expire natively via Redis `PX` (millisecond TTL). Neither store grows
+without limit.
+
+**Operational requirement for multi-instance:**
+
+```bash
+# In your .env or orchestration config
+REDIS_URL=redis://your-redis-host:6379
+```
+
+No schema migration is needed. Keys are prefixed `lockout:` and use JSON
+serialization with millisecond TTL.
+
 #### Proxy Configuration
 
 For deployments behind a reverse proxy or CDN (nginx, Cloudflare, AWS ALB, etc.):

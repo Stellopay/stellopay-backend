@@ -182,7 +182,7 @@ authRouter.post("/auth/verify", async (req, res, next) => {
   try {
     const { address, signature } = VerifyBody.parse(req.body);
 
-    if (isLockedOut(address)) {
+    if (await isLockedOut(address)) {
       incAuthMetric(AUTH_METRICS.VERIFY_LOCKED_OUT);
       logAuthEvent("warn", "auth.verify.locked_out", {
         address: address.toLowerCase(),
@@ -211,7 +211,7 @@ authRouter.post("/auth/verify", async (req, res, next) => {
 
     const ok = await provider.verifyMessageInStarknet(typedData, signature as any, address);
     if (!ok) {
-      recordFailure(address);
+      await recordFailure(address);
       incAuthMetric(AUTH_METRICS.VERIFY_SIGNATURE_INVALID);
       logAuthEvent("warn", "auth.verify.signature_invalid", {
         address: address.toLowerCase(),
@@ -220,7 +220,7 @@ authRouter.post("/auth/verify", async (req, res, next) => {
       return;
     }
 
-    clearFailures(address);
+    await clearFailures(address);
     try {
       const session = await createSession(address);
       res.json({

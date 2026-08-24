@@ -237,6 +237,15 @@ signature — short-circuit before the RPC provider is called and return
 `401 Invalid signature or account locked`. A successful verify
 (`clearFailures`) deletes the lockout record outright.
 
+#### Shared state
+
+Lockout state is backed by a pluggable `LockoutStore` interface. In-memory
+backing (default) is suitable for single-instance deployments. For
+multi-instance deployments behind a load balancer, set `REDIS_URL` to
+enable `RedisLockoutStore` so all replicas share the same failure counters
+and lockout windows. See "Account Lockout & multi-instance deployment" in
+the project README for fail-open semantics and operational details.
+
 ---
 
 ## 3. `POST /auth/session/validate`

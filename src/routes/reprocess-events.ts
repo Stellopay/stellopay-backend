@@ -58,8 +58,6 @@ const statusChangeQuarantine = new Set<string>();
  * on subsequent calls to avoid endless spinning on unparseable events.
  */
 export const MAX_RETRIES = 3;
-export const statusChangeRetryCounts = new Map<string, number>();
-export const statusChangeQuarantine = new Set<string>();
 
 /**
  * Reset in‑memory status-change retry and quarantine state. Exported for tests.
@@ -197,19 +195,6 @@ const StatusChangesQuerySchema = z.object({
 // ABI functions are imported from events.ts (single source of truth).
 // The lazy‑loaded ABIs are shared across routes to avoid duplicate I/O.
 
-/** In-memory map tracking retry attempts per event ID for status-changes processing. */
-const statusChangeRetryCounts = new Map<string, number>();
-
-/** In-memory set of quarantined event IDs for status-changes processing. */
-const statusChangeQuarantine = new Set<string>();
-
-/**
- * Reset in-memory retry counts for status-changes. Exported for tests.
- */
-export function __resetStatusChangeRetryCounts() {
-  statusChangeRetryCounts.clear();
-}
-
 function getFirstZodErrorMessage(error: z.ZodError): string {
   return error.issues?.[0]?.message ?? error.message ?? "Validation failed";
 }
@@ -231,26 +216,6 @@ function getFirstZodErrorMessage(error: z.ZodError): string {
  * Returns `{ message, result }` where `result` is the shared
  * {@link processTxReceipt} result shape (`TxProcessResult`).
  */
-export function __resetStatusChangeQuarantine() {
-  statusChangeQuarantine.clear();
-}
-
-/**
- * Log reprocessing telemetry for status-changes.
- */
-function logReprocess(level: string, operation: string, data: Record<string, unknown>): void {
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    level,
-    operation,
-    ...data,
-  };
-  if (level === "error") {
-    console.error(JSON.stringify(logEntry));
-  } else {
-    console.log(JSON.stringify(logEntry));
-  }
-}
 
 /**
  * Handle a failure during status-changes reprocessing.

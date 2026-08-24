@@ -526,30 +526,8 @@ function parseEventTypes(req: {
   return parsed.length > 0 ? parsed : null;
 }
 
-/** Parses optional startDate/from and endDate/to from the query string. */
-function parseDateFilters(req: {
-  query: Record<string, unknown>;
-}): { startDate?: Date; endDate?: Date } {
-  const rawStart = req.query.from || req.query.startDate;
-  const rawEnd = req.query.to || req.query.endDate;
 /**
  * Parses and validates optional date-range parameters from the request query.
- *
- * Idempotency contract
- * --------------------
- * Both endpoints that accept date filters (`startDate`/`endDate` on the
- * filtered route, `from`/`to` on the main route) must return the **same**
- * response for the **same** input on every retry.  That guarantee breaks down
- * when `new Date("not-a-date")` silently produces an `Invalid Date` which
- * drizzle then serialises to a garbage SQL literal.  To keep retries safe:
- *
- * - If a date string is present but parses to `Invalid Date`, this function
- *   throws an error with `status = 400` and a `{ success: false, error }` body
- *   so the caller always receives the same deterministic rejection.
- * - If `from`/`startDate` is strictly after `to`/`endDate`, the range can never
- *   match any row on any retry — this is also rejected with 400.
- * - Absent parameters are returned as `undefined` (no filter applied), which is
- *   idempotent: every retry with no date params sees all rows.
  *
  * @param req - Express-compatible request with a `query` map.
  * @param opts.fromParam  - Query-param name for the lower bound (default `"startDate"`).
@@ -568,42 +546,6 @@ function parseDateFilters(
   let startDate: Date | undefined;
   let endDate: Date | undefined;
 
-  if (rawStart) {
-    if (typeof rawStart !== "string") {
-      const err = new Error("`from` or `startDate` must be a valid date string");
-      // @ts-ignore custom status property
-      err.status = 400;
-      throw err;
-    }
-    startDate = new Date(rawStart);
-    if (isNaN(startDate.getTime())) {
-      const err = new Error("Invalid `from` or `startDate` date format");
-      // @ts-ignore custom status property
-      err.status = 400;
-      throw err;
-    }
-  }
-
-  if (rawEnd) {
-    if (typeof rawEnd !== "string") {
-      const err = new Error("`to` or `endDate` must be a valid date string");
-      // @ts-ignore custom status property
-      err.status = 400;
-      throw err;
-    }
-    endDate = new Date(rawEnd);
-    if (isNaN(endDate.getTime())) {
-      const err = new Error("Invalid `to` or `endDate` date format");
-      // @ts-ignore custom status property
-      err.status = 400;
-      throw err;
-    }
-  }
-
-  if (startDate && endDate && startDate > endDate) {
-    const err = new Error("`from` date cannot be after `to` date");
-    // @ts-ignore custom status property
-    err.status = 400;
   if (rawFrom) {
     const d = new Date(rawFrom);
     if (Number.isNaN(d.getTime())) {
@@ -1278,7 +1220,6 @@ transactionsRouter.get(
       const userAddress = normalizeAddr(req.params.user_address);
       const { limit, offset } = parsePagination(req);
       const eventTypes = parseEventTypes(req);
-      const { startDate, endDate } = parseDateFilters(req);
 
       // Idempotent date-range validation: `from` / `to` are the supported
       // aliases on the main endpoint.  Absent params → no date filter (all
@@ -1296,7 +1237,6 @@ transactionsRouter.get(
       }
       const { sortBy, sortDir } = sortResult;
 
-      const conds = buildConditions(userAddress, { eventTypes: eventTypes ?? undefined, startDate, endDate });
       const conds = buildConditions(userAddress, {
         eventTypes: eventTypes ?? undefined,
         startDate,
