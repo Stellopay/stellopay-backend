@@ -631,8 +631,8 @@ describe("backward-compatibility contract", () => {
       expect(typeof schema.SCHEMA_COMPATIBILITY_VERSION).toBe("number");
     });
 
-    it("exports exactly 11 tables", () => {
-      expect(schema.SCHEMA_TABLES).toHaveLength(11);
+    it("exports exactly 12 tables", () => {
+      expect(schema.SCHEMA_TABLES).toHaveLength(12);
     });
 
     it("SENSITIVE_BILLING_FIELDS contains exactly the expected fields", () => {
@@ -1535,5 +1535,98 @@ describeDbMigration("Database migration integration test", () => {
         stdio: "pipe",
       }),
     ).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Migration naming consistency
+// ---------------------------------------------------------------------------
+
+describe("migration naming consistency", () => {
+  const MIGRATIONS_DIR = resolve("src/db/migrations");
+
+  function readSqlFiles(): string[] {
+    return fs
+      .readdirSync(MIGRATIONS_DIR)
+      .filter((f) => f.endsWith(".sql"));
+  }
+
+  function readJournalTags(): string[] {
+    const journal = JSON.parse(
+      fs.readFileSync(resolve("src/db/migrations/meta/_journal.json"), "utf8"),
+    );
+    return journal.entries.map((e: { tag: string }) => e.tag);
+  }
+
+  it("every .sql migration file is registered in _journal.json", () => {
+    const sqlFiles = readSqlFiles().map((f) => f.replace(/\.sql$/, ""));
+    const journalTags = readJournalTags();
+    const journalSet = new Set(journalTags);
+
+    const unregistered = sqlFiles.filter((tag) => !journalSet.has(tag));
+    expect(
+      unregistered,
+      `Unregistered migration files: ${unregistered.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("every journal tag has a corresponding .sql file", () => {
+    const sqlFiles = new Set(
+      readSqlFiles().map((f) => f.replace(/\.sql$/, "")),
+    );
+    const journalTags = readJournalTags();
+
+    const missing = journalTags.filter((tag) => !sqlFiles.has(tag));
+    expect(
+      missing,
+      `Journal entries without .sql files: ${missing.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("no duplicate tags in _journal.json", () => {
+    const journalTags = readJournalTags();
+    const seen = new Set<string>();
+    const duplicates: string[] = [];
+    for (const tag of journalTags) {
+      if (seen.has(tag)) duplicates.push(tag);
+      seen.add(tag);
+    }
+    expect(
+      duplicates,
+      `Duplicate journal tags: ${duplicates.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("journal entries have monotonically increasing idx values", () => {
+    const journal = JSON.parse(
+      fs.readFileSync(resolve("src/db/migrations/meta/_journal.json"), "utf8"),
+    );
+    const indices = journal.entries.map((e: { idx: number }) => e.idx);
+    for (let i = 1; i < indices.length; i++) {
+      expect(indices[i]).toBeGreaterThan(indices[i - 1]);
+    }
+  });
+
+  it("new timestamp-prefixed migrations use unique 13-14 digit prefixes", () => {
+    const sqlFiles = readSqlFiles();
+    const timestampPattern = /^\d{13,14}_(.+)\.sql$/;
+    const prefixes = new Map<string, string[]>();
+
+    for (const file of sqlFiles) {
+      const match = file.match(timestampPattern);
+      if (match) {
+        const prefix = file.split("_")[0];
+        const existing = prefixes.get(prefix) ?? [];
+        existing.push(file);
+        prefixes.set(prefix, existing);
+      }
+    }
+
+    for (const [prefix, files] of prefixes) {
+      expect(
+        files.length,
+        `Duplicate timestamp prefix "${prefix}" in: ${files.join(", ")}`,
+      ).toBe(1);
+    }
   });
 });

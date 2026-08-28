@@ -5,50 +5,64 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1782074550149,
+      "when": 1753574400000,
       "tag": "20240101000000_faulty_mole_man",
       "breakpoints": true
     },
     {
       "idx": 1,
       "version": "7",
-      "when": 1783240693251,
+      "when": 1753660800000,
       "tag": "20240102000000_faulty_blue_blade",
       "breakpoints": true
     },
     {
       "idx": 2,
       "version": "7",
-      "when": 1785084169250,
+      "when": 1753747200000,
       "tag": "20240103000000_hard_onslaught",
       "breakpoints": true
     },
     {
       "idx": 3,
       "version": "7",
-      "when": 1753574400000,
+      "when": 1753833600000,
       "tag": "20240104000000_schema_check_constraints",
       "breakpoints": true
     },
     {
       "idx": 4,
       "version": "7",
+      "when": 1785087699130,
+      "tag": "0003_slow_sally_floyd",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
       "when": 1785098317950,
       "tag": "0004_noisy_eternals",
       "breakpoints": true
     },
     {
-      "idx": 3,
+      "idx": 6,
       "version": "7",
-      "when": 1785087699130,
-      "tag": "0003_slow_sally_floyd",
+      "when": 1785170000000,
+      "tag": "20240105000000_backfill_lag_columns",
       "breakpoints": true
     },
     {
-      "idx": 3,
+      "idx": 7,
       "version": "7",
-      "when": 1785087699130,
-      "tag": "0003_slow_sally_floyd",
+      "when": 1785256400000,
+      "tag": "20240106000000_event_ingestion_unique_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785342800000,
+      "tag": "20240107000000_idempotency_keys",
       "breakpoints": true
     }
   ]

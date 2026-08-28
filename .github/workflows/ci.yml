@@ -13,8 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: CI green
-        run: echo "CI temporarily scoped to smoke check while build/test failures are triaged."
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint migrations
+        run: pnpm check:migrations
+
+      - name: Type check
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Unit tests
+        run: pnpm test
 
   sbom:
     name: CycloneDX SBOM

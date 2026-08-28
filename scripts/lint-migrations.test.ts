@@ -59,7 +59,7 @@ describe("lintMigrations script", () => {
       expect(result).toBe(true);
     });
 
-    it("should return false for invalid timestamp prefixed files", () => {
+    it("should return false for files that match neither scheme", () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
       vi.mocked(fs.readdirSync).mockReturnValue([
         "20240101120000_init.sql",
@@ -70,7 +70,127 @@ describe("lintMigrations script", () => {
       
       const result = lintMigrations("dummy");
       expect(result).toBe(false);
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("does not follow the timestamp-prefixed convention"));
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("does not match any recognized convention"));
+    });
+
+    it("should detect duplicate timestamp prefixes", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "20240101000000_init.sql",
+        "20240101000000_second.sql",
+      ] as unknown as fs.Dirent[]);
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      
+      const result = lintMigrations("dummy");
+      expect(result).toBe(false);
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Duplicate migration prefix"),
+      );
+    });
+
+    it("should detect duplicate sequence prefixes", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // Both files are unregistered (no journal mock), so both are flagged
+      // as unregistered sequence files. The duplicate check still runs.
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "0003_first.sql",
+        "0003_second.sql",
+      ] as unknown as fs.Dirent[]);
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      
+      const result = lintMigrations("dummy");
+      expect(result).toBe(false);
+      // Should report both unregistered AND duplicate
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Duplicate migration prefix"),
+      );
+    });
+
+    it("should detect mixed naming schemes with unregistered files", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "20240101120000_init.sql",
+        "0003_unregistered.sql",
+      ] as unknown as fs.Dirent[]);
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      
+      const result = lintMigrations("dummy");
+      expect(result).toBe(false);
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("uses sequence prefix but is not registered"),
+      );
+    });
+
+    it("should grandfather registered journal entries with sequence prefix", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "20240101120000_init.sql",
+        "0003_registered.sql",
+      ] as unknown as fs.Dirent[]);
+      // Mock the journal read: first call is for drizzle.config.ts check, second for journal
+      vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
+        const pathStr = p.toString();
+        if (pathStr.includes("_journal.json")) {
+          return JSON.stringify({
+            entries: [
+              { idx: 0, when: 100, tag: "0003_registered" },
+            ],
+          });
+        }
+        return "";
+      });
+      
+      const result = lintMigrations("dummy");
+      expect(result).toBe(true);
+    });
+
+    it("should allow both sequence and timestamp files when all sequence files are registered", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "20240101120000_init.sql",
+        "20240102120000_add_sessions.sql",
+        "0003_fk_constraints.sql",
+        "0004_backfill.sql",
+      ] as unknown as fs.Dirent[]);
+      vi.mocked(fs.readFileSync).mockImplementation((p: fs.PathOrFileDescriptor) => {
+        const pathStr = p.toString();
+        if (pathStr.includes("_journal.json")) {
+          return JSON.stringify({
+            entries: [
+              { idx: 0, when: 100, tag: "0003_fk_constraints" },
+              { idx: 1, when: 200, tag: "0004_backfill" },
+            ],
+          });
+        }
+        return "";
+      });
+      
+      const result = lintMigrations("dummy");
+      expect(result).toBe(true);
+    });
+
+    it("should accept all-sequence files when no timestamp files exist (no mixed scheme)", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "0003_first.sql",
+        "0004_second.sql",
+      ] as unknown as fs.Dirent[]);
+      
+      const result = lintMigrations("dummy");
+      // All-sequence is one consistent scheme, so no mixed-scheme error
+      expect(result).toBe(true);
+    });
+
+    it("should accept all-timestamp files with unique prefixes", () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue([
+        "20240101000000_init.sql",
+        "20240102000000_add_sessions.sql",
+        "20240103000000_add_constraints.sql",
+      ] as unknown as fs.Dirent[]);
+      
+      const result = lintMigrations("dummy");
+      expect(result).toBe(true);
     });
   });
 

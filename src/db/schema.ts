@@ -9,6 +9,8 @@ import {
   uniqueIndex,
   numeric,
   check,
+  jsonb,
+  primaryKey,
   type PgTableWithColumns,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
