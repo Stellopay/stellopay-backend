@@ -33,6 +33,47 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+  # Repository guards run standalone (tsx scripts, no build/test required), so
+  # they are kept out of the `ci` job on purpose: they stay green/red
+  # independently of the currently-triaged build pipeline and give an
+  # unambiguous signal per guard class.
+  guards:
+    name: Repository guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # BLOCKING — env.example must mirror src/config.ts exactly. The tree is
+      # currently in sync (48 variables); any new variable must land together
+      # with its documented example entry or CI fails.
+      - name: Env contract sync (pnpm check:env)
+        run: pnpm check:env
+
+      # BLOCKING — internal docs/ links must resolve to real files. Only
+      # filesystem targets are validated (external URLs are never fetched),
+      # so this cannot go red from network flakiness.
+      - name: Docs link integrity (pnpm check:docs)
+        run: pnpm check:docs
+
+      # ADVISORY (day one) — the current tree has 5 pre-existing migrations
+      # violating the timestamp-prefix convention (three sharing the 0005_
+      # prefix). Renaming them is owned by the separate migration-hygiene
+      # issue; until that lands this step reports but does not block. Flip to
+      # blocking (remove continue-on-error) when renames merge.
+      - name: Migration filename lint (pnpm check:migrations, advisory)
+        run: pnpm check:migrations
+        continue-on-error: true
+
   sbom:
     name: CycloneDX SBOM
     runs-on: ubuntu-latest
