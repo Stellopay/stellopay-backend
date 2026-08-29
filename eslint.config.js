@@ -76,4 +76,10 @@ export default [
       "no-console": "off",
     },
   },
+  {
+    files: ["src/auth/**/*.ts"],
+    rules: {
+      "@typescript-eslint/no-explicit-any": "error",
+    },
+  },
 ];
