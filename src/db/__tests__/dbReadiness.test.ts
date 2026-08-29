@@ -46,8 +46,12 @@ describe('waitForDbReadiness', () => {
   it('rejects after exhausting all attempts', async () => {
     querySpy.mockRejectedValue(new Error('db unavailable'));
     const promise = waitForDbReadiness();
+    // Attach the rejection handler before running the fake timers so the
+    // rejection is handled synchronously and cannot surface as an unhandled
+    // rejection while `runAllTimersAsync` processes the retry delay timers.
+    const rejection = expect(promise).rejects.toThrowError(/Unable to connect to database/);
     await vi.runAllTimersAsync();
-    await expect(promise).rejects.toThrowError(/Unable to connect to database/);
+    await rejection;
     expect(querySpy).toHaveBeenCalledTimes(env.DB_CONNECTION_RETRY_MAX_ATTEMPTS);
   });
 });

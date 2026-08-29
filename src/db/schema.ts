@@ -8,6 +8,8 @@ import {
   index,
   uniqueIndex,
   numeric,
+  jsonb,
+  primaryKey,
   check,
   type PgTableWithColumns,
 } from "drizzle-orm/pg-core";
@@ -674,13 +676,20 @@ export const idempotencyKeys = pgTable(
     route: text("route").notNull(),
     key: text("key").notNull(),
     bodyFingerprint: text("body_fingerprint").notNull(),
-    statusCode: integer("status_code").notNull(),
+    /** Lifecycle state: `in_progress` (claimed, awaiting completion), `completed` (response persisted, replayable), `failed` (retryable). */
+    status: text("status").notNull().default("completed"),
+    /** HTTP status of the stored response; NULL while the operation is in progress. */
+    statusCode: integer("status_code"),
     responseBody: jsonb("response_body").notNull().default({}),
     expiresAt: timestamp("expires_at").notNull(),
   },
   (table) => ({
     primaryKey: primaryKey({ columns: [table.route, table.key] }),
     expiresAtIdx: index("idempotency_keys_expires_at_idx").on(table.expiresAt),
+    statusCheck: check(
+      "idempotency_keys_status_check",
+      sql`${table.status} IN ('in_progress', 'completed', 'failed')`,
+    ),
   }),
 );
 

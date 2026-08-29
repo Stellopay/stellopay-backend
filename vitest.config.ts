@@ -28,6 +28,7 @@ export default defineConfig({
         "src/config.ts",
         "src/db/migrate.ts",
         "src/middleware/rate-limit.ts",
+        "src/middleware/idempotency-store.ts",
         "src/routes/token.ts",
         "src/routes/not-found.ts",
         "src/routes/read.ts",
