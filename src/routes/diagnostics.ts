@@ -225,7 +225,7 @@ export async function fetchDiagnosticsData(
     Number(process.hrtime.bigint() - queryStart) / 1_000_000;
 
   incDiagnosticsMetric(DIAGNOSTICS_METRICS.QUERY_DURATION_MS, queryDurationMs);
-  setDiagnosticsGauge("diagnostics_last_query_duration_ms", queryDurationMs);
+  setDiagnosticsGauge(DIAGNOSTICS_METRICS.LAST_QUERY_DURATION_MS, queryDurationMs);
 
   logDiagnosticsEvent("debug", "diagnostics.query_timing", {
     durationMs: Math.round(queryDurationMs * 100) / 100,

@@ -156,4 +156,5 @@ export const STARKNET_METRICS = {
   NETWORK_INFO_ERRORS: "starknet_network_info_errors_total",
   CIRCUIT_BREAKER_STATE: "starknet_circuit_breaker_state",
   CIRCUIT_BREAKER_TRANSITIONS: "starknet_circuit_breaker_transitions_total",
+  BACKFILL_LAG_RPC_ERRORS: "backfill_lag_rpc_errors_total",
 } as const;
