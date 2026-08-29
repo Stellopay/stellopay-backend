@@ -95,17 +95,6 @@ export function resetStarknetMetrics(): void {
   for (const k of Object.keys(gauges)) delete gauges[k];
 }
 
-/** Build a Prometheus-style metric key without allowing label syntax injection. */
-export function labeledStarknetMetric(
-  name: string,
-  labels: Record<string, string>,
-): string {
-  const encoded = Object.entries(labels)
-    .map(([key, value]) => `${key}="${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`)
-    .join(",");
-  return `${name}{${encoded}}`;
-}
-
 // ---------------------------------------------------------------------------
 // Structured logging
 // ---------------------------------------------------------------------------

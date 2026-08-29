@@ -33,6 +33,7 @@ import { verifyAbiCompatibility } from "./starknet/abi.js";
 import { provider, getEscrowAbi, getAgreementAbi } from "./starknet/client.js";
 import Redis from "ioredis";
 import { RedisStore } from "rate-limit-redis";
+import { setLockoutStore, RedisLockoutStore } from "./auth/lockout.js";
 
 export const app = express();
 initLogger();
@@ -111,6 +112,19 @@ const rateLimitStore = redisClient
         redisClient.call(args[0]!, ...args.slice(1)),
     })
   : undefined;
+
+// Shared lockout store: when Redis is available, use it so lockout state is
+// shared across replicas.  Without Redis, the default in-memory store is used
+// (single-instance only — see src/auth/lockout.ts for trade-offs).
+if (redisClient) {
+  setLockoutStore(
+    new RedisLockoutStore({
+      get: (key) => redisClient.get(key),
+      set: (key, value, mode, ttl) => redisClient.set(key, value, mode, ttl),
+      del: (key) => redisClient.del(key),
+    }),
+  );
+}
 
 // Global limiter (looser) — applied to all /api routes; /health is exempt.
 const globalLimiter = makeLimiter({

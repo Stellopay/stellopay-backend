@@ -118,9 +118,22 @@ vi.mock("../config.js", () => ({
     NODE_ENV: "test",
     LOG_LEVEL: "debug",
     LOG_FORMAT: "json",
+    LOG_REDACT_QUERY_PARAMS: ["token", "signature", "secret"],
+    CORS_ORIGIN: "http://localhost:3000",
     ADMIN_ADDRESSES: [] as string[],
     SESSION_TTL_MS: 86400000,
     SESSION_MAX_TTL_MS: 2592000000,
+    RATE_LIMIT_WINDOW_MS: 60000,
+    RATE_LIMIT_MAX: 100,
+    RATE_LIMIT_STRICT_WINDOW_MS: 60000,
+    RATE_LIMIT_STRICT_MAX: 20,
+    RATE_LIMIT_CONTACT_WINDOW_MS: 3600000,
+    RATE_LIMIT_CONTACT_MAX: 3,
+    RATE_LIMIT_ANALYTICS_WINDOW_MS: 60000,
+    RATE_LIMIT_ANALYTICS_MAX: 200,
+    TRUST_PROXY: "1",
+    REDIS_URL: undefined as string | undefined,
+    SKIP_ABI_VERIFICATION: true,
   },
   defaults: {},
   circuitBreakerConfig: {},
@@ -256,12 +269,12 @@ function captureEvents(
 }
 
 describe("Auth Routes Integration", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     mockState.sessions = [];
     vi.clearAllMocks();
-    lockouts.clear();
+    await lockouts.clear();
     clearChallengesForTesting();
   });
 
@@ -1288,11 +1301,11 @@ describe("debug middleware body-clone guard", () => {
 // ===========================================================================
 
 describe("auth route telemetry", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     mockState.sessions = [];
-    lockouts.clear();
+    await lockouts.clear();
     resetAuthMetrics();
   });
 
