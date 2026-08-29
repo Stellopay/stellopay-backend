@@ -155,4 +155,5 @@ export const DIAGNOSTICS_METRICS = {
   SUCCESS: "diagnostics_success_total",
   ERRORS: "diagnostics_errors_total",
   QUERY_DURATION_MS: "diagnostics_query_duration_ms_total",
+  LAST_QUERY_DURATION_MS: "diagnostics_last_query_duration_ms",
 } as const;
