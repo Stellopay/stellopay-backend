@@ -181,9 +181,6 @@ export const EnvSchema = z
 
     // Optional shared cache for analytics responses. When unset, the route
     // uses its existing in-process cache.
-    REDIS_URL: z.string().url().optional(),
-
-    // Session token lifetime in milliseconds (sliding expiry) — default 24 hours
     SESSION_TTL_MS: z.coerce
       .number()
       .int()
@@ -270,21 +267,6 @@ export const EnvSchema = z
     .default(60_000),
 
     // Graceful shutdown drain timeout (milliseconds) — default 10 seconds
-    SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .default(10_000),
-
-    // Feature flag for billing endpoints — default false
-    BILLING_ENABLED: z
-      .string()
-      .optional()
-      .default("false")
-      .transform((v) => v === "true"),
-
-    // Maximum allowed billing amount per request — default 1,000,000
     MAX_BILLING_AMOUNT: z.coerce
       .number()
       .positive()
