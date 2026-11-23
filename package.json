@@ -52,7 +52,7 @@
     "@types/pg": "^8.23.1",
     "@types/supertest": "^7.2.1",
     "@vitest/coverage-v8": "^3.2.4",
-    "autocannon": "^7.15.0",
+    "autocannon": "^9.0.0",
     "drizzle-kit": "^0.31.11",
     "eslint": "^10.13.0",
     "prettier": "^3.9.10",
