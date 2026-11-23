@@ -82,8 +82,8 @@ importers:
         specifier: ^3.2.4
         version: 3.2.6(vitest@3.2.6(@types/node@26.6.5)(tsx@4.23.15))
       autocannon:
-        specifier: ^7.15.0
-        version: 7.15.0
+        specifier: ^9.0.0
+        version: 9.0.0
       drizzle-kit:
         specifier: ^0.31.11
         version: 0.31.11
@@ -110,6 +110,9 @@ importers:
         version: 3.2.6(@types/node@26.6.5)(tsx@4.23.15)
 
 packages:
+
+  '@adraffy/ens-normalize.ts@1.0.1':
+    resolution: {integrity: sha512-7wvZTCkt4A/beL2KqvUVBftZvyugvqANY74YFkTOLwX4JtsgIBOMGogItvGrd+yOg2ctDkvrZ6+HV0WtsZ6Q9g==}
 
   '@adraffy/ens-normalize@1.11.1':
     resolution: {integrity: sha512-nhCBV3quEgesuf7c7KYfperqSS14T8bYuvJ8PcLJp6znkZpFc0AuW4qBtr8eKVyPPe/8RSr7sglCWPU5eaxwKQ==}
@@ -855,6 +858,9 @@ packages:
   '@keyv/serialize@1.1.1':
     resolution: {integrity: sha512-dXn3FZhPv0US+7dtJsIi2R+c7qWYiReoEh5zUntWCf4oSpMNib8FDhSoed6m3QyZdx5hK7iLFkYk3rNxwt8vTA==}
 
+  '@minimistjs/subarg@1.0.0':
+    resolution: {integrity: sha512-Q/ONBiM2zNeYUy0mVSO44mWWKYM3UHuEK43PKIOzJCbvUnPoMH1K+gk3cf1kgnCVJFlWmddahQQCmrmBGlk9jQ==}
+
   '@noble/ciphers@2.2.0':
     resolution: {integrity: sha512-Z6pjIZ/8IJcCGzb2S/0Px5J81yij85xASuk1teLNeg75bfT07MV3a/O2Mtn1I2se43k3lkVEcFaR10N4cgQcZA==}
     engines: {node: '>= 20.19.0'}
@@ -1311,8 +1317,8 @@ packages:
     resolution: {integrity: sha512-quJQXlTSUGL2LH9SUXo8VwsY4soanhgo6LNSm84E1LBcE8s3O0wpdiRzyR9z/ZZJMlMWv37qOOb9pdJlMUEKFQ==}
     engines: {node: '>=8'}
 
-  ansi-regex@6.2.2:
-    resolution: {integrity: sha512-Bq3SmSpyFHaWjPk8If9yc6svM8c56dB5BAtW4Qbw5jHTwwXXcTLoRMkpDJp6VL0XzlWaCHTXrkFURMYmD0sLqg==}
+  ansi-regex@6.6.0:
+    resolution: {integrity: sha512-XZ5apbzreCbXSKwPjJstu8R0zOi247w3XYwWxtwBXgpZrCyc1Ka7p9/xY0A9/diMewmHbEKz+FIraWaEWjlN5g==}
     engines: {node: '>=12'}
 
   ansi-styles@4.3.0:
@@ -1343,8 +1349,8 @@ packages:
     resolution: {integrity: sha512-kNOjDqAh7px0XWNI+4QbzoiR/nTkHAWNud2uvnJquD1/x5a7EQZMJT0AczqK0Qn67oY/TTQ1LbUKajZpp3I9tQ==}
     engines: {node: '>=8.0.0'}
 
-  autocannon@7.15.0:
-    resolution: {integrity: sha512-NaP2rQyA+tcubOJMFv2+oeW9jv2pq/t+LM6BL3cfJic0HEfscEcnWgAyU5YovE/oTHUzAgTliGdLPR+RQAWUbg==}
+  autocannon@9.0.0:
+    resolution: {integrity: sha512-hUIWSNtxPEdvFFz/ZGzvoCkfN4Pw9RZBXr4zT95Ff8lEUUvUMB9BnOdjW3lwlCZfpY/US2fWUjZ5+GTtcJKjIQ==}
     hasBin: true
 
   balanced-match@1.0.2:
@@ -1374,8 +1380,8 @@ packages:
   buffer-from@1.1.2:
     resolution: {integrity: sha512-E+XQCRwSbaaiChtv6k6Dwgc+bx+Bs6vuKJHHl5kox/BaKbhiXzqQOwK4cO22yElGp2OCmjwVhT3HmxgyPGnJfQ==}
 
-  buffer@5.7.1:
-    resolution: {integrity: sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==}
+  buffer@6.0.3:
+    resolution: {integrity: sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==}
 
   bytes@3.1.2:
     resolution: {integrity: sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg==}
@@ -1902,8 +1908,8 @@ packages:
   http-parser-js@0.5.10:
     resolution: {integrity: sha512-Pysuw9XpUq5dVc/2SMHpuTY01RFl8fttgcyunjL7eEMhGM3cI4eOmiCycJDVCo/7O7ClfQD3SaI6ftDzqOXYMA==}
 
-  hyperid@3.3.0:
-    resolution: {integrity: sha512-7qhCVT4MJIoEsNcbhglhdmBKb09QtcmJNiIQGq7js/Khf5FtQQ9bzcAuloeqBeee7XD7JqDeve9KNlQya5tSGQ==}
+  hyperid@4.0.0:
+    resolution: {integrity: sha512-vjhh0CG44/iGjcNEjebL0BpRDR+C7d1KZ1Yqf92ralTOO5JjZiGHQT0bjDaKuNu1kk3jB+5jGFhNbxkT0wcQmA==}
 
   iconv-lite@0.7.3:
     resolution: {integrity: sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ==}
@@ -2139,8 +2145,8 @@ packages:
       typescript:
         optional: true
 
-  ox@1.8.8:
-    resolution: {integrity: sha512-zPWwnOSwzWO6vmNPp02GYLbz5OwfQ0nAUyh5whRNyH4l65y9GAXFG3Jrcn5lZU3E2S0PBXIMnCgsm+P9Mj+10Q==}
+  ox@1.8.18:
+    resolution: {integrity: sha512-j3mTPiHKiCQ1L80ZQ7SLKgmfJ0KRa3VXM6SvxtygxsaYzVYwC7XIF9tFn2iEzvK5s6E5l/r/pZTP/vhOPZen6g==}
     peerDependencies:
       typescript: '>=5.4.0'
     peerDependenciesMeta:
@@ -2358,8 +2364,8 @@ packages:
   safer-buffer@2.1.2:
     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
 
-  semver@7.8.5:
-    resolution: {integrity: sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==}
+  semver@7.8.6:
+    resolution: {integrity: sha512-9lpSSU4Mly3mrtruwLs1eLK6+gzbzqeBFwRNjIjE+9LuDpWdYctrQlQ3ej1Ilgi7gknpsTRnPoLP8DpCHqHIJw==}
     engines: {node: '>=10'}
     hasBin: true
 
@@ -2459,9 +2465,6 @@ packages:
   strip-literal@3.1.0:
     resolution: {integrity: sha512-8r3mkIM/2+PpjHoOtiAW8Rg3jJLHaV7xPwG+YRGrv6FP0wwk/toTpATxWYOW0BKdWwl82VT2tFYi5DlROa0Mxg==}
 
-  subarg@1.0.0:
-    resolution: {integrity: sha512-RIrIdRY0X1xojthNcVtgT9sjpOGagEUKpZdgBUi054OEPFo282yg+zE+t1Rj3+RqKq2xStL7uUHhY+AjbC4BXg==}
-
   superagent@10.4.1:
     resolution: {integrity: sha512-PVMkMrhKrSTtFhUU8jiWuGh/gyRMKiyCTCmm0+qVzRNxlfntmRKJkDhlEXN62x3HIb33sQ4kmL8lcSdccWAchQ==}
     engines: {node: '>=14.18.0'}
@@ -2559,14 +2562,6 @@ packages:
 
   uri-js@4.4.1:
     resolution: {integrity: sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg==}
-
-  uuid-parse@1.1.0:
-    resolution: {integrity: sha512-OdmXxA8rDsQ7YpNVbKSJkNzTw2I+S5WsbMDnCtIWSQaosNAcWtFuI/YK1TjzUI6nbkgiqEyh8gWngfcv8Asd9A==}
-
-  uuid@8.3.2:
-    resolution: {integrity: sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==}
-    deprecated: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
-    hasBin: true
 
   vary@1.1.2:
     resolution: {integrity: sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==}
@@ -2694,6 +2689,8 @@ packages:
     resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
 
 snapshots:
+
+  '@adraffy/ens-normalize.ts@1.0.1': {}
 
   '@adraffy/ens-normalize@1.11.1': {}
 
@@ -3131,6 +3128,10 @@ snapshots:
 
   '@keyv/serialize@1.1.1': {}
 
+  '@minimistjs/subarg@1.0.0':
+    dependencies:
+      minimist: 1.2.8
+
   '@noble/ciphers@2.2.0': {}
 
   '@noble/ciphers@2.4.0': {}
@@ -3298,7 +3299,7 @@ snapshots:
       '@starknet-io/types-js': 0.10.4
       '@wallet-standard/base': 1.1.1
       '@wallet-standard/features': 1.1.1
-      ox: 1.8.8(typescript@5.9.3)
+      ox: 1.8.18(typescript@5.9.3)
     transitivePeerDependencies:
       - typescript
 
@@ -3475,7 +3476,7 @@ snapshots:
       '@typescript-eslint/visitor-keys': 8.71.2
       debug: 4.4.3
       minimatch: 10.2.6
-      semver: 7.8.5
+      semver: 7.8.6
       tinyglobby: 0.2.17
       ts-api-utils: 2.5.0(typescript@5.9.3)
       typescript: 5.9.3
@@ -3597,7 +3598,7 @@ snapshots:
 
   ansi-regex@5.0.1: {}
 
-  ansi-regex@6.2.2: {}
+  ansi-regex@6.6.0: {}
 
   ansi-styles@4.3.0:
     dependencies:
@@ -3621,8 +3622,9 @@ snapshots:
 
   atomic-sleep@1.0.0: {}
 
-  autocannon@7.15.0:
+  autocannon@9.0.0:
     dependencies:
+      '@minimistjs/subarg': 1.0.0
       chalk: 4.1.2
       char-spinner: 1.0.1
       cli-table3: 0.6.5
@@ -3633,7 +3635,7 @@ snapshots:
       hdr-histogram-js: 3.0.1
       hdr-histogram-percentiles-obj: 3.0.0
       http-parser-js: 0.5.10
-      hyperid: 3.3.0
+      hyperid: 4.0.0
       lodash.chunk: 4.2.0
       lodash.clonedeep: 4.5.0
       lodash.flatten: 4.4.0
@@ -3643,8 +3645,7 @@ snapshots:
       progress: 2.0.3
       reinterval: 1.1.0
       retimer: 3.0.0
-      semver: 7.8.5
-      subarg: 1.0.0
+      semver: 7.8.6
       timestring: 6.0.0
 
   balanced-match@1.0.2: {}
@@ -3679,7 +3680,7 @@ snapshots:
 
   buffer-from@1.1.2: {}
 
-  buffer@5.7.1:
+  buffer@6.0.3:
     dependencies:
       base64-js: 1.5.1
       ieee754: 1.2.1
@@ -4240,11 +4241,9 @@ snapshots:
 
   http-parser-js@0.5.10: {}
 
-  hyperid@3.3.0:
+  hyperid@4.0.0:
     dependencies:
-      buffer: 5.7.1
-      uuid: 8.3.2
-      uuid-parse: 1.1.0
+      buffer: 6.0.3
 
   iconv-lite@0.7.3:
     dependencies:
@@ -4365,7 +4364,7 @@ snapshots:
 
   make-dir@4.0.0:
     dependencies:
-      semver: 7.8.5
+      semver: 7.8.6
 
   manage-path@2.0.0: {}
 
@@ -4454,9 +4453,9 @@ snapshots:
     transitivePeerDependencies:
       - zod
 
-  ox@1.8.8(typescript@5.9.3):
+  ox@1.8.18(typescript@5.9.3):
     dependencies:
-      '@adraffy/ens-normalize': 1.11.1
+      '@adraffy/ens-normalize.ts': 1.0.1
       '@noble/ciphers': 2.4.0
       '@noble/curves': 2.4.0
       '@noble/hashes': 2.4.0
@@ -4682,7 +4681,7 @@ snapshots:
 
   safer-buffer@2.1.2: {}
 
-  semver@7.8.5: {}
+  semver@7.8.6: {}
 
   send@1.2.1:
     dependencies:
@@ -4808,15 +4807,11 @@ snapshots:
 
   strip-ansi@7.2.0:
     dependencies:
-      ansi-regex: 6.2.2
+      ansi-regex: 6.6.0
 
   strip-literal@3.1.0:
     dependencies:
       js-tokens: 9.0.1
-
-  subarg@1.0.0:
-    dependencies:
-      minimist: 1.2.8
 
   superagent@10.4.1:
     dependencies:
@@ -4919,10 +4914,6 @@ snapshots:
   uri-js@4.4.1:
     dependencies:
       punycode: 2.3.1
-
-  uuid-parse@1.1.0: {}
-
-  uuid@8.3.2: {}
 
   vary@1.1.2: {}
 
